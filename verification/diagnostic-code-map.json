@@ -474,6 +474,12 @@
       "evidence": "Property does not exist on this type -> TS2339 via tsc --noEmit on 'interface I { a: string; } declare var x: I; x.b;'.",
       "status": "mapped",
       "tsCode": 2339
+    },
+    {
+      "bamtsCode": "BAMTS-C070",
+      "evidence": "Unused @ts-expect-error directive -> TS2578 via tsc --noEmit when the following statement has no diagnostic.",
+      "status": "mapped",
+      "tsCode": 2578
     }
   ]
 }

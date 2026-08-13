@@ -1198,7 +1198,10 @@ impl<'a> Emitter<'a> {
 
     fn emit_decorator(&mut self, decorator: &DecoratorNode) {
         self.raw("@");
-        self.emit_expression_prec(&decorator.data().expression, P_ASSIGN);
+        // Decorator grammar only permits a call/member expression (or a
+        // parenthesized one); emit with that precedence so lower-precedence
+        // inner expressions are parenthesized.
+        self.emit_expression_prec(&decorator.data().expression, P_CALL_MEMBER);
     }
 
     fn emit_decorators_inline(&mut self, decorators: &[DecoratorNode]) {
@@ -4140,6 +4143,81 @@ export = answer;";
             decorator_texts(&accessor.decorators),
             ["@accessorFirst", "@accessorSecond"]
         );
+    }
+    #[test]
+    fn parenthesized_decorator_expression_emits_with_preserved_precedence() {
+        let input = concat!(
+            "const a = 1, b = 1, c = 1;\n",
+            "@(a + b) class C {\n",
+            "    x = a + b * c;\n",
+            "}\n",
+        );
+        let source =
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget"));
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        assert!(parsed.diagnostics().is_empty());
+
+        let output = emit_js(parsed.product());
+        assert!(!output.has_errors());
+        assert_eq!(
+            output.code,
+            concat!(
+                "const a = 1, b = 1, c = 1;\n",
+                "@(a + b)\n",
+                "class C {\n",
+                "    x = a + b * c;\n",
+                "}\n",
+            ),
+        );
+
+        let reparsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(output.code.as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
+        ));
+        assert!(reparsed.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn plain_decorator_expression_and_neighbor_stay_unparenthesized() {
+        let input = concat!(
+            "const a = 1, b = 1, c = 1;\n",
+            "@foo class C {\n",
+            "    x = a + b * c;\n",
+            "}\n",
+        );
+        let source =
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget"));
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        assert!(parsed.diagnostics().is_empty());
+
+        let output = emit_js(parsed.product());
+        assert!(!output.has_errors());
+        assert_eq!(
+            output.code,
+            concat!(
+                "const a = 1, b = 1, c = 1;\n",
+                "@foo\n",
+                "class C {\n",
+                "    x = a + b * c;\n",
+                "}\n",
+            ),
+        );
+
+        let reparsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(output.code.as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
+        ));
+        assert!(reparsed.diagnostics().is_empty());
     }
 
     #[test]

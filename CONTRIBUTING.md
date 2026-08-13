@@ -4,7 +4,7 @@ This guide describes how to set up your environment, navigate the repository, va
 
 ## Project status
 
-bamTiScript is in pre-release state (`0.1.0`).
+bamTiScript is in pre-release state (`0.2.0`).
 
 - `bamti` and `bamti-cli` 0.1.0 are published, but their referenced platform binary packages are unavailable.
 - TypeScript 7.0.2 serves as the primary compatibility oracle, not a completed compatibility claim.
@@ -89,7 +89,7 @@ cargo build --release -p bamts-cli
 ### Conventions for tests and examples
 
 - Use `process.stdout.write` for program output in TypeScript examples and fixtures. Do not use `console.log`, `console.debug`, `console.trace`, `console.table`, or `debugger` statements.
-- Single entrypoint source files are supported for compilation. Generation of declaration files (`.d.ts`) and source maps is rejected in version `0.1.0`.
+- Single entrypoint source files are supported for compilation. Generation of declaration files (`.d.ts`) and source maps is rejected in version `0.2.0`.
 
 ---
 

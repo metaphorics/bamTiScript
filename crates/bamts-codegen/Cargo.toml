@@ -10,6 +10,7 @@ description = "Code generation (JIT/AOT) backend for BamTS"
 
 [dependencies]
 bamts-bytecode.workspace = true
+bamts-cancel.workspace = true
 bamts-native = { workspace = true, optional = true, features = ["jit-entry"] }
 cranelift-codegen = { version = "=0.134.2", default-features = false, features = ["std", "unwind", "all-native-arch"] }
 cranelift-frontend = "=0.134.2"

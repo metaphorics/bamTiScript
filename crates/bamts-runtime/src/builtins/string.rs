@@ -1335,12 +1335,10 @@ fn regexp_replacement<H: Host>(
         }
         arguments.push(crate::number_value(matched.range.start as f64));
         arguments.push(allocate_string(machine, input.clone())?);
-        // ECMA-262 §22.1.3.2.1: when the pattern has named groups the
-        // replacer receives a trailing `groups` object; otherwise it
-        // receives `undefined`.
-        let groups = if matched.named.is_empty() {
-            Value::UNDEFINED
-        } else {
+        // ECMA-262 §22.1.3.2.1 appends `groups` only when the pattern
+        // defines named capture metadata. The map retains unmatched groups
+        // as `None`, so metadata presence does not depend on participation.
+        if !matched.named.is_empty() {
             let groups = machine
                 .allocate(HeapEntry::Object {
                     properties: PropertyMap::default(),
@@ -1358,9 +1356,8 @@ fn regexp_replacement<H: Host>(
                 };
                 machine.set_data_property(groups, name, value)?;
             }
-            groups
-        };
-        arguments.push(groups);
+            arguments.push(groups);
+        }
         return machine
             .call_value(replacer, Value::UNDEFINED, &arguments)
             .and_then(|value| machine.to_string(value));
@@ -1398,9 +1395,10 @@ fn regexp_replacement<H: Host>(
             // ECMA-262 §22.1.3.19.1 GetSubstitution: $<Name> resolves a
             // named capture group. If the name is absent or the group did
             // not participate, the substitution is the empty string.
-            if let Some(close) = units[offset + 2..]
-                .iter()
-                .position(|&unit| unit == u16::from(b'>'))
+            if !matched.named.is_empty()
+                && let Some(close) = units[offset + 2..]
+                    .iter()
+                    .position(|&unit| unit == u16::from(b'>'))
             {
                 let name_units = &units[offset + 2..offset + 2 + close];
                 let name = String::from_utf16_lossy(name_units);
@@ -1413,7 +1411,8 @@ fn regexp_replacement<H: Host>(
                 offset += 2 + close + 1;
                 continue;
             }
-            // No closing '>' — fall through to literal '$'.
+            // Without named capture metadata, or without a closing `>`,
+            // `$<` starts a literal sequence.
             output.push_unit(units[offset]);
             offset += 1;
             continue;
@@ -1801,6 +1800,30 @@ mod split_replace_tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
+    use crate::intrinsics::{BuiltinDef, native_function};
+
+    fn replacement_argument_count(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        args: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(
+            crate::number_value(args.len() as f64),
+        ))
+    }
+
+    fn native_replacer(
+        machine: &mut Machine<'_, TestHost>,
+        handler: BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "replacementArgumentCount",
+            length: 0,
+            handler,
+        });
+        native_function(&mut machine.heap, id, "replacementArgumentCount", 0)
+    }
 
     /// Constructs a RegExp the same way the `RegExp` constructor does, so
     /// `regexp_parts` recognises the result in split/replace dispatch.
@@ -2113,6 +2136,46 @@ mod split_replace_tests {
             machine.string_value(result).unwrap().to_utf8_lossy(),
             "/users/id=7"
         );
+    }
+
+    #[test]
+    fn replace_callback_omits_groups_argument_without_named_captures() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let replacer = native_replacer(&mut machine, replacement_argument_count);
+        let result = call_string_method(&mut machine, "replace", "x", &[regexp, replacer]);
+        assert_eq!(machine.string_value(result).unwrap().to_utf8_lossy(), "3");
+    }
+
+    #[test]
+    fn replace_named_reference_stays_literal_without_named_captures() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("$<foo>")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "x", &[regexp, replacement]);
+        assert_eq!(
+            machine.string_value(result).unwrap().to_utf8_lossy(),
+            "$<foo>"
+        );
+    }
+
+    #[test]
+    fn replace_absent_named_group_substitutes_empty() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "(?<name>x)", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("[$<missing>]")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "x", &[regexp, replacement]);
+        assert_eq!(machine.string_value(result).unwrap().to_utf8_lossy(), "[]");
     }
 
     #[test]

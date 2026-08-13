@@ -60,23 +60,36 @@ fn constructor<H: Host>(
     if !constructing {
         return Err(type_error("Uint8Array constructor requires 'new'"));
     }
-    let (length, values) = match args.first().copied() {
-        None | Some(Value::UNDEFINED) => (0, None),
-        Some(source) if !machine.is_object(source) => (typed_array_length(machine, source)?, None),
+    let (length, values, copied_bytes) = match args.first().copied() {
+        None | Some(Value::UNDEFINED) => (0, None, None),
+        Some(source) if !machine.is_object(source) => {
+            (typed_array_length(machine, source)?, None, None)
+        }
         Some(source) => {
-            let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-            let iterator_key = machine.to_property_key(iterator_symbol)?;
-            let iterator_method = machine.get_property_key(source, &iterator_key)?;
-            match iterator_method.decode() {
-                Some(Decoded::Undefined | Decoded::Null) => {
-                    let values = array_like_values(machine, source)?;
-                    (values.len(), Some(values))
+            let copied_bytes = match machine.runtime_slot(source).map_err(EvalFailure::Runtime)? {
+                Some(slot) => match &machine.heap[slot] {
+                    HeapEntry::Uint8Array { bytes, .. } => Some(bytes.clone()),
+                    _ => None,
+                },
+                None => None,
+            };
+            if let Some(bytes) = copied_bytes {
+                (bytes.len(), None, Some(bytes))
+            } else {
+                let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+                let iterator_key = machine.to_property_key(iterator_symbol)?;
+                let iterator_method = machine.get_property_key(source, &iterator_key)?;
+                match iterator_method.decode() {
+                    Some(Decoded::Undefined | Decoded::Null) => {
+                        let values = array_like_values(machine, source)?;
+                        (values.len(), Some(values), None)
+                    }
+                    _ if machine.is_callable(iterator_method)? => {
+                        let values = machine.iterable_values(source)?;
+                        (values.len(), Some(values), None)
+                    }
+                    _ => return Err(type_error("value is not iterable")),
                 }
-                _ if machine.is_callable(iterator_method)? => {
-                    let values = machine.iterable_values(source)?;
-                    (values.len(), Some(values))
-                }
-                _ => return Err(type_error("value is not iterable")),
             }
         }
     };
@@ -89,20 +102,25 @@ fn constructor<H: Host>(
                 .saturating_add(1),
         )
         .map_err(EvalFailure::Runtime)?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(length).map_err(|_| {
-        EvalFailure::Runtime(crate::RuntimeErrorKind::HeapByteLimitExceeded {
-            limit: machine.limits.max_heap_bytes,
-        })
-    })?;
-    match values {
-        Some(values) => {
-            for value in values {
-                bytes.push(to_uint8(machine, value)?);
+    let bytes = if let Some(copied) = copied_bytes {
+        copied
+    } else {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|_| {
+            EvalFailure::Runtime(crate::RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: machine.limits.max_heap_bytes,
+            })
+        })?;
+        match values {
+            Some(values) => {
+                for value in values {
+                    bytes.push(to_uint8(machine, value)?);
+                }
             }
+            None => bytes.resize(length, 0),
         }
-        None => bytes.resize(length, 0),
-    }
+        bytes
+    };
     let default_prototype = machine.intrinsics.builtins.uint8array_prototype();
     let new_target = machine.current_new_target();
     let prototype = if new_target != Value::UNDEFINED {
@@ -341,6 +359,17 @@ mod tests {
         _: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         Ok(BuiltinOutcome::Value(this))
+    }
+
+    fn throwing_iterator(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "source Symbol.iterator called",
+        }))
     }
 
     fn iterator_next(
@@ -733,6 +762,32 @@ mod tests {
             ));
         });
     }
+
+    #[test]
+    fn uint8array_copies_typed_array_without_calling_symbol_iterator() {
+        with_machine(|machine| {
+            let source_values = array_of(
+                machine,
+                &[Value::int32(3), Value::int32(17), Value::int32(255)],
+            );
+            let source = construct(machine, source_values);
+            let iterator = native(machine, "throwing [Symbol.iterator]", throwing_iterator);
+            let iterator_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                .unwrap();
+            machine
+                .set_data_property_key(source, iterator_key, iterator)
+                .unwrap();
+
+            let copy = construct(machine, source);
+
+            assert_eq!(int(machine, copy, "length"), 3);
+            assert_eq!(int(machine, copy, "0"), 3);
+            assert_eq!(int(machine, copy, "1"), 17);
+            assert_eq!(int(machine, copy, "2"), 255);
+        });
+    }
+
     #[test]
     fn uint8array_preflights_dedicated_backing_storage() {
         let program = blank_program("<test>");

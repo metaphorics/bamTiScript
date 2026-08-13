@@ -1,8 +1,8 @@
 # Verification evidence
 
-This document explains the evidence model for bamTiScript 0.1.0, the scope of recorded proofs, and the limits of current claims.
+This document explains the evidence model for bamTiScript 0.2.0, the scope of recorded proofs, and the limits of current claims.
 
-bamTiScript is pre-release software (version 0.1.0). `bamti` and `bamti-cli` 0.1.0 are published, but their referenced platform binary packages are unavailable.
+bamTiScript is pre-release software (version 0.2.0). Currently published 0.1.0 packages for `bamti` and `bamti-cli` do not contain prebuilt native binary artifacts. The in-process `bamti` Node-API native bindings (`bamts-napi`) exist in the source repository but are unpublished. Five-target release validation remains blocked by GitHub billing and is unverified.
 
 ## Three evidence sources
 
@@ -91,7 +91,7 @@ The current evidence does not prove:
 
 * Full TypeScript compatibility: TypeScript 7.0.2 is used as a reference oracle for comparison. It is not a claim of complete language or type-system coverage.
 * Public performance: Verification records functional and property evidence, not execution speed or production performance.
-* npm distribution: The JavaScript shim packages are published, but their referenced platform binary packages are unavailable. This evidence does not establish a working npm-distributed compiler.
+* npm distribution: Published 0.1.0 npm packages do not provide native binary artifacts. The source implementation of native Node-API bindings (`bamts-napi`) is unpublished, and real five-target release validation remains blocked by GitHub billing and is unverified. Optional native artifact loading is fail-closed.
 * Production adoption: The evidence does not establish production-workload stability.
 * Cross-platform runtime correctness: Runtime instructions currently target Linux x64. AOT compilation does not cross-compile. Non-Linux runtime behavior is not established here.
 * Complete compiler or runtime verification: Source policies and named formal properties do not prove the complete compiler pipeline, virtual machine, generated code, dependencies, or native process boundary.

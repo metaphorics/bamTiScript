@@ -40,7 +40,7 @@ use super::{
     PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
     SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-    SUPER_REFERENCE_NON_DERIVED, TYPE_NOT_ASSIGNABLE, USED_BEFORE_ASSIGNED,
+    SUPER_REFERENCE_NON_DERIVED, TYPE_NOT_ASSIGNABLE, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
     USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
     USING_DECLARATION_MISSING_INITIALIZER, WITH_STATEMENT_NOT_ALLOWED,
 };
@@ -65,7 +65,7 @@ use super::{
     PROPERTY_NOT_INITIALIZED_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
     SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
-    SUPER_REFERENCE_NON_DERIVED_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
+    SUPER_REFERENCE_NON_DERIVED_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
     USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
     USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
@@ -714,6 +714,19 @@ impl TypeParameterBounds {
     }
 }
 
+/// Intrinsic value/type symbol pairs captured while binding the standard
+/// environment. Every collection special case keys off these identities and
+/// never off source-level names, so user declarations keep shadowing the
+/// intrinsics.
+struct CollectionIntrinsicSymbols {
+    set_value: SymbolId,
+    map_value: SymbolId,
+    set_type: SymbolId,
+    readonly_set_type: SymbolId,
+    map_type: SymbolId,
+    readonly_map_type: SymbolId,
+}
+
 #[derive(Clone, Debug)]
 pub struct FunctionSignature {
     type_parameters: Vec<SymbolId>,
@@ -810,6 +823,37 @@ impl FunctionSignature {
         };
         (required, total, rest_index)
     }
+
+    /// Returns `(required, total, rest_index)` for this signature adjusted for
+    /// tuple-typed rest parameters. Required tuple elements add to the minimum,
+    /// optional elements do not, a fixed tuple gives a finite maximum, and a
+    /// tuple rest tail stays unbounded. Ordinary and array-rest signatures keep
+    /// the behavior of [`arity`].
+    #[must_use]
+    pub(crate) fn call_arity(&self, types: &TypeTable) -> (usize, usize, Option<usize>) {
+        let (required, total, rest_index) = self.arity();
+        let Some(rest_index) = rest_index else {
+            return (required, total, None);
+        };
+        let rest_parameter = &self.parameters[rest_index];
+        match types.get(rest_parameter.type_id()) {
+            Type::Tuple(shape) => {
+                let rest_min = shape.min_arity();
+                let fixed_before = rest_index;
+                let required = if rest_min == 0 {
+                    required
+                } else {
+                    fixed_before + rest_min
+                };
+                let total = match shape.max_arity() {
+                    Some(max) => fixed_before + max,
+                    None => usize::MAX,
+                };
+                (required, total, Some(rest_index))
+            }
+            _ => (required, total, Some(rest_index)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -841,6 +885,13 @@ impl SignatureCandidate for ConstructEntry {
     fn is_abstract(&self) -> bool {
         self.is_abstract
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordKeyState {
+    Concrete,
+    Deferred,
+    Invalid,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1109,8 +1160,8 @@ pub enum Type {
     Function(FunctionSignature),
     /// A nominal type-parameter or interface head compared by identity.
     Named(SymbolId),
-    /// The canonical semantic identity of a class instance. The argument vector
-    /// is complete, including defaults, and is empty for non-generic classes.
+    /// The canonical semantic identity of a class instance or generic interface
+    /// application. The argument vector is complete, including defaults.
     AppliedClass {
         symbol: SymbolId,
         arguments: Vec<TypeId>,
@@ -1124,6 +1175,12 @@ pub enum Type {
     IndexedAccess {
         object: TypeId,
         index: TypeId,
+    },
+    /// A deferred `Record<K, V>` mapped type. Concrete keys reduce to an
+    /// ordinary object type at construction or generic instantiation.
+    Record {
+        key: TypeId,
+        value: TypeId,
     },
     /// A receiver-bound `this` type. The owner isolates markers from nested
     /// foreign types; the constraint names its declaring class or interface.
@@ -1204,11 +1261,15 @@ pub struct TypeTable {
     symbol: TypeId,
     object: TypeId,
     object_symbol: Option<SymbolId>,
+    collection_symbols: [Option<SymbolId>; 4],
+    record_symbol: Option<SymbolId>,
+    property_key_symbol: Option<SymbolId>,
     /// Declared constraint per type-parameter symbol. Class and interface names
     /// never enter this map, so nominal named types remain nominal.
     type_parameter_constraints: HashMap<SymbolId, TypeId>,
-    /// Canonical class metadata. Raw object types live only as revisioned
-    /// templates behind this seam; semantic class identities are AppliedClass.
+    type_parameter_defaults: HashMap<SymbolId, TypeId>,
+    /// Canonical application metadata. Raw class and generic-interface object
+    /// types live as revisioned templates; applied identities are `AppliedClass`.
     classes: HashMap<SymbolId, ClassMetadata>,
     /// Finite shallow structural views keyed by their canonical applied head.
     applied_class_views: HashMap<TypeId, AppliedClassView>,
@@ -1253,7 +1314,11 @@ impl TypeTable {
             symbol: TypeId(0),
             object: TypeId(0),
             object_symbol: None,
+            collection_symbols: [None; 4],
+            record_symbol: None,
+            property_key_symbol: None,
             type_parameter_constraints: HashMap::new(),
+            type_parameter_defaults: HashMap::new(),
             classes: HashMap::new(),
             applied_class_views: HashMap::new(),
             materializing_class_views: HashSet::new(),
@@ -1613,6 +1678,16 @@ impl TypeTable {
         self.object_symbol == Some(symbol)
     }
 
+    fn intrinsic_collection_index(&self, symbol: SymbolId) -> Option<usize> {
+        self.collection_symbols
+            .iter()
+            .position(|candidate| *candidate == Some(symbol))
+    }
+
+    fn is_record_symbol(&self, symbol: SymbolId) -> bool {
+        self.record_symbol == Some(symbol)
+    }
+
     /// Predeclares a class before its bounds, heritage, or members are resolved.
     pub fn declare_class(&mut self, symbol: SymbolId, parameters: Vec<SymbolId>) {
         self.classes.entry(symbol).or_insert_with(|| ClassMetadata {
@@ -1863,20 +1938,18 @@ impl TypeTable {
             _ => type_id,
         }
     }
-    /// Expands one named interface head or applied class to its completed
-    /// structural body for indexed access. Other named identities remain inert.
+    /// Expands one named interface, `this` constraint, or applied class to
+    /// its completed structural body for indexed access.
     #[must_use]
     pub fn indexed_access_view(&mut self, type_id: TypeId) -> TypeId {
         let view = self.named_structural_view(type_id);
-        if view == type_id {
-            if let Some(prepared) = self.prepare_applied_class_view(type_id) {
-                prepared
-            } else {
-                type_id
-            }
-        } else {
-            view
+        if view != type_id {
+            return view;
         }
+        if let Type::This { constraint, .. } = self.get(type_id) {
+            return self.indexed_access_view(*constraint);
+        }
+        self.prepare_applied_class_view(type_id).unwrap_or(type_id)
     }
 
     /// Reduces `keyof T` when `T` is a concrete object, tuple, or array;
@@ -1925,6 +1998,7 @@ impl TypeTable {
                 }
             }
             Type::Array(_) => Some(self.number()),
+            Type::Record { key, .. } => Some(key),
             Type::Union(members) => {
                 // keyof(A | B) = keyof(A) & keyof(B)
                 let mut keys = Vec::with_capacity(members.len());
@@ -1944,6 +2018,157 @@ impl TypeTable {
                 Some(self.union_or_single(keys))
             }
             _ => None,
+        }
+    }
+    /// Reduces `Record<K, V>` for concrete keys and preserves a mapped type
+    /// while `K` still depends on a type parameter.
+    pub fn record(&mut self, key: TypeId, value: TypeId) -> TypeId {
+        let mut properties = Vec::new();
+        let mut index_keys = Vec::new();
+        match self.collect_record_members(key, value, &mut properties, &mut index_keys) {
+            RecordKeyState::Concrete => {
+                index_keys.sort_by_key(|type_id| type_id.get());
+                index_keys.dedup();
+                let index_signatures = index_keys
+                    .into_iter()
+                    .map(|key_type| IndexSignature {
+                        readonly: false,
+                        parameters: vec![FunctionParameter::new(
+                            "key".to_owned(),
+                            key_type,
+                            false,
+                            false,
+                        )],
+                        value_type: value,
+                        declaring_types: Vec::new(),
+                    })
+                    .collect();
+                self.object_type_with_members(ObjectType {
+                    properties,
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signatures,
+                    generator_return: None,
+                    iterator_property: None,
+                    async_iterator_property: None,
+                })
+            }
+            RecordKeyState::Deferred => self.intern(Type::Record { key, value }),
+            RecordKeyState::Invalid => self.error_type(),
+        }
+    }
+
+    fn collect_record_members(
+        &self,
+        key: TypeId,
+        value: TypeId,
+        properties: &mut Vec<PropertyType>,
+        index_keys: &mut Vec<TypeId>,
+    ) -> RecordKeyState {
+        match self.get(key) {
+            Type::String => index_keys.push(self.string()),
+            Type::Number => index_keys.push(self.number()),
+            Type::Symbol => index_keys.push(self.symbol_type()),
+            Type::StringLiteral(name) => {
+                let Ok(name) = name.to_utf8_strict() else {
+                    return RecordKeyState::Invalid;
+                };
+                properties.push(PropertyType::new(name, false, value));
+            }
+            Type::NumberLiteral(name) => {
+                properties.push(PropertyType::new(name.clone(), false, value));
+            }
+            Type::Any => index_keys.extend([self.string(), self.number(), self.symbol_type()]),
+            Type::Never => {}
+            Type::Union(members) => {
+                let mut deferred = false;
+                for member in members {
+                    match self.collect_record_members(*member, value, properties, index_keys) {
+                        RecordKeyState::Concrete => {}
+                        RecordKeyState::Deferred => deferred = true,
+                        RecordKeyState::Invalid => return RecordKeyState::Invalid,
+                    }
+                }
+                if deferred {
+                    return RecordKeyState::Deferred;
+                }
+            }
+            Type::Intersection(members) => {
+                let mut domains = Vec::with_capacity(members.len());
+                let mut unresolved = false;
+                for member in members {
+                    let mut member_properties = Vec::new();
+                    let mut member_indexes = Vec::new();
+                    match self.collect_record_members(
+                        *member,
+                        value,
+                        &mut member_properties,
+                        &mut member_indexes,
+                    ) {
+                        RecordKeyState::Concrete => {
+                            domains.push((member_properties, member_indexes));
+                        }
+                        RecordKeyState::Deferred => unresolved = true,
+                        RecordKeyState::Invalid => {}
+                    }
+                }
+                if domains.len() != members.len() {
+                    return if unresolved || !domains.is_empty() {
+                        RecordKeyState::Deferred
+                    } else {
+                        RecordKeyState::Invalid
+                    };
+                }
+
+                let mut literal_keys = domains
+                    .iter()
+                    .flat_map(|(member_properties, _)| member_properties.iter().cloned())
+                    .filter(|property| {
+                        members.iter().all(|member| {
+                            self.property_name_assignable_to_key(property.name(), *member)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                literal_keys.sort_by(|left, right| left.name().cmp(right.name()));
+                literal_keys.dedup_by(|left, right| left.name() == right.name());
+                properties.extend(literal_keys);
+
+                for domain in [self.string(), self.number(), self.symbol_type()] {
+                    if domains
+                        .iter()
+                        .all(|(_, member_indexes)| member_indexes.contains(&domain))
+                    {
+                        index_keys.push(domain);
+                    }
+                }
+            }
+            Type::Named(_) | Type::Keyof(_) | Type::IndexedAccess { .. } => {
+                return RecordKeyState::Deferred;
+            }
+            _ => return RecordKeyState::Invalid,
+        }
+        RecordKeyState::Concrete
+    }
+    #[must_use]
+    pub(crate) fn property_name_assignable_to_key(&self, name: &str, key: TypeId) -> bool {
+        match self.get(key) {
+            Type::Any | Type::Error | Type::String => true,
+            Type::Number => name
+                .parse::<f64>()
+                .ok()
+                .is_some_and(|number| format_number(number) == name),
+            Type::StringLiteral(literal) => literal
+                .to_utf8_strict()
+                .is_ok_and(|literal| literal == name),
+            Type::NumberLiteral(literal) => literal.as_ref() == name,
+            Type::Union(members) => members
+                .iter()
+                .any(|member| self.property_name_assignable_to_key(name, *member)),
+            Type::Intersection(members) => members
+                .iter()
+                .all(|member| self.property_name_assignable_to_key(name, *member)),
+            Type::Named(_) => false,
+            _ => false,
         }
     }
 
@@ -2097,7 +2322,12 @@ impl TypeTable {
                     .map_or(self.string(), |_| self.number());
                 self.named_index_constraint(object, &name, key)
             }
-            Type::NumberLiteral(name) => self.named_index_constraint(object, name, self.number()),
+            Type::NumberLiteral(name) => match self.get(object) {
+                Type::String => {
+                    IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.string()))
+                }
+                _ => self.named_index_constraint(object, name, self.number()),
+            },
             Type::String => self.index_signature_constraint(object, self.string()),
             Type::Number => self.number_index_constraint(object),
             Type::Symbol => self.index_signature_constraint(object, self.symbol_type()),
@@ -2182,6 +2412,9 @@ impl TypeTable {
                     .collect(),
             ),
             Type::ObjectType(_) => self.index_signature_constraint(object, self.number()),
+            Type::String => {
+                IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.string()))
+            }
             Type::Any | Type::Error => {
                 IndexedAccessConstraint::Reduced(self.constraint_type_expr(object))
             }
@@ -2246,7 +2479,11 @@ impl TypeTable {
             Type::Union(members) => {
                 let mut found = Vec::with_capacity(members.len());
                 for &member in &members {
-                    found.push(self.indexed_access(object, member));
+                    let reduced = self.indexed_access(object, member);
+                    if reduced == self.error_type() {
+                        return Some(reduced);
+                    }
+                    found.push(reduced);
                 }
                 Some(self.union(&found))
             }
@@ -2274,13 +2511,37 @@ impl TypeTable {
             Type::Never => Some(self.never()),
             Type::Error => Some(self.error_type()),
             Type::Null | Type::Undefined => Some(self.error_type()),
+            Type::Record { key, value } => {
+                let constraint = self.type_parameter_constraint_view(index).unwrap_or(index);
+                if self.assignable(index, key)
+                    || (constraint != index && self.assignable(constraint, key))
+                {
+                    Some(value)
+                } else {
+                    Some(self.error_type())
+                }
+            }
             Type::ObjectType(_) | Type::Tuple(_) | Type::Array(_) => {
                 self.try_resolve_concrete_indexed_access(view, index)
             }
+            Type::String | Type::StringLiteral(_) => match self.get(index) {
+                Type::Number | Type::NumberLiteral(_) => Some(self.string()),
+                _ => None,
+            },
             Type::Union(members) => {
+                if members
+                    .iter()
+                    .any(|member| matches!(self.get(*member), Type::Error))
+                {
+                    return Some(self.error_type());
+                }
                 let mut found = Vec::with_capacity(members.len());
                 for &member in &members {
-                    found.push(self.indexed_access(member, index));
+                    let reduced = self.indexed_access(member, index);
+                    if reduced == self.error_type() {
+                        return Some(reduced);
+                    }
+                    found.push(reduced);
                 }
                 Some(self.union(&found))
             }
@@ -2325,16 +2586,25 @@ impl TypeTable {
             Type::Number => match self.get(view).clone() {
                 Type::Array(element) => Some(element),
                 Type::Tuple(shape) => Some(self.union(&shape.all_element_types())),
-                Type::ObjectType(object) => {
-                    if let Some(signature) = object.index_signatures.iter().find(|signature| {
+                Type::ObjectType(object) => object
+                    .index_signatures
+                    .iter()
+                    .find(|signature| {
                         signature.parameters.first().is_some_and(|parameter| {
                             matches!(self.get(parameter.type_id()), Type::Number)
                         })
-                    }) {
-                        return Some(signature.value_type);
-                    }
-                    Some(self.error_type())
-                }
+                    })
+                    .or_else(|| {
+                        object.index_signatures.iter().find(|signature| {
+                            signature.parameters.first().is_some_and(|parameter| {
+                                matches!(self.get(parameter.type_id()), Type::String)
+                            })
+                        })
+                    })
+                    .map_or_else(
+                        || Some(self.error_type()),
+                        |signature| Some(signature.value_type),
+                    ),
                 _ => Some(self.error_type()),
             },
             Type::Symbol => {
@@ -2351,11 +2621,69 @@ impl TypeTable {
             }
             Type::Any => Some(self.any()),
             Type::Never => Some(self.never()),
-            Type::Named(_)
-            | Type::Keyof(_)
-            | Type::IndexedAccess { .. }
-            | Type::Intersection(_) => None,
+            Type::Named(symbol) => self
+                .type_parameter_constraint(symbol)
+                .filter(|constraint| *constraint != index)
+                .and_then(|constraint| self.try_resolve_concrete_indexed_access(view, constraint)),
+            Type::Intersection(members) => {
+                let error = self.error_type();
+                let found: Vec<_> = members
+                    .into_iter()
+                    .filter_map(|member| {
+                        self.try_resolve_concrete_indexed_access(view, member)
+                            .filter(|reduced| *reduced != error)
+                    })
+                    .collect();
+                (!found.is_empty()).then(|| self.union(&found))
+            }
+            Type::Keyof(_) | Type::IndexedAccess { .. } => None,
             _ => Some(self.error_type()),
+        }
+    }
+
+    fn contains_error(&self, type_id: TypeId) -> bool {
+        match self.get(type_id) {
+            Type::Error => true,
+            Type::Union(members) | Type::Intersection(members) => {
+                members.iter().any(|member| self.contains_error(*member))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_unconstrained_index_key(&self, index: TypeId) -> bool {
+        match self.get(index) {
+            Type::Any | Type::String | Type::Number | Type::Symbol => true,
+            Type::Intersection(members) => members
+                .iter()
+                .all(|member| self.is_unconstrained_index_key(*member)),
+            _ => false,
+        }
+    }
+    fn accepts_any_index(&mut self, object: TypeId) -> bool {
+        let constraint = self
+            .type_parameter_constraint_view(object)
+            .unwrap_or(object);
+        if constraint != object {
+            return self.accepts_any_index(constraint);
+        }
+        let view = self.indexed_access_view(object);
+        match self.get(view).clone() {
+            Type::Any
+            | Type::Error
+            | Type::String
+            | Type::StringLiteral(_)
+            | Type::Array(_)
+            | Type::Tuple(_) => true,
+            Type::Record { .. } => true,
+            Type::ObjectType(object) => !object.index_signatures.is_empty(),
+            Type::Union(members) => members
+                .into_iter()
+                .all(|member| self.accepts_any_index(member)),
+            Type::Intersection(members) => members
+                .into_iter()
+                .any(|member| self.accepts_any_index(member)),
+            _ => false,
         }
     }
 
@@ -2393,6 +2721,15 @@ impl TypeTable {
     #[must_use]
     pub fn type_parameter_constraint(&self, symbol: SymbolId) -> Option<TypeId> {
         self.type_parameter_constraints.get(&symbol).copied()
+    }
+
+    pub fn set_type_parameter_default(&mut self, symbol: SymbolId, default: TypeId) {
+        self.type_parameter_defaults.insert(symbol, default);
+    }
+
+    #[must_use]
+    pub fn type_parameter_default(&self, symbol: SymbolId) -> Option<TypeId> {
+        self.type_parameter_defaults.get(&symbol).copied()
     }
 
     /// Interns a boolean literal type.
@@ -2756,6 +3093,30 @@ impl TypeTable {
             _ => type_id,
         }
     }
+    fn optional_access_view(&mut self, type_id: TypeId) -> TypeId {
+        let non_nullable = self.non_nullable(type_id);
+        let constrained = self
+            .type_parameter_constraint_view(non_nullable)
+            .unwrap_or(non_nullable);
+        self.non_nullable(constrained)
+    }
+    /// Removes constituents that can never be the result of the left operand
+    /// of `||`.
+    pub fn truthy_type(&mut self, type_id: TypeId) -> TypeId {
+        match self.get(type_id).clone() {
+            Type::Null | Type::Undefined | Type::Void | Type::BooleanLiteral(false) => self.never,
+            Type::NumberLiteral(text) if number_value(&text) == Some(0.0) => self.never,
+            Type::StringLiteral(text) if text.is_empty() => self.never,
+            Type::Union(members) => {
+                let members: Vec<_> = members
+                    .into_iter()
+                    .filter(|member| self.truthy_type(*member) != self.never)
+                    .collect();
+                self.union(&members)
+            }
+            _ => type_id,
+        }
+    }
 
     /// Returns whether a value of `source` may be assigned where `target` is
     /// expected, using structural rules over the modeled type space.
@@ -2854,9 +3215,10 @@ impl TypeTable {
         &mut self,
         source: &Self,
         root: TypeId,
+        source_parameters: &[SymbolId],
         imported: &mut ImportedTypeMap,
         next_symbol: &mut u32,
-    ) -> TypeId {
+    ) -> (TypeId, Vec<SymbolId>) {
         fn copy(
             target: &mut TypeTable,
             source: &TypeTable,
@@ -3084,6 +3446,11 @@ impl TypeTable {
                     let index = copy(target, source, index, imported, next_symbol);
                     target.indexed_access(object, index)
                 }
+                Type::Record { key, value } => {
+                    let key = copy(target, source, key, imported, next_symbol);
+                    let value = copy(target, source, value, imported, next_symbol);
+                    target.record(key, value)
+                }
                 Type::This { owner, constraint } => {
                     let owner = remap_symbol(target, source, owner, imported, next_symbol);
                     let constraint = copy(target, source, constraint, imported, next_symbol);
@@ -3106,6 +3473,12 @@ impl TypeTable {
             }
             if source.object_symbol == Some(source_symbol)
                 && let Some(symbol) = target.object_symbol
+            {
+                imported.symbols.insert(source_symbol, symbol);
+                return symbol;
+            }
+            if let Some(index) = source.intrinsic_collection_index(source_symbol)
+                && let Some(symbol) = target.collection_symbols[index]
             {
                 imported.symbols.insert(source_symbol, symbol);
                 return symbol;
@@ -3148,6 +3521,10 @@ impl TypeTable {
             {
                 let constraint = copy(target, source, constraint, imported, next_symbol);
                 target.set_type_parameter_constraint(symbol, constraint);
+            }
+            if let Some(default) = source.type_parameter_defaults.get(&source_symbol).copied() {
+                let default = copy(target, source, default, imported, next_symbol);
+                target.set_type_parameter_default(symbol, default);
             }
             symbol
         }
@@ -3223,7 +3600,12 @@ impl TypeTable {
             }
         }
 
-        copy(self, source, root, imported, next_symbol)
+        let root = copy(self, source, root, imported, next_symbol);
+        let parameters = source_parameters
+            .iter()
+            .map(|parameter| remap_symbol(self, source, *parameter, imported, next_symbol))
+            .collect();
+        (root, parameters)
     }
 }
 
@@ -3258,6 +3640,7 @@ pub(crate) struct ImportedSymbolType<'a> {
     pub symbol: SymbolId,
     pub source_types: &'a TypeTable,
     pub value_type_id: TypeId,
+    pub type_parameters: &'a [SymbolId],
     pub type_plane_id: Option<TypeId>,
 }
 
@@ -3308,10 +3691,40 @@ fn directive_prologue_is_strict(source: &SourceFile, statements: &[Stmt]) -> boo
     false
 }
 
-fn diagnostic_suppression_lines(source: &SourceFile) -> HashSet<usize> {
+struct ExpectedDiagnostic {
+    directive_range: TextRange,
+    used: bool,
+}
+
+enum DiagnosticSuppression {
+    Ignore,
+    Expect(usize),
+}
+
+struct DiagnosticSuppressions {
+    lines: HashMap<usize, Vec<DiagnosticSuppression>>,
+    expectations: Vec<ExpectedDiagnostic>,
+}
+
+fn consume_diagnostic_suppression(
+    lines: &HashMap<usize, Vec<DiagnosticSuppression>>,
+    expectations: &mut [ExpectedDiagnostic],
+    line: usize,
+) -> bool {
+    let Some(suppression) = lines.get(&line).and_then(|directives| directives.last()) else {
+        return false;
+    };
+    if let DiagnosticSuppression::Expect(expectation) = suppression {
+        expectations[*expectation].used = true;
+    }
+    true
+}
+
+fn diagnostic_suppressions(source: &SourceFile) -> DiagnosticSuppressions {
     let source_text = source.source_text();
     let tokens = source.tokens();
-    let mut lines = HashSet::new();
+    let mut lines: HashMap<usize, Vec<DiagnosticSuppression>> = HashMap::new();
+    let mut expectations = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
         if !matches!(
@@ -3333,10 +3746,8 @@ fn diagnostic_suppression_lines(source: &SourceFile) -> HashSet<usize> {
             .trim_start()
             .trim_start_matches(['/', '*'])
             .trim_start();
-        let is_suppression = ["@ts-expect-error", "@ts-ignore"]
-            .iter()
-            .any(|directive| body.starts_with(directive));
-        if !is_suppression {
+        let expect_error = body.starts_with("@ts-expect-error");
+        if !expect_error && !body.starts_with("@ts-ignore") {
             continue;
         }
 
@@ -3354,18 +3765,43 @@ fn diagnostic_suppression_lines(source: &SourceFile) -> HashSet<usize> {
                     | TokenKind::EndOfFile
             )
         }) else {
+            if expect_error {
+                expectations.push(ExpectedDiagnostic {
+                    directive_range: token.range(),
+                    used: false,
+                });
+            }
             continue;
         };
         let target_line = source_text
             .line_column(target.range().start())
             .expect("token range belongs to its source")
             .0;
-        if target_line > directive_line {
-            lines.insert(target_line);
+        if target_line <= directive_line {
+            continue;
+        }
+        if expect_error {
+            let expectation = expectations.len();
+            expectations.push(ExpectedDiagnostic {
+                directive_range: token.range(),
+                used: false,
+            });
+            lines
+                .entry(target_line)
+                .or_default()
+                .push(DiagnosticSuppression::Expect(expectation));
+        } else {
+            lines
+                .entry(target_line)
+                .or_default()
+                .push(DiagnosticSuppression::Ignore);
         }
     }
 
-    lines
+    DiagnosticSuppressions {
+        lines,
+        expectations,
+    }
 }
 
 /// Returns whether an enum initializer is a numeric literal expression.
@@ -3389,6 +3825,7 @@ pub(crate) fn is_numeric_enum_initializer(expression: &Expr) -> bool {
 pub struct SemanticModel {
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,
+    generic_type_parameters: HashMap<SymbolId, Vec<SymbolId>>,
     symbol_types: Vec<TypeId>,
     #[cfg(test)]
     overload_signatures: Vec<Vec<FunctionSignature>>,
@@ -3426,6 +3863,14 @@ impl SemanticModel {
     #[must_use]
     pub fn scope(&self, id: ScopeId) -> &Scope {
         &self.scopes[id.0 as usize]
+    }
+
+    /// Returns the type parameters declared by a generic type symbol.
+    #[must_use]
+    pub(crate) fn generic_type_parameters(&self, symbol: SymbolId) -> &[SymbolId] {
+        self.generic_type_parameters
+            .get(&symbol)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Returns the top-level module scope.
@@ -3686,6 +4131,7 @@ pub(crate) struct Binder<'src> {
     typed_expressions: Vec<(TextRange, TypeId)>,
     symbol_references: Vec<(TextRange, SymbolId)>,
     pub(crate) diagnostics: Vec<Diagnostic>,
+    probing_contextual_type: bool,
     pending_constraint_checks: Vec<PendingConstraintCheck>,
     pub(crate) types: TypeTable,
     module_scope: ScopeId,
@@ -3710,6 +4156,7 @@ pub(crate) struct Binder<'src> {
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
+    imported_type_parameters: HashMap<SymbolId, Vec<SymbolId>>,
     imported_type_planes: HashMap<SymbolId, TypeId>,
     hoisted_declaration_symbols: HashMap<HoistedDeclarationIdentity, SymbolId>,
     /// JSX expression node → checked element result type, recorded by
@@ -3724,6 +4171,7 @@ pub(crate) struct Binder<'src> {
     /// during class-body resolution so `new C()` and member access on class-typed
     /// values can resolve declared instance members.
     pub(crate) class_instance_types: HashMap<SymbolId, TypeId>,
+    reg_exp_instance_type: Option<TypeId>,
     /// Shared by provisional and final class-shape passes so a generic method's
     /// type parameters keep one semantic identity.
     class_method_signature_scopes: HashMap<NodeId, ScopeId>,
@@ -3797,6 +4245,10 @@ pub(crate) struct Binder<'src> {
     function_body_stack: Vec<NodeId>,
     /// Return contract for each function body currently being resolved.
     return_contexts: Vec<ReturnContext>,
+    /// One directive that suppresses diagnostics on each target source line.
+    diagnostic_suppressions: HashMap<usize, Vec<DiagnosticSuppression>>,
+    /// `@ts-expect-error` directives in source order, with exact consumption state.
+    expected_diagnostics: Vec<ExpectedDiagnostic>,
     /// Enclosing `this` types for `this` expressions, innermost last.
     this_context: Vec<TypeId>,
     /// Whether the current binding context is inside a `declare` directive.
@@ -3805,26 +4257,23 @@ pub(crate) struct Binder<'src> {
     /// Whether the source file is a `.d.ts`/`.d.mts`/`.d.cts` declaration file.
     /// Top-level statements in such files must be declarations.
     is_declaration_file: bool,
-    /// Source lines suppressed by `@ts-expect-error` or `@ts-ignore`.
-    diagnostic_suppression_lines: HashSet<usize>,
+    /// Cooperative cancellation signal. `None` for the non-cancellable path;
+    /// set by `_with_cancel` entry points so long loops and recursive
+    /// entrypoints can poll it.
+    pub(crate) cancel: Option<bamts_cancel::CancellationToken>,
 }
 
 impl<'src> Binder<'src> {
-    pub(crate) fn new(source: &'src SourceFile) -> Self {
-        Self::with_environment(
-            source,
-            GlobalEnvironment::standard(),
-            source_is_module(source),
-            ProgramCheckOptions::standard(),
-        )
-    }
-
     pub(crate) fn with_environment(
         source: &'src SourceFile,
         intrinsics: GlobalEnvironment,
         is_module: bool,
         options: ProgramCheckOptions,
     ) -> Self {
+        let DiagnosticSuppressions {
+            lines: diagnostic_suppressions,
+            expectations: expected_diagnostics,
+        } = diagnostic_suppressions(source);
         let mut checker = Self {
             source,
             intrinsics,
@@ -3842,6 +4291,7 @@ impl<'src> Binder<'src> {
             typed_expressions: Vec::new(),
             symbol_references: Vec::new(),
             diagnostics: Vec::new(),
+            probing_contextual_type: false,
             pending_constraint_checks: Vec::new(),
             types: TypeTable::new(),
             module_scope: ScopeId(0),
@@ -3866,9 +4316,11 @@ impl<'src> Binder<'src> {
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
+            imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
             hoisted_declaration_symbols: HashMap::new(),
             class_instance_types: HashMap::new(),
+            reg_exp_instance_type: None,
             class_method_signature_scopes: HashMap::new(),
             class_header_scopes: HashMap::new(),
             class_owner_stack: Vec::new(),
@@ -3893,6 +4345,8 @@ impl<'src> Binder<'src> {
             uninitialized_variables: HashSet::new(),
             declarator_symbols: HashMap::new(),
             suppress_used_before_assigned: false,
+            diagnostic_suppressions,
+            expected_diagnostics,
             return_types: HashMap::new(),
             yield_types: HashMap::new(),
             declaration_function_bodies: HashSet::new(),
@@ -3901,7 +4355,7 @@ impl<'src> Binder<'src> {
             this_context: Vec::new(),
             ambient_binding: false,
             is_declaration_file: source.source_text().is_declaration_file(),
-            diagnostic_suppression_lines: diagnostic_suppression_lines(source),
+            cancel: None,
         };
         let global_scope = checker.new_scope(ScopeKind::Global, None);
         checker.global_scope = global_scope;
@@ -3911,6 +4365,30 @@ impl<'src> Binder<'src> {
             || directive_prologue_is_strict(source, source.statements());
         checker.bind_intrinsic_environment(global_scope);
         checker
+    }
+
+    /// Constructs a binder that polls `cancel` during long loops and
+    /// recursive entrypoints. The token is also threaded into relation,
+    /// inference, and narrowing sub-engines.
+    pub(crate) fn with_environment_and_cancel(
+        source: &'src SourceFile,
+        intrinsics: GlobalEnvironment,
+        is_module: bool,
+        options: ProgramCheckOptions,
+        cancel: bamts_cancel::CancellationToken,
+    ) -> Self {
+        let mut binder = Self::with_environment(source, intrinsics, is_module, options);
+        binder.cancel = Some(cancel);
+        binder
+    }
+
+    /// Returns `Err(CheckCancelled)` when the cancellation token has been
+    /// triggered, `Ok(())` otherwise. No-op when no token is installed.
+    fn check_cancel(&self) -> Result<(), super::CheckCancelled> {
+        match &self.cancel {
+            Some(token) => token.check().map_err(super::CheckCancelled::from),
+            None => Ok(()),
+        }
     }
 
     fn types_assignable(&self, source: TypeId, target: TypeId) -> bool {
@@ -4003,6 +4481,16 @@ impl<'src> Binder<'src> {
             PropertyType::new("stack", true, self.types.string()),
             PropertyType::new("cause", true, self.types.unknown()),
         ]);
+        let any = self.types.any();
+        let global_this_type = self.types.object_type(
+            self.intrinsics
+                .values()
+                .iter()
+                .map(|name| PropertyType::new(*name, false, any))
+                .collect(),
+        );
+        let mut set_value = None;
+        let mut map_value = None;
         for name in self
             .intrinsics
             .values()
@@ -4016,8 +4504,17 @@ impl<'src> Binder<'src> {
                 NodeId::default(),
                 NodeId::default_range(),
             );
+            if *name == "Set" {
+                set_value = Some(id);
+            }
+            if *name == "Map" {
+                map_value = Some(id);
+            }
             if *name == "undefined" {
                 self.symbol_types[id.get() as usize] = self.types.undefined_type();
+            }
+            if *name == "globalThis" {
+                self.symbol_types[id.get() as usize] = global_this_type;
             }
             if matches!(
                 *name,
@@ -4047,14 +4544,397 @@ impl<'src> Binder<'src> {
             if *name == "Object" {
                 self.types.object_symbol = Some(id);
             }
+            // Slot order: [Set, ReadonlySet, Map, ReadonlyMap].
+            match *name {
+                "Set" => self.types.collection_symbols[0] = Some(id),
+                "ReadonlySet" => self.types.collection_symbols[1] = Some(id),
+                "Map" => self.types.collection_symbols[2] = Some(id),
+                "ReadonlyMap" => self.types.collection_symbols[3] = Some(id),
+                "Record" => self.types.record_symbol = Some(id),
+                "PropertyKey" => self.types.property_key_symbol = Some(id),
+                _ => {}
+            }
+            if *name == "RegExp" {
+                self.types.declare_class(id, Vec::new());
+                let string = self.types.string();
+                let boolean = self.types.boolean();
+                let array_of_string = self.types.array(string);
+                let exec_return = self.types.union(&[array_of_string, self.types.null_type()]);
+                let exec = self.types.function_with_parameters(
+                    Vec::new(),
+                    vec![FunctionParameter::new(
+                        "string".to_owned(),
+                        string,
+                        false,
+                        false,
+                    )],
+                    exec_return,
+                );
+                let test = self.types.function_with_parameters(
+                    Vec::new(),
+                    vec![FunctionParameter::new(
+                        "string".to_owned(),
+                        string,
+                        false,
+                        false,
+                    )],
+                    boolean,
+                );
+                let reg_exp_instance = self.types.object_type(vec![
+                    PropertyType::new("source", false, string),
+                    PropertyType::new("flags", false, string),
+                    PropertyType::new("exec", false, exec).with_method(true),
+                    PropertyType::new("test", false, test).with_method(true),
+                ]);
+                self.types
+                    .publish_final_class_template(id, reg_exp_instance);
+                let applied = self.types.applied_class(id, Vec::new());
+                self.class_instance_types.insert(id, applied);
+                self.reg_exp_instance_type = Some(applied);
+            }
+        }
+        if let (
+            Some(set_value),
+            Some(map_value),
+            [
+                Some(set_type),
+                Some(readonly_set_type),
+                Some(map_type),
+                Some(readonly_map_type),
+            ],
+        ) = (set_value, map_value, self.types.collection_symbols)
+        {
+            self.bind_collection_intrinsics(CollectionIntrinsicSymbols {
+                set_value,
+                map_value,
+                set_type,
+                readonly_set_type,
+                map_type,
+                readonly_map_type,
+            });
         }
     }
 
-    pub(crate) fn run(&mut self) {
-        self.run_with_imported_types(&[]);
+    fn bind_collection_intrinsics(&mut self, symbols: CollectionIntrinsicSymbols) {
+        let parameter_scope = self.new_scope(ScopeKind::Block, None);
+        let set_parameter = self.declare_intrinsic_type_parameter(parameter_scope, "SetT");
+        let readonly_set_parameter =
+            self.declare_intrinsic_type_parameter(parameter_scope, "ReadonlySetT");
+        let map_key = self.declare_intrinsic_type_parameter(parameter_scope, "MapK");
+        let map_value = self.declare_intrinsic_type_parameter(parameter_scope, "MapV");
+        let readonly_map_key =
+            self.declare_intrinsic_type_parameter(parameter_scope, "ReadonlyMapK");
+        let readonly_map_value =
+            self.declare_intrinsic_type_parameter(parameter_scope, "ReadonlyMapV");
+
+        self.bind_set_intrinsic(symbols.set_type, set_parameter, true);
+        self.bind_set_intrinsic(symbols.readonly_set_type, readonly_set_parameter, false);
+        self.bind_map_intrinsic(symbols.map_type, map_key, map_value, true);
+        self.bind_map_intrinsic(
+            symbols.readonly_map_type,
+            readonly_map_key,
+            readonly_map_value,
+            false,
+        );
+
+        let set_element = self.types.named(set_parameter);
+        let set_constructor = self.collection_constructor(
+            symbols.set_type,
+            vec![set_parameter],
+            "values",
+            set_element,
+        );
+        self.symbol_types[symbols.set_value.get() as usize] = set_constructor;
+        let set_instance = self
+            .types
+            .applied_class(symbols.set_type, vec![self.types.any()]);
+        self.class_instance_types
+            .insert(symbols.set_value, set_instance);
+
+        let map_key_type = self.types.named(map_key);
+        let map_value_type = self.types.named(map_value);
+        let map_entry = self.types.tuple(vec![map_key_type, map_value_type]);
+        let map_constructor = self.collection_constructor(
+            symbols.map_type,
+            vec![map_key, map_value],
+            "entries",
+            map_entry,
+        );
+        self.symbol_types[symbols.map_value.get() as usize] = map_constructor;
+        let map_instance = self
+            .types
+            .applied_class(symbols.map_type, vec![self.types.any(), self.types.any()]);
+        self.class_instance_types
+            .insert(symbols.map_value, map_instance);
     }
 
-    fn run_with_imported_types(&mut self, imported_types: &[ImportedSymbolType<'_>]) {
+    fn declare_intrinsic_type_parameter(&mut self, scope: ScopeId, name: &str) -> SymbolId {
+        let id = self.declare(
+            name,
+            SymbolKind::TypeParameter,
+            scope,
+            NodeId::default(),
+            NodeId::default_range(),
+        );
+        let ty = self.types.named(id);
+        self.symbol_types[id.get() as usize] = ty;
+        id
+    }
+
+    fn bind_set_intrinsic(&mut self, owner: SymbolId, parameter: SymbolId, mutable: bool) {
+        self.types.declare_class(owner, vec![parameter]);
+        self.types.set_class_bounds(
+            owner,
+            vec![TypeParameterBounds::new(None, Some(self.types.any()))],
+        );
+        let element = self.types.named(parameter);
+        let instance = self
+            .types
+            .declared_class(owner)
+            .expect("collection class declared");
+        let this_type = self.types.this_type(owner, instance);
+        let iterator = self.collection_iterator(element);
+        let pair = self.types.tuple(vec![element, element]);
+        let entries = self.collection_iterator(pair);
+        let callback = self.types.function_with_parameters(
+            Vec::new(),
+            vec![
+                FunctionParameter::new("value".to_owned(), element, false, false),
+                FunctionParameter::new("value2".to_owned(), element, false, false),
+                FunctionParameter::new("set".to_owned(), instance, false, false),
+            ],
+            self.types.void(),
+        );
+        let mut properties = vec![
+            PropertyType::new("size", false, self.types.number()).with_readonly(true),
+            self.collection_method(
+                owner,
+                "has",
+                vec![("value", element, false)],
+                self.types.boolean(),
+            ),
+            self.collection_method(
+                owner,
+                "forEach",
+                vec![
+                    ("callbackfn", callback, false),
+                    ("thisArg", self.types.any(), true),
+                ],
+                self.types.void(),
+            ),
+            self.collection_method(owner, "entries", Vec::new(), entries),
+            self.collection_method(owner, "keys", Vec::new(), iterator),
+            self.collection_method(owner, "values", Vec::new(), iterator),
+        ];
+        if mutable {
+            properties.extend([
+                self.collection_method(owner, "add", vec![("value", element, false)], this_type),
+                self.collection_method(owner, "clear", Vec::new(), self.types.void()),
+                self.collection_method(
+                    owner,
+                    "delete",
+                    vec![("value", element, false)],
+                    self.types.boolean(),
+                ),
+            ]);
+        }
+        let iterator_method = self.types.function(Vec::new(), iterator);
+        let raw = self.types.object_type_with_members(ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: Some(
+                IteratorProperty::new(iterator_method, false)
+                    .with_method(true)
+                    .with_declaring_type(owner),
+            ),
+            async_iterator_property: None,
+        });
+        self.types.publish_final_class_template(owner, raw);
+    }
+
+    fn bind_map_intrinsic(
+        &mut self,
+        owner: SymbolId,
+        key_parameter: SymbolId,
+        value_parameter: SymbolId,
+        mutable: bool,
+    ) {
+        self.types
+            .declare_class(owner, vec![key_parameter, value_parameter]);
+        self.types.set_class_bounds(
+            owner,
+            vec![
+                TypeParameterBounds::new(None, Some(self.types.any())),
+                TypeParameterBounds::new(None, Some(self.types.any())),
+            ],
+        );
+        let key = self.types.named(key_parameter);
+        let value = self.types.named(value_parameter);
+        let entry = self.types.tuple(vec![key, value]);
+        let instance = self
+            .types
+            .declared_class(owner)
+            .expect("collection class declared");
+        let this_type = self.types.this_type(owner, instance);
+        let entries = self.collection_iterator(entry);
+        let keys = self.collection_iterator(key);
+        let values = self.collection_iterator(value);
+        let callback = self.types.function_with_parameters(
+            Vec::new(),
+            vec![
+                FunctionParameter::new("value".to_owned(), value, false, false),
+                FunctionParameter::new("key".to_owned(), key, false, false),
+                FunctionParameter::new("map".to_owned(), instance, false, false),
+            ],
+            self.types.void(),
+        );
+        let maybe_value = self.types.union(&[value, self.types.undefined_type()]);
+        let mut properties = vec![
+            PropertyType::new("size", false, self.types.number()).with_readonly(true),
+            self.collection_method(owner, "get", vec![("key", key, false)], maybe_value),
+            self.collection_method(
+                owner,
+                "has",
+                vec![("key", key, false)],
+                self.types.boolean(),
+            ),
+            self.collection_method(
+                owner,
+                "forEach",
+                vec![
+                    ("callbackfn", callback, false),
+                    ("thisArg", self.types.any(), true),
+                ],
+                self.types.void(),
+            ),
+            self.collection_method(owner, "entries", Vec::new(), entries),
+            self.collection_method(owner, "keys", Vec::new(), keys),
+            self.collection_method(owner, "values", Vec::new(), values),
+        ];
+        if mutable {
+            properties.extend([
+                self.collection_method(
+                    owner,
+                    "set",
+                    vec![("key", key, false), ("value", value, false)],
+                    this_type,
+                ),
+                self.collection_method(owner, "clear", Vec::new(), self.types.void()),
+                self.collection_method(
+                    owner,
+                    "delete",
+                    vec![("key", key, false)],
+                    self.types.boolean(),
+                ),
+            ]);
+        }
+        let iterator_method = self.types.function(Vec::new(), entries);
+        let raw = self.types.object_type_with_members(ObjectType {
+            properties,
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: Some(
+                IteratorProperty::new(iterator_method, false)
+                    .with_method(true)
+                    .with_declaring_type(owner),
+            ),
+            async_iterator_property: None,
+        });
+        self.types.publish_final_class_template(owner, raw);
+    }
+
+    fn collection_iterator(&mut self, element: TypeId) -> TypeId {
+        self.intrinsic_iterable_iterator_type(
+            element,
+            self.types.undefined_type(),
+            self.types.unknown(),
+            ForOfMode::Sync,
+        )
+    }
+
+    fn collection_method(
+        &mut self,
+        owner: SymbolId,
+        name: &str,
+        parameters: Vec<(&str, TypeId, bool)>,
+        return_type: TypeId,
+    ) -> PropertyType {
+        let parameters = parameters
+            .into_iter()
+            .map(|(name, ty, optional)| {
+                FunctionParameter::new(name.to_owned(), ty, optional, false)
+            })
+            .collect();
+        let method = self
+            .types
+            .function_with_parameters(Vec::new(), parameters, return_type);
+        PropertyType::new(name, false, method)
+            .with_method(true)
+            .with_declaring_types(vec![owner])
+    }
+
+    fn collection_constructor(
+        &mut self,
+        owner: SymbolId,
+        parameters: Vec<SymbolId>,
+        parameter_name: &str,
+        element: TypeId,
+    ) -> TypeId {
+        let iterable = self.intrinsic_iterable_type(
+            element,
+            self.types.any(),
+            self.types.any(),
+            ForOfMode::Sync,
+        );
+        let array = self.types.array(element);
+        let null = self.types.null_type();
+        let values = self.types.union(&[array, iterable, null]);
+        let arguments = parameters
+            .iter()
+            .map(|parameter| self.types.named(*parameter))
+            .collect();
+        let result = self.types.applied_class(owner, arguments);
+        let bounds = vec![TypeParameterBounds::new(None, Some(self.types.any())); parameters.len()];
+        let signature_type = self.types.function_with_parameter_bounds(
+            parameters,
+            bounds,
+            vec![FunctionParameter::new(
+                parameter_name.to_owned(),
+                values,
+                true,
+                false,
+            )],
+            result,
+            false,
+        );
+        let Type::Function(signature) = self.types.get(signature_type).clone() else {
+            unreachable!("collection constructor is a function")
+        };
+        let any_arguments = vec![self.types.any(); self.types.class_type_parameters(owner).len()];
+        let prototype = self.types.applied_class(owner, any_arguments);
+        self.types.object_type_with_members(ObjectType {
+            properties: vec![PropertyType::new("prototype", false, prototype).with_readonly(true)],
+            call_signatures: Vec::new(),
+            construct_signatures: vec![ConstructEntry {
+                signature,
+                is_abstract: false,
+            }],
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        })
+    }
+
+    fn run_with_imported_types_and_cancel(
+        &mut self,
+        imported_types: &[ImportedSymbolType<'_>],
+    ) -> Result<(), super::CheckCancelled> {
         let statements = self.source.statements();
         let scope = self.module_scope;
         if self.is_declaration_file {
@@ -4068,26 +4948,36 @@ impl<'src> Binder<'src> {
                 }
             }
         }
-        self.bind_statements(statements, scope);
+        self.check_cancel()?;
+        self.bind_statement_names_and_class_headers(statements, scope);
+        self.check_cancel()?;
         self.bind_hoisted_statements(statements, scope);
+        self.check_cancel()?;
         self.build_import_equals_targets(statements, scope);
         let mut imported_by_source = HashMap::<*const TypeTable, ImportedTypeMap>::new();
         let mut next_imported_symbol =
             u32::try_from(self.symbols.len()).expect("symbol count fits in u32");
         for imported in imported_types {
+            self.check_cancel()?;
             let identities = imported_by_source
                 .entry(std::ptr::from_ref(imported.source_types))
                 .or_default();
-            let value_type_id = self.types.import_type(
+            let (value_type_id, type_parameters) = self.types.import_type(
                 imported.source_types,
                 imported.value_type_id,
+                imported.type_parameters,
                 identities,
                 &mut next_imported_symbol,
             );
+            if !type_parameters.is_empty() {
+                self.imported_type_parameters
+                    .insert(imported.symbol, type_parameters);
+            }
             if let Some(source_type_id) = imported.type_plane_id {
-                let type_id = self.types.import_type(
+                let (type_id, _) = self.types.import_type(
                     imported.source_types,
                     source_type_id,
+                    imported.type_parameters,
                     identities,
                     &mut next_imported_symbol,
                 );
@@ -4096,14 +4986,18 @@ impl<'src> Binder<'src> {
             self.symbol_types[imported.symbol.get() as usize] = value_type_id;
             self.type_state[imported.symbol.get() as usize] = TypeState::Done(value_type_id);
         }
+        self.resolve_statement_class_bounds(statements);
+        self.check_cancel()?;
         self.resolve_statements(statements, scope);
+        self.check_cancel()?;
         self.validate_pending_constraints();
         self.check_export_assignment_conflicts();
+        Ok(())
     }
 
     fn validate_pending_constraints(&mut self) {
         let pending = std::mem::take(&mut self.pending_constraint_checks);
-        let relations = TypeRelations::new(&self.types);
+        let relations = TypeRelations::new_with_cancel(&self.types, self.cancel.clone());
         let failed: Vec<_> = pending
             .into_iter()
             .filter(|check| {
@@ -4157,6 +5051,33 @@ impl<'src> Binder<'src> {
         let namespace_reference_blocks = std::mem::take(&mut self.namespace_reference_blocks);
         let namespace_qualified_type_paths =
             std::mem::take(&mut self.namespace_qualified_type_paths);
+        let generic_type_parameters = self
+            .type_defs
+            .iter()
+            .filter_map(|(&symbol, definition)| {
+                let (scope, list) = match definition {
+                    TypeDef::Alias {
+                        scope,
+                        type_parameters,
+                        ..
+                    }
+                    | TypeDef::Interface {
+                        scope,
+                        type_parameters,
+                    } => (*scope, *type_parameters),
+                    TypeDef::Enum { .. } => return None,
+                };
+                let parameters = list
+                    .into_iter()
+                    .flat_map(|list| &list.parameters)
+                    .filter_map(|parameter| {
+                        let name = self.identifier_text(&parameter.data().name);
+                        self.lookup_type(scope, &name)
+                    })
+                    .collect();
+                Some((symbol, parameters))
+            })
+            .collect();
         let qualified_import_paths = std::mem::take(&mut self.qualified_import_paths);
         let mut model = SemanticModel {
             scopes: self.scopes,
@@ -4170,6 +5091,7 @@ impl<'src> Binder<'src> {
             node_types: self.node_types,
             typed_expressions: self.typed_expressions,
             symbol_references: self.symbol_references,
+            generic_type_parameters,
             types: self.types,
             module_scope: self.module_scope,
             facts: AnalysisFacts::default(),
@@ -4199,7 +5121,31 @@ impl<'src> Binder<'src> {
         );
         namespace_facts.set_qualified_import_paths(qualified_import_paths);
         model.namespace_facts = namespace_facts;
-        self.diagnostics.extend(diagnostics);
+        for diagnostic in diagnostics {
+            let line = self
+                .source
+                .source_text()
+                .line_column(diagnostic.range().start())
+                .expect("diagnostic range belongs to its source")
+                .0;
+            if !consume_diagnostic_suppression(
+                &self.diagnostic_suppressions,
+                &mut self.expected_diagnostics,
+                line,
+            ) {
+                self.diagnostics.push(diagnostic);
+            }
+        }
+        for expectation in &self.expected_diagnostics {
+            if !expectation.used {
+                self.diagnostics.push(Diagnostic::error(
+                    UNUSED_EXPECT_ERROR,
+                    self.source.source_id(),
+                    expectation.directive_range,
+                    UNUSED_EXPECT_ERROR_MESSAGE,
+                ));
+            }
+        }
         (model, self.diagnostics)
     }
 
@@ -4219,7 +5165,11 @@ impl<'src> Binder<'src> {
             source: self.source,
             fallback: self.types.any(),
         };
-        let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
         let guards = narrowing.guards_from(condition, &resolver, negated);
         for guard in &guards {
             let symbol = guard.reference().root_symbol();
@@ -4230,7 +5180,11 @@ impl<'src> Binder<'src> {
 
     /// Forks `parent` and refines the fork by `guards`.
     fn branch_guarded(&mut self, parent: FlowNodeId, guards: &[NarrowingGuard]) -> FlowNodeId {
-        let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
         let flow = narrowing.branch(parent);
         narrowing.apply_guards(flow, guards);
         flow
@@ -4254,8 +5208,12 @@ impl<'src> Binder<'src> {
 
     /// Merges forked points back into `parent` and settles the walk there.
     fn join_flow(&mut self, parent: FlowNodeId, branches: &[FlowNodeId]) {
-        self.flow =
-            NarrowingContext::new(&mut self.types, &mut self.flow_facts).join(parent, branches);
+        self.flow = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        )
+        .join(parent, branches);
     }
 
     /// Runs `walk` at a fresh flow root, then restores the caller's program
@@ -4290,7 +5248,11 @@ impl<'src> Binder<'src> {
                     .then_some((symbol_id, self.symbol_types[index]))
             })
             .collect();
-        let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
         let seed = narrowing.branch(FlowNodeId::ROOT);
         for (symbol, declared) in stable_roots {
             let key = FlowKey::root(symbol);
@@ -4308,7 +5270,11 @@ impl<'src> Binder<'src> {
     fn narrowed_type(&mut self, symbol: SymbolId, declared: TypeId) -> TypeId {
         let key = FlowKey::root(symbol);
         let flow = self.flow;
-        let mut narrowing = NarrowingContext::new(&mut self.types, &mut self.flow_facts);
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
         narrowing.declare(symbol, declared);
         narrowing.type_at(flow, &key).unwrap_or(declared)
     }
@@ -4358,8 +5324,12 @@ impl<'src> Binder<'src> {
                 let Some(key) = self.assignment_flow_key(target) else {
                     return;
                 };
-                NarrowingContext::new(&mut self.types, &mut self.flow_facts)
-                    .invalidate(self.flow, &key);
+                NarrowingContext::new_with_cancel(
+                    &mut self.types,
+                    &mut self.flow_facts,
+                    self.cancel.clone(),
+                )
+                .invalidate(self.flow, &key);
             }
             AssignmentTarget::Missing(_) => {}
         }
@@ -4708,13 +5678,20 @@ impl<'src> Binder<'src> {
     }
 
     pub(crate) fn emit(&mut self, code: DiagnosticCode, range: TextRange, message: &'static str) {
+        if self.probing_contextual_type {
+            return;
+        }
         let line = self
             .source
             .source_text()
             .line_column(range.start())
             .expect("diagnostic range belongs to its source")
             .0;
-        if self.diagnostic_suppression_lines.contains(&line) {
+        if consume_diagnostic_suppression(
+            &self.diagnostic_suppressions,
+            &mut self.expected_diagnostics,
+            line,
+        ) {
             return;
         }
         self.diagnostics.push(Diagnostic::error(
@@ -4908,6 +5885,15 @@ impl<'src> Binder<'src> {
     }
 
     fn bind_statements(&mut self, statements: &'src [crate::syntax::Stmt], scope: ScopeId) {
+        self.bind_statement_names_and_class_headers(statements, scope);
+        self.resolve_statement_class_bounds(statements);
+    }
+
+    fn bind_statement_names_and_class_headers(
+        &mut self,
+        statements: &'src [crate::syntax::Stmt],
+        scope: ScopeId,
+    ) {
         for statement in statements {
             self.bind_statement(statement, scope);
         }
@@ -4916,6 +5902,9 @@ impl<'src> Binder<'src> {
                 self.predeclare_class_header(class, scope);
             }
         }
+    }
+
+    fn resolve_statement_class_bounds(&mut self, statements: &'src [crate::syntax::Stmt]) {
         for statement in statements {
             if let Some(class) = Self::statement_class(statement) {
                 self.resolve_predeclared_class_bounds(class);
@@ -6461,6 +7450,7 @@ impl<'src> Binder<'src> {
             }
             Statement::If(statement) => {
                 self.resolve_expr(&statement.test, scope);
+                self.type_of_expr(&statement.test, scope);
                 let parent = self.flow;
                 let truthy = self.guards_for(&statement.test, false);
                 let falsy = self.guards_for(&statement.test, true);
@@ -6489,10 +7479,12 @@ impl<'src> Binder<'src> {
             }
             Statement::Switch(statement) => {
                 self.resolve_expr(&statement.discriminant, scope);
+                self.type_of_expr(&statement.discriminant, scope);
                 let child = self.new_scope(ScopeKind::Block, Some(scope));
                 for case in &statement.cases {
                     if let Some(test) = &case.data().test {
                         self.resolve_expr(test, child);
+                        self.type_of_expr(test, child);
                     }
                     self.bind_statements(&case.data().consequent, child);
                 }
@@ -6510,6 +7502,7 @@ impl<'src> Binder<'src> {
                 }
                 if let Some(test) = &for_statement.test {
                     self.resolve_expr(test, child);
+                    self.type_of_expr(test, child);
                 }
                 let parent = self.flow;
                 let truthy = for_statement
@@ -6520,6 +7513,7 @@ impl<'src> Binder<'src> {
                     binder.resolve_statement(&for_statement.body, child);
                     if let Some(update) = &for_statement.update {
                         binder.resolve_expr(update, child);
+                        binder.type_of_expr(update, child);
                     }
                 });
                 if let Some(test) = &for_statement.test {
@@ -6555,6 +7549,10 @@ impl<'src> Binder<'src> {
                     self.resolve_for_binding(&for_statement.binding, child, false);
                 }
                 self.resolve_expr(&for_statement.object, child);
+                let object_type = self.type_of_expr(&for_statement.object, child);
+                if using_diagnostic.is_none() {
+                    self.assign_for_in_binding_type(&for_statement.binding, child, object_type);
+                }
                 let parent = self.flow;
                 let skipped = self.branch_guarded(parent, &[]);
                 let body_end = self.in_branch(parent, &[], |binder| {
@@ -6588,6 +7586,7 @@ impl<'src> Binder<'src> {
             }
             Statement::While(statement) => {
                 self.resolve_expr(&statement.test, scope);
+                self.type_of_expr(&statement.test, scope);
                 let parent = self.flow;
                 let truthy = self.guards_for(&statement.test, false);
                 let falsy = self.guards_for(&statement.test, true);
@@ -6601,6 +7600,7 @@ impl<'src> Binder<'src> {
             Statement::DoWhile(statement) => {
                 self.resolve_statement(&statement.body, scope);
                 self.resolve_expr(&statement.test, scope);
+                self.type_of_expr(&statement.test, scope);
             }
             Statement::Try(statement) => {
                 let block = &statement.block;
@@ -6632,6 +7632,7 @@ impl<'src> Binder<'src> {
                     );
                 }
                 self.resolve_expr(&with_statement.object, scope);
+                self.type_of_expr(&with_statement.object, scope);
                 let body_scope = if forbidden {
                     scope
                 } else {
@@ -6682,7 +7683,10 @@ impl<'src> Binder<'src> {
                         .push(return_type);
                 }
             }
-            Statement::Throw(statement) => self.resolve_expr(&statement.argument, scope),
+            Statement::Throw(statement) => {
+                self.resolve_expr(&statement.argument, scope);
+                self.type_of_expr(&statement.argument, scope);
+            }
             Statement::Enum(declaration) => {
                 let member_scope = self
                     .enum_declaration_symbols
@@ -6693,6 +7697,7 @@ impl<'src> Binder<'src> {
                 for member in &declaration.members {
                     if let Some(initializer) = &member.data().initializer {
                         self.resolve_expr(initializer, member_scope);
+                        self.type_of_expr(initializer, member_scope);
                     }
                 }
             }
@@ -6818,6 +7823,31 @@ impl<'src> Binder<'src> {
                     self.inventory_assignment_target_writes_in_scope(target, scope);
                     self.resolve_assignment_target(target, scope);
                 }
+            }
+        }
+    }
+
+    fn assign_for_in_binding_type(
+        &mut self,
+        binding: &'src ForBinding,
+        scope: ScopeId,
+        object_type: TypeId,
+    ) {
+        let ForBinding::Variable(variable) = binding else {
+            return;
+        };
+        let object_key = self.types.keyof(object_type);
+        let string = self.types.string();
+        let key_type = self.types.intersection(vec![object_key, string]);
+        let keep_literal = variable.kind == VariableKind::Const;
+        for declarator in &variable.declarations {
+            if declarator.data().type_annotation.is_none() {
+                self.assign_binding_pattern_types(
+                    &declarator.data().binding,
+                    key_type,
+                    scope,
+                    keep_literal,
+                );
             }
         }
     }
@@ -7294,6 +8324,9 @@ impl<'src> Binder<'src> {
                 .default
                 .as_ref()
                 .map(|default| self.resolve_type(default, scope));
+            if let Some(default) = default {
+                self.types.set_type_parameter_default(symbol, default);
+            }
             symbols.push(symbol);
             bounds.push(TypeParameterBounds {
                 constraint,
@@ -9200,7 +10233,18 @@ impl<'src> Binder<'src> {
             }
             Expression::Logical(logical) => {
                 self.resolve_expr(&logical.left, scope);
-                self.resolve_expr(&logical.right, scope);
+                if logical.operator == LogicalOperator::Nullish {
+                    self.resolve_expr(&logical.right, scope);
+                } else {
+                    let parent = self.flow;
+                    let right_guards =
+                        self.guards_for(&logical.left, logical.operator == LogicalOperator::Or);
+                    let skipped = self.branch_guarded(parent, &[]);
+                    let right_end = self.in_branch(parent, &right_guards, |binder| {
+                        binder.resolve_expr(&logical.right, scope);
+                    });
+                    self.join_flow(parent, &[skipped, right_end]);
+                }
             }
             Expression::Conditional(conditional) => {
                 self.resolve_expr(&conditional.test, scope);
@@ -9546,6 +10590,7 @@ impl<'src> Binder<'src> {
             &arguments,
             explicit_types.as_deref(),
             call.callee.range(),
+            scope,
         );
         if short_circuits && let Some(return_type) = evaluation.return_type {
             evaluation.return_type = Some(
@@ -9617,6 +10662,7 @@ impl<'src> Binder<'src> {
             &arguments,
             explicit_types.as_deref(),
             new.callee.range(),
+            scope,
         )
     }
 
@@ -9626,16 +10672,27 @@ impl<'src> Binder<'src> {
         arguments: &[ResolvedCallArgument<'src>],
         explicit_types: Option<&[TypeId]>,
         diagnostic_range: TextRange,
+        scope: ScopeId,
     ) -> CallEvaluation {
-        let inference_types: Vec<_> = arguments
-            .iter()
-            .filter_map(|argument| match argument {
-                ResolvedCallArgument::Fixed { type_id, .. } => Some(*type_id),
-                ResolvedCallArgument::Variadic { .. } => None,
-            })
-            .collect();
+        let mut inference_types = Vec::with_capacity(arguments.len());
+        let mut fresh_literal_sources = Vec::new();
+        for argument in arguments {
+            if let ResolvedCallArgument::Fixed {
+                type_id,
+                expression,
+                ..
+            } = argument
+            {
+                let source = inference_types.len() as u32;
+                inference_types.push(*type_id);
+                if expression.is_some_and(Self::is_fresh_array_literal) {
+                    fresh_literal_sources.push(source);
+                }
+            }
+        }
         let mut return_types = Vec::with_capacity(groups.len());
         let mut abstract_constructor = false;
+        let mut selected_signatures = Vec::with_capacity(groups.len());
         for group in groups {
             let mut group_mismatches = vec![CallMismatch::ArgumentCount];
             let mut selected = None;
@@ -9647,7 +10704,11 @@ impl<'src> Binder<'src> {
                         self.explicit_function_signature(signature, explicit, diagnostic_range)
                     }
                     None => self
-                        .inferred_function_signature(signature, &inference_types)
+                        .inferred_function_signature(
+                            signature,
+                            &inference_types,
+                            &fresh_literal_sources,
+                        )
                         .ok_or(CallMismatch::ArgumentType(diagnostic_range)),
                 };
                 let signature = match instantiated {
@@ -9657,22 +10718,92 @@ impl<'src> Binder<'src> {
                         continue;
                     }
                 };
-                let mismatches = self.signature_argument_mismatches(&signature, arguments);
+                let contextual_arguments =
+                    self.probe_contextual_call_arguments(&signature, arguments, scope);
+                let mismatches =
+                    self.signature_argument_mismatches(&signature, &contextual_arguments);
                 if mismatches.is_empty() {
-                    selected = Some((signature.return_type(), is_abstract));
+                    selected = Some((signature, is_abstract));
                     break;
                 }
                 group_mismatches = mismatches;
             }
-            let Some((return_type, is_abstract)) = selected else {
+            let Some((signature, is_abstract)) = selected else {
                 return CallEvaluation::failure_all(group_mismatches);
             };
-            return_types.push(return_type);
+            return_types.push(signature.return_type());
+            selected_signatures.push(signature);
             abstract_constructor |= is_abstract;
         }
+        self.contextualize_call_arguments(&selected_signatures, arguments, scope);
         let mut evaluation = CallEvaluation::success(self.types.union(&return_types));
         evaluation.abstract_constructor = abstract_constructor;
         evaluation
+    }
+
+    fn probe_contextual_call_arguments(
+        &mut self,
+        signature: &FunctionSignature,
+        arguments: &[ResolvedCallArgument<'src>],
+        scope: ScopeId,
+    ) -> Vec<ResolvedCallArgument<'src>> {
+        debug_assert!(!self.probing_contextual_type);
+        self.probing_contextual_type = true;
+        let contextual =
+            self.contextualize_call_arguments(std::slice::from_ref(signature), arguments, scope);
+        self.probing_contextual_type = false;
+        contextual
+    }
+
+    fn contextualize_call_arguments(
+        &mut self,
+        signatures: &[FunctionSignature],
+        arguments: &[ResolvedCallArgument<'src>],
+        scope: ScopeId,
+    ) -> Vec<ResolvedCallArgument<'src>> {
+        arguments
+            .iter()
+            .enumerate()
+            .map(|(position, argument)| {
+                let ResolvedCallArgument::Fixed {
+                    range,
+                    expression: Some(expression),
+                    ..
+                } = argument
+                else {
+                    return *argument;
+                };
+                let targets: Vec<_> = signatures
+                    .iter()
+                    .filter_map(|signature| self.signature_parameter_target(signature, position))
+                    .collect();
+                if targets.is_empty() {
+                    return *argument;
+                }
+                let target = self.types.union(&targets);
+                ResolvedCallArgument::Fixed {
+                    type_id: self.type_of_expr_with_target(expression, target, scope),
+                    range: *range,
+                    expression: Some(expression),
+                }
+            })
+            .collect()
+    }
+
+    fn signature_parameter_target(
+        &mut self,
+        signature: &FunctionSignature,
+        position: usize,
+    ) -> Option<TypeId> {
+        let rest_index = signature.arity().2;
+        let parameter_index = rest_index.map_or(position, |rest| position.min(rest));
+        let parameter = signature.parameters().get(parameter_index)?;
+        let target = parameter.type_id();
+        if rest_index == Some(parameter_index) {
+            self.array_element_type(target).or(Some(target))
+        } else {
+            Some(target)
+        }
     }
 
     fn resolve_call_arguments(
@@ -9765,7 +10896,7 @@ impl<'src> Binder<'src> {
             return;
         }
         let evaluation =
-            self.evaluate_signature_groups(groups, &arguments, None, tagged.tag.range());
+            self.evaluate_signature_groups(groups, &arguments, None, tagged.tag.range(), scope);
         for mismatch in evaluation.mismatches {
             let (code, range, message) = match mismatch {
                 CallMismatch::NotCallable => (
@@ -9806,7 +10937,7 @@ impl<'src> Binder<'src> {
         if groups.is_empty() {
             return CallEvaluation::failure(CallMismatch::NotCallable);
         }
-        self.evaluate_signature_groups(groups, &arguments, None, tagged.tag.range())
+        self.evaluate_signature_groups(groups, &arguments, None, tagged.tag.range(), scope)
     }
 
     fn resolve_tagged_template_arguments(
@@ -10001,13 +11132,10 @@ impl<'src> Binder<'src> {
         let has_variadic = arguments
             .iter()
             .any(|argument| matches!(argument, ResolvedCallArgument::Variadic { .. }));
-        let (required, total, rest_index) = {
-            let (r, t, rest) = signature.arity();
-            if signature.javascript() {
-                (0, usize::MAX, rest)
-            } else {
-                (r, t, rest)
-            }
+        let (required, total, rest_index) = if signature.javascript() {
+            (0, usize::MAX, signature.arity().2)
+        } else {
+            signature.call_arity(&self.types)
         };
         if !has_variadic && (fixed_count < required || fixed_count > total) {
             return vec![CallMismatch::ArgumentCount];
@@ -10067,8 +11195,12 @@ impl<'src> Binder<'src> {
     fn zero_argument_return_type(&mut self, callable: TypeId) -> Option<TypeId> {
         let mut returns = Vec::new();
         for group in self.call_signature_groups_for_type(callable) {
-            if let Some(signature) = group.into_iter().find(|signature| signature.arity().0 == 0) {
-                returns.push(signature.return_type());
+            for signature in group {
+                let (required, _, _) = signature.call_arity(&self.types);
+                if required == 0 {
+                    returns.push(signature.return_type());
+                    break;
+                }
             }
         }
         match returns.len() {
@@ -10369,18 +11501,93 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn flow_narrowed_expression_type(&mut self, expression: &'src Expr) -> Option<TypeId> {
+        let resolver = BinderGuardResolver {
+            references: &self.references,
+            node_types: &self.node_types,
+            source: self.source,
+            fallback: self.types.any(),
+        };
+        let key = flow_key_of(expression, &resolver)?;
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
+        narrowing.refined_type_at(self.flow, &key)
+    }
+    fn flow_narrowed_property_type(
+        &mut self,
+        object: &'src Expr,
+        property_name: &str,
+    ) -> Option<TypeId> {
+        let resolver = BinderGuardResolver {
+            references: &self.references,
+            node_types: &self.node_types,
+            source: self.source,
+            fallback: self.types.any(),
+        };
+        let key = flow_key_of(object, &resolver)?.child(property_name);
+        let mut narrowing = NarrowingContext::new_with_cancel(
+            &mut self.types,
+            &mut self.flow_facts,
+            self.cancel.clone(),
+        );
+        narrowing.refined_type_at(self.flow, &key)
+    }
+
     fn type_of_member(
         &mut self,
         object: &'src Expr,
-        property: &MemberProperty,
+        property: &'src MemberProperty,
         optional: bool,
         read: bool,
         scope: ScopeId,
     ) -> TypeId {
         let Some(name) = enum_plan::cook_member_property_name(self.source, property) else {
-            return self.types.any();
+            let MemberProperty::Computed(expression) = property else {
+                return self.types.any();
+            };
+            let object_type = self.type_of_expr(object, scope);
+            let object_type = self
+                .flow_narrowed_expression_type(object)
+                .unwrap_or(object_type);
+            let object_was_nullish = match self.types.get(object_type) {
+                Type::Null | Type::Undefined => true,
+                Type::Union(members) => members
+                    .iter()
+                    .any(|member| matches!(self.types.get(*member), Type::Null | Type::Undefined)),
+                _ => false,
+            };
+            let lookup_type = if optional {
+                self.types.optional_access_view(object_type)
+            } else {
+                object_type
+            };
+            let key_type = self.type_of_expr(expression, scope);
+            let typescript = self.is_typescript();
+            let rejects_any_key = typescript
+                && self.types.is_unconstrained_index_key(key_type)
+                && !self.types.accepts_any_index(lookup_type);
+            let type_id = if rejects_any_key {
+                self.emit(
+                    INVALID_INDEXED_ACCESS_KEY,
+                    expression.range(),
+                    INVALID_INDEXED_ACCESS_KEY_MESSAGE,
+                );
+                self.types.error_type()
+            } else if typescript {
+                self.resolve_indexed_access_by_type(lookup_type, key_type, expression.range())
+            } else {
+                self.types.any()
+            };
+            return if optional && object_was_nullish {
+                self.types.union(&[type_id, self.types.undefined_type()])
+            } else {
+                type_id
+            };
         };
-        let name_str = name.to_utf8_lossy();
+        let name_str = Self::semantic_property_key(&name);
         if let Some(object_symbol) = self.resolved_expression_reference(object) {
             let kind = self.symbols[object_symbol.get() as usize].kind;
             if kind == SymbolKind::Namespace
@@ -10403,6 +11610,9 @@ impl<'src> Binder<'src> {
             }
         }
         let object_type = self.type_of_expr(object, scope);
+        let object_type = self
+            .flow_narrowed_expression_type(object)
+            .unwrap_or(object_type);
         let object_was_nullish = match self.types.get(object_type) {
             Type::Null | Type::Undefined => true,
             Type::Union(members) => members
@@ -10411,7 +11621,7 @@ impl<'src> Binder<'src> {
             _ => false,
         };
         let lookup_type = if optional {
-            self.types.non_nullable(object_type)
+            self.types.optional_access_view(object_type)
         } else {
             object_type
         };
@@ -10420,9 +11630,20 @@ impl<'src> Binder<'src> {
             MemberProperty::Private(identifier) => identifier.range(),
             MemberProperty::Computed(expression) => expression.range(),
         };
-        if let Some(type_id) =
-            self.property_type_for_member(lookup_type, name_str.as_str(), property_range, read)
+        if !optional
+            && read
+            && let Some(narrowed) = self.flow_narrowed_property_type(object, name_str.as_ref())
         {
+            return narrowed;
+        }
+        if let Some(type_id) = self.property_type_for_member_raw(
+            lookup_type,
+            name_str.as_str(),
+            property_range,
+            read,
+            object_type,
+            None,
+        ) {
             if optional && object_was_nullish {
                 return self.types.union(&[type_id, self.types.undefined_type()]);
             }
@@ -10537,6 +11758,14 @@ impl<'src> Binder<'src> {
         self.property_type_for_member_raw(object_type, name, range, read, object_type, None)
     }
 
+    fn deferred_record_property_type(&mut self, key: TypeId, value: TypeId, name: &str) -> TypeId {
+        if self.types.property_name_assignable_to_key(name, key) {
+            value
+        } else {
+            self.types.error_type()
+        }
+    }
+
     fn property_type_for_member_raw(
         &mut self,
         object_type: TypeId,
@@ -10547,6 +11776,17 @@ impl<'src> Binder<'src> {
         owner_hint: Option<SymbolId>,
     ) -> Option<TypeId> {
         match self.types.get(object_type).clone() {
+            Type::Record { key, value } => {
+                let property = self.deferred_record_property_type(key, value, name);
+                if property == self.types.error_type() && self.is_typescript() {
+                    self.emit(
+                        PROPERTY_DOES_NOT_EXIST,
+                        range,
+                        PROPERTY_DOES_NOT_EXIST_MESSAGE,
+                    );
+                }
+                Some(property)
+            }
             Type::ObjectType(object) => {
                 if let Some(property) = object
                     .properties
@@ -11261,8 +12501,8 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let result = self.types.indexed_access(object_type, index_type);
         if result == self.types.error_type()
-            && object_type != self.types.error_type()
-            && index_type != self.types.error_type()
+            && !self.types.contains_error(object_type)
+            && !self.types.contains_error(index_type)
         {
             self.emit(
                 INVALID_INDEXED_ACCESS_KEY,
@@ -11528,6 +12768,19 @@ impl<'src> Binder<'src> {
                                 _ => unreachable!("matched intrinsic iterator name"),
                             };
                         }
+                        if self.types.is_record_symbol(symbol) {
+                            return self
+                                .intrinsic_record_type(explicit_arguments.as_deref(), range);
+                        }
+                        if name.as_ref() == "Partial"
+                            && matches!(
+                                self.symbols[symbol.get() as usize].kind,
+                                SymbolKind::IntrinsicType
+                            )
+                        {
+                            return self
+                                .intrinsic_partial_type(explicit_arguments.as_deref(), range);
+                        }
                         let base = self.resolve_named_type_symbol(symbol);
                         self.instantiate_explicit_type_arguments(
                             symbol,
@@ -11587,18 +12840,9 @@ impl<'src> Binder<'src> {
         base: TypeId,
         diagnostic_range: TextRange,
     ) -> TypeId {
-        let (parameters, bounds) = if let Some((class_symbol, _)) = self.types.class_identity(base)
-        {
-            (
-                self.types.class_type_parameters(class_symbol).to_vec(),
-                self.types
-                    .class_type_parameter_bounds(class_symbol)
-                    .to_vec(),
-            )
-        } else {
-            let Some(definition) = self.type_defs.get(&symbol).copied() else {
-                return base;
-            };
+        let definition = self.type_defs.get(&symbol).copied();
+        let imported_parameters = self.imported_type_parameters.get(&symbol).cloned();
+        let (parameters, bounds) = if let Some(definition) = definition {
             match definition {
                 TypeDef::Alias {
                     scope,
@@ -11612,12 +12856,43 @@ impl<'src> Binder<'src> {
                 } => self.signature_type_parameters(type_parameters, scope),
                 TypeDef::Enum { .. } => (Vec::new(), Vec::new()),
             }
+        } else if let Some(parameters) = imported_parameters {
+            let bounds = parameters
+                .iter()
+                .map(|parameter| {
+                    TypeParameterBounds::new(
+                        self.types.type_parameter_constraint(*parameter),
+                        self.types.type_parameter_default(*parameter),
+                    )
+                })
+                .collect();
+            (parameters, bounds)
+        } else if let Some((class_symbol, _)) = self.types.class_identity(base) {
+            (
+                self.types.class_type_parameters(class_symbol).to_vec(),
+                self.types
+                    .class_type_parameter_bounds(class_symbol)
+                    .to_vec(),
+            )
+        } else {
+            return base;
         };
         let inferred =
             self.resolve_explicit_type_arguments(&parameters, &bounds, arguments, diagnostic_range);
         if inferred.is_empty() {
             return base;
         }
+        // A recursive generic interface reference is resolved while its raw
+        // structure is still in progress. Preserve the application as an opaque
+        // head; publishing the completed template materializes its finite view.
+        if matches!(self.types.get(base), Type::Named(_)) && self.types.has_class(symbol) {
+            let arguments = inferred
+                .into_iter()
+                .map(|argument| argument.type_id())
+                .collect();
+            return self.types.applied_class(symbol, arguments);
+        }
+        let base = self.types.named_structural_view(base);
         InferredTypeArguments::new(inferred).instantiate(&mut self.types, base)
     }
 
@@ -11748,12 +13023,168 @@ impl<'src> Binder<'src> {
             SymbolKind::IntrinsicType if self.types.is_object_symbol(symbol) => {
                 self.types.named(symbol)
             }
+            SymbolKind::IntrinsicType if self.types.property_key_symbol == Some(symbol) => {
+                let string = self.types.string();
+                let number = self.types.number();
+                let symbol = self.types.symbol_type();
+                self.types.union(&[string, number, symbol])
+            }
+            SymbolKind::IntrinsicType
+                if self.types.intrinsic_collection_index(symbol).is_some() =>
+            {
+                self.types
+                    .declared_class(symbol)
+                    .expect("intrinsic collection class registered")
+            }
+            SymbolKind::IntrinsicType if self.class_instance_types.contains_key(&symbol) => {
+                self.class_instance_types[&symbol]
+            }
             SymbolKind::Import => self
                 .imported_type_planes
                 .get(&symbol)
                 .copied()
                 .unwrap_or_else(|| self.resolve_import_equals_type_symbol(symbol)),
             _ => self.types.error_type(),
+        }
+    }
+
+    fn intrinsic_record_type(&mut self, arguments: Option<&[TypeId]>, range: TextRange) -> TypeId {
+        if arguments.is_none_or(|arguments| arguments.len() != 2) {
+            self.emit(
+                ARGUMENT_COUNT_MISMATCH,
+                range,
+                ARGUMENT_COUNT_MISMATCH_MESSAGE,
+            );
+        }
+        let key = arguments
+            .and_then(|arguments| arguments.first().copied())
+            .unwrap_or_else(|| self.types.any());
+        let value = arguments
+            .and_then(|arguments| arguments.get(1).copied())
+            .unwrap_or_else(|| self.types.any());
+        let Some(constraint) = self.record_key_constraint(key) else {
+            self.emit(
+                ARGUMENT_NOT_ASSIGNABLE,
+                range,
+                ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+            );
+            return self.types.error_type();
+        };
+        if self.record_key_validity(constraint) == RecordKeyState::Invalid {
+            self.emit(
+                ARGUMENT_NOT_ASSIGNABLE,
+                range,
+                ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
+            );
+            return self.types.error_type();
+        }
+        self.types.record(key, value)
+    }
+
+    fn intrinsic_partial_type(&mut self, arguments: Option<&[TypeId]>, range: TextRange) -> TypeId {
+        if arguments.is_none_or(|arguments| arguments.len() != 1) {
+            self.emit(
+                ARGUMENT_COUNT_MISMATCH,
+                range,
+                ARGUMENT_COUNT_MISMATCH_MESSAGE,
+            );
+        }
+        let input = arguments
+            .and_then(|arguments| arguments.first().copied())
+            .unwrap_or_else(|| self.types.any());
+        let view = self.types.indexed_access_view(input);
+        match self.types.get(view).clone() {
+            Type::Record { key, value } => {
+                let value = self.types.union(&[value, self.types.undefined_type()]);
+                self.types.record(key, value)
+            }
+            Type::ObjectType(mut object) => {
+                for property in &mut object.properties {
+                    property.optional = true;
+                }
+                for signature in &mut object.index_signatures {
+                    signature.value_type = self
+                        .types
+                        .union(&[signature.value_type, self.types.undefined_type()]);
+                }
+                self.types.object_type_with_members(object)
+            }
+            Type::Any | Type::Error => view,
+            _ => self.types.error_type(),
+        }
+    }
+
+    fn record_key_constraint(&self, key: TypeId) -> Option<TypeId> {
+        match self.types.get(key) {
+            Type::Named(_) => self.types.type_parameter_constraint_view(key).ok(),
+            _ => Some(key),
+        }
+    }
+
+    fn record_key_validity(&mut self, key: TypeId) -> RecordKeyState {
+        self.record_key_validity_inner(key, &mut HashSet::new())
+    }
+
+    fn record_key_validity_inner(
+        &mut self,
+        key: TypeId,
+        seen: &mut HashSet<SymbolId>,
+    ) -> RecordKeyState {
+        match self.types.get(key).clone() {
+            Type::String
+            | Type::Number
+            | Type::Symbol
+            | Type::StringLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::Any
+            | Type::Never => RecordKeyState::Concrete,
+            Type::Keyof(_) => RecordKeyState::Deferred,
+            Type::IndexedAccess { .. } => RecordKeyState::Invalid,
+            Type::Named(symbol) => {
+                if !seen.insert(symbol) {
+                    return RecordKeyState::Invalid;
+                }
+                let constraint = self.types.type_parameter_constraint(symbol);
+                let state = if let Some(constraint) = constraint {
+                    self.record_key_validity_inner(constraint, seen)
+                } else {
+                    let resolved = self.resolve_named_type_symbol(symbol);
+                    if resolved == key {
+                        RecordKeyState::Invalid
+                    } else {
+                        self.record_key_validity_inner(resolved, seen)
+                    }
+                };
+                seen.remove(&symbol);
+                state
+            }
+            Type::Union(members) => {
+                let mut state = RecordKeyState::Concrete;
+                for member in members {
+                    match self.record_key_validity_inner(member, seen) {
+                        RecordKeyState::Invalid => return RecordKeyState::Invalid,
+                        RecordKeyState::Deferred => state = RecordKeyState::Deferred,
+                        RecordKeyState::Concrete => {}
+                    }
+                }
+                state
+            }
+            Type::Intersection(members) => {
+                let mut deferred = false;
+                for member in members {
+                    match self.record_key_validity_inner(member, seen) {
+                        RecordKeyState::Concrete => return RecordKeyState::Concrete,
+                        RecordKeyState::Deferred => deferred = true,
+                        RecordKeyState::Invalid => {}
+                    }
+                }
+                if deferred {
+                    RecordKeyState::Deferred
+                } else {
+                    RecordKeyState::Invalid
+                }
+            }
+            _ => RecordKeyState::Invalid,
         }
     }
 
@@ -11981,7 +13412,14 @@ impl<'src> Binder<'src> {
                 type_parameters,
             } => {
                 let head = self.types.named(symbol);
-                self.resolve_type_parameter_bounds(type_parameters, scope);
+                let (parameters, bounds) = self.signature_type_parameters(type_parameters, scope);
+                let is_generic = !parameters.is_empty();
+                // Generic interfaces share the applied-head machinery with
+                // classes so recursive references retain their arguments.
+                if is_generic {
+                    self.types.declare_class(symbol, parameters);
+                    self.types.set_class_bounds(symbol, bounds);
+                }
                 let declarations = self
                     .interface_merges
                     .get(&symbol)
@@ -12046,7 +13484,12 @@ impl<'src> Binder<'src> {
                 }
                 let structure = self.types.object_type_with_members(merged);
                 self.types.set_interface_structure(symbol, structure);
-                head
+                if is_generic {
+                    self.types.publish_final_class_template(symbol, structure);
+                    self.types.declared_class(symbol).unwrap_or(head)
+                } else {
+                    head
+                }
             }
             TypeDef::Enum { numeric } => {
                 if numeric {
@@ -12056,6 +13499,7 @@ impl<'src> Binder<'src> {
                 }
             }
         };
+        self.symbol_types[symbol.get() as usize] = resolved;
         self.type_state[symbol.get() as usize] = TypeState::Done(resolved);
         resolved
     }
@@ -12111,7 +13555,7 @@ impl<'src> Binder<'src> {
                             || !self.types_assignable(existing.type_id(), base_property.type_id())
                     } else {
                         existing.optional() != base_property.optional()
-                            || !TypeRelations::new(&self.types)
+                            || !TypeRelations::new_with_cancel(&self.types, self.cancel.clone())
                                 .equivalent(existing.type_id(), base_property.type_id())
                     };
                     if incompatible {
@@ -12136,7 +13580,7 @@ impl<'src> Binder<'src> {
                             || !self.types_assignable(existing.type_id(), base_property.type_id())
                     } else {
                         existing.optional() != base_property.optional()
-                            || !TypeRelations::new(&self.types)
+                            || !TypeRelations::new_with_cancel(&self.types, self.cancel.clone())
                                 .equivalent(existing.type_id(), base_property.type_id())
                     };
                     if incompatible {
@@ -12153,7 +13597,7 @@ impl<'src> Binder<'src> {
                         Some(existing) => self.merge_iterator_properties(existing, base_property),
                     });
             }
-            let base_view = self.types.named_structural_view(base_type);
+            let base_view = self.types.indexed_access_view(base_type);
             if let Type::ObjectType(base_object) = self.types.get(base_view).clone() {
                 for base_property in &base_object.properties {
                     let declared = object.properties[..declared_properties]
@@ -12167,7 +13611,7 @@ impl<'src> Binder<'src> {
                             || !self.types_assignable(property.type_id(), base_property.type_id())
                     }) || inherited.is_some_and(|property| {
                         property.optional() != base_property.optional()
-                            || !TypeRelations::new(&self.types)
+                            || !TypeRelations::new_with_cancel(&self.types, self.cancel.clone())
                                 .equivalent(property.type_id(), base_property.type_id())
                     });
                     if incompatible {
@@ -12855,7 +14299,9 @@ impl<'src> Binder<'src> {
             return cached;
         }
         let result = self.compute_type_of_expr(expression, scope);
-        if self.node_types.insert(expression.id(), result).is_none() {
+        if !self.probing_contextual_type
+            && self.node_types.insert(expression.id(), result).is_none()
+        {
             self.typed_expressions.push((expression.range(), result));
         }
         result
@@ -12875,11 +14321,10 @@ impl<'src> Binder<'src> {
                     .any(|element| matches!(element, ArrayElement::Spread(_))) =>
             {
                 let target = self.types.non_nullable(target);
-                let (target_shape, array_target) = match self.types.get(target).clone() {
-                    Type::Tuple(shape) => (Some(shape), None),
-                    Type::Array(element) => (None, Some(element)),
-                    _ => return self.type_of_expr(expression, scope),
-                };
+                let (target_shape, array_target) = self.contextual_array_target(target);
+                if target_shape.is_none() && array_target.is_none() {
+                    return self.type_of_expr(expression, scope);
+                }
                 let mut element_types = Vec::with_capacity(array.elements.len());
                 let source_length = array.elements.len();
                 for (index, element) in array.elements.iter().enumerate() {
@@ -12923,10 +14368,34 @@ impl<'src> Binder<'src> {
             }
             _ => return self.type_of_expr(expression, scope),
         };
-        if self.node_types.insert(expression.id(), result).is_none() {
+        if !self.probing_contextual_type
+            && self.node_types.insert(expression.id(), result).is_none()
+        {
             self.typed_expressions.push((expression.range(), result));
         }
         result
+    }
+
+    fn contextual_array_target(&mut self, target: TypeId) -> (Option<TupleShape>, Option<TypeId>) {
+        match self.types.get(target).clone() {
+            Type::Tuple(shape) => (Some(shape), None),
+            Type::Array(element) => (None, Some(element)),
+            Type::Union(members) => {
+                let elements: Vec<_> = members
+                    .into_iter()
+                    .filter_map(|member| match self.types.get(member) {
+                        Type::Array(element) => Some(*element),
+                        _ => None,
+                    })
+                    .collect();
+                if elements.is_empty() {
+                    (None, None)
+                } else {
+                    (None, Some(self.types.union(&elements)))
+                }
+            }
+            _ => (None, None),
+        }
     }
 
     /// Checks one contextual method against every target overload.
@@ -13030,6 +14499,7 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let contextual_target = contextual_target.map(|target| self.types.non_nullable(target));
         let mut properties = Vec::new();
+        let mut index_signatures = Vec::new();
         let mut iterator_property = None;
         let mut async_iterator_property = None;
         let mut accessors: BTreeMap<String, (Option<TypeId>, Option<TypeId>)> = BTreeMap::new();
@@ -13164,32 +14634,49 @@ impl<'src> Binder<'src> {
                 }
                 ObjectMember::Spread(spread) => {
                     let spread_type = self.type_of_expr(&spread.argument, scope);
-                    let spread_type = self.types.named_structural_view(spread_type);
                     let spread_type = self
                         .types
-                        .prepare_applied_class_view(spread_type)
+                        .type_parameter_constraint_view(spread_type)
                         .unwrap_or(spread_type);
-                    if let Type::ObjectType(object) = self.types.get(spread_type).clone() {
-                        if let Some(source_iterator) = object
-                            .iterator_property
-                            .filter(IteratorProperty::spreadable)
-                        {
-                            iterator_property = Some(source_iterator);
+                    let spread_type = self.types.indexed_access_view(spread_type);
+                    match self.types.get(spread_type).clone() {
+                        Type::ObjectType(object) => {
+                            if let Some(source_iterator) = object
+                                .iterator_property
+                                .filter(IteratorProperty::spreadable)
+                            {
+                                iterator_property = Some(source_iterator);
+                            }
+                            if let Some(source_iterator) = object
+                                .async_iterator_property
+                                .filter(IteratorProperty::spreadable)
+                            {
+                                async_iterator_property = Some(source_iterator);
+                            }
+                            for source_property in &object.properties {
+                                let fresh = PropertyType::new(
+                                    source_property.name.as_ref(),
+                                    source_property.optional(),
+                                    source_property.type_id(),
+                                );
+                                upsert_property(&mut properties, fresh);
+                            }
+                            index_signatures.extend(object.index_signatures);
                         }
-                        if let Some(source_iterator) = object
-                            .async_iterator_property
-                            .filter(IteratorProperty::spreadable)
-                        {
-                            async_iterator_property = Some(source_iterator);
+                        Type::Record { key, value } => {
+                            index_signatures.push(IndexSignature {
+                                readonly: false,
+                                parameters: vec![FunctionParameter::new(
+                                    "key".to_owned(),
+                                    key,
+                                    false,
+                                    false,
+                                )],
+                                value_type: value,
+                                declaring_types: Vec::new(),
+                            });
                         }
-                        for source_property in &object.properties {
-                            let fresh = PropertyType::new(
-                                source_property.name.as_ref(),
-                                source_property.optional(),
-                                source_property.type_id(),
-                            );
-                            upsert_property(&mut properties, fresh);
-                        }
+                        _ => {}
                     }
                     // Non-object spread operands add no properties and produce no
                     // diagnostic here because the checker has no boundary for them.
@@ -13201,7 +14688,7 @@ impl<'src> Binder<'src> {
             properties,
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
-            index_signatures: Vec::new(),
+            index_signatures,
             generator_return: None,
             iterator_property,
             async_iterator_property,
@@ -13346,13 +14833,28 @@ impl<'src> Binder<'src> {
             }
             Expression::Logical(logical) => {
                 let left = self.type_of_expr(&logical.left, scope);
-                let right = self.type_of_expr(&logical.right, scope);
-                let left = if logical.operator == LogicalOperator::Nullish {
-                    self.types.non_nullable(left)
+                let right = if logical.operator == LogicalOperator::Nullish {
+                    self.type_of_expr(&logical.right, scope)
                 } else {
-                    left
+                    let parent = self.flow;
+                    let guards =
+                        self.guards_for(&logical.left, logical.operator == LogicalOperator::Or);
+                    let mut right = self.types.any();
+                    self.in_branch(parent, &guards, |binder| {
+                        right = binder.type_of_expr(&logical.right, scope);
+                    });
+                    right
                 };
-                self.types.union(&[left, right])
+                let left = match logical.operator {
+                    LogicalOperator::Nullish => self.types.non_nullable(left),
+                    LogicalOperator::Or => self.types.truthy_type(left),
+                    LogicalOperator::And => left,
+                };
+                if logical.operator != LogicalOperator::And && self.types.assignable(right, left) {
+                    left
+                } else {
+                    self.types.union(&[left, right])
+                }
             }
             Expression::Sequence(sequence) => sequence
                 .expressions
@@ -13939,6 +15441,7 @@ impl<'src> Binder<'src> {
         &mut self,
         signature: &FunctionSignature,
         argument_types: &[TypeId],
+        fresh_literal_sources: &[u32],
     ) -> Option<FunctionSignature> {
         if signature.type_parameters().is_empty() {
             return Some(signature.clone());
@@ -13959,7 +15462,14 @@ impl<'src> Binder<'src> {
                 parameter
             })
             .collect();
-        let mut context = InferenceContext::new(&mut self.types, &inference_parameters);
+        let mut context = InferenceContext::new_with_cancel(
+            &mut self.types,
+            &inference_parameters,
+            self.cancel.clone(),
+        );
+        for &source in fresh_literal_sources {
+            context.mark_fresh_literal_source(source);
+        }
         context.infer_from_arguments(signature, argument_types);
         let mut inferred = context.resolve();
         inferred.widen_unconstrained_literals(&mut self.types, &inference_parameters);
@@ -14003,7 +15513,9 @@ impl<'src> Binder<'src> {
                 self.types.boolean_literal(value)
             }
             Literal::Null(_) => self.types.null_type(),
-            Literal::Regex(_) => self.types.object(),
+            Literal::Regex(_) => self
+                .reg_exp_instance_type
+                .expect("RegExp intrinsic installed before expression resolution"),
         }
     }
 }
@@ -14022,14 +15534,32 @@ impl DefaultRange for NodeId {
 
 /// Binds one parsed source into its immutable semantic model using the
 /// standard intrinsic environment.
+#[cfg(test)]
 pub(crate) fn bind_source(source: &SourceFile) -> (SemanticModel, Vec<Diagnostic>) {
-    let mut binder = Binder::new(source);
-    binder.run();
-    binder.finish()
+    bind_source_with_cancel(source, bamts_cancel::CancellationToken::new())
+        .expect("fresh token is never cancelled")
+}
+
+/// Binds one parsed source into its immutable semantic model using the
+/// standard intrinsic environment. Fails early when `cancel` is triggered.
+pub(crate) fn bind_source_with_cancel(
+    source: &SourceFile,
+    cancel: bamts_cancel::CancellationToken,
+) -> Result<(SemanticModel, Vec<Diagnostic>), super::CheckCancelled> {
+    let mut binder = Binder::with_environment_and_cancel(
+        source,
+        GlobalEnvironment::standard(),
+        source_is_module(source),
+        ProgramCheckOptions::standard(),
+        cancel,
+    );
+    binder.run_with_imported_types_and_cancel(&[])?;
+    Ok(binder.finish())
 }
 
 /// Binds one parsed source into its immutable semantic model using an
 /// explicit intrinsic environment and module/script classification.
+#[cfg(test)]
 pub(crate) fn bind_source_with_environment(
     source: &SourceFile,
     environment: GlobalEnvironment,
@@ -14039,6 +15569,25 @@ pub(crate) fn bind_source_with_environment(
     bind_source_with_environment_and_imports(source, environment, is_module, options, &[])
 }
 
+/// Cancellable variant of [`bind_source_with_environment`].
+pub(crate) fn bind_source_with_environment_and_cancel(
+    source: &SourceFile,
+    environment: GlobalEnvironment,
+    is_module: bool,
+    options: ProgramCheckOptions,
+    cancel: bamts_cancel::CancellationToken,
+) -> Result<(SemanticModel, Vec<Diagnostic>), super::CheckCancelled> {
+    bind_source_with_environment_and_imports_with_cancel(
+        source,
+        environment,
+        is_module,
+        options,
+        &[],
+        cancel,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn bind_source_with_environment_and_imports(
     source: &SourceFile,
     environment: GlobalEnvironment,
@@ -14046,9 +15595,29 @@ pub(crate) fn bind_source_with_environment_and_imports(
     options: ProgramCheckOptions,
     imported_types: &[ImportedSymbolType<'_>],
 ) -> (SemanticModel, Vec<Diagnostic>) {
-    let mut binder = Binder::with_environment(source, environment, is_module, options);
-    binder.run_with_imported_types(imported_types);
-    binder.finish()
+    bind_source_with_environment_and_imports_with_cancel(
+        source,
+        environment,
+        is_module,
+        options,
+        imported_types,
+        bamts_cancel::CancellationToken::new(),
+    )
+    .expect("fresh token is never cancelled")
+}
+
+pub(crate) fn bind_source_with_environment_and_imports_with_cancel(
+    source: &SourceFile,
+    environment: GlobalEnvironment,
+    is_module: bool,
+    options: ProgramCheckOptions,
+    imported_types: &[ImportedSymbolType<'_>],
+    cancel: bamts_cancel::CancellationToken,
+) -> Result<(SemanticModel, Vec<Diagnostic>), super::CheckCancelled> {
+    let mut binder =
+        Binder::with_environment_and_cancel(source, environment, is_module, options, cancel);
+    binder.run_with_imported_types_and_cancel(imported_types)?;
+    Ok(binder.finish())
 }
 
 #[cfg(test)]
@@ -14249,8 +15818,12 @@ mod tests {
     fn var_hoists_to_the_module_scope_but_let_stays_in_its_block() {
         let (model, diagnostics) = bound("{ var v = 1; let b = 2; }");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let block = ScopeId(2);
-        assert_eq!(model.scope(block).kind(), ScopeKind::Block);
+        let block = model
+            .scopes()
+            .iter()
+            .position(|scope| scope.kind() == ScopeKind::Block && scope.value("b").is_some())
+            .map(|index| ScopeId(index as u32))
+            .expect("block containing b exists");
         let v = model
             .lookup_value(model.module_scope(), "v")
             .expect("var hoists to the module scope");
@@ -15420,15 +16993,17 @@ mod tests {
 
         let mut target = TypeTable::new();
         let mut next_symbol = 1_000;
-        let imported_left = target.import_type(
+        let (imported_left, _) = target.import_type(
             &left,
             left_class,
+            &[],
             &mut super::ImportedTypeMap::default(),
             &mut next_symbol,
         );
-        let imported_right = target.import_type(
+        let (imported_right, _) = target.import_type(
             &right,
             right_class,
+            &[],
             &mut super::ImportedTypeMap::default(),
             &mut next_symbol,
         );
@@ -15491,15 +17066,17 @@ mod tests {
 
         let mut target = TypeTable::new();
         let mut next_symbol = 2_000;
-        let imported_left = target.import_type(
+        let (imported_left, _) = target.import_type(
             &left,
             left_named,
+            &[],
             &mut super::ImportedTypeMap::default(),
             &mut next_symbol,
         );
-        let imported_right = target.import_type(
+        let (imported_right, _) = target.import_type(
             &right,
             right_named,
+            &[],
             &mut super::ImportedTypeMap::default(),
             &mut next_symbol,
         );
@@ -15508,5 +17085,40 @@ mod tests {
             target.named_structural_view(imported_left),
             target.named_structural_view(imported_right)
         );
+    }
+
+    #[test]
+    fn tuple_rest_call_arity_counts_required_optional_and_variadic_elements() {
+        let (_, diagnostics) = bound(
+            "function allOptional(...args: [number?]) {}\n\
+             allOptional();\n\
+             allOptional(1);\n\
+             allOptional(1, 2);\n\
+             function requiredFirst(...args: [number, string?]) {}\n\
+             requiredFirst();\n\
+             requiredFirst(1);\n\
+             requiredFirst(1, 'x');\n\
+             requiredFirst(1, 'x', true);\n\
+             function variadic(...args: [number, string?, ...boolean[]]) {}\n\
+             variadic();\n\
+             variadic(1);\n\
+             variadic(1, 'x');\n\
+             variadic(1, 'x', true, false);\n\
+             function optionalFixed(a: number, b?: string, ...args: [boolean?]) {}\n\
+             optionalFixed(1);\n\
+             optionalFixed(1, 'x');\n\
+             optionalFixed(1, 'x', true);\n\
+             optionalFixed(1, 'x', true, false);\n\
+             function mixed(a: number, ...args: [string, boolean?]) {}\n\
+             mixed(1);\n\
+             mixed(1, 'x');\n\
+             mixed(1, 'x', true);\n\
+             mixed(1, 'x', true, false);\n",
+        );
+        let count = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == ARGUMENT_COUNT_MISMATCH)
+            .count();
+        assert_eq!(count, 7, "{diagnostics:?}");
     }
 }

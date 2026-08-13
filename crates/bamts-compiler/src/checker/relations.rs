@@ -31,6 +31,7 @@ use crate::syntax::Accessibility;
 /// Completed structural relations are memoized up to this bound; beyond it,
 /// results stay deterministic because the algebra never depends on cache state.
 const RELATION_CACHE_CAPACITY: usize = 4096;
+const ERASURE_VARIANTS_PER_RELATION: usize = 8;
 
 /// A compatibility decision plus the intentional TypeScript hazards that made
 /// the conversion possible.
@@ -106,16 +107,37 @@ struct RelationKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RelationContext {
     parameter_aliases: Box<[(SymbolId, SymbolId)]>,
-    /// Comparable recursion only adds erased parameters, and erasure can only
-    /// relax a relation. One active identity therefore terminates recursive
-    /// signatures; completed results remain membership-sensitive and uncached.
     erasure_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ErasureRequirement {
+    symbol: SymbolId,
+    erased: bool,
+}
+
+#[derive(Debug)]
+struct DependencyFrame {
+    assumptions: HashSet<RelationKey>,
+    erasure_requirements: HashMap<SymbolId, bool>,
+    erased_base: usize,
+}
+
+impl DependencyFrame {
+    fn new(erased_base: usize) -> Self {
+        Self {
+            assumptions: HashSet::new(),
+            erasure_requirements: HashMap::new(),
+            erased_base,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CachedRelation {
     compatible: bool,
     assumptions: Box<[RelationKey]>,
+    erasure_requirements: Box<[ErasureRequirement]>,
 }
 
 /// Relation queries over one interned [`TypeTable`].
@@ -128,8 +150,9 @@ pub struct TypeRelations<'table> {
     cache: RefCell<HashMap<RelationKey, Vec<CachedRelation>>>,
     /// Pairs currently being compared, to break recursive structural types.
     visiting: RefCell<HashSet<RelationKey>>,
-    /// Coinductive assumptions consumed by each active relation frame.
-    dependency_stack: RefCell<Vec<HashSet<RelationKey>>>,
+    /// Coinductive assumptions and erased-membership predicates consumed by
+    /// each active relation frame.
+    dependency_stack: RefCell<Vec<DependencyFrame>>,
     /// Interned identities for effective alias/erasure environments. Identity
     /// zero is the empty environment.
     contexts: RefCell<HashMap<RelationContext, usize>>,
@@ -141,13 +164,24 @@ pub struct TypeRelations<'table> {
     /// Signature type parameters erased to `any` for the comparable relation.
     /// Non-empty only while one signature comparison is active.
     erased_parameters: RefCell<Vec<SymbolId>>,
+    /// Cooperative cancellation signal. `None` for the non-cancellable path.
+    cancel: Option<bamts_cancel::CancellationToken>,
     #[cfg(test)]
     computed_relations: Cell<usize>,
 }
 
 impl<'table> TypeRelations<'table> {
-    #[must_use]
     pub fn new(table: &'table TypeTable) -> Self {
+        Self::new_with_cancel(table, None)
+    }
+
+    /// Constructs a relation engine that polls `cancel` on recursive
+    /// backedges. Pass `None` for the non-cancellable path.
+    #[must_use]
+    pub fn new_with_cancel(
+        table: &'table TypeTable,
+        cancel: Option<bamts_cancel::CancellationToken>,
+    ) -> Self {
         Self {
             table,
             cache: RefCell::new(HashMap::new()),
@@ -157,6 +191,7 @@ impl<'table> TypeRelations<'table> {
             active_context: Cell::new(0),
             parameter_aliases: RefCell::new(Vec::new()),
             erased_parameters: RefCell::new(Vec::new()),
+            cancel,
             #[cfg(test)]
             computed_relations: Cell::new(0),
         }
@@ -274,40 +309,58 @@ impl<'table> TypeRelations<'table> {
         if source == target {
             return true;
         }
+        // Poll the cancellation token on every recursive entry. A cancelled
+        // relation short-circuits to `false`; the binder's next `check_cancel`
+        // propagates the typed error and discards any spurious diagnostics.
+        if let Some(token) = &self.cancel
+            && token.is_cancelled()
+        {
+            return false;
+        }
         let relation = RelationKey {
             source,
             target,
             strictness,
             context: self.active_context.get(),
         };
-        let comparable_erasure_active =
-            strictness == Strictness::Comparable && !self.erased_parameters.borrow().is_empty();
-        // A recursive Comparable visit may coinductively reuse the active
-        // erasure identity because nested signatures only add `any` leaves. A
-        // completed result cannot: whether a specific symbol is erased matters.
-        let cacheable = (self.is_structural(source) || self.is_structural(target))
-            && !comparable_erasure_active;
+        let cacheable = self.is_structural(source) || self.is_structural(target);
         if cacheable {
             let cached = {
                 let visiting = self.visiting.borrow();
+                let erased = self.erased_parameters.borrow();
                 self.cache.borrow().get(&relation).and_then(|entries| {
-                    entries
-                        .iter()
-                        .find(|entry| {
-                            !entry.compatible
-                                || entry
-                                    .assumptions
-                                    .iter()
-                                    .all(|assumption| visiting.contains(assumption))
-                        })
-                        .cloned()
+                    let mut matched: Option<&CachedRelation> = None;
+                    let mut conflict = false;
+                    for entry in entries.iter().filter(|entry| {
+                        entry
+                            .assumptions
+                            .iter()
+                            .all(|assumption| visiting.contains(assumption))
+                            && entry.erasure_requirements.iter().all(|requirement| {
+                                erased.contains(&requirement.symbol) == requirement.erased
+                            })
+                    }) {
+                        if matched.is_some_and(|current| current.compatible != entry.compatible) {
+                            conflict = true;
+                            break;
+                        }
+                        matched.get_or_insert(entry);
+                    }
+                    debug_assert!(
+                        !conflict,
+                        "matching relation cache variants disagree on compatibility"
+                    );
+                    (!conflict).then(|| matched.cloned()).flatten()
                 })
             };
             if let Some(cached) = cached {
-                if cached.compatible
-                    && let Some(parent) = self.dependency_stack.borrow_mut().last_mut()
-                {
-                    parent.extend(cached.assumptions.iter().copied());
+                if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
+                    parent
+                        .assumptions
+                        .extend(cached.assumptions.iter().copied());
+                    for requirement in cached.erasure_requirements.iter().copied() {
+                        self.record_erasure_requirement(parent, requirement);
+                    }
                 }
                 return cached.compatible;
             }
@@ -318,12 +371,14 @@ impl<'table> TypeRelations<'table> {
             let mut visiting = self.visiting.borrow_mut();
             if !visiting.insert(relation) {
                 if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
-                    parent.insert(relation);
+                    parent.assumptions.insert(relation);
                 }
                 return true;
             }
         }
-        self.dependency_stack.borrow_mut().push(HashSet::new());
+        self.dependency_stack
+            .borrow_mut()
+            .push(DependencyFrame::new(self.erased_parameters.borrow().len()));
 
         // Applications relate through their substituted structural views.
         // The in-progress key above uses the applied TypeIds themselves, so a
@@ -331,7 +386,22 @@ impl<'table> TypeRelations<'table> {
         // either application with a different argument pair.
         let source_applied = matches!(self.table.get(source), Type::AppliedClass { .. });
         let target_applied = matches!(self.table.get(target), Type::AppliedClass { .. });
-        let result = if source_applied || target_applied {
+        let identical_application = matches!(
+            (self.table.get(source), self.table.get(target)),
+            (
+                Type::AppliedClass {
+                    symbol: source_symbol,
+                    arguments: source_arguments,
+                },
+                Type::AppliedClass {
+                    symbol: target_symbol,
+                    arguments: target_arguments,
+                },
+            ) if source_symbol == target_symbol && source_arguments == target_arguments
+        );
+        let result = if identical_application {
+            true
+        } else if source_applied || target_applied {
             let source_view = source_applied
                 .then(|| self.table.applied_class_view(source))
                 .flatten();
@@ -351,45 +421,55 @@ impl<'table> TypeRelations<'table> {
             self.relates_uncached(source, target, strictness)
         };
 
-        let mut assumptions = self
+        let mut frame = self
             .dependency_stack
             .borrow_mut()
             .pop()
             .expect("active relation owns a dependency frame");
         self.visiting.borrow_mut().remove(&relation);
         if is_root {
-            assumptions.clear();
+            frame.assumptions.clear();
         } else if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
-            parent.extend(assumptions.iter().copied());
+            parent.assumptions.extend(frame.assumptions.iter().copied());
+            for (&symbol, &erased) in &frame.erasure_requirements {
+                self.record_erasure_requirement(parent, ErasureRequirement { symbol, erased });
+            }
         }
-        if cacheable && (result || assumptions.is_empty()) {
-            let mut assumptions: Vec<_> = assumptions.into_iter().collect();
+        if cacheable && (result || frame.assumptions.is_empty()) {
+            let mut assumptions: Vec<_> = frame.assumptions.into_iter().collect();
             assumptions.sort_unstable();
+            let mut erasure_requirements: Vec<_> = frame
+                .erasure_requirements
+                .into_iter()
+                .map(|(symbol, erased)| ErasureRequirement { symbol, erased })
+                .collect();
+            erasure_requirements.sort_unstable();
             let cached = CachedRelation {
                 compatible: result,
                 assumptions: assumptions.into_boxed_slice(),
+                erasure_requirements: erasure_requirements.into_boxed_slice(),
             };
             let mut cache = self.cache.borrow_mut();
             if cache.len() < RELATION_CACHE_CAPACITY || cache.contains_key(&relation) {
                 let entries = cache.entry(relation).or_default();
-                if !result {
-                    entries.clear();
-                    entries.push(cached);
-                } else if entries.iter().all(|entry| entry.compatible)
-                    && !entries.iter().any(|entry| {
-                        entry
+                let dominates = |left: &CachedRelation, right: &CachedRelation| {
+                    left.compatible == right.compatible
+                        && left
                             .assumptions
                             .iter()
-                            .all(|assumption| cached.assumptions.binary_search(assumption).is_ok())
-                    })
-                {
-                    entries.retain(|entry| {
-                        !cached
-                            .assumptions
-                            .iter()
-                            .all(|assumption| entry.assumptions.binary_search(assumption).is_ok())
-                    });
-                    entries.push(cached);
+                            .all(|assumption| right.assumptions.binary_search(assumption).is_ok())
+                        && left.erasure_requirements.iter().all(|requirement| {
+                            right
+                                .erasure_requirements
+                                .binary_search(requirement)
+                                .is_ok()
+                        })
+                };
+                if !entries.iter().any(|entry| dominates(entry, &cached)) {
+                    entries.retain(|entry| !dominates(&cached, entry));
+                    if entries.len() < ERASURE_VARIANTS_PER_RELATION {
+                        entries.push(cached);
+                    }
                 }
             }
         }
@@ -471,6 +551,16 @@ impl<'table> TypeRelations<'table> {
             {
                 true
             }
+            (_, Type::Named(symbol))
+                if strictness == Strictness::Comparable
+                    && self.table.type_parameter_constraint(*symbol).is_some() =>
+            {
+                let constraint = self
+                    .table
+                    .type_parameter_constraint(*symbol)
+                    .expect("guard checked constraint");
+                constraint != target && self.relates(source, constraint, strictness)
+            }
             // `unknown` is the top type: everything flows in, nothing flows out.
             (_, Type::Unknown) => true,
             (Type::Unknown, _) => false,
@@ -507,6 +597,31 @@ impl<'table> TypeRelations<'table> {
                     IndexedAccessConstraint::Invalid => false,
                 }
             }
+            (
+                Type::Record {
+                    key: source_key,
+                    value: source_value,
+                },
+                Type::Record {
+                    key: target_key,
+                    value: target_value,
+                },
+            ) => {
+                self.relates(*target_key, *source_key, strictness)
+                    && self.relates(*source_value, *target_value, strictness)
+            }
+            (
+                Type::ObjectType(source_object),
+                Type::Record {
+                    key: target_key,
+                    value: target_value,
+                },
+            ) => {
+                self.object_satisfies_record(source_object, *target_key, *target_value, strictness)
+            }
+            (Type::Record { .. }, Type::Object) => true,
+            (Type::Never, Type::Record { .. }) => true,
+            (Type::Record { .. }, _) | (_, Type::Record { .. }) => false,
             // An interface with a completed structural body expands through that body
             // once. The `visiting` set in `relates` terminates recursive self and mutual
             // interface pairs; returned member types that are the interface's own head stay inert.
@@ -732,10 +847,13 @@ impl<'table> TypeRelations<'table> {
         let added = source.type_parameters().len() + target.type_parameters().len();
         let previous_context = self.active_context.get();
         let mut erased = self.erased_parameters.borrow_mut();
+        let already_active = !erased.is_empty();
         erased.extend(source.type_parameters());
         erased.extend(target.type_parameters());
         drop(erased);
-        self.refresh_context();
+        if !already_active {
+            self.refresh_context();
+        }
         let result = compare();
         let mut erased = self.erased_parameters.borrow_mut();
         let kept = erased.len() - added;
@@ -746,7 +864,33 @@ impl<'table> TypeRelations<'table> {
     }
 
     fn is_erased_parameter(&self, symbol: SymbolId) -> bool {
-        self.erased_parameters.borrow().contains(&symbol)
+        let erased = self.erased_parameters.borrow().contains(&symbol);
+        if let Some(frame) = self.dependency_stack.borrow_mut().last_mut() {
+            self.record_erasure_requirement(frame, ErasureRequirement { symbol, erased });
+        }
+        erased
+    }
+
+    fn record_erasure_requirement(
+        &self,
+        frame: &mut DependencyFrame,
+        requirement: ErasureRequirement,
+    ) {
+        if requirement.erased {
+            let erased = self.erased_parameters.borrow();
+            if !erased[..frame.erased_base.min(erased.len())].contains(&requirement.symbol) {
+                return;
+            }
+        }
+        if let Some(previous) = frame
+            .erasure_requirements
+            .insert(requirement.symbol, requirement.erased)
+        {
+            debug_assert_eq!(
+                previous, requirement.erased,
+                "one relation frame observed conflicting erasure membership"
+            );
+        }
     }
 
     fn is_structural(&self, type_id: TypeId) -> bool {
@@ -760,6 +904,7 @@ impl<'table> TypeRelations<'table> {
                 | Type::Named(_)
                 | Type::AppliedClass { .. }
                 | Type::This { .. }
+                | Type::Record { .. }
         )
     }
     fn contains_undefined(&self, type_id: TypeId) -> bool {
@@ -796,6 +941,7 @@ impl<'table> TypeRelations<'table> {
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
+            | Type::Record { .. }
             | Type::This { .. } => false,
         }
     }
@@ -854,7 +1000,7 @@ impl<'table> TypeRelations<'table> {
     }
     fn property_origin_compatible(have: &PropertyType, want: &PropertyType) -> bool {
         if want.access() == Accessibility::Public {
-            return true;
+            return have.access() == Accessibility::Public;
         }
         have.access() != Accessibility::Public && have.declaring_class() == want.declaring_class()
     }
@@ -919,24 +1065,30 @@ impl<'table> TypeRelations<'table> {
         strictness: Strictness,
     ) -> bool {
         let properties_relate = target.properties.iter().all(|want| {
-            match source
+            if let Some(have) = source
                 .properties
                 .iter()
                 .find(|have| have.name() == want.name())
             {
-                Some(have) => {
-                    Self::property_origin_compatible(have, want)
-                        && (self.property_type_relates(have, want, strictness)
-                            || (matches!(
-                                strictness,
-                                Strictness::Assignable
-                                    | Strictness::StrictNull
-                                    | Strictness::Comparable
-                            ) && want.optional()
-                                && matches!(self.table.get(have.type_id()), Type::Undefined)))
-                }
-                None => want.optional(),
+                return Self::property_origin_compatible(have, want)
+                    && (self.property_type_relates(have, want, strictness)
+                        || (matches!(
+                            strictness,
+                            Strictness::Assignable
+                                | Strictness::StrictNull
+                                | Strictness::Comparable
+                        ) && want.optional()
+                            && matches!(self.table.get(have.type_id()), Type::Undefined)));
             }
+            if let Some(signature) = source.index_signatures.iter().find(|signature| {
+                signature.parameters.first().is_some_and(|parameter| {
+                    self.table
+                        .property_name_assignable_to_key(want.name(), parameter.type_id())
+                })
+            }) {
+                return self.relates(signature.value_type, want.type_id(), strictness);
+            }
+            want.optional()
         });
         properties_relate
             && self.optional_semantic_type_relates(
@@ -968,9 +1120,11 @@ impl<'table> TypeRelations<'table> {
                 let Some(want_parameter) = want.parameters.first() else {
                     return false;
                 };
-                let numeric = matches!(self.table.get(want_parameter.type_id()), Type::Number);
                 let properties_relate = source.properties.iter().all(|property| {
-                    if numeric && property.name().parse::<usize>().is_err() {
+                    if !self
+                        .table
+                        .property_name_assignable_to_key(property.name(), want_parameter.type_id())
+                    {
                         return true;
                     }
                     self.relates(property.type_id(), want.value_type, strictness)
@@ -996,6 +1150,11 @@ impl<'table> TypeRelations<'table> {
                             matches!(self.table.get(parameter.type_id()), Type::String)
                         })
                     }),
+                    Type::Symbol => source.index_signatures.iter().find(|have| {
+                        have.parameters.first().is_some_and(|parameter| {
+                            matches!(self.table.get(parameter.type_id()), Type::Symbol)
+                        })
+                    }),
                     _ => return false,
                 };
                 let signatures_relate = source_signature
@@ -1005,12 +1164,97 @@ impl<'table> TypeRelations<'table> {
             })
     }
 
+    fn object_satisfies_record(
+        &self,
+        source: &ObjectType,
+        key: TypeId,
+        value: TypeId,
+        strictness: Strictness,
+    ) -> bool {
+        if let Some(names) = self.record_literal_keys(key) {
+            return names.iter().all(|name| {
+                source
+                    .properties
+                    .iter()
+                    .find(|property| property.name() == name)
+                    .map(|property| self.relates(property.type_id(), value, strictness))
+                    .or_else(|| {
+                        source.index_signatures.iter().find_map(|signature| {
+                            let parameter = signature.parameters.first()?;
+                            self.table
+                                .property_name_assignable_to_key(name, parameter.type_id())
+                                .then(|| self.relates(signature.value_type, value, strictness))
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+        }
+        if !self.record_key_is_concrete_domain(key) {
+            return false;
+        }
+        source
+            .properties
+            .iter()
+            .filter(|property| {
+                self.table
+                    .property_name_assignable_to_key(property.name(), key)
+            })
+            .all(|property| self.relates(property.type_id(), value, strictness))
+            && source.index_signatures.iter().all(|signature| {
+                let Some(parameter) = signature.parameters.first() else {
+                    return false;
+                };
+                let parameter = parameter.type_id();
+                let overlaps = self.relates(parameter, key, Strictness::Comparable)
+                    || self.relates(key, parameter, Strictness::Comparable);
+                !overlaps || self.relates(signature.value_type, value, strictness)
+            })
+    }
+
+    fn record_literal_keys(&self, key: TypeId) -> Option<Vec<String>> {
+        match self.table.get(key) {
+            Type::Never => Some(Vec::new()),
+            Type::StringLiteral(name) => name.to_utf8_strict().ok().map(|name| vec![name]),
+            Type::NumberLiteral(name) => Some(vec![name.to_string()]),
+            Type::Union(members) => {
+                let mut names = Vec::new();
+                for member in members {
+                    names.extend(self.record_literal_keys(*member)?);
+                }
+                names.sort_unstable();
+                names.dedup();
+                Some(names)
+            }
+            _ => None,
+        }
+    }
+
+    fn record_key_is_concrete_domain(&self, key: TypeId) -> bool {
+        match self.table.get(key) {
+            Type::Any
+            | Type::Error
+            | Type::Never
+            | Type::String
+            | Type::Number
+            | Type::Symbol
+            | Type::StringLiteral(_)
+            | Type::NumberLiteral(_) => true,
+            Type::Union(members) => members
+                .iter()
+                .all(|member| self.record_key_is_concrete_domain(*member)),
+            _ => false,
+        }
+    }
+
     fn property_type_relates(
         &self,
         source: &PropertyType,
         target: &PropertyType,
         strictness: Strictness,
     ) -> bool {
+        if source.optional() && !target.optional() {
+            return false;
+        }
         self.relates(source.type_id(), target.type_id(), strictness)
             || (strictness == Strictness::Comparable
                 && self.relates(target.type_id(), source.type_id(), strictness))
@@ -2267,6 +2511,118 @@ mod tests {
     }
 
     #[test]
+    fn optional_source_property_rejects_required_target() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let optional_source = table.object_type(vec![
+            PropertyType::new("x", true, number),
+            PropertyType::new("y", false, number),
+        ]);
+        let required_target = table.object_type(vec![PropertyType::new("x", false, number)]);
+        let optional_target = table.object_type(vec![PropertyType::new("x", true, number)]);
+        let required_source = table.object_type(vec![PropertyType::new("x", false, number)]);
+        let relations = TypeRelations::new(&table);
+
+        assert!(!relations.assignable(optional_source, required_target));
+        assert!(!relations.subtype(optional_source, required_target));
+        assert!(!relations.assignable_with_strict_null(optional_source, required_target));
+        assert!(relations.assignable(optional_source, optional_target));
+        assert!(relations.subtype(optional_source, optional_target));
+        assert!(relations.assignable(required_source, optional_target));
+        assert!(relations.subtype(required_source, optional_target));
+    }
+
+    #[test]
+    fn public_target_requires_public_source() {
+        use crate::syntax::Accessibility;
+
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let class_symbol = SymbolId::new(510);
+        table.declare_class(class_symbol, Vec::new());
+        let public_target = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Public, Some(class_symbol)),
+        ]);
+        let private_source = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Private, Some(class_symbol)),
+            PropertyType::new("y", false, number),
+        ]);
+        let public_source = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Public, Some(class_symbol)),
+            PropertyType::new("y", false, number),
+        ]);
+        let relations = TypeRelations::new(&table);
+
+        assert!(!relations.assignable(private_source, public_target));
+        assert!(!relations.subtype(private_source, public_target));
+        assert!(relations.assignable(public_source, public_target));
+        assert!(relations.subtype(public_source, public_target));
+    }
+
+    #[test]
+    fn same_private_origin_still_compatible() {
+        use crate::syntax::Accessibility;
+
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let class_symbol = SymbolId::new(511);
+        table.declare_class(class_symbol, Vec::new());
+        let source = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Private, Some(class_symbol)),
+            PropertyType::new("y", false, number),
+        ]);
+        let target = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Private, Some(class_symbol)),
+        ]);
+        let relations = TypeRelations::new(&table);
+
+        assert!(relations.assignable(source, target));
+        assert!(relations.subtype(source, target));
+    }
+
+    #[test]
+    fn protected_source_requires_same_origin_and_rejects_public_target() {
+        use crate::syntax::Accessibility;
+
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let class_symbol = SymbolId::new(512);
+        let other_symbol = SymbolId::new(513);
+        table.declare_class(class_symbol, Vec::new());
+        table.declare_class(other_symbol, Vec::new());
+        let protected_target = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Protected, Some(class_symbol)),
+        ]);
+        let protected_source = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Protected, Some(class_symbol)),
+            PropertyType::new("y", false, number),
+        ]);
+        let wrong_origin = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Protected, Some(other_symbol)),
+        ]);
+        let public_target = table.object_type(vec![
+            PropertyType::new("x", false, number)
+                .with_accessibility(Accessibility::Public, Some(class_symbol)),
+        ]);
+        let relations = TypeRelations::new(&table);
+
+        assert!(relations.assignable(protected_source, protected_target));
+        assert!(relations.subtype(protected_source, protected_target));
+        assert!(!relations.assignable(wrong_origin, protected_target));
+        assert!(!relations.subtype(wrong_origin, protected_target));
+        assert!(!relations.assignable(protected_source, public_target));
+        assert!(!relations.subtype(protected_source, public_target));
+    }
+
+    #[test]
     fn optional_tuple_accepts_every_source_length_and_checks_present_values() {
         let mut table = TypeTable::new();
         let number = table.number();
@@ -2412,6 +2768,8 @@ mod tests {
         let unrelated_right = signature(unrelated_right);
         let captured_left = signature(captured_left);
         let captured_right = signature(captured_right);
+        let captured_array = table.array(captured_object);
+        let number_array = table.array(number_object);
         let relations = TypeRelations::new(&table);
 
         assert!(!relations.comparable(root_left, root_right));
@@ -2421,14 +2779,28 @@ mod tests {
             1,
             "nested erased signatures must share one recursive context"
         );
+        let unrelated_before = relations.computed_relations();
         assert!(
             !relations.with_erased_parameters(&unrelated_left, &unrelated_right, || relations
                 .relates(captured_object, number_object, Strictness::Comparable),)
         );
+        let unrelated_after = relations.computed_relations();
+        assert!(unrelated_after > unrelated_before);
+        assert!(
+            !relations.with_erased_parameters(&unrelated_left, &unrelated_right, || relations
+                .relates(captured_object, number_object, Strictness::Comparable),)
+        );
+        assert_eq!(relations.computed_relations(), unrelated_after);
         assert!(
             relations.with_erased_parameters(&captured_left, &captured_right, || relations
                 .relates(captured_object, number_object, Strictness::Comparable),)
         );
+        let captured_after = relations.computed_relations();
+        assert!(
+            relations.with_erased_parameters(&captured_left, &captured_right, || relations
+                .relates(captured_object, number_object, Strictness::Comparable),)
+        );
+        assert_eq!(relations.computed_relations(), captured_after);
         let reverse = TypeRelations::new(&table);
         assert!(
             reverse.with_erased_parameters(&captured_left, &captured_right, || reverse.relates(
@@ -2444,6 +2816,127 @@ mod tests {
                 Strictness::Comparable
             ),)
         );
+
+        let dependency = TypeRelations::new(&table);
+        assert!(
+            !dependency.with_erased_parameters(&unrelated_left, &unrelated_right, || dependency
+                .relates(captured_object, number_object, Strictness::Comparable),)
+        );
+        assert!(
+            !dependency.with_erased_parameters(&unrelated_left, &unrelated_right, || dependency
+                .relates(captured_array, number_array, Strictness::Comparable),)
+        );
+        assert!(
+            dependency.with_erased_parameters(&captured_left, &captured_right, || dependency
+                .relates(captured_array, number_array, Strictness::Comparable),)
+        );
+    }
+
+    #[test]
+    fn locally_introduced_erasure_reuses_cache_across_outer_scopes() {
+        let mut table = TypeTable::new();
+        let inner_source_symbol = SymbolId::new(700);
+        let inner_target_symbol = SymbolId::new(701);
+        let source_value = table.named(inner_source_symbol);
+        let source_object =
+            table.object_type(vec![PropertyType::new("value", false, source_value)]);
+        let target_object =
+            table.object_type(vec![PropertyType::new("value", false, table.number())]);
+        let inner_source =
+            table.function_with_parameters(vec![inner_source_symbol], Vec::new(), source_object);
+        let inner_target =
+            table.function_with_parameters(vec![inner_target_symbol], Vec::new(), target_object);
+        let outer_a =
+            table.function_with_parameters(vec![SymbolId::new(702)], Vec::new(), table.void());
+        let outer_b =
+            table.function_with_parameters(vec![SymbolId::new(703)], Vec::new(), table.void());
+        let outer_c =
+            table.function_with_parameters(vec![SymbolId::new(704)], Vec::new(), table.void());
+        let outer_d =
+            table.function_with_parameters(vec![SymbolId::new(705)], Vec::new(), table.void());
+        let signature = |type_id| match table.get(type_id) {
+            Type::Function(signature) => signature.clone(),
+            _ => panic!("test fixture must be a function"),
+        };
+        let outer_a = signature(outer_a);
+        let outer_b = signature(outer_b);
+        let outer_c = signature(outer_c);
+        let outer_d = signature(outer_d);
+        let relations = TypeRelations::new(&table);
+
+        assert!(relations.with_erased_parameters(&outer_a, &outer_b, || {
+            relations.comparable(inner_source, inner_target)
+        },));
+        let computed = relations.computed_relations();
+        assert!(relations.with_erased_parameters(&outer_c, &outer_d, || {
+            relations.comparable(inner_source, inner_target)
+        },));
+        assert_eq!(
+            relations.computed_relations(),
+            computed,
+            "locally introduced generic erasure must not bind a cache entry to its outer scope"
+        );
+    }
+
+    #[test]
+    fn relation_cache_bounds_erasure_variants_per_pair() {
+        const SYMBOLS: usize = ERASURE_VARIANTS_PER_RELATION + 1;
+
+        let mut table = TypeTable::new();
+        let symbols: Vec<_> = (0..SYMBOLS)
+            .map(|index| SymbolId::new(720 + index as u32))
+            .collect();
+        let source_properties = symbols
+            .iter()
+            .enumerate()
+            .map(|(index, &symbol)| {
+                PropertyType::new(format!("value{index}"), false, table.named(symbol))
+            })
+            .collect();
+        let target_properties = (0..SYMBOLS)
+            .map(|index| PropertyType::new(format!("value{index}"), false, table.number()))
+            .collect();
+        let source = table.object_type(source_properties);
+        let target = table.object_type(target_properties);
+        let mut scopes = Vec::new();
+        for count in 0..=SYMBOLS {
+            let source_parameters = if count == 0 {
+                vec![SymbolId::new(800)]
+            } else {
+                symbols[..count].to_vec()
+            };
+            let target_parameters = (0..source_parameters.len())
+                .map(|index| SymbolId::new(820 + count as u32 * 16 + index as u32))
+                .collect();
+            let left = table.function_with_parameters(source_parameters, Vec::new(), table.void());
+            let right = table.function_with_parameters(target_parameters, Vec::new(), table.void());
+            let Type::Function(left) = table.get(left).clone() else {
+                panic!("test fixture must be a function");
+            };
+            let Type::Function(right) = table.get(right).clone() else {
+                panic!("test fixture must be a function");
+            };
+            scopes.push((left, right));
+        }
+        let relations = TypeRelations::new(&table);
+
+        for (left, right) in &scopes {
+            let _ = relations.with_erased_parameters(left, right, || {
+                relations.relates(source, target, Strictness::Comparable)
+            });
+        }
+        let variants = relations
+            .cache
+            .borrow()
+            .iter()
+            .filter(|(key, _)| {
+                key.source == source
+                    && key.target == target
+                    && key.strictness == Strictness::Comparable
+            })
+            .map(|(_, entries)| entries.len())
+            .sum::<usize>();
+        assert_eq!(variants, ERASURE_VARIANTS_PER_RELATION);
     }
 
     #[test]
@@ -2519,7 +3012,10 @@ mod tests {
             context: 0,
         };
         relations.visiting.borrow_mut().insert(dummy_relation);
-        relations.dependency_stack.borrow_mut().push(HashSet::new());
+        relations
+            .dependency_stack
+            .borrow_mut()
+            .push(DependencyFrame::new(0));
         assert!(!relations.assignable(parent_source, parent_target));
         relations.dependency_stack.borrow_mut().pop();
         relations.visiting.borrow_mut().remove(&dummy_relation);
@@ -2529,7 +3025,10 @@ mod tests {
         );
 
         relations.visiting.borrow_mut().insert(child_relation);
-        relations.dependency_stack.borrow_mut().push(HashSet::new());
+        relations
+            .dependency_stack
+            .borrow_mut()
+            .push(DependencyFrame::new(0));
         assert!(relations.assignable(parent_source, parent_target));
         relations.dependency_stack.borrow_mut().pop();
         relations.visiting.borrow_mut().remove(&child_relation);

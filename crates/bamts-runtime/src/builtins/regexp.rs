@@ -60,7 +60,18 @@ fn constructor<H: Host>(
     };
     compile(machine, &pattern, &flags)?;
     let properties = initial_regexp_properties();
-    let prototype = machine.intrinsics.regexp_prototype();
+    let default_prototype = machine.intrinsics.regexp_prototype();
+    let new_target = machine.current_new_target();
+    let prototype = if new_target != Value::UNDEFINED {
+        let candidate = machine.get_named_property(new_target, "prototype")?;
+        if machine.is_object(candidate) {
+            candidate
+        } else {
+            default_prototype
+        }
+    } else {
+        default_prototype
+    };
     let value = machine
         .allocate(HeapEntry::RegExp {
             pattern,
@@ -341,8 +352,8 @@ fn append_canonical_source(pattern: &EcmaString, output: &mut bamts_bytecode::Ec
 #[cfg(test)]
 mod tests {
     use bamts_bytecode::{
-        BinaryOp, Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module,
-        ModuleId, Program, ProgramModule, Register, Verified,
+        AccessorKind, BinaryOp, Constant, ConstantId, Function, FunctionFlags, FunctionId,
+        Instruction, Module, ModuleId, Program, ProgramModule, Register, Verified,
     };
 
     use super::super::test_support::{TestHost, blank_program};
@@ -778,6 +789,122 @@ mod tests {
             machine.to_string(all_value).unwrap(),
             EcmaString::encode("gimsuy"),
             "flags_getter must return all flags in canonical gimsuy order"
+        );
+    }
+    fn throw_prototype_getter<H: Host>(
+        _machine: &mut Machine<'_, H>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(type_error("throwing prototype getter"))
+    }
+
+    #[test]
+    fn constructor_uses_new_target_prototype() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let regexp_prototype = machine.intrinsics.regexp_prototype();
+
+        // Build a custom prototype that inherits from RegExp.prototype.
+        let custom_prototype =
+            super::super::ordinary_runtime(&mut machine, Some(regexp_prototype)).unwrap();
+        machine
+            .set_data_property(custom_prototype, "marker", Value::int32(123))
+            .unwrap();
+
+        // Build a new_target with .prototype set to the custom prototype.
+        let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        machine
+            .set_data_property(new_target, "prototype", custom_prototype)
+            .unwrap();
+
+        let regexp_id = machine.intrinsics.builtins.id_named("RegExp").unwrap();
+        let BuiltinOutcome::Value(instance) = machine
+            .call_builtin_with_new_target(regexp_id, Value::UNDEFINED, &[], true, new_target)
+            .unwrap()
+        else {
+            panic!("RegExp construct returns a value");
+        };
+
+        assert_eq!(
+            machine.prototype_value(instance).unwrap(),
+            Some(custom_prototype),
+            "subclass instance must inherit the custom prototype"
+        );
+        assert_eq!(
+            machine.get_named_property(instance, "marker").unwrap(),
+            Value::int32(123),
+            "custom prototype methods must be visible on the instance"
+        );
+    }
+
+    #[test]
+    fn constructor_falls_back_to_default_for_non_object_prototype() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let regexp_prototype = machine.intrinsics.regexp_prototype();
+
+        // A new_target whose .prototype is a primitive must fall back to
+        // %RegExp.prototype%.
+        let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        machine
+            .set_data_property(new_target, "prototype", Value::int32(42))
+            .unwrap();
+
+        let regexp_id = machine.intrinsics.builtins.id_named("RegExp").unwrap();
+        let BuiltinOutcome::Value(instance) = machine
+            .call_builtin_with_new_target(regexp_id, Value::UNDEFINED, &[], true, new_target)
+            .unwrap()
+        else {
+            panic!("RegExp construct returns a value");
+        };
+
+        assert_eq!(
+            machine.prototype_value(instance).unwrap(),
+            Some(regexp_prototype),
+            "non-object newTarget.prototype must fall back to %RegExp.prototype%"
+        );
+    }
+
+    #[test]
+    fn constructor_propagates_throwing_prototype_getter() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // Install a getter on new_target.prototype that throws.
+        let getter = install_function(
+            &mut machine.heap,
+            &mut machine.intrinsics.builtins,
+            "throwing prototype getter",
+            0,
+            throw_prototype_getter::<TestHost>,
+        );
+        let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        machine
+            .define_accessor(
+                new_target,
+                PropertyKey::Named(EcmaString::encode("prototype")),
+                getter,
+                AccessorKind::Getter,
+            )
+            .unwrap();
+
+        let regexp_id = machine.intrinsics.builtins.id_named("RegExp").unwrap();
+        let result = machine.call_builtin_with_new_target(
+            regexp_id,
+            Value::UNDEFINED,
+            &[],
+            true,
+            new_target,
+        );
+
+        assert!(
+            matches!(result, Err(EvalFailure::Throw(_))),
+            "throwing newTarget.prototype getter must propagate"
         );
     }
 }

@@ -112,6 +112,28 @@ const NODE_VERSION_OUTPUT_CAP: usize = 128;
 const INTERPRETER_FUEL_PER_MILLISECOND: u64 = 10_000;
 const CORPUS_WORKER_REQUEST: &str = "BAMTS_CORPUS_WORKER_REQUEST";
 const CORPUS_WORKER_TEST: &str = "corpus_differential_worker";
+const HARNESS_OWNED_ARGS: &[&str] = &[
+    "check",
+    "compile",
+    "run",
+    "explain",
+    "-c",
+    "--compile",
+    "-r",
+    "--run",
+    "--check",
+    "aot",
+    "jit",
+    "--aot",
+    "--jit",
+    "-t",
+    "--target",
+    "-o",
+    "--output",
+    "--out-dir",
+    "--output-dir",
+    "--js-compat",
+];
 
 // ---------------------------------------------------------------------------
 // Validated records
@@ -232,6 +254,8 @@ pub fn load_manifest(root: &Path) -> Result<CorpusManifest> {
 /// that each declared source directory, entrypoint, and source file exists.
 pub fn load_corpus(root: &Path) -> Result<Corpus> {
     let manifest = load_manifest(root)?;
+    let manifest_path = root.join(MANIFEST_PATH);
+    verify_pinned_case_ids(&manifest_path, &manifest.projects)?;
     verify_exact_layout(root, &manifest)?;
     let mut cases = Vec::with_capacity(manifest.projects.len());
     for project in &manifest.projects {
@@ -375,6 +399,39 @@ fn validate_spec(path: &Path, raw: RawSpec, project: &ManifestProject) -> Result
     })
 }
 
+fn verify_pinned_case_ids(path: &Path, projects: &[ManifestProject]) -> Result<()> {
+    let manifest_ids: Vec<&str> = projects.iter().map(|project| project.id.as_str()).collect();
+    if manifest_ids != PINNED_CASE_IDS {
+        return Err(VerificationError::new(
+            ErrorCode::SetMismatch,
+            format!(
+                "{}: manifest project IDs do not match the pinned list: expected {:?}, got {:?}",
+                path.display(),
+                PINNED_CASE_IDS,
+                manifest_ids
+            ),
+        ));
+    }
+    let pinned: BTreeSet<&str> = PINNED_CASE_IDS.iter().copied().collect();
+    for (name, subset) in [
+        ("TASK_106_SYNC_CASE_IDS", TASK_106_SYNC_CASE_IDS.as_slice()),
+        ("TASK_107_NODE_CASE_IDS", TASK_107_NODE_CASE_IDS.as_slice()),
+    ] {
+        if let Some(id) = subset.iter().find(|id| !pinned.contains(*id)) {
+            return Err(VerificationError::new(
+                ErrorCode::SetMismatch,
+                format!(
+                    "{}: {} contains id `{}` not present in PINNED_CASE_IDS",
+                    path.display(),
+                    name,
+                    *id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_exact_layout(root: &Path, manifest: &CorpusManifest) -> Result<()> {
     let expected_specs = manifest
         .projects
@@ -475,31 +532,15 @@ fn validate_node_args(path: &Path, args: &[String]) -> Result<()> {
 }
 
 fn validate_compiler_args(path: &Path, args: &[String]) -> Result<()> {
-    const HARNESS_OWNED_ARGS: &[&str] = &[
-        "--target",
-        "-t",
-        "--output",
-        "-o",
-        "--out-dir",
-        "--output-dir",
-        "--aot",
-        "--jit",
-        "--compile",
-        "--run",
-        "--check",
-        "--js-compat",
-    ];
-
     for argument in args {
-        if argument.is_empty() {
+        let trimmed = argument.trim();
+        if trimmed.is_empty() {
             return Err(schema_error(
                 path,
-                "compiler_args must not contain empty entries",
+                "compiler_args must not contain empty or whitespace-only entries",
             ));
         }
-        let name = argument
-            .split_once('=')
-            .map_or(argument.as_str(), |(name, _)| name);
+        let name = trimmed.split_once('=').map_or(trimmed, |(name, _)| name);
         if HARNESS_OWNED_ARGS.contains(&name) {
             return Err(schema_error(
                 path,
@@ -702,7 +743,8 @@ impl CorpusFailure {
             | driver::DriverError::MissingEntrypoint
             | driver::DriverError::MultipleCompileInputs
             | driver::DriverError::UnsupportedCompileTarget(_)
-            | driver::DriverError::UnsupportedOutputOption(_) => CorpusStage::Resolve,
+            | driver::DriverError::UnsupportedOutputOption(_)
+            | driver::DriverError::UnexpectedResolution(_) => CorpusStage::Resolve,
             driver::DriverError::Diagnostics { .. } => CorpusStage::Check,
             driver::DriverError::Lower(error) => program_lower_stage(error),
             driver::DriverError::Jit(error) => jit_stage(error),
@@ -718,6 +760,7 @@ impl CorpusFailure {
             | driver::DriverError::LinkStart { .. }
             | driver::DriverError::LinkFailed { .. }
             | driver::DriverError::PublishExecutable { .. }
+            | driver::DriverError::Cancelled
             | driver::DriverError::CrossTargetLink { .. } => CorpusStage::Link,
         };
         Self {
@@ -784,6 +827,7 @@ fn jit_stage(error: &bamts_codegen::JitError) -> CorpusStage {
         bamts_codegen::JitError::Lower(_) => CorpusStage::Lower,
         bamts_codegen::JitError::InvalidLoweredModule(_)
         | bamts_codegen::JitError::Module(_)
+        | bamts_codegen::JitError::Cancelled
         | bamts_codegen::JitError::UnknownHelper { .. } => CorpusStage::Instantiate,
     }
 }
@@ -796,15 +840,16 @@ fn aot_stage(error: &bamts_codegen::AotError) -> CorpusStage {
         | bamts_codegen::AotError::TargetEndianness(_)
         | bamts_codegen::AotError::InvalidLoweredModule(_)
         | bamts_codegen::AotError::Module(_)
+        | bamts_codegen::AotError::Cancelled
         | bamts_codegen::AotError::Emit(_) => CorpusStage::Instantiate,
     }
 }
 
 fn native_stage(error: &bamts_runtime::NativeError) -> CorpusStage {
     match error {
-        bamts_runtime::NativeError::Runtime(_) | bamts_runtime::NativeError::FatalTrap { .. } => {
-            CorpusStage::Evaluate
-        }
+        bamts_runtime::NativeError::Runtime(_)
+        | bamts_runtime::NativeError::FatalTrap { .. }
+        | bamts_runtime::NativeError::Cancelled => CorpusStage::Evaluate,
         bamts_runtime::NativeError::Abi(_) | bamts_runtime::NativeError::ProgramMismatch => {
             CorpusStage::Link
         }
@@ -884,11 +929,14 @@ fn bounded_text(text: &str) -> String {
 
 /// Runs validated corpus cases through the public `bamts_cli` driver.
 ///
-/// # Precondition
+/// # Preconditions
 ///
-/// The repository root contains a valid `corpus/manifest.toml`, the pinned
-/// Node interpreter is discoverable, and `load_corpus` has already validated
-/// the requested case.
+/// The repository manifest must already have been validated by [`load_corpus`].
+/// Every execution mode re-executes [`std::env::current_exe`] as a libtest
+/// worker, so the current executable must be a libtest binary containing an
+/// `#[ignore]` test named `corpus_differential_worker` that is selected with
+/// `--exact corpus_differential_worker --ignored --nocapture` and calls
+/// [`run_corpus_worker_from_env`].
 #[derive(Debug, Clone)]
 pub struct BamtsRunner {
     root: PathBuf,
@@ -916,18 +964,21 @@ impl BamtsRunner {
         require_clean_relative(&manifest, "entrypoint", &spec.entrypoint)
             .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         match mode {
-            ExecutionMode::Interpreter => self.run_interpreter(spec),
-            ExecutionMode::Jit => self.run_jit(spec),
+            ExecutionMode::Interpreter | ExecutionMode::Jit => {
+                self.run_in_process_worker(spec, mode)
+            }
             ExecutionMode::Aot => self.run_aot(spec),
         }
     }
 
-    /// Runs one validated case through the bytecode interpreter in a killable
-    /// worker process, so a stuck host call is wall-clock bounded just like
-    /// the JIT and AOT paths.  Fuel still bounds interpreted compute loops.
-    fn run_interpreter(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
+    fn run_in_process_worker(&self, spec: &CaseSpec, mode: ExecutionMode) -> Result<OracleOutcome> {
+        let operation = match mode {
+            ExecutionMode::Interpreter => WorkerOperation::Interpreter,
+            ExecutionMode::Jit => WorkerOperation::Jit,
+            ExecutionMode::Aot => unreachable!("AOT uses run_aot"),
+        };
         let started = Instant::now();
-        let artifacts = ArtifactDirectory::create(&self.root, spec, ExecutionMode::Interpreter)
+        let artifacts = ArtifactDirectory::create(&self.root, spec, mode)
             .map_err(|error| corpus_stage_error(CorpusStage::Spawn, error))?;
         let Some(budget) = remaining_case_budget(spec.timeout(), started.elapsed()) else {
             return Ok(timeout_outcome(Vec::new(), self.max_output_bytes));
@@ -935,7 +986,7 @@ impl BamtsRunner {
         let request = WorkerRequest {
             root: self.root.clone(),
             spec: spec.clone(),
-            operation: WorkerOperation::Interpreter,
+            operation,
             max_output_bytes: self.max_output_bytes,
             executable: None,
         };
@@ -943,38 +994,14 @@ impl BamtsRunner {
             WorkerRun::TimedOut(outcome) => Ok(outcome),
             WorkerRun::Completed(WorkerResponse::Outcome(outcome)) => Ok(outcome),
             WorkerRun::Completed(WorkerResponse::Failure(failure)) => {
-                Err(mode_failure(spec, ExecutionMode::Interpreter, failure))
+                Err(mode_failure(spec, mode, failure))
             }
             WorkerRun::Completed(WorkerResponse::Compile { .. }) => Err(VerificationError::new(
                 ErrorCode::ToolFailed,
-                "corpus interpreter worker returned a compile response",
-            )),
-        }
-    }
-
-    fn run_jit(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
-        let started = Instant::now();
-        let artifacts = ArtifactDirectory::create(&self.root, spec, ExecutionMode::Jit)
-            .map_err(|error| corpus_stage_error(CorpusStage::Spawn, error))?;
-        let Some(budget) = remaining_case_budget(spec.timeout(), started.elapsed()) else {
-            return Ok(timeout_outcome(Vec::new(), self.max_output_bytes));
-        };
-        let request = WorkerRequest {
-            root: self.root.clone(),
-            spec: spec.clone(),
-            operation: WorkerOperation::Jit,
-            max_output_bytes: self.max_output_bytes,
-            executable: None,
-        };
-        match run_worker(&artifacts, &request, budget)? {
-            WorkerRun::TimedOut(outcome) => Ok(outcome),
-            WorkerRun::Completed(WorkerResponse::Outcome(outcome)) => Ok(outcome),
-            WorkerRun::Completed(WorkerResponse::Failure(failure)) => {
-                Err(mode_failure(spec, ExecutionMode::Jit, failure))
-            }
-            WorkerRun::Completed(WorkerResponse::Compile { .. }) => Err(VerificationError::new(
-                ErrorCode::ToolFailed,
-                "corpus JIT worker returned an AOT compile response",
+                format!(
+                    "corpus {} worker returned an AOT compile response",
+                    mode.as_str()
+                ),
             )),
         }
     }
@@ -994,24 +1021,29 @@ impl BamtsRunner {
             max_output_bytes: self.max_output_bytes,
             executable: Some(executable.clone()),
         };
-        let compile_stderr = match run_worker(&artifacts, &request, compile_budget)? {
-            WorkerRun::TimedOut(outcome) => return Ok(outcome),
-            WorkerRun::Completed(WorkerResponse::Compile { stderr }) => stderr,
-            WorkerRun::Completed(WorkerResponse::Failure(failure)) => {
-                return Err(mode_failure(spec, ExecutionMode::Aot, failure));
-            }
-            WorkerRun::Completed(WorkerResponse::Outcome(_)) => {
-                return Err(VerificationError::new(
-                    ErrorCode::ToolFailed,
-                    "corpus AOT worker returned a JIT execution response",
-                ));
-            }
-        };
+        let (compile_stderr, compile_stderr_truncated) =
+            match run_worker(&artifacts, &request, compile_budget)? {
+                WorkerRun::TimedOut(outcome) => return Ok(outcome),
+                WorkerRun::Completed(WorkerResponse::Compile {
+                    stderr,
+                    stderr_truncated,
+                }) => (stderr, stderr_truncated),
+                WorkerRun::Completed(WorkerResponse::Failure(failure)) => {
+                    return Err(mode_failure(spec, ExecutionMode::Aot, failure));
+                }
+                WorkerRun::Completed(WorkerResponse::Outcome(_)) => {
+                    return Err(VerificationError::new(
+                        ErrorCode::ToolFailed,
+                        "corpus AOT worker returned a JIT execution response",
+                    ));
+                }
+            };
         let Some(execution_budget) = remaining_case_budget(spec.timeout(), started.elapsed())
         else {
             return Ok(with_aot_compile_evidence(
                 timeout_outcome(Vec::new(), self.max_output_bytes),
                 compile_stderr,
+                compile_stderr_truncated,
                 self.max_output_bytes,
             ));
         };
@@ -1027,6 +1059,7 @@ impl BamtsRunner {
         Ok(with_aot_compile_evidence(
             outcome,
             compile_stderr,
+            compile_stderr_truncated,
             self.max_output_bytes,
         ))
     }
@@ -1051,7 +1084,10 @@ enum WorkerOperation {
 #[derive(Debug, Serialize, Deserialize)]
 enum WorkerResponse {
     Outcome(OracleOutcome),
-    Compile { stderr: Vec<u8> },
+    Compile {
+        stderr: Vec<u8>,
+        stderr_truncated: bool,
+    },
     Failure(CorpusFailure),
 }
 
@@ -1115,9 +1151,14 @@ fn execute_driver_request(request: &WorkerRequest) -> Result<WorkerResponse> {
                 false,
                 request.max_output_bytes,
             ))),
-            WorkerOperation::AotCompile => Ok(WorkerResponse::Compile {
-                stderr: outcome.stderr,
-            }),
+            WorkerOperation::AotCompile => {
+                let (stderr, stderr_truncated) =
+                    bounded_output(outcome.stderr, request.max_output_bytes);
+                Ok(WorkerResponse::Compile {
+                    stderr,
+                    stderr_truncated,
+                })
+            }
             WorkerOperation::Interpreter => {
                 unreachable!("interpreter requests are handled by execute_interpreter_request")
             }
@@ -1381,10 +1422,12 @@ fn aot_execution_limits(timeout: Duration, max_output_bytes: usize) -> OracleLim
 fn with_aot_compile_evidence(
     mut runtime: OracleOutcome,
     compile_stderr: Vec<u8>,
+    compile_stderr_truncated: bool,
     max_output_bytes: usize,
 ) -> OracleOutcome {
-    (runtime.compile_stderr, runtime.compile_stderr_truncated) =
-        bounded_output(compile_stderr, max_output_bytes);
+    let (compile_stderr, truncated_here) = bounded_output(compile_stderr, max_output_bytes);
+    runtime.compile_stderr = compile_stderr;
+    runtime.compile_stderr_truncated = compile_stderr_truncated || truncated_here;
     runtime
 }
 
@@ -1398,6 +1441,31 @@ fn case_requires_javascript_compatibility(spec: &CaseSpec) -> bool {
         })
 }
 
+fn cli_arg_strings(
+    mode: Mode,
+    target: ExecutionTarget,
+    entrypoint: PathBuf,
+    output: Option<&Path>,
+    javascript_compatibility: bool,
+    compiler_args: &[String],
+) -> Vec<String> {
+    let mut raw = vec![
+        harness_arg(&mode.to_string()),
+        entrypoint.to_string_lossy().into_owned(),
+        harness_arg("--target"),
+        harness_arg(&target.to_string()),
+    ];
+    if javascript_compatibility {
+        raw.push(harness_arg("--js-compat"));
+    }
+    if let Some(path) = output {
+        raw.push(harness_arg("--output"));
+        raw.push(path.to_string_lossy().into_owned());
+    }
+    raw.extend(compiler_args.iter().cloned());
+    raw
+}
+
 pub(crate) fn cli_args(
     mode: Mode,
     target: ExecutionTarget,
@@ -1406,26 +1474,28 @@ pub(crate) fn cli_args(
     javascript_compatibility: bool,
     compiler_args: &[String],
 ) -> Result<CliArgs> {
-    let mut raw = vec![
-        mode.to_string(),
-        entrypoint.to_string_lossy().into_owned(),
-        "--target".to_owned(),
-        target.to_string(),
-    ];
-    if javascript_compatibility {
-        raw.push("--js-compat".to_owned());
-    }
-    if let Some(path) = output {
-        raw.push("--output".to_owned());
-        raw.push(path.to_string_lossy().into_owned());
-    }
-    raw.extend(compiler_args.iter().cloned());
-    parse_args(raw).map_err(|error| {
+    parse_args(cli_arg_strings(
+        mode,
+        target,
+        entrypoint,
+        output,
+        javascript_compatibility,
+        compiler_args,
+    ))
+    .map_err(|error| {
         VerificationError::new(
             ErrorCode::Usage,
             format!("cannot construct corpus CLI invocation: {error}"),
         )
     })
+}
+
+fn harness_arg(name: &str) -> String {
+    debug_assert!(
+        HARNESS_OWNED_ARGS.contains(&name),
+        "corpus CLI builder may only emit harness-owned arguments"
+    );
+    name.to_owned()
 }
 
 fn driver_outcome(outcome: driver::CommandOutcome, timed_out: bool, cap: usize) -> OracleOutcome {
@@ -2141,13 +2211,22 @@ mod tests {
     fn load_corpus_accepts_the_real_repository() {
         let corpus = load_corpus(&repo_root()).expect("real corpus validates");
         assert_eq!(corpus.cases.len(), corpus.manifest.projects.len());
-        assert!(corpus.cases.len() >= 20);
-        assert_eq!(corpus.manifest.node_version, NODE_VERSION);
-        for (project, case) in corpus.manifest.projects.iter().zip(&corpus.cases) {
-            assert_eq!(project.id, case.id);
-            assert_eq!(project.commit, case.commit);
-            assert!(is_lower_hex(&case.commit, COMMIT_LEN));
-            assert!(case.entrypoint.ends_with(".ts"));
+        let manifest_ids: Vec<&str> = corpus
+            .manifest
+            .projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect();
+        assert_eq!(manifest_ids, PINNED_CASE_IDS);
+        let pinned: BTreeSet<&str> = PINNED_CASE_IDS.into_iter().collect();
+        for (name, subset) in [
+            ("synchronous", TASK_106_SYNC_CASE_IDS.as_slice()),
+            ("node", TASK_107_NODE_CASE_IDS.as_slice()),
+        ] {
+            assert!(
+                subset.iter().all(|id| pinned.contains(id)),
+                "{name} case IDs must be a subset of PINNED_CASE_IDS"
+            );
         }
         assert!(corpus.case("tiny-invariant").is_some());
     }
@@ -2496,25 +2575,11 @@ mod tests {
     fn spec_rejects_harness_owned_compiler_args() {
         let path = Path::new("spec.toml");
         let project = valid_project();
-        let owned = [
-            "--target",
-            "-t",
-            "--output",
-            "-o",
-            "--out-dir",
-            "--output-dir",
-            "--aot",
-            "--jit",
-            "--compile",
-            "--run",
-            "--check",
-            "--js-compat",
-        ];
 
-        for argument in owned
+        for argument in HARNESS_OWNED_ARGS
             .iter()
             .flat_map(|argument| [(*argument).to_owned(), format!("{argument}=value")])
-            .chain([String::new()])
+            .chain([String::new(), " \t".to_owned()])
         {
             let mut raw = valid_raw_spec();
             raw.compiler_args = vec![argument.clone()];
@@ -2522,7 +2587,7 @@ mod tests {
             assert_eq!(error.code(), ErrorCode::Schema);
             assert!(
                 error.to_string().contains(&format!("`{argument}`"))
-                    || argument.is_empty() && error.to_string().contains("empty"),
+                    || argument.trim().is_empty() && error.to_string().contains("empty"),
                 "{error}"
             );
         }
@@ -2774,7 +2839,7 @@ mod tests {
             compile_stderr_truncated: false,
         };
 
-        let outcome = with_aot_compile_evidence(runtime, b"compile warning".to_vec(), 128);
+        let outcome = with_aot_compile_evidence(runtime, b"compile warning".to_vec(), false, 128);
         assert!(outcome.timed_out);
         assert_eq!(outcome.exit_code, None);
         assert_eq!(outcome.stdout, b"runtime stdout");
@@ -2902,5 +2967,123 @@ mod tests {
             !message.contains("No such file or directory"),
             "error must not leak a filesystem I/O message: {message}"
         );
+    }
+
+    #[test]
+    fn aot_compile_evidence_preserves_worker_truncation() {
+        let runtime = timeout_outcome(Vec::new(), 4);
+        let outcome = with_aot_compile_evidence(runtime, b"warn".to_vec(), true, 4);
+        assert_eq!(outcome.compile_stderr, b"warn");
+        assert!(outcome.compile_stderr_truncated);
+    }
+
+    #[test]
+    fn manifest_pinned_ids_and_subsets() {
+        let path = Path::new("manifest.toml");
+        let project = |id: &str| ManifestProject {
+            id: id.into(),
+            repository: "https://example.com".into(),
+            commit: "a".repeat(40),
+            spec: "corpus/specs/x.toml".into(),
+            entrypoint: "corpus/cases/x.ts".into(),
+        };
+        let projects: Vec<_> = PINNED_CASE_IDS.iter().copied().map(project).collect();
+        assert!(verify_pinned_case_ids(path, &projects).is_ok());
+
+        let mut wrong_order = projects.clone();
+        if wrong_order.len() >= 2 {
+            wrong_order.swap(0, 1);
+        }
+        assert_eq!(
+            verify_pinned_case_ids(path, &wrong_order)
+                .unwrap_err()
+                .code(),
+            ErrorCode::SetMismatch
+        );
+
+        let mut extra = projects;
+        extra.push(project("extra"));
+        assert_eq!(
+            verify_pinned_case_ids(path, &extra).unwrap_err().code(),
+            ErrorCode::SetMismatch
+        );
+    }
+
+    #[test]
+    fn cli_arg_strings_are_harness_owned() {
+        let entrypoint = PathBuf::from("corpus/cases/sample.ts");
+        let output = Path::new("target/corpus-differential/sample");
+        for mode in [Mode::Check, Mode::Compile, Mode::Run, Mode::Explain] {
+            for target in [ExecutionTarget::Aot, ExecutionTarget::Jit] {
+                for js in [false, true] {
+                    for out in [None, Some(output)] {
+                        let strings =
+                            cli_arg_strings(mode, target, entrypoint.clone(), out, js, &[]);
+                        let entrypoint_str = entrypoint.to_string_lossy().into_owned();
+                        let output_str = out.map(|p| p.to_string_lossy().into_owned());
+                        for token in &strings {
+                            if token == &entrypoint_str || output_str.as_ref() == Some(token) {
+                                continue;
+                            }
+                            assert!(
+                                HARNESS_OWNED_ARGS.contains(&token.as_str()),
+                                "`{token}` emitted by cli_arg_strings is not in HARNESS_OWNED_ARGS"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compiler_args_reject_emitted_flags_and_whitespace() {
+        let path = Path::new("spec.toml");
+        for token in [
+            "run",
+            "compile",
+            "aot",
+            "jit",
+            "--target",
+            "--output",
+            "--js-compat",
+        ] {
+            assert_eq!(
+                validate_compiler_args(path, &[token.to_owned()])
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Schema
+            );
+            assert_eq!(
+                validate_compiler_args(path, &[format!("{token}=value")])
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Schema
+            );
+        }
+        assert_eq!(
+            validate_compiler_args(path, &[" \t".to_owned()])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Schema
+        );
+        assert_eq!(
+            validate_compiler_args(path, &["  --target  ".to_owned()])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Schema
+        );
+        assert!(validate_compiler_args(path, &["--strict".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn bounded_output_caps_and_flags_truncation() {
+        let (out, truncated) = bounded_output(vec![0, 1, 2, 3, 4], 3);
+        assert_eq!(out, vec![0, 1, 2]);
+        assert!(truncated);
+
+        let (out, truncated) = bounded_output(vec![0, 1, 2], 5);
+        assert_eq!(out, vec![0, 1, 2]);
+        assert!(!truncated);
     }
 }

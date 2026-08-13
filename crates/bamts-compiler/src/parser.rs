@@ -86,6 +86,9 @@ use crate::syntax::{
     VariableDeclaration, VariableDeclarator, VariableDeclaratorNode, VariableKind, Variance,
     WhileStatement, WithStatement, YieldExpression, cook_identifier_text,
 };
+use bamts_cancel::{CancellationToken, Cancelled};
+use std::error::Error;
+use std::fmt;
 
 /// A token of one kind was required by the grammar but absent.
 const EXPECTED_TOKEN: DiagnosticCode = DiagnosticCode::new("BAMTS-P001");
@@ -115,6 +118,45 @@ pub const USING_DECLARATION_REQUIRES_INITIALIZER: DiagnosticCode =
     DiagnosticCode::new("BAMTS-P012");
 const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
 
+/// A parser operation was interrupted before completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseError {
+    /// The caller requested cancellation.
+    Cancelled(Cancelled),
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::Cancelled(_) => formatter.write_str("parse cancelled"),
+        }
+    }
+}
+
+impl Error for ParseError {}
+
+impl From<Cancelled> for ParseError {
+    fn from(cancelled: Cancelled) -> Self {
+        ParseError::Cancelled(cancelled)
+    }
+}
+
+impl From<ParseError> for Cancelled {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::Cancelled(cancelled) => cancelled,
+        }
+    }
+}
+
+impl From<crate::scanner::ScanError> for ParseError {
+    fn from(error: crate::scanner::ScanError) -> Self {
+        match error {
+            crate::scanner::ScanError::Cancelled(cancelled) => ParseError::Cancelled(cancelled),
+        }
+    }
+}
+
 /// The maximum expression/type nesting depth before recovery abandons a
 /// construct.
 ///
@@ -139,6 +181,25 @@ const MAX_DEPTH: u32 = 256;
 /// and the end-of-file token.
 #[must_use]
 pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
+    match parse_with_cancel(scanned, CancellationToken::new()) {
+        Ok(recovered) => recovered,
+        Err(_) => unreachable!("fresh token is never cancelled"),
+    }
+}
+
+/// Parses a scanned source with cooperative cancellation.
+///
+/// A caller-supplied [`CancellationToken`] is checked before parsing, at every
+/// statement boundary, and inside long list/recovery loops. Triggering it
+/// aborts parsing with [`ParseError::Cancelled`].
+pub fn parse_with_cancel(
+    scanned: Recovered<ScannedSource>,
+    cancel: CancellationToken,
+) -> Result<Recovered<SourceFile>, ParseError> {
+    if cancel.is_cancelled() {
+        return Err(ParseError::Cancelled(Cancelled));
+    }
+
     let (scanned, lexical) = scanned.into_parts();
     let source_id = scanned.source_id();
     let script_kind = scanned.script_kind();
@@ -146,7 +207,7 @@ pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
     let eof = *scanned.eof();
     let tokens = scanned.tokens().to_vec();
 
-    let mut parser = Parser::new(source_id, script_kind, source, tokens, eof);
+    let mut parser = Parser::new_with_cancel(source_id, script_kind, source, tokens, eof, cancel);
     let statements = parser.parse_statements_until(&[]);
 
     // The default scanner pass emits only `Slash`/`SlashEq`, never a
@@ -175,6 +236,7 @@ pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
 
     let full_range = TextRange::new(Utf16Pos::ZERO, parser.source.len_utf16())
         .expect("a source range starts at zero");
+    let was_cancelled = parser.is_cancelled();
     let file_id = parser.fresh_id();
     let file = SourceFile::new(
         file_id,
@@ -187,7 +249,12 @@ pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
         eof,
         diagnostics.clone(),
     );
-    Recovered::new(file, diagnostics)
+
+    if was_cancelled {
+        return Err(ParseError::Cancelled(Cancelled));
+    }
+
+    Ok(Recovered::new(file, diagnostics))
 }
 
 /// One reversible token-stream rescan, journaled so speculative parses can
@@ -252,6 +319,8 @@ struct Parser {
     /// recorded inside them reflect a non-JSX reading and are dropped, mirroring
     /// the regex-rescan span handling.
     jsx_spans: Vec<TextRange>,
+    /// Cooperative cancellation signal checked at statement and list boundaries.
+    cancel: CancellationToken,
 }
 
 fn is_trivia(kind: TokenKind) -> bool {
@@ -376,12 +445,31 @@ fn is_any_word(kind: TokenKind) -> bool {
 }
 
 impl Parser {
+    #[cfg(test)]
     fn new(
         source_id: SourceId,
         script_kind: ScriptKind,
         source: Arc<SourceText>,
         tokens: Vec<Token>,
         eof: Token,
+    ) -> Self {
+        Self::new_with_cancel(
+            source_id,
+            script_kind,
+            source,
+            tokens,
+            eof,
+            CancellationToken::new(),
+        )
+    }
+
+    fn new_with_cancel(
+        source_id: SourceId,
+        script_kind: ScriptKind,
+        source: Arc<SourceText>,
+        tokens: Vec<Token>,
+        eof: Token,
+        cancel: CancellationToken,
     ) -> Self {
         let mut parser = Self {
             source_id,
@@ -398,9 +486,15 @@ impl Parser {
             keyword_context: KeywordContext::default(),
             ambient: AmbientContext::None,
             jsx_spans: Vec::new(),
+            cancel,
         };
         parser.cursor = parser.next_significant(0);
         parser
+    }
+
+    /// Returns whether cancellation has been requested.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     // ------------------------------------------------------------------
@@ -1013,6 +1107,9 @@ impl Parser {
     fn parse_statements_until(&mut self, stop: &[TokenKind]) -> Vec<Stmt> {
         let mut statements = Vec::new();
         while !self.at_eof() && !stop.contains(&self.kind()) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let statement = self.parse_statement();
             statements.push(statement);
@@ -1231,6 +1328,9 @@ impl Parser {
         }
         let mut depth = 0i32;
         loop {
+            if self.is_cancelled() {
+                break false;
+            }
             index = self.next_significant(index + 1);
             match self.tokens.get(index).copied().unwrap_or(self.eof).kind() {
                 TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
@@ -1323,6 +1423,9 @@ impl Parser {
         let kind = self.variable_kind();
         let mut declarations = Vec::new();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let declarator = self.parse_variable_declarator(allow_in);
             declarations.push(declarator);
             if self.eat(TokenKind::Comma).is_none() {
@@ -1432,6 +1535,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut cases = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let case_start = self.cur_start();
             let test = if self.eat(TokenKind::KwCase).is_some() {
                 Some(Box::new(self.parse_expression(false)))
@@ -1545,6 +1651,9 @@ impl Parser {
                     // any further declarators.
                     let mut declarations = vec![self.finish_for_declarator(first)];
                     while self.eat(TokenKind::Comma).is_some() {
+                        if self.is_cancelled() {
+                            break;
+                        }
                         declarations.push(self.parse_variable_declarator(false));
                     }
                     self.expect(TokenKind::Semicolon, "expected `;`");
@@ -1860,6 +1969,9 @@ impl Parser {
     fn parse_decorators(&mut self) -> Vec<DecoratorNode> {
         let mut decorators = Vec::new();
         while self.at(TokenKind::At) {
+            if self.is_cancelled() {
+                break;
+            }
             let start = self.cur_start();
             self.bump();
             let expression = self.parse_lhs_expression(LhsContext::Decorator);
@@ -1901,6 +2013,9 @@ impl Parser {
         let mut extends = None;
         let mut implements = Vec::new();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             if self.at(TokenKind::KwExtends) && extends.is_none() {
                 self.bump();
                 let expression = self.parse_lhs_expression(LhsContext::Expression);
@@ -1914,6 +2029,9 @@ impl Parser {
                 self.note_typescript_syntax(range);
                 self.bump();
                 loop {
+                    if self.is_cancelled() {
+                        break;
+                    }
                     implements.push(self.parse_type());
                     if self.eat(TokenKind::Comma).is_none() {
                         break;
@@ -1927,6 +2045,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut members = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let member = self.parse_class_member();
             members.push(member);
@@ -1971,6 +2092,9 @@ impl Parser {
         let mut typescript_modifier: Option<TextRange> = None;
 
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let kind = self.kind();
             if !self.modifier_is_followed_by_member(1) {
                 break;
@@ -2258,6 +2382,9 @@ impl Parser {
         let mut extends = Vec::new();
         if self.eat(TokenKind::KwExtends).is_some() {
             loop {
+                if self.is_cancelled() {
+                    break;
+                }
                 let entity = self.parse_entity_name();
                 let type_arguments = if self.at_less_like() {
                     Some(self.parse_type_arguments())
@@ -2314,6 +2441,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut members = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let member_start = self.cur_start();
             let name = self.parse_property_name();
@@ -2352,8 +2482,25 @@ impl Parser {
     fn parse_namespace_body(&mut self, keyword: NamespaceKeyword) -> BlockNode {
         if self.at(TokenKind::Dot) {
             let inner_start = self.cur_start();
+            if !self.enter() {
+                // Depth limit reached. Consume the dot so the source advances,
+                // then return a block with a missing statement to stop the
+                // dotted recursion without exhausting the native stack.
+                self.bump();
+                let missing = self.node_at(
+                    empty_range(inner_start),
+                    Statement::Missing(MissingNode::new(NodeKind::MissingStatement)),
+                );
+                return self.node(
+                    inner_start,
+                    Block {
+                        statements: vec![missing],
+                    },
+                );
+            }
             self.bump();
             let inner = self.parse_namespace_tail(inner_start, keyword);
+            self.leave();
             let statements = vec![inner];
             self.node(inner_start, Block { statements })
         } else {
@@ -2616,6 +2763,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut specifiers = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let start = self.cur_start();
             let mode = if self.at(TokenKind::KwType) && self.specifier_type_is_modifier() {
@@ -2706,6 +2856,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut entries = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let name = self.parse_module_export_name();
             self.expect(TokenKind::Colon, "expected `:`");
@@ -2934,6 +3087,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut specifiers = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let specifier_start = self.cur_start();
             let mode = if self.at(TokenKind::KwType) && self.specifier_type_is_modifier() {
@@ -3089,6 +3245,9 @@ impl Parser {
         }
         let mut expressions = vec![first];
         while self.eat(TokenKind::Comma).is_some() {
+            if self.is_cancelled() {
+                break;
+            }
             expressions.push(self.parse_assignment_expression(no_in));
         }
         self.node(
@@ -3208,6 +3367,9 @@ impl Parser {
         let start = self.cur_start();
         let mut left = self.parse_unary_expression();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             // TypeScript `as`/`satisfies` postfix type operators (precedence
             // just above relational). Disallowed across a newline.
             if matches!(self.kind(), TokenKind::KwAs | TokenKind::KwSatisfies)
@@ -3488,6 +3650,9 @@ impl Parser {
     /// Member-only tail (no calls): used for a `new` callee.
     fn parse_member_tail(&mut self, start: Utf16Pos, mut expr: Expr, ctx: LhsContext) -> Expr {
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.kind() {
                 TokenKind::Dot => {
                     self.bump();
@@ -3538,6 +3703,9 @@ impl Parser {
         ctx: LhsContext,
     ) -> Expr {
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.kind() {
                 TokenKind::Dot => {
                     self.bump();
@@ -3725,6 +3893,9 @@ impl Parser {
         self.expect(TokenKind::LParen, "expected `(`");
         let mut arguments = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RParen) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::DotDotDot) {
                 let spread_start = self.cur_start();
@@ -4066,6 +4237,9 @@ impl Parser {
         }
         let mut current = JsxElementName::Identifier(first);
         while self.at(TokenKind::Dot) {
+            if self.is_cancelled() {
+                break;
+            }
             self.bump();
             let property = self.parse_jsx_name_identifier();
             current = JsxElementName::Member(JsxMemberName {
@@ -4093,6 +4267,9 @@ impl Parser {
     fn parse_jsx_attributes(&mut self) -> Vec<JsxAttributeItem> {
         let mut items = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::GreaterThan) && !self.at(TokenKind::Slash) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::LBrace) {
                 items.push(self.parse_jsx_spread_attribute());
@@ -4183,6 +4360,9 @@ impl Parser {
     fn parse_jsx_children(&mut self) -> Vec<JsxChild> {
         let mut children = Vec::new();
         while !self.at_eof() {
+            if self.is_cancelled() {
+                break;
+            }
             if self.at(TokenKind::LessThan) {
                 if self.nth_kind(1) == TokenKind::Slash {
                     break;
@@ -4242,6 +4422,9 @@ impl Parser {
         self.bump();
         let mut elements = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBracket) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::Comma) {
                 self.bump();
@@ -4281,6 +4464,9 @@ impl Parser {
         self.bump();
         let mut members = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let member = self.parse_object_member();
             members.push(member);
@@ -4496,6 +4682,9 @@ impl Parser {
         let head_range = head.range();
         elements.push(self.node_at(head_range, TemplateElement::new(head)));
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let expr = self.parse_expression(false);
             expressions.push(expr);
             match self.kind() {
@@ -4562,6 +4751,9 @@ impl Parser {
         self.bump();
         let mut properties = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::DotDotDot) {
                 self.bump();
@@ -4650,6 +4842,9 @@ impl Parser {
         self.bump();
         let mut elements = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBracket) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::Comma) {
                 self.bump();
@@ -4771,6 +4966,9 @@ impl Parser {
         self.expect(open, "expected `(`");
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.at(close) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let parameter = self.parse_parameter();
             parameters.push(parameter);
@@ -4795,6 +4993,9 @@ impl Parser {
         let decorators = self.parse_decorators();
         let mut modifiers = ParameterModifiers::default();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             if !self.parameter_modifier_follows() {
                 break;
             }
@@ -5123,6 +5324,9 @@ impl Parser {
         let mut index = self.cursor;
         let mut depth = 0i32;
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let token = self.tokens.get(index).copied().unwrap_or(self.eof);
             match token.kind() {
                 TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
@@ -5384,6 +5588,9 @@ impl Parser {
         }
         let mut types = vec![first];
         while self.eat(TokenKind::Pipe).is_some() {
+            if self.is_cancelled() {
+                break;
+            }
             types.push(self.parse_intersection_type());
         }
         self.node(start, TypeNode::Union(types))
@@ -5398,6 +5605,9 @@ impl Parser {
         }
         let mut types = vec![first];
         while self.eat(TokenKind::Amp).is_some() {
+            if self.is_cancelled() {
+                break;
+            }
             types.push(self.parse_postfix_type());
         }
         self.node(start, TypeNode::Intersection(types))
@@ -5435,6 +5645,9 @@ impl Parser {
         let start = self.cur_start();
         let mut type_node = self.parse_primary_type();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             if self.at(TokenKind::LBracket) && !self.has_newline_before() {
                 self.bump();
                 if self.eat(TokenKind::RBracket).is_some() {
@@ -5609,6 +5822,9 @@ impl Parser {
         self.bump();
         let mut elements = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBracket) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let rest = self.eat(TokenKind::DotDotDot).is_some();
             // Named tuple element `name?: Type`.
@@ -5809,6 +6025,9 @@ impl Parser {
         self.expect(TokenKind::LParen, "expected `(`");
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RParen) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let rest = self.eat(TokenKind::DotDotDot).is_some();
             let name = if is_identifier_like(self.kind()) || self.at(TokenKind::KwThis) {
@@ -5858,6 +6077,9 @@ impl Parser {
         };
         let mut depth = 0i32;
         while !self.at_eof() {
+            if self.is_cancelled() {
+                break;
+            }
             if self.kind() == open {
                 depth += 1;
             } else if self.kind() == close {
@@ -5890,6 +6112,9 @@ impl Parser {
                     ImportAttributes::default()
                 };
                 while !self.at_eof() && !self.at(TokenKind::RBrace) {
+                    if self.is_cancelled() {
+                        break;
+                    }
                     self.bump();
                 }
                 self.expect(TokenKind::RBrace, "expected `}`");
@@ -5926,6 +6151,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut entries = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let name = self.parse_module_export_name();
             self.expect(TokenKind::Colon, "expected `:`");
             let value = self.parse_string_literal();
@@ -5950,6 +6178,9 @@ impl Parser {
             let range = head.range();
             elements.push(self.node_at(range, TemplateElement::new(head)));
             loop {
+                if self.is_cancelled() {
+                    break;
+                }
                 types.push(self.parse_type());
                 if self.at(TokenKind::TemplateMiddle) {
                     let token = self.bump();
@@ -6008,6 +6239,9 @@ impl Parser {
         self.expect_type_open("expected `<`");
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.at_greater_like() {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             parameters.push(self.parse_type_parameter());
             if self.eat(TokenKind::Comma).is_none() {
@@ -6078,6 +6312,9 @@ impl Parser {
         self.expect_type_open("expected `<`");
         let mut arguments = Vec::new();
         while !self.at_eof() && !self.at_greater_like() {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             arguments.push(self.parse_type());
             if self.eat(TokenKind::Comma).is_none() {
@@ -6139,6 +6376,9 @@ impl Parser {
         let token = self.bump();
         let mut name = EntityName::Identifier(self.ident_from(token));
         while self.eat(TokenKind::Dot).is_some() {
+            if self.is_cancelled() {
+                break;
+            }
             let right = self.expect_identifier("expected a qualified name");
             name = EntityName::Qualified {
                 left: Box::new(name),
@@ -6152,6 +6392,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut members = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             members.push(self.parse_type_member());
             if self.eat(TokenKind::Semicolon).is_none()
@@ -6271,6 +6514,9 @@ impl Parser {
         self.expect(TokenKind::LBracket, "expected `[` ");
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBracket) {
+            if self.is_cancelled() {
+                break;
+            }
             let rest = self.eat(TokenKind::DotDotDot).is_some();
             let name = self.expect_identifier("expected a parameter name");
             let optional = self.eat(TokenKind::Question).is_some();
@@ -7698,6 +7944,41 @@ mod tests {
     }
 
     #[test]
+    fn dotted_namespace_within_depth_parses_cleanly() {
+        let names = (0..50)
+            .map(|i| format!("N{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        let source = format!("namespace {names} {{}}");
+        let recovered = assert_clean(&source);
+        assert_eq!(stmt_kind(&recovered, 0), NodeKind::NamespaceDeclaration);
+        let Statement::Namespace(outer) = recovered.product().statements()[0].data() else {
+            panic!("expected a namespace");
+        };
+        assert!(matches!(
+            outer.body.data().statements[0].data(),
+            Statement::Namespace(_)
+        ));
+    }
+
+    #[test]
+    fn deep_dotted_namespace_rejects_recursion_with_nesting_diagnostic() {
+        let names = (0..260)
+            .map(|i| format!("N{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        let source = format!("namespace {names} {{}}");
+        let recovered = parse_ts(&source);
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == NESTING_TOO_DEEP),
+            "a 260-segment dotted namespace must emit BAMTS-P010 instead of overflowing"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
     fn declare_module_non_name_recovers_with_missing_identifier() {
         let recovered = parse_ts("declare module 123 {}");
         assert!(
@@ -7963,5 +8244,19 @@ mod tests {
         let source = file.source_text().as_str();
         let byte = source.find(needle).expect("needle present");
         source[..byte].encode_utf16().count()
+    }
+
+    #[test]
+    fn parse_cancellation_returns_typed_error() {
+        let source =
+            Arc::new(SourceText::new("const x = 1;".to_owned()).expect("test source fits budget"));
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = parse_with_cancel(scanned, cancel);
+        assert!(
+            matches!(result, Err(ParseError::Cancelled(_))),
+            "cancelled parse must return ParseError::Cancelled"
+        );
     }
 }

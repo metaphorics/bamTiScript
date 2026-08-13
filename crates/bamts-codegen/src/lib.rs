@@ -187,12 +187,17 @@ mod jit;
 #[allow(unsafe_code)]
 mod jit_memory;
 #[cfg(feature = "host-jit")]
-pub use jit::{JitError, JitProgram, JitTelemetry, compile_jit, compile_jit_with_telemetry};
+pub use jit::{
+    JitError, JitProgram, JitTelemetry, compile_jit, compile_jit_with_cancel,
+    compile_jit_with_telemetry, compile_jit_with_telemetry_cancel,
+};
 
 #[cfg(feature = "aot")]
 mod aot;
 #[cfg(feature = "aot")]
-pub use aot::{AotError, AotObject, PROGRAM_DESCRIPTOR_SYMBOL, compile_aot};
+pub use aot::{
+    AotError, AotObject, PROGRAM_DESCRIPTOR_SYMBOL, compile_aot, compile_aot_with_cancel,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -202,6 +207,8 @@ use bamts_bytecode::{
     AccessorKind, BinaryOp, DescriptorSlot, DisposeHint, ExceptionHandler, FunctionId, Instruction,
     IteratorCloseMode, IteratorKind, Module, ModuleId, Pc, Program, Register, UnaryOp, Verified,
 };
+use bamts_cancel::{CancellationToken, Cancelled};
+
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     AbiParam, Block, ExtFuncData, ExternalName, Function, InstBuilder, MemFlagsData, Signature,
@@ -888,6 +895,14 @@ pub enum LowerError {
         /// The verifier's diagnostics.
         message: String,
     },
+    /// A caller-supplied cancellation token was triggered at a checkpoint.
+    Cancelled,
+}
+
+impl From<Cancelled> for LowerError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
+    }
 }
 
 impl fmt::Display for LowerError {
@@ -919,6 +934,7 @@ impl fmt::Display for LowerError {
                     function.get()
                 )
             }
+            LowerError::Cancelled => f.write_str("operation cancelled"),
         }
     }
 }
@@ -1023,6 +1039,88 @@ pub struct LoweredProgram {
     pub entry_function: FunctionId,
 }
 
+/// A deterministic failure from validating the structure of a lowered program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LoweredProgramError {
+    /// A module's canonical id does not match its position in the program.
+    ModuleIndexMismatch {
+        /// The expected id (the vector index).
+        expected: u32,
+        /// The id stored on the module.
+        found: u32,
+    },
+    /// A function's canonical id does not match its position in its module.
+    FunctionIndexMismatch {
+        /// The id of the containing module.
+        module: u32,
+        /// The expected id (the vector index).
+        expected: u32,
+        /// The id stored on the function.
+        found: u32,
+    },
+}
+
+impl fmt::Display for LoweredProgramError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ModuleIndexMismatch { expected, found } => {
+                write!(f, "module {found} appears at index {expected}")
+            }
+            Self::FunctionIndexMismatch {
+                module,
+                expected,
+                found,
+            } => write!(
+                f,
+                "module {module} function {found} appears at local index {expected}"
+            ),
+        }
+    }
+}
+
+impl Error for LoweredProgramError {}
+
+/// Validates that `lowered` has dense, identity-ordered modules and functions.
+///
+/// The returned vector lists every `(module_id, function_id)` in the canonical
+/// tuple order that the JIT binary search and the AOT unit descriptor table rely
+/// on. A mismatch between an id and its vector index is reported as a typed
+/// error so each backend can map it to its own public error variant.
+pub(crate) fn validate_lowered_program(
+    lowered: &LoweredProgram,
+) -> Result<Vec<(u32, u32)>, LoweredProgramError> {
+    let mut units = Vec::with_capacity(
+        lowered
+            .modules
+            .iter()
+            .map(|module| module.functions.len())
+            .sum(),
+    );
+    for (module_index, module) in lowered.modules.iter().enumerate() {
+        let module_id = module.id.get();
+        let expected_module_id = module_index as u32;
+        if module_id != expected_module_id {
+            return Err(LoweredProgramError::ModuleIndexMismatch {
+                expected: expected_module_id,
+                found: module_id,
+            });
+        }
+        for (function_index, function) in module.functions.iter().enumerate() {
+            let function_id = function.id.get();
+            let expected_function_id = function_index as u32;
+            if function_id != expected_function_id {
+                return Err(LoweredProgramError::FunctionIndexMismatch {
+                    module: module_id,
+                    expected: expected_function_id,
+                    found: function_id,
+                });
+            }
+            units.push((module_id, function_id));
+        }
+    }
+    Ok(units)
+}
+
 /// The collision-free linker symbol for a module-qualified lowered function.
 #[must_use]
 pub fn function_symbol(module_id: u32, function_id: u32) -> String {
@@ -1034,21 +1132,39 @@ pub fn function_symbol(module_id: u32, function_id: u32) -> String {
 /// Lowers every function of every module in a verified canonical program.
 ///
 /// Modules remain separate: function and constant ids are never flattened or
-/// renumbered. Each error carries the module id whose lowering failed.
+/// renumbered. Each error carries the module id whose lowering failed. This is
+/// a convenience wrapper that uses a fresh, never-cancelled token; for
+/// cancellation support use [`lower_program_with_cancel`].
 pub fn lower_program(
     program: &Program<Verified>,
     config: TargetFrontendConfig,
 ) -> Result<LoweredProgram, ProgramLowerError> {
+    lower_program_with_cancel(program, config, &CancellationToken::new())
+}
+
+/// Lowers every function of every module with cooperative cancellation checks.
+///
+/// Cancellation is checked at the entry, before each module, before each
+/// function, and immediately before/after Cranelift's IR verifier.
+pub fn lower_program_with_cancel(
+    program: &Program<Verified>,
+    config: TargetFrontendConfig,
+    cancel: &CancellationToken,
+) -> Result<LoweredProgram, ProgramLowerError> {
+    cancel.check().map_err(|_| ProgramLowerError {
+        module: program.entry(),
+        kind: LowerError::Cancelled,
+    })?;
     let mut modules = Vec::with_capacity(program.modules().len());
     for (index, module) in program.modules().iter().enumerate() {
         let module_id = ModuleId::new(index as u32);
         modules.push(
-            lower_code_module(module_id, module.code(), config).map_err(|kind| {
-                ProgramLowerError {
+            lower_code_module_with_cancel(module_id, module.code(), config, cancel).map_err(
+                |kind| ProgramLowerError {
                     module: module_id,
                     kind,
-                }
-            })?,
+                },
+            )?,
         );
     }
     let entry_module = program.entry();
@@ -1064,11 +1180,22 @@ pub fn lower_program(
     })
 }
 
+#[cfg(test)]
 fn lower_code_module(
     module_id: ModuleId,
     module: &Module<Verified>,
     config: TargetFrontendConfig,
 ) -> Result<LoweredModule, LowerError> {
+    lower_code_module_with_cancel(module_id, module, config, &CancellationToken::new())
+}
+
+fn lower_code_module_with_cancel(
+    module_id: ModuleId,
+    module: &Module<Verified>,
+    config: TargetFrontendConfig,
+    cancel: &CancellationToken,
+) -> Result<LoweredModule, LowerError> {
+    cancel.check()?;
     if config.pointer_bits() != 64 {
         return Err(LowerError::UnsupportedPointerWidth {
             bits: config.pointer_bits(),
@@ -1085,21 +1212,21 @@ fn lower_code_module(
     let entry_signature = entry_signature(call_conv);
     let flags = Flags::new(settings::builder());
     let mut builder_context = FunctionBuilderContext::new();
+    let mut context = LowerFunctionContext {
+        module_id,
+        entry_signature: &entry_signature,
+        config,
+        flags: &flags,
+        builder_context: &mut builder_context,
+        cancel,
+    };
 
     let mut functions = Vec::with_capacity(function_count);
     for (index, function) in module.functions().iter().enumerate() {
         // Bounds checked above.
         let id = FunctionId::new(index as u32);
-        let lowered = lower_function(
-            module_id,
-            id,
-            function,
-            &entry_signature,
-            config,
-            &flags,
-            &mut builder_context,
-        )?;
-        functions.push(lowered);
+        cancel.check()?;
+        functions.push(lower_function(id, function, &mut context)?);
     }
 
     Ok(LoweredModule {
@@ -1137,15 +1264,19 @@ fn validate_slots(id: FunctionId, function: &bamts_bytecode::Function) -> Result
         })
     }
 }
+struct LowerFunctionContext<'a> {
+    module_id: ModuleId,
+    entry_signature: &'a Signature,
+    config: TargetFrontendConfig,
+    flags: &'a Flags,
+    builder_context: &'a mut FunctionBuilderContext,
+    cancel: &'a CancellationToken,
+}
 
 fn lower_function(
-    module_id: ModuleId,
     id: FunctionId,
     function: &bamts_bytecode::Function,
-    entry_signature: &Signature,
-    config: TargetFrontendConfig,
-    flags: &Flags,
-    builder_context: &mut FunctionBuilderContext,
+    context: &mut LowerFunctionContext<'_>,
 ) -> Result<LoweredFunction, LowerError> {
     validate_slots(id, function)?;
 
@@ -1155,31 +1286,38 @@ fn lower_function(
     let entry_points = resume_tokens(code, &reachable);
 
     let name = UserFuncName::user(FUNCTION_NAMESPACE, id.get());
-    let mut clif = Function::with_name_signature(name, entry_signature.clone());
+    let mut clif = Function::with_name_signature(name, context.entry_signature.clone());
 
     let helpers = {
-        let builder = FunctionBuilder::new(&mut clif, builder_context);
-        let mut lowering = Lowering::new(builder, code.len(), handlers, config.default_call_conv);
+        let builder = FunctionBuilder::new(&mut clif, context.builder_context);
+        let mut lowering = Lowering::new(
+            builder,
+            code.len(),
+            handlers,
+            context.config.default_call_conv,
+        );
         lowering.build(code, &reachable);
-        lowering.finish(config)
+        lowering.finish(context.config)
     };
 
     // Signature validation: the produced entry ABI must be identical to the
     // shared native-entry signature (params and returns), independent of the
     // structural IR checks Cranelift performs below.
-    if clif.signature != *entry_signature {
+    if clif.signature != *context.entry_signature {
         return Err(LowerError::EntrySignatureMismatch { function: id });
     }
 
-    verify_function(&clif, flags).map_err(|errors| LowerError::IrVerification {
+    context.cancel.check()?;
+    verify_function(&clif, context.flags).map_err(|errors| LowerError::IrVerification {
         function: id,
         message: errors.to_string(),
     })?;
+    context.cancel.check()?;
 
     Ok(LoweredFunction {
         id,
-        symbol: function_symbol(module_id.get(), id.get()),
-        signature: entry_signature.clone(),
+        symbol: function_symbol(context.module_id.get(), id.get()),
+        signature: context.entry_signature.clone(),
         clif,
         entry_points,
         helpers,
@@ -3990,6 +4128,60 @@ mod tests {
         assert_eq!(lowered.entry_function, FunctionId::new(0));
     }
 
+    fn two_module_lowered() -> LoweredProgram {
+        let make_module = |name: &str| bamts_bytecode::ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![Constant::String(EcmaString::encode(name))],
+                vec![func(0, vec![Instruction::Halt], Vec::new())],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("module verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let program = Program::link(
+            vec![make_module("dependency"), make_module("entry")],
+            ModuleId::new(1),
+        )
+        .expect("program verifies");
+        lower_program(&program, host_config()).expect("program lowers")
+    }
+
+    #[test]
+    fn validate_lowered_program_accepts_canonical_order() {
+        assert_eq!(
+            validate_lowered_program(&two_module_lowered()).unwrap(),
+            vec![(0, 0), (1, 0)]
+        );
+    }
+
+    #[test]
+    fn validate_lowered_program_rejects_module_identity_mismatch() {
+        let mut lowered = two_module_lowered();
+        lowered.modules[0].id = ModuleId::new(7);
+
+        assert!(matches!(
+            validate_lowered_program(&lowered),
+            Err(LoweredProgramError::ModuleIndexMismatch { expected, found })
+                if expected == 0 && found == 7
+        ));
+    }
+
+    #[test]
+    fn validate_lowered_program_rejects_function_identity_mismatch() {
+        let mut lowered = two_module_lowered();
+        lowered.modules[0].functions[0].id = FunctionId::new(3);
+
+        assert!(matches!(
+            validate_lowered_program(&lowered),
+            Err(LoweredProgramError::FunctionIndexMismatch { module, expected, found })
+                if module == 0 && expected == 0 && found == 3
+        ));
+    }
+
     #[test]
     fn load_import_meta_lowers_to_helper_38() {
         let module = single(func(
@@ -4030,5 +4222,34 @@ mod tests {
             clif.contains("(i64, i64, i64) -> i32"),
             "ToObject helper ABI wrong:\n{clif}"
         );
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_lower_program() {
+        let module = verified(
+            vec![Constant::String(EcmaString::encode("<test>"))],
+            vec![func(1, vec![Instruction::Halt], Vec::new())],
+        );
+        let program = Program::link(
+            vec![bamts_bytecode::ProgramModule {
+                name: ConstantId::new(0),
+                code: module,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("program verifies");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = lower_program_with_cancel(&program, host_config(), &cancel);
+        assert!(matches!(
+            result,
+            Err(ProgramLowerError {
+                kind: LowerError::Cancelled,
+                ..
+            })
+        ));
     }
 }

@@ -184,6 +184,11 @@ structure EncodedModule where
   entry : EncodedField
   deriving DecidableEq, Repr
 
+/-- A bounded module header plus opaque linkage payloads.
+
+This model decodes `name` and `code`. The host must decode and validate `edges`,
+`bindings`, and `exports` before it constructs this value. The functions below
+preserve those three payloads but do not model their wire codec. -/
 structure EncodedProgramModule where
   name : EncodedField
   code : EncodedModule
@@ -480,7 +485,9 @@ def decodeModule (encoded : EncodedModule) : Except DecodeError Module :=
         else
           match decodeConstants encoded.constants, decodeFunctions encoded.functions,
                 decodeField encoded.entry with
-          | .ok constants, .ok functions, .ok entry => .ok ⟨constants, functions, entry⟩
+          | .ok constants, .ok functions, .ok entry =>
+              if entry < functions.length then .ok ⟨constants, functions, entry⟩
+              else .error .malformedModule
           | .error error, _, _ => .error error
           | _, .error error, _ => .error error
           | _, _, .error error => .error error
@@ -546,7 +553,9 @@ def functionCanonical (function : Function) : Prop :=
 abbrev functionBodyCanonical := functionCanonical
 
 def moduleCanonical (module : Module) : Prop :=
-  module.entry < FieldLimit ∧ ∀ function ∈ module.functions, functionCanonical function
+  module.entry < FieldLimit ∧
+  module.entry < module.functions.length ∧
+  ∀ function ∈ module.functions, functionCanonical function
 
 def programModuleCanonical (module : ProgramModule) : Prop :=
   module.name < FieldLimit ∧ moduleCanonical module.code
@@ -704,12 +713,13 @@ theorem decodeFunctions_encodeFunctions (functions : List Function)
 
 theorem decodeModule_encodeModule (module : Module) (h : moduleCanonical module) :
     decodeModule (encodeModule module) = .ok module := by
-  rcases h with ⟨entryCanonical, functionsCanonical⟩
+  rcases h with ⟨entryCanonical, entryInRange, functionsCanonical⟩
   have versionBound : formatVersion < FieldLimit := by decide
   simp [decodeModule, encodeModule, decodeField_encodeField formatVersion versionBound,
     decodeField_encodeField module.entry entryCanonical,
     decodeConstants_encodeConstants module.constants,
-    decodeFunctions_encodeFunctions module.functions functionsCanonical]
+    decodeFunctions_encodeFunctions module.functions functionsCanonical,
+    if_pos entryInRange]
 
 theorem decodeProgramModule_encodeProgramModule
     (module : ProgramModule) (h : programModuleCanonical module) :
@@ -744,6 +754,20 @@ def emptyModule : Module :=
 
 private theorem moduleCanonical_emptyModule : moduleCanonical emptyModule := by
   simp [moduleCanonical, emptyModule, functionCanonical_empty, FieldLimit]
+  <;> try { decide }
+
+/-- A one-function module whose entry index names no function (127 >= 1). -/
+def oneFunctionBadEntryModule : Module :=
+  ⟨[], [emptyFunction], 127⟩
+
+theorem oneFunctionBadEntryModule_not_canonical :
+    ¬ moduleCanonical oneFunctionBadEntryModule := by
+  simp [moduleCanonical, oneFunctionBadEntryModule, functionCanonical_empty, FieldLimit]
+  <;> try { decide }
+
+theorem oneFunctionBadEntryModule_decodes_malformed :
+    decodeModule (encodeModule oneFunctionBadEntryModule) = .error .malformedModule := by
+  rfl
 
 /-- A canonical program module carrying only a bounded name and the empty module. -/
 def exampleProgramModule (name : Nat) : ProgramModule :=
@@ -752,10 +776,12 @@ def exampleProgramModule (name : Nat) : ProgramModule :=
 private theorem programModuleCanonical_example_zero :
     programModuleCanonical (exampleProgramModule 0) := by
   simp [programModuleCanonical, exampleProgramModule, moduleCanonical_emptyModule, FieldLimit]
+  <;> try { decide }
 
 private theorem programModuleCanonical_example_one :
     programModuleCanonical (exampleProgramModule 1) := by
   simp [programModuleCanonical, exampleProgramModule, moduleCanonical_emptyModule, FieldLimit]
+  <;> try { decide }
 
 private theorem programModulesCanonical_two :
     ∀ module ∈ [exampleProgramModule 0, exampleProgramModule 1], programModuleCanonical module := by

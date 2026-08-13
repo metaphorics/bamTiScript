@@ -53,6 +53,57 @@ enum Command {
     },
 }
 
+enum ClassifySync {
+    SnapshotIfMissing,
+    Always {
+        verify_pin: bool,
+        write_snapshot: bool,
+    },
+}
+
+fn classify_suite(
+    workspace_root: PathBuf,
+    snapshot_root: PathBuf,
+    ledger_out: PathBuf,
+    sync: ClassifySync,
+) -> Result<()> {
+    match sync {
+        ClassifySync::SnapshotIfMissing => {
+            if !snapshot_root.join("snapshot.sha256").exists() {
+                sync_suite(&SyncOptions {
+                    verify_pin: true,
+                    write_snapshot: true,
+                    workspace_root,
+                    snapshot_root: snapshot_root.clone(),
+                    extracted_suite_root: None,
+                })?;
+            }
+        }
+        ClassifySync::Always {
+            verify_pin,
+            write_snapshot,
+        } => {
+            sync_suite(&SyncOptions {
+                verify_pin,
+                write_snapshot,
+                workspace_root,
+                snapshot_root: snapshot_root.clone(),
+                extracted_suite_root: None,
+            })?;
+        }
+    }
+    let ledger = write_suite_ledger(&snapshot_root, &ledger_out)?;
+    println!(
+        "ledger_written path={} entries={} included={} deferred={} excluded={}",
+        ledger_out.display(),
+        ledger.entries.len(),
+        ledger.totals.included,
+        ledger.totals.deferred,
+        ledger.totals.excluded,
+    );
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = run() {
         let _ = writeln!(io::stderr().lock(), "{error}");
@@ -83,52 +134,27 @@ fn run() -> Result<()> {
             workspace_root,
             snapshot_root,
             ledger_out,
-        } => {
-            if !snapshot_root.join("snapshot.sha256").exists() {
-                sync_suite(&SyncOptions {
-                    verify_pin: true,
-                    write_snapshot: true,
-                    workspace_root,
-                    snapshot_root: snapshot_root.clone(),
-                    extracted_suite_root: None,
-                })?;
-            }
-            let ledger = write_suite_ledger(&snapshot_root, &ledger_out)?;
-            println!(
-                "ledger_written path={} entries={} included={} deferred={} excluded={}",
-                ledger_out.display(),
-                ledger.entries.len(),
-                ledger.totals.included,
-                ledger.totals.deferred,
-                ledger.totals.excluded,
-            );
-            Ok(())
-        }
+        } => classify_suite(
+            workspace_root,
+            snapshot_root,
+            ledger_out,
+            ClassifySync::SnapshotIfMissing,
+        ),
         Command::SyncAndClassify {
             verify_pin,
             write_snapshot,
             workspace_root,
             snapshot_root,
             ledger_out,
-        } => {
-            sync_suite(&SyncOptions {
+        } => classify_suite(
+            workspace_root,
+            snapshot_root,
+            ledger_out,
+            ClassifySync::Always {
                 verify_pin,
                 write_snapshot,
-                workspace_root,
-                snapshot_root: snapshot_root.clone(),
-                extracted_suite_root: None,
-            })?;
-            let ledger = write_suite_ledger(&snapshot_root, &ledger_out)?;
-            println!(
-                "ledger_written path={} entries={} included={} deferred={} excluded={}",
-                ledger_out.display(),
-                ledger.entries.len(),
-                ledger.totals.included,
-                ledger.totals.deferred,
-                ledger.totals.excluded,
-            );
-            Ok(())
-        }
+            },
+        ),
         Command::AuditLedger {
             require_complete,
             ledger,

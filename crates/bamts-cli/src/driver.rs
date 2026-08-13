@@ -4,24 +4,31 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use bamts::{ResolutionError, resolve_project};
+use bamts::{Error as BamtsError, resolve_project_with_cancel};
+use bamts_cancel::CancellationToken;
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{
-    FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_lints,
+    FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_cancel,
 };
 use bamts_compiler::program::{
-    ProgramLoadError, ProgramLowerError, ResolvedProgram, lower_program,
+    ProgramLoadError, ProgramLowerError, ProgramLowerErrorKind, ResolvedProgram,
+    lower_program_with_cancel,
 };
 use bamts_compiler::{
     diagnostic::DiagnosticReport,
     lint::{LintOverride, LintProfile, LintTable},
     project::parse_bamts_toml,
 };
-use bamts_runtime::{Limits, run_linked_program};
+#[cfg(windows)]
+use bamts_native::cache_guard::CacheGuardError;
+use bamts_native::cache_guard::{HeldArchive, PrivateCacheRoot};
+use bamts_runtime::{Limits, run_linked_program_with_cancel};
+use processkit::ErrorReason as PkErrorReason;
+use processkit::{CancellationToken as PkCancellationToken, Command as PkCommand};
 
 use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
 use crate::context::ExecutionContext;
@@ -140,6 +147,11 @@ pub enum DriverError {
     UnsafeFallbackCacheRoot {
         path: PathBuf,
     },
+    /// The project resolver returned an error from a later compiler stage.
+    UnexpectedResolution(BamtsError),
+    /// A caller-supplied [`CancellationToken`] was triggered during compilation,
+    /// linking, or execution.
+    Cancelled,
 }
 
 impl DriverError {
@@ -268,9 +280,13 @@ impl fmt::Display for DriverError {
             ),
             Self::UnsafeFallbackCacheRoot { path } => write!(
                 formatter,
-                "cache root `{}` is not a private directory owned by the current user",
+                "cache root `{}` is not private to the current user",
                 path.display()
             ),
+            Self::UnexpectedResolution(error) => {
+                write!(formatter, "project resolution failed unexpectedly: {error}")
+            }
+            Self::Cancelled => formatter.write_str("operation cancelled"),
         }
     }
 }
@@ -291,6 +307,7 @@ impl Error for DriverError {
             Self::Native(error) => Some(error),
             Self::Aot(error) => Some(error),
             Self::Usage(error) => Some(error),
+            Self::UnexpectedResolution(error) => Some(error),
             Self::MissingEntrypoint
             | Self::UnsupportedSourceExtension { .. }
             | Self::Diagnostics { .. }
@@ -304,8 +321,9 @@ impl Error for DriverError {
             | Self::ToolchainMissing { .. }
             | Self::ToolchainRejected { .. }
             | Self::LinkFailed { .. }
+            | Self::UnsafeFallbackCacheRoot { .. }
             | Self::CrossTargetLink { .. }
-            | Self::UnsafeFallbackCacheRoot { .. } => None,
+            | Self::Cancelled => None,
         }
     }
 }
@@ -339,6 +357,24 @@ pub fn execute_in_context(
     execute_with_telemetry_in_context(args, context).map(|(outcome, _telemetry)| outcome)
 }
 
+/// [`execute`] with a caller-supplied cancellation token.
+pub fn execute_with_cancel(
+    args: &CliArgs,
+    cancel: CancellationToken,
+) -> Result<CommandOutcome, DriverError> {
+    execute_with_telemetry_with_cancel(args, cancel).map(|(outcome, _telemetry)| outcome)
+}
+
+/// [`execute_in_context`] with a caller-supplied cancellation token.
+pub fn execute_in_context_with_cancel(
+    args: &CliArgs,
+    context: &ExecutionContext,
+    cancel: CancellationToken,
+) -> Result<CommandOutcome, DriverError> {
+    execute_with_telemetry_in_context_with_cancel(args, context, cancel)
+        .map(|(outcome, _telemetry)| outcome)
+}
+
 /// [`execute`] plus AOT phase telemetry.
 ///
 /// The returned telemetry is `Some` only for a `run --target aot` command,
@@ -359,13 +395,37 @@ pub fn execute_with_telemetry_in_context(
     args: &CliArgs,
     context: &ExecutionContext,
 ) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
+    execute_with_telemetry_in_context_with_cancel(args, context, CancellationToken::new())
+}
+
+/// [`execute_with_telemetry`] with a caller-supplied cancellation token.
+pub fn execute_with_telemetry_with_cancel(
+    args: &CliArgs,
+    cancel: CancellationToken,
+) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    if args.mode == Mode::Explain {
+        return explain(args);
+    }
+    let context = ExecutionContext::ambient()?;
+    execute_with_telemetry_in_context_with_cancel(args, &context, cancel)
+}
+
+/// [`execute_with_telemetry_in_context`] with a caller-supplied cancellation
+/// token.
+pub fn execute_with_telemetry_in_context_with_cancel(
+    args: &CliArgs,
+    context: &ExecutionContext,
+    cancel: CancellationToken,
+) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     match args.mode {
         Mode::Check | Mode::Compile | Mode::Run => {
-            let frontend = load_program_frontend(args, context)?;
+            let frontend = load_program_frontend_with_cancel(args, context, &cancel)?;
             match args.mode {
-                Mode::Check => Ok((check(args, &frontend)?, None)),
-                Mode::Compile => Ok((compile(args, &frontend, context)?, None)),
-                Mode::Run => run(args, &frontend, context),
+                Mode::Check => Ok((check(args, &frontend, &cancel)?, None)),
+                Mode::Compile => Ok((compile(args, &frontend, context, &cancel)?, None)),
+                Mode::Run => run_with_cancel(args, &frontend, context, &cancel),
                 Mode::Explain => unreachable!("explain handled without a program"),
             }
         }
@@ -440,21 +500,53 @@ fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> 
 
 /// Maps the shared facade resolution error into the CLI's typed driver error,
 /// preserving the same variants the inlined code produced before unification.
-fn map_resolution_error(error: ResolutionError) -> DriverError {
+fn map_resolution_error(error: BamtsError) -> DriverError {
     match error {
-        ResolutionError::InvalidRoot(io_error) => {
-            DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(io_error))
-        }
-        ResolutionError::ReadConfig { path, source } => DriverError::ReadSource { path, source },
-        ResolutionError::Config { path, source } => DriverError::ProjectConfig {
+        BamtsError::ReadConfig { path, source } => DriverError::ReadSource { path, source },
+        BamtsError::ProjectConfig { path, source } => DriverError::ProjectConfig {
             path,
             message: source.to_string(),
         },
-        ResolutionError::Load(load_error) => DriverError::ProgramLoad(load_error),
-        _ => DriverError::ProjectConfig {
-            path: PathBuf::from("<unknown>"),
-            message: error.to_string(),
-        },
+        BamtsError::ProgramLoad(load_error) => DriverError::ProgramLoad(load_error),
+        BamtsError::Cancelled(_) => DriverError::Cancelled,
+        error => DriverError::UnexpectedResolution(error),
+    }
+}
+
+fn map_lower_error(error: ProgramLowerError) -> DriverError {
+    if matches!(error.kind, ProgramLowerErrorKind::Cancelled(_)) {
+        DriverError::Cancelled
+    } else {
+        DriverError::Lower(error)
+    }
+}
+
+fn map_jit_error(error: bamts_codegen::JitError) -> DriverError {
+    match error {
+        bamts_codegen::JitError::Cancelled
+        | bamts_codegen::JitError::Lower(bamts_codegen::ProgramLowerError {
+            kind: bamts_codegen::LowerError::Cancelled,
+            ..
+        }) => DriverError::Cancelled,
+        error => DriverError::Jit(error),
+    }
+}
+
+fn map_aot_error(error: bamts_codegen::AotError) -> DriverError {
+    match error {
+        bamts_codegen::AotError::Cancelled
+        | bamts_codegen::AotError::Lower(bamts_codegen::ProgramLowerError {
+            kind: bamts_codegen::LowerError::Cancelled,
+            ..
+        }) => DriverError::Cancelled,
+        error => DriverError::Aot(error),
+    }
+}
+
+fn map_native_error(error: bamts_runtime::NativeError) -> DriverError {
+    match error {
+        bamts_runtime::NativeError::Cancelled => DriverError::Cancelled,
+        error => DriverError::Native(error),
     }
 }
 
@@ -464,8 +556,12 @@ fn lower_options(args: &CliArgs) -> LowerOptions {
     }
 }
 
-fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
-    let (rendered, truncation) = require_clean_frontend(args, frontend)?;
+fn check(
+    args: &CliArgs,
+    frontend: &LoadedProgramFrontend,
+    cancel: &CancellationToken,
+) -> Result<CommandOutcome, DriverError> {
+    let (rendered, truncation) = require_clean_frontend(args, frontend, cancel)?;
     Ok(CommandOutcome {
         stderr: rendered.into_bytes(),
         truncation,
@@ -477,6 +573,7 @@ fn compile(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
     context: &ExecutionContext,
+    cancel: &CancellationToken,
 ) -> Result<CommandOutcome, DriverError> {
     if !args.extra_inputs.is_empty() {
         return Err(DriverError::MultipleCompileInputs);
@@ -492,19 +589,46 @@ fn compile(
     }
 
     let entrypoint = required_entrypoint(args)?;
-    let (warnings, truncation) = require_clean_frontend(args, frontend)?;
-    let executable = lower_program(&frontend.program, &frontend.output, lower_options(args))
-        .map_err(DriverError::Lower)?;
+    let (warnings, truncation) = require_clean_frontend(args, frontend, cancel)?;
+    let executable = lower_program_with_cancel(
+        &frontend.program,
+        &frontend.output,
+        lower_options(args),
+        cancel,
+    )
+    .map_err(map_lower_error)?;
     if BUILD_TARGET != HOST_TARGET {
         return Err(DriverError::CrossTargetLink {
             host: HOST_TARGET,
             target: BUILD_TARGET,
         });
     }
-    let object =
-        bamts_codegen::compile_aot(executable.wire(), HOST_TARGET).map_err(DriverError::Aot)?;
+    let object = bamts_codegen::compile_aot_with_cancel(executable.wire(), HOST_TARGET, cancel)
+        .map_err(map_aot_error)?;
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     let destination = output_path(args, entrypoint, context)?;
-    link_executable(&object.bytes, &destination, context)?;
+    let cache = cache_capability(context)?;
+    #[cfg(windows)]
+    {
+        let invocation_dir = cache
+            .create_invocation_dir("bamts-compile")
+            .map_err(map_cache_root_error)?;
+        let staged = invocation_dir.path().join(format!(
+            "bamts-compile-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX
+        ));
+        link_executable_with_cancel(&object.bytes, &staged, &cache, context, cancel)?;
+        cache
+            .verify_executable(&staged)
+            .map_err(map_cache_root_error)?;
+        fs::copy(&staged, &destination).map_err(|source| DriverError::PublishExecutable {
+            path: destination.clone(),
+            source,
+        })?;
+    }
+    #[cfg(not(windows))]
+    link_executable_with_cancel(&object.bytes, &destination, &cache, context, cancel)?;
     Ok(CommandOutcome {
         stderr: warnings.into_bytes(),
         truncation,
@@ -512,37 +636,62 @@ fn compile(
     })
 }
 
-fn run(
+fn run_with_cancel(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
     context: &ExecutionContext,
+    cancel: &CancellationToken,
 ) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
     let entrypoint = required_entrypoint(args)?;
-    let (warnings, truncation) = require_clean_frontend(args, frontend)?;
-    let executable = lower_program(&frontend.program, &frontend.output, lower_options(args))
-        .map_err(DriverError::Lower)?;
+    let (warnings, truncation) = require_clean_frontend(args, frontend, cancel)?;
+    let executable = lower_program_with_cancel(
+        &frontend.program,
+        &frontend.output,
+        lower_options(args),
+        cancel,
+    )
+    .map_err(map_lower_error)?;
     match args.target {
         ExecutionTarget::Jit => Ok((
-            run_jit(args, entrypoint, warnings, truncation, &executable, context)?,
+            run_jit_with_cancel(
+                args,
+                entrypoint,
+                warnings,
+                truncation,
+                &executable,
+                context,
+                cancel,
+            )?,
             None,
         )),
         ExecutionTarget::Aot => {
-            let (outcome, telemetry) =
-                run_aot(args, entrypoint, warnings, truncation, &executable, context)?;
+            let (outcome, telemetry) = run_aot_with_cancel(
+                args,
+                entrypoint,
+                warnings,
+                truncation,
+                &executable,
+                context,
+                cancel,
+            )?;
             Ok((outcome, Some(telemetry)))
         }
     }
 }
 
-fn run_jit(
+fn run_jit_with_cancel(
     args: &CliArgs,
     entrypoint: &Path,
     warnings: String,
     truncation: Option<TruncationNotice>,
     executable: &bamts_compiler::program::ExecutableProgram,
     context: &ExecutionContext,
+    cancel: &CancellationToken,
 ) -> Result<CommandOutcome, DriverError> {
-    let program = bamts_codegen::compile_jit(executable.wire()).map_err(DriverError::Jit)?;
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    let program =
+        bamts_codegen::compile_jit_with_cancel(executable.wire(), cancel).map_err(map_jit_error)?;
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     let mut host = bamts_node::NodeHost::new();
     host.set_script_compiler(Box::new(bamts::ScriptCompiler));
     host.set_argv(
@@ -551,6 +700,7 @@ fn run_jit(
             .chain(args.program_args.iter().cloned()),
     );
     for (name, value) in context.envs() {
+        cancel.check().map_err(|_| DriverError::Cancelled)?;
         if name == OsStr::new(bamts_node::AOT_ENTRYPOINT_ENV)
             || name == OsStr::new(bamts_node::AOT_LAUNCH_TOKEN_ENV)
         {
@@ -568,8 +718,14 @@ fn run_jit(
             })?;
         host.set_env(name, value);
     }
-    let outcome = run_linked_program(executable.wire(), &program, &mut host, &Limits::default())
-        .map_err(DriverError::Native)?;
+    let outcome = run_linked_program_with_cancel(
+        executable.wire(),
+        &program,
+        &mut host,
+        &Limits::default(),
+        cancel.clone(),
+    )
+    .map_err(map_native_error)?;
     let mut stdout = host.stdout().to_vec();
     stdout.extend_from_slice(&outcome.stdout);
     let exit_code = host.completion_exit_code(outcome.exit_code);
@@ -583,13 +739,14 @@ fn run_jit(
     })
 }
 
-fn run_aot(
+fn run_aot_with_cancel(
     args: &CliArgs,
     entrypoint: &Path,
     warnings: String,
     truncation: Option<TruncationNotice>,
     executable: &bamts_compiler::program::ExecutableProgram,
     context: &ExecutionContext,
+    cancel: &CancellationToken,
 ) -> Result<(CommandOutcome, AotPhaseTelemetry), DriverError> {
     if BUILD_TARGET != HOST_TARGET {
         return Err(DriverError::CrossTargetLink {
@@ -597,45 +754,69 @@ fn run_aot(
             target: BUILD_TARGET,
         });
     }
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     let object_started = Instant::now();
-    let object =
-        bamts_codegen::compile_aot(executable.wire(), HOST_TARGET).map_err(DriverError::Aot)?;
+    let object = bamts_codegen::compile_aot_with_cancel(executable.wire(), HOST_TARGET, cancel)
+        .map_err(map_aot_error)?;
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     let object_wall_ms = elapsed_ms(object_started);
     let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    let root = cache_root(context)?;
-    let run_dir = root.join("run");
-    fs::create_dir_all(&run_dir).map_err(|source| DriverError::CreateDirectory {
-        path: run_dir.clone(),
-        source,
-    })?;
-    let destination = run_dir.join(format!(
+    let cache = cache_capability(context)?;
+    #[cfg(windows)]
+    let invocation_dir = cache
+        .create_invocation_dir("bamts-run")
+        .map_err(map_cache_root_error)?;
+    #[cfg(windows)]
+    let destination = invocation_dir.path().join(format!(
         "bamts-run-{}-{id}{}",
         std::process::id(),
         std::env::consts::EXE_SUFFIX
     ));
-    require_within_cache_root(&destination, &root)?;
+    #[cfg(not(windows))]
+    let destination = {
+        let run_dir = cache.root_path().join("run");
+        fs::create_dir_all(&run_dir).map_err(|source| DriverError::CreateDirectory {
+            path: run_dir.clone(),
+            source,
+        })?;
+        run_dir.join(format!(
+            "bamts-run-{}-{id}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX
+        ))
+    };
+    require_within_cache_root(&destination, cache.root_path())?;
     let link_started = Instant::now();
-    link_executable(&object.bytes, &destination, context)?;
+    link_executable_with_cancel(&object.bytes, &destination, &cache, context, cancel)?;
     let link_wall_ms = elapsed_ms(link_started);
     let launch_token = format!("{}-{id}", std::process::id());
     let run_started = Instant::now();
-    let output = Command::new(&destination)
-        .current_dir(context.cwd())
-        .env_clear()
-        .envs(context.envs())
-        .env(bamts_node::AOT_ENTRYPOINT_ENV, entrypoint.as_os_str())
-        .env(bamts_node::AOT_LAUNCH_TOKEN_ENV, &launch_token)
-        .arg(launch_token)
-        .args(&args.program_args)
-        .output();
+    let entrypoint_env = entrypoint.as_os_str();
+    let token_env = OsStr::new(&launch_token);
+    let token_arg = OsStr::new(&launch_token);
+    let extra_envs = [
+        (OsStr::new(bamts_node::AOT_ENTRYPOINT_ENV), entrypoint_env),
+        (OsStr::new(bamts_node::AOT_LAUNCH_TOKEN_ENV), token_env),
+    ];
+    let mut run_args: Vec<&OsStr> = vec![token_arg];
+    for arg in &args.program_args {
+        run_args.push(OsStr::new(arg));
+    }
+    let destination_os = destination.as_os_str();
+    #[cfg(windows)]
+    cache
+        .verify_executable(&destination)
+        .map_err(map_cache_root_error)?;
+    let capture = managed_capture(destination_os, &run_args, context, &extra_envs, cancel)
+        .map_err(|error| map_pk_run_error(error, destination_os));
     let run_wall_ms = elapsed_ms(run_started);
     let _ = fs::remove_file(&destination);
-    let output = output.map_err(|source| DriverError::LinkStart {
-        program: destination.into_os_string(),
-        source,
-    })?;
+    #[cfg(windows)]
+    invocation_dir.close_and_remove();
+    let capture = capture?;
+    let exit_code = capture.exit_code();
     let mut stderr = warnings.into_bytes();
-    stderr.extend_from_slice(&output.stderr);
+    stderr.extend_from_slice(&capture.stderr);
     let telemetry = AotPhaseTelemetry {
         object_wall_ms,
         link_wall_ms,
@@ -644,9 +825,9 @@ fn run_aot(
     };
     Ok((
         CommandOutcome {
-            stdout: output.stdout,
+            stdout: capture.stdout,
             stderr,
-            exit_code: output.status.code().unwrap_or(1),
+            exit_code,
             truncation,
         },
         telemetry,
@@ -669,6 +850,221 @@ fn peak_rss_kb() -> Option<u64> {
             .parse()
             .ok()
     })
+}
+
+/// Constructs an [`ExitStatus`] from processkit's portable code/signal pair.
+fn exit_status_from_parts(code: Option<i32>, signal: Option<i32>) -> ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        signal.map_or_else(
+            || ExitStatus::from_raw(code.unwrap_or(1) << 8),
+            ExitStatus::from_raw,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        let _ = signal;
+        ExitStatus::from_raw(code.unwrap_or(1) as u32)
+    }
+}
+
+/// Captured output and process status from a processkit-managed child process.
+#[derive(Debug)]
+struct ManagedCapture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    status: ExitStatus,
+}
+
+impl ManagedCapture {
+    fn exit_code(&self) -> i32 {
+        self.status.code().unwrap_or(1)
+    }
+}
+
+/// Spawns `program` inside a processkit kill-on-drop process group, capturing
+/// raw stdout and stderr bytes, and returns the exit code. The `bamts` token
+/// is bridged to a processkit `CancellationToken` inside a per-call current-
+/// thread Tokio runtime: a `tokio::select!` polls the bamts token and races it
+/// against the processkit run. When the bamts token fires, the processkit
+/// token is cancelled, which kills the whole descendant tree and surfaces
+/// [`PkErrorReason::Cancelled`].
+///
+/// `extra_envs` are set on top of the context's `env_clear` + `envs` baseline.
+fn managed_capture(
+    program: &OsStr,
+    args: &[&OsStr],
+    context: &ExecutionContext,
+    extra_envs: &[(&OsStr, &OsStr)],
+    cancel: &CancellationToken,
+) -> Result<ManagedCapture, processkit::Error> {
+    if cancel.is_cancelled() {
+        return Err(PkErrorReason::Cancelled {
+            program: program.to_string_lossy().into_owned(),
+        }
+        .into());
+    }
+
+    // output_bytes preserves stdout exactly but processkit's result stores
+    // stderr as decoded text. Redirect stderr to a child-owned temporary file
+    // so the CLI retains the raw bytes produced by std::Command::output.
+    let stderr_path = tempfile::Builder::new()
+        .prefix("bamts-stderr-")
+        .tempfile_in(context.temp_dir())
+        .map_err(PkErrorReason::Io)?
+        .into_temp_path();
+    let pk_token = PkCancellationToken::new();
+    let bamts_token = cancel.clone();
+    let result = std::thread::scope(|scope| -> Result<_, processkit::Error> {
+        let worker = std::thread::Builder::new()
+            .name("bamts-processkit".to_owned())
+            .spawn_scoped(scope, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .map_err(|source| PkErrorReason::Io(io::Error::other(source)))?;
+                runtime.block_on(async {
+                    let command = build_pk_command(
+                        program,
+                        args,
+                        context,
+                        extra_envs,
+                        pk_token.clone(),
+                        stderr_path.as_ref(),
+                    );
+                    let run_fut = command.output_bytes();
+                    tokio::pin!(run_fut);
+
+                    tokio::select! {
+                        biased;
+                        _ = bridge_cancel(bamts_token, pk_token.clone()) => run_fut.await,
+                        result = &mut run_fut => result,
+                    }
+                })
+            })
+            .map_err(|source| processkit::Error::from(PkErrorReason::Io(source)))?;
+        worker.join().map_err(|_| {
+            processkit::Error::from(PkErrorReason::Io(io::Error::other(
+                "processkit worker thread panicked",
+            )))
+        })?
+    })?;
+    let stderr = fs::read(&stderr_path).map_err(PkErrorReason::Io)?;
+    let status = exit_status_from_parts(result.code(), result.signal());
+    Ok(ManagedCapture {
+        stdout: result.into_stdout(),
+        stderr,
+        status,
+    })
+}
+
+/// Builds a processkit [`PkCommand`] with `env_clear`, the context's envs,
+/// extra envs, the context's cwd, and the processkit cancel token.
+fn build_pk_command(
+    program: &OsStr,
+    args: &[&OsStr],
+    context: &ExecutionContext,
+    extra_envs: &[(&OsStr, &OsStr)],
+    pk_token: PkCancellationToken,
+    stderr_path: &Path,
+) -> PkCommand {
+    let mut command = PkCommand::new(program)
+        .current_dir(context.cwd())
+        .env_clear()
+        .cancel_on(pk_token)
+        .stderr_file(stderr_path);
+    for (name, value) in context.envs() {
+        command = command.env(name, value);
+    }
+    for (name, value) in extra_envs {
+        command = command.env(name, value);
+    }
+    for arg in args {
+        command = command.arg(arg);
+    }
+    command
+}
+
+/// Polls the bamts token; when it fires, cancels the processkit token. The
+/// future resolves once the bamts token is cancelled (or never, if it isn't).
+async fn bridge_cancel(bamts_token: CancellationToken, pk_token: PkCancellationToken) {
+    loop {
+        if bamts_token.is_cancelled() {
+            pk_token.cancel();
+            return;
+        }
+        // Bounded polling: check the bamts token at a 10 ms interval. The
+        // sleep yields to the runtime so the run future is polled between
+        // checks. No separate monitor task is spawned — the select! drives
+        // both arms in the current task, and the bridge resolves as soon as
+        // the bamts token fires or the run completes (whichever arm wins).
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn copy_io_error(source: &io::Error) -> io::Error {
+    io::Error::new(source.kind(), source.to_string())
+}
+
+/// Maps a processkit error to a [`DriverError`] for linker invocations.
+fn map_pk_link_error(error: processkit::Error, program: &OsStr) -> DriverError {
+    match error.reason() {
+        PkErrorReason::Cancelled { .. } => DriverError::Cancelled,
+        PkErrorReason::NotFound { .. } => DriverError::ToolchainMissing {
+            program: program.to_os_string(),
+        },
+        PkErrorReason::Spawn { source, .. } | PkErrorReason::Io(source) => DriverError::LinkStart {
+            program: program.to_os_string(),
+            source: copy_io_error(source),
+        },
+        _ => DriverError::LinkStart {
+            program: program.to_os_string(),
+            source: io::Error::other(error.to_string()),
+        },
+    }
+}
+
+/// Maps a processkit error to a [`DriverError`] for toolchain probe
+/// invocations.
+fn map_pk_probe_error(error: processkit::Error, program: &OsStr) -> DriverError {
+    match error.reason() {
+        PkErrorReason::Cancelled { .. } => DriverError::Cancelled,
+        PkErrorReason::NotFound { .. } => DriverError::ToolchainMissing {
+            program: program.to_os_string(),
+        },
+        PkErrorReason::Spawn { source, .. } | PkErrorReason::Io(source) => {
+            DriverError::ToolchainProbe {
+                program: program.to_os_string(),
+                source: copy_io_error(source),
+            }
+        }
+        _ => DriverError::ToolchainProbe {
+            program: program.to_os_string(),
+            source: io::Error::other(error.to_string()),
+        },
+    }
+}
+
+/// Maps a processkit error to a [`DriverError`] for AOT program execution.
+fn map_pk_run_error(error: processkit::Error, program: &OsStr) -> DriverError {
+    match error.reason() {
+        PkErrorReason::Cancelled { .. } => DriverError::Cancelled,
+        PkErrorReason::NotFound { .. } => DriverError::LinkStart {
+            program: program.to_os_string(),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        },
+        PkErrorReason::Spawn { source, .. } | PkErrorReason::Io(source) => DriverError::LinkStart {
+            program: program.to_os_string(),
+            source: copy_io_error(source),
+        },
+        _ => DriverError::LinkStart {
+            program: program.to_os_string(),
+            source: io::Error::other(error.to_string()),
+        },
+    }
 }
 
 fn required_entrypoint(args: &CliArgs) -> Result<&Path, DriverError> {
@@ -703,134 +1099,192 @@ fn output_path(
     Ok(entrypoint.with_file_name(file_name))
 }
 
-fn link_executable(
+fn link_executable_with_cancel(
     object: &[u8],
     destination: &Path,
+    cache: &PrivateCacheRoot,
     context: &ExecutionContext,
+    cancel: &CancellationToken,
 ) -> Result<(), DriverError> {
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| DriverError::CreateDirectory {
         path: parent.to_owned(),
         source,
     })?;
-    let archive = cached_node_archive(context)?;
-    let compiler = discover_toolchain(context)?;
-    let temporary = TemporaryLinkFiles::create(parent, destination)?;
-    fs::write(&temporary.object, object).map_err(|source| DriverError::WriteObject {
-        path: temporary.object.clone(),
-        source,
-    })?;
+    let archive = cached_node_archive(cache)?;
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    let compiler = discover_toolchain_with_cancel(context, cancel)?;
+    let mut temporary = TemporaryLinkFiles::create(parent, destination)?;
+    temporary
+        .object_file
+        .write_all(object)
+        .and_then(|()| temporary.object_file.sync_all())
+        .map_err(|source| DriverError::WriteObject {
+            path: temporary.object.clone(),
+            source,
+        })?;
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
 
-    let mut command = Command::new(&compiler);
-    command
-        .current_dir(context.cwd())
-        .env_clear()
-        .envs(context.envs())
-        .arg(&temporary.object)
-        .arg(&archive)
-        .arg("-o")
-        .arg(&temporary.executable);
+    let mut link_args = vec![
+        temporary.object.as_os_str(),
+        archive.path().as_os_str(),
+        OsStr::new("-o"),
+        temporary.executable.as_os_str(),
+    ];
+    let extra: Vec<OsString>;
     if cfg!(target_os = "linux") {
-        command.args(["-ldl", "-lpthread", "-lm"]);
+        extra = ["-ldl", "-lpthread", "-lm"]
+            .iter()
+            .map(|s| OsString::from(*s))
+            .collect();
+        for arg in &extra {
+            link_args.push(arg.as_os_str());
+        }
     }
-    let output = command.output().map_err(|source| DriverError::LinkStart {
-        program: compiler.clone(),
-        source,
-    })?;
-    if !output.status.success() {
+    let capture = managed_capture(&compiler, &link_args, context, &[], cancel)
+        .map_err(|error| map_pk_link_error(error, &compiler))?;
+    if !capture.status.success() {
         return Err(DriverError::LinkFailed {
             program: compiler,
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: capture.status,
+            stderr: String::from_utf8_lossy(&capture.stderr).into_owned(),
         });
     }
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     publish_linked_executable(&temporary.executable, destination)
 }
 
+#[cfg(test)]
 fn discover_toolchain(context: &ExecutionContext) -> Result<OsString, DriverError> {
+    discover_toolchain_with_cancel(context, &CancellationToken::new())
+}
+
+fn discover_toolchain_with_cancel(
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+) -> Result<OsString, DriverError> {
     let program = context
         .env("CC")
         .map(OsStr::to_os_string)
         .unwrap_or_else(|| OsString::from("cc"));
-    probe_toolchain(program, context)
+    probe_toolchain_with_cancel(program, context, cancel)
 }
 
+#[cfg(test)]
 fn probe_toolchain(program: OsString, context: &ExecutionContext) -> Result<OsString, DriverError> {
-    let probe = Command::new(&program)
-        .current_dir(context.cwd())
-        .env_clear()
-        .envs(context.envs())
-        .arg("--version")
-        .output();
-    match probe {
-        Ok(output) if output.status.success() => Ok(program),
-        Ok(output) => Err(DriverError::ToolchainRejected {
+    probe_toolchain_with_cancel(program, context, &CancellationToken::new())
+}
+
+fn probe_toolchain_with_cancel(
+    program: OsString,
+    context: &ExecutionContext,
+    cancel: &CancellationToken,
+) -> Result<OsString, DriverError> {
+    let probe_args = [OsStr::new("--version")];
+    match managed_capture(&program, &probe_args, context, &[], cancel) {
+        Ok(capture) if capture.status.success() => Ok(program),
+        Ok(capture) => Err(DriverError::ToolchainRejected {
             program,
-            status: output.status,
+            status: capture.status,
         }),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            Err(DriverError::ToolchainMissing { program })
-        }
-        Err(source) => Err(DriverError::ToolchainProbe { program, source }),
+        Err(error) => Err(map_pk_probe_error(error, &program)),
     }
 }
 
-fn cached_node_archive(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
-    let cache_dir = cache_root(context)?.join("runtime");
-    fs::create_dir_all(&cache_dir).map_err(|source| DriverError::CacheArchive {
-        path: cache_dir.clone(),
-        source,
-    })?;
+fn cached_node_archive(cache: &PrivateCacheRoot) -> Result<HeldArchive, DriverError> {
     let extension = if cfg!(target_env = "msvc") {
         "lib"
     } else {
         "a"
     };
-    let path = cache_dir.join(format!(
+    let file_name = format!(
         "bamts-node-{:016x}.{extension}",
         content_hash(NODE_STATICLIB)
-    ));
-    if path.is_file() {
-        return Ok(path);
+    );
+
+    #[cfg(windows)]
+    {
+        let cache_dir = cache
+            .guard_child_dir(OsStr::new("runtime"))
+            .map_err(map_cache_archive_error)?;
+        return cache
+            .materialize_archive(&cache_dir, &file_name, NODE_STATICLIB)
+            .map_err(map_cache_archive_error);
     }
-    let (temporary, mut file) = loop {
-        let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary =
-            path.with_extension(format!("{extension}.{}.{}.tmp", std::process::id(), id));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(source) => {
-                return Err(DriverError::CacheArchive {
-                    path: temporary,
-                    source,
-                });
+
+    #[cfg(not(windows))]
+    {
+        let cache_dir = cache.root_path().join("runtime");
+        fs::create_dir_all(&cache_dir).map_err(|source| DriverError::CacheArchive {
+            path: cache_dir.clone(),
+            source,
+        })?;
+        let path = cache_dir.join(file_name);
+        if path.is_file() {
+            return Ok(HeldArchive::from_prevalidated(path));
+        }
+        let (temporary, mut file) = loop {
+            let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let temporary =
+                path.with_extension(format!("{extension}.{}.{}.tmp", std::process::id(), id));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(DriverError::CacheArchive {
+                        path: temporary,
+                        source,
+                    });
+                }
             }
+        };
+        if let Err(error) = write_cached_archive(&mut file, &temporary) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
         }
-    };
-    if let Err(error) = write_cached_archive(&mut file, &temporary) {
         drop(file);
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    drop(file);
-    match fs::rename(&temporary, &path) {
-        Ok(()) => Ok(path),
-        Err(_error) if path.is_file() => {
-            let _ = fs::remove_file(&temporary);
-            Ok(path)
-        }
-        Err(source) => {
-            let _ = fs::remove_file(&temporary);
-            Err(DriverError::CacheArchive { path, source })
+        match fs::rename(&temporary, &path) {
+            Ok(()) => Ok(HeldArchive::from_prevalidated(path)),
+            Err(_error) if path.is_file() => {
+                let _ = fs::remove_file(&temporary);
+                Ok(HeldArchive::from_prevalidated(path))
+            }
+            Err(source) => {
+                let _ = fs::remove_file(&temporary);
+                Err(DriverError::CacheArchive { path, source })
+            }
         }
     }
 }
 
+#[cfg(windows)]
+fn map_cache_root_error(error: CacheGuardError) -> DriverError {
+    match error {
+        CacheGuardError::Io { path, source } => DriverError::CreateDirectory { path, source },
+        error => DriverError::UnsafeFallbackCacheRoot {
+            path: error.path().to_owned(),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn map_cache_archive_error(error: CacheGuardError) -> DriverError {
+    match error {
+        CacheGuardError::Io { path, source } => DriverError::CacheArchive { path, source },
+        error => DriverError::CacheArchive {
+            path: error.path().to_owned(),
+            source: io::Error::other(error.to_string()),
+        },
+    }
+}
+
+#[cfg(not(windows))]
 fn write_cached_archive(file: &mut File, path: &Path) -> Result<(), DriverError> {
     file.write_all(NODE_STATICLIB)
         .and_then(|()| file.sync_all())
@@ -840,8 +1294,8 @@ fn write_cached_archive(file: &mut File, path: &Path) -> Result<(), DriverError>
         })
 }
 
-fn cache_root(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
-    cache_root_from_env_values(
+fn cache_capability(context: &ExecutionContext) -> Result<PrivateCacheRoot, DriverError> {
+    cache_capability_from_env_values(
         context.env("BAMTS_CACHE_DIR"),
         context.env("XDG_CACHE_HOME"),
         context.env("HOME"),
@@ -849,26 +1303,45 @@ fn cache_root(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
     )
 }
 
+#[cfg(test)]
+fn cache_root(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    cache_capability(context).map(|cache| cache.root_path().to_owned())
+}
+
+#[cfg(test)]
 fn cache_root_from_env_values(
     bamts_cache_dir: Option<&OsStr>,
     xdg_cache_home: Option<&OsStr>,
     home: Option<&OsStr>,
     context: &ExecutionContext,
 ) -> Result<PathBuf, DriverError> {
+    cache_capability_from_env_values(bamts_cache_dir, xdg_cache_home, home, context)
+        .map(|cache| cache.root_path().to_owned())
+}
+
+fn cache_capability_from_env_values(
+    bamts_cache_dir: Option<&OsStr>,
+    xdg_cache_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    context: &ExecutionContext,
+) -> Result<PrivateCacheRoot, DriverError> {
     if let Some(path) = bamts_cache_dir {
-        return ensure_private_cache_root(context.resolve_path(path), context);
+        return ensure_private_cache_capability(context.resolve_path(path), context);
     }
     if let Some(path) = xdg_cache_home {
-        return ensure_private_cache_root(context.resolve_path(path).join("bamts"), context);
+        return ensure_private_cache_capability(context.resolve_path(path).join("bamts"), context);
     }
     if let Some(path) = home {
-        match ensure_private_cache_root(context.resolve_path(path).join(".cache/bamts"), context) {
+        match ensure_private_cache_capability(
+            context.resolve_path(path).join(".cache/bamts"),
+            context,
+        ) {
             Ok(root) => return Ok(root),
             Err(DriverError::UnsafeFallbackCacheRoot { .. }) => {}
             Err(error) => return Err(error),
         }
     }
-    ensure_private_cache_root(fallback_cache_root_path(context)?, context)
+    ensure_private_cache_capability(fallback_cache_root_path(context)?, context)
 }
 
 #[cfg(unix)]
@@ -889,7 +1362,7 @@ fn fallback_cache_user_key(context: &ExecutionContext) -> Result<String, DriverE
     Ok(effective_uid(context)?.to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn fallback_cache_user_key(context: &ExecutionContext) -> Result<String, DriverError> {
     Ok(context
         .env("USERNAME")
@@ -899,6 +1372,27 @@ fn fallback_cache_user_key(context: &ExecutionContext) -> Result<String, DriverE
         .unwrap_or_else(|| "default".to_owned()))
 }
 
+#[cfg(windows)]
+fn fallback_cache_user_key(_context: &ExecutionContext) -> Result<String, DriverError> {
+    PrivateCacheRoot::fallback_user_key().map_err(map_cache_root_error)
+}
+
+fn ensure_private_cache_capability(
+    path: PathBuf,
+    context: &ExecutionContext,
+) -> Result<PrivateCacheRoot, DriverError> {
+    #[cfg(windows)]
+    {
+        let _ = context;
+        return PrivateCacheRoot::acquire(&path).map_err(map_cache_root_error);
+    }
+
+    #[cfg(not(windows))]
+    {
+        ensure_private_cache_root(path, context).map(PrivateCacheRoot::from_prevalidated)
+    }
+}
+#[cfg(not(windows))]
 fn ensure_private_cache_root(
     path: PathBuf,
     context: &ExecutionContext,
@@ -941,14 +1435,13 @@ fn ensure_private_cache_root(
     validate_private_cache_dir(&path, context)?;
     Ok(path)
 }
-
 #[cfg(unix)]
 fn create_private_cache_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new().mode(0o700).create(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn create_private_cache_dir(path: &Path) -> io::Result<()> {
     fs::create_dir(path)
 }
@@ -1006,7 +1499,7 @@ fn validate_private_cache_dir(path: &Path, context: &ExecutionContext) -> Result
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn validate_private_cache_dir(path: &Path, _context: &ExecutionContext) -> Result<(), DriverError> {
     let metadata = fs::metadata(path).map_err(|source| DriverError::CreateDirectory {
         path: path.to_owned(),
@@ -1084,6 +1577,7 @@ const fn content_hash(bytes: &[u8]) -> u64 {
 
 struct TemporaryLinkFiles {
     object: PathBuf,
+    object_file: File,
     executable: PathBuf,
 }
 
@@ -1101,9 +1595,10 @@ impl TemporaryLinkFiles {
                 .create_new(true)
                 .open(&object)
             {
-                Ok(_) => {
+                Ok(object_file) => {
                     return Ok(Self {
                         object,
+                        object_file,
                         executable: parent.join(format!("{prefix}.out")),
                     });
                 }
@@ -1158,10 +1653,12 @@ struct LoadedProgramFrontend {
     output: ProgramFrontendOutput,
 }
 
-fn load_program_frontend(
+fn load_program_frontend_with_cancel(
     args: &CliArgs,
     context: &ExecutionContext,
+    cancel: &CancellationToken,
 ) -> Result<LoadedProgramFrontend, DriverError> {
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     if !args.extra_inputs.is_empty() {
         return Err(DriverError::MultipleCompileInputs);
     }
@@ -1185,14 +1682,21 @@ fn load_program_frontend(
             .unwrap_or_else(|| Path::new("/"))
             .to_path_buf()
     };
-    let mut resolved =
-        resolve_project(&absolute_entrypoint, fallback_root).map_err(map_resolution_error)?;
+    let mut resolved = resolve_project_with_cancel(&absolute_entrypoint, fallback_root, cancel)
+        .map_err(map_resolution_error)?;
     if args.js_compat.check_js {
         resolved.program.enable_javascript_checking();
     }
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
     let levels = levels(args, resolved.root.path())?;
-    let output =
-        compile_program_frontend_with_lints(&resolved.program, FrontendMode::Check, &levels);
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    let output = compile_program_frontend_with_cancel(
+        &resolved.program,
+        FrontendMode::Check,
+        &levels,
+        cancel,
+    )
+    .map_err(|_| DriverError::Cancelled)?;
     Ok(LoadedProgramFrontend {
         program: resolved.program,
         output,
@@ -1202,56 +1706,57 @@ fn load_program_frontend(
 fn render_program_diagnostics(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
-) -> (String, Option<TruncationNotice>) {
-    let diagnostics = frontend
-        .output
-        .modules()
-        .iter()
-        .flat_map(|module| module.diagnostics().iter().cloned())
-        .collect::<Vec<_>>();
-    let names = frontend
-        .program
-        .modules()
-        .iter()
-        .map(|module| module.path().to_string_lossy())
-        .collect::<Vec<_>>();
-    let sources = frontend
-        .program
-        .modules()
-        .iter()
-        .zip(&names)
-        .map(|(module, name)| DiagnosticSource {
+    cancel: &CancellationToken,
+) -> Result<(String, Option<TruncationNotice>), DriverError> {
+    let mut diagnostics = Vec::new();
+    for module in frontend.output.modules() {
+        cancel.check().map_err(|_| DriverError::Cancelled)?;
+        for diagnostic in module.diagnostics() {
+            cancel.check().map_err(|_| DriverError::Cancelled)?;
+            diagnostics.push(diagnostic.clone());
+        }
+    }
+    let mut names = Vec::with_capacity(frontend.program.modules().len());
+    for module in frontend.program.modules() {
+        cancel.check().map_err(|_| DriverError::Cancelled)?;
+        names.push(module.path().to_string_lossy());
+    }
+    let mut sources = Vec::with_capacity(frontend.program.modules().len());
+    for (module, name) in frontend.program.modules().iter().zip(&names) {
+        cancel.check().map_err(|_| DriverError::Cancelled)?;
+        sources.push(DiagnosticSource {
             id: module.source_id(),
             name,
             text: module.source(),
-        })
-        .collect::<Vec<_>>();
-    diagnostics::render_report(
+        });
+    }
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    let rendered = diagnostics::render_report(
         args.diagnostics_format,
         &DiagnosticReport::new(&diagnostics),
         &sources,
         args.error_limit,
-    )
+    );
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    Ok(rendered)
 }
 
 fn require_clean_frontend(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
+    cancel: &CancellationToken,
 ) -> Result<(String, Option<TruncationNotice>), DriverError> {
-    let (rendered, truncation) = render_program_diagnostics(args, frontend);
-    if frontend
-        .output
-        .modules()
-        .iter()
-        .any(|module| module.has_errors())
-    {
-        Err(DriverError::Diagnostics {
-            rendered,
-            truncation,
-        })
-    } else {
-        Ok((rendered, truncation))
+    let (rendered, truncation) = render_program_diagnostics(args, frontend, cancel)?;
+    for module in frontend.output.modules() {
+        cancel.check().map_err(|_| DriverError::Cancelled)?;
+        if module.has_errors() {
+            return Err(DriverError::Diagnostics {
+                rendered,
+                truncation,
+            });
+        }
     }
+    Ok((rendered, truncation))
 }
 
 /// Compiles a source entrypoint through the same frontend, lint, and lowering
@@ -1271,10 +1776,34 @@ pub fn compile_program_in_context(
     args: &CliArgs,
     context: &ExecutionContext,
 ) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
-    let frontend = load_program_frontend(args, context)?;
-    require_clean_frontend(args, &frontend)?;
-    lower_program(&frontend.program, &frontend.output, lower_options(args))
-        .map_err(DriverError::Lower)
+    compile_program_in_context_with_cancel(args, context, CancellationToken::new())
+}
+
+/// [`compile_program`] with a caller-supplied cancellation token.
+pub fn compile_program_with_cancel(
+    args: &CliArgs,
+    cancel: CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    let context = ExecutionContext::ambient()?;
+    compile_program_in_context_with_cancel(args, &context, cancel)
+}
+
+/// [`compile_program_in_context`] with a caller-supplied cancellation token.
+pub fn compile_program_in_context_with_cancel(
+    args: &CliArgs,
+    context: &ExecutionContext,
+    cancel: CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
+    let frontend = load_program_frontend_with_cancel(args, context, &cancel)?;
+    require_clean_frontend(args, &frontend, &cancel)?;
+    lower_program_with_cancel(
+        &frontend.program,
+        &frontend.output,
+        lower_options(args),
+        &cancel,
+    )
+    .map_err(map_lower_error)
 }
 
 #[cfg(test)]
@@ -1292,7 +1821,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::peak_rss_kb;
     use super::{
-        DriverError, content_hash, execute_with_telemetry, levels, lower_options, probe_toolchain,
+        BamtsError, DriverError, ProgramLoadError, content_hash, execute_with_telemetry, levels,
+        lower_options, map_resolution_error, probe_toolchain,
     };
 
     fn ambient_context() -> crate::context::ExecutionContext {
@@ -1306,6 +1836,66 @@ mod tests {
         crate::context::ExecutionContext::new(cwd, env.into_iter().collect::<BTreeMap<_, _>>())
             .expect("explicit execution context")
     }
+    #[test]
+    fn map_resolution_error_preserves_variant_classification_and_message() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from("/project/tsconfig.json");
+
+        let root = std::io::Error::new(std::io::ErrorKind::NotFound, "root missing");
+        let root_error =
+            map_resolution_error(BamtsError::ProgramLoad(ProgramLoadError::InvalidRoot(root)));
+        assert!(matches!(
+            root_error,
+            DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(_))
+        ));
+        let text = root_error.to_string();
+        assert!(
+            !text.contains("<unknown>"),
+            "must not fabricate a path: {text}"
+        );
+        assert!(text.contains("cannot canonicalize project root"));
+
+        let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let read_error = map_resolution_error(BamtsError::ReadConfig {
+            path: path.clone(),
+            source,
+        });
+        assert!(matches!(
+            read_error,
+            DriverError::ReadSource { path: ref p, .. } if *p == path
+        ));
+        let text = read_error.to_string();
+        assert!(!text.contains("<unknown>"));
+        assert!(text.contains("could not read"));
+        assert!(text.contains("/project/tsconfig.json"));
+
+        use bamts_compiler::project::ConfigError;
+        let config_error = map_resolution_error(BamtsError::ProjectConfig {
+            path: path.clone(),
+            source: ConfigError::RootMustBeObject,
+        });
+        assert!(matches!(
+            config_error,
+            DriverError::ProjectConfig { path: ref p, .. } if *p == path
+        ));
+        let text = config_error.to_string();
+        assert!(!text.contains("<unknown>"));
+        assert!(text.contains("could not load project configuration"));
+        assert!(text.contains("tsconfig root must be an object"));
+
+        let load_error =
+            map_resolution_error(BamtsError::ProgramLoad(ProgramLoadError::TooManySources));
+        assert!(matches!(
+            load_error,
+            DriverError::ProgramLoad(ProgramLoadError::TooManySources)
+        ));
+        let text = load_error.to_string();
+        assert!(!text.contains("<unknown>"));
+        assert!(text.contains("could not load program"));
+        assert!(text.contains("more than u32::MAX sources"));
+    }
+
     #[test]
     fn jit_exit_code_prefers_host_zero() {
         let mut host = bamts_node::NodeHost::new();
@@ -1865,5 +2455,209 @@ mod tests {
             Err(other) => return Err(Box::new(other)),
         }
         Ok(())
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_probe_toolchain() {
+        let context = ambient_context();
+        let token = bamts_cancel::CancellationToken::new();
+        token.cancel();
+        let error = super::probe_toolchain_with_cancel(OsString::from("cc"), &context, &token)
+            .expect_err("pre-cancelled token must abort probe");
+        assert!(matches!(error, DriverError::Cancelled), "got {error:?}");
+    }
+
+    #[test]
+    fn managed_capture_runs_simple_command() {
+        let context = ambient_context();
+        let token = bamts_cancel::CancellationToken::new();
+        let capture = super::managed_capture(
+            std::ffi::OsStr::new("echo"),
+            &[std::ffi::OsStr::new("hello")],
+            &context,
+            &[],
+            &token,
+        )
+        .expect("echo should succeed");
+        assert_eq!(capture.exit_code(), 0);
+        assert!(
+            String::from_utf8_lossy(&capture.stdout).contains("hello"),
+            "stdout must contain echo output: {:?}",
+            capture.stdout,
+        );
+    }
+
+    #[test]
+    fn managed_capture_pre_cancelled_returns_cancelled() {
+        let context = ambient_context();
+        let token = bamts_cancel::CancellationToken::new();
+        token.cancel();
+        let error = super::managed_capture(
+            std::ffi::OsStr::new("echo"),
+            &[std::ffi::OsStr::new("hello")],
+            &context,
+            &[],
+            &token,
+        )
+        .expect_err("pre-cancelled token must abort managed_capture");
+        assert!(
+            error.is_cancelled(),
+            "processkit error must be Cancelled, got {:?}",
+            error.reason(),
+        );
+    }
+
+    #[test]
+    fn managed_capture_preserves_env_clear_and_envs() {
+        let context = explicit_context(
+            std::env::temp_dir().as_path(),
+            [
+                (
+                    OsString::from("PATH"),
+                    std::env::var_os("PATH").unwrap_or_default(),
+                ),
+                (
+                    OsString::from("BAMTS_TEST_VAR"),
+                    OsString::from("test-value"),
+                ),
+            ],
+        );
+        let token = bamts_cancel::CancellationToken::new();
+        // `printenv BAMTS_TEST_VAR` exits 0 and prints the value if the env
+        // var is set; exits 1 if not. On systems without printenv, skip.
+        let capture = super::managed_capture(
+            std::ffi::OsStr::new("printenv"),
+            &[std::ffi::OsStr::new("BAMTS_TEST_VAR")],
+            &context,
+            &[],
+            &token,
+        );
+        match capture {
+            Ok(capture) => {
+                assert_eq!(capture.exit_code(), 0, "env var must be set in child");
+                let stdout = String::from_utf8_lossy(&capture.stdout);
+                assert!(
+                    stdout.trim() == "test-value",
+                    "child must see the context env var: {stdout:?}",
+                );
+            }
+            Err(error) if error.is_not_found() => {
+                // printenv not installed — skip, not a failure.
+            }
+            Err(error) => panic!("managed_capture failed: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_capture_preserves_raw_stream_bytes_and_exit_code() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let context = explicit_context(directory.path(), []);
+        let token = bamts_cancel::CancellationToken::new();
+        let capture = super::managed_capture(
+            std::ffi::OsStr::new("/bin/sh"),
+            &[
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new(r#"printf '\377\000x'; printf '\376\000e' >&2; exit 7"#),
+            ],
+            &context,
+            &[],
+            &token,
+        )
+        .expect("shell capture should complete");
+        assert_eq!(capture.stdout, [0xff, 0x00, b'x']);
+        assert_eq!(capture.stderr, [0xfe, 0x00, b'e']);
+        assert_eq!(capture.exit_code(), 7);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_until_process_is_gone(pid: u32) -> bool {
+        let process = std::path::PathBuf::from(format!("/proc/{pid}"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while process.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        !process.exists()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelling_managed_capture_kills_parent_and_descendant_before_return() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let context = explicit_context(directory.path(), []);
+        let parent_file = directory.path().join("parent.pid");
+        let child_file = directory.path().join("child.pid");
+        let ready_file = directory.path().join("ready");
+        let cancel = bamts_cancel::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let worker_context = context.clone();
+        let worker_parent = parent_file.clone();
+        let worker_child = child_file.clone();
+        let worker_ready = ready_file.clone();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let args = [
+                OsString::from("-c"),
+                OsString::from(r#"echo $$ > "$1"; /bin/sleep 60 & echo $! > "$2"; : > "$3"; wait"#),
+                OsString::from("bamts-cancel-test"),
+                worker_parent.into_os_string(),
+                worker_child.into_os_string(),
+                worker_ready.into_os_string(),
+            ];
+            let arg_refs = args.iter().map(OsString::as_os_str).collect::<Vec<_>>();
+            let result = super::managed_capture(
+                std::ffi::OsStr::new("/bin/sh"),
+                &arg_refs,
+                &worker_context,
+                &[],
+                &worker_cancel,
+            );
+            send.send(result.map(|capture| capture.exit_code())).ok();
+        });
+
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_file.exists() {
+            if std::time::Instant::now() >= ready_deadline {
+                cancel.cancel();
+                let _ = receive.recv_timeout(std::time::Duration::from_secs(5));
+                worker.join().expect("managed-capture worker cleanup");
+                panic!("child tree did not report readiness within five seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let parent_pid = std::fs::read_to_string(&parent_file)
+            .expect("parent pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric parent pid");
+        let child_pid = std::fs::read_to_string(&child_file)
+            .expect("child pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric child pid");
+
+        cancel.cancel();
+        let result = receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("managed capture must return within five seconds");
+        let error = result.expect_err("cancelled child tree must not produce an exit result");
+        assert!(error.is_cancelled(), "unexpected processkit error: {error}");
+        worker.join().expect("managed-capture worker");
+        assert!(
+            wait_until_process_is_gone(parent_pid),
+            "direct child survived cancellation"
+        );
+        assert!(
+            wait_until_process_is_gone(child_pid),
+            "descendant survived cancellation"
+        );
+    }
+
+    #[test]
+    fn exit_status_from_parts_round_trips() {
+        let status = super::exit_status_from_parts(Some(42), None);
+        assert_eq!(status.code(), Some(42));
+        let status = super::exit_status_from_parts(Some(0), None);
+        assert_eq!(status.code(), Some(0));
     }
 }

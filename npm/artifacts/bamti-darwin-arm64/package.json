@@ -1,0 +1,35 @@
+{
+  "name": "@bamti/bamti-darwin-arm64",
+  "version": "0.2.0",
+  "description": "BamTS native Node-API addon for macOS arm64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/metaphorics/bamTiScript.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "commonjs",
+  "main": "bamti.darwin-arm64.node",
+  "files": ["bamti.darwin-arm64.node"],
+  "engines": {
+    "node": ">=24"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "bamtiNative": {
+    "entry": "bamti.darwin-arm64.node",
+    "target": "aarch64-apple-darwin",
+    "artifactKind": "native-addon",
+    "sha256": "__BAMTI_SHA256__",
+    "release": {
+      "packageVersion": "0.2.0",
+      "sourceCommit": "__BAMTI_SOURCE_COMMIT__",
+      "nativeAbi": 1,
+      "cliProtocol": 1,
+      "buildSetId": "__BAMTI_BUILD_SET_ID__",
+      "releaseId": "__BAMTI_RELEASE_ID__"
+    }
+  }
+}

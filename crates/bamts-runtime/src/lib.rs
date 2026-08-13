@@ -34,6 +34,7 @@ use bamts_bytecode::{
     IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, RESUME_NEXT, RESUME_RETURN,
     RESUME_THROW, ResolvedExport, UnaryOp, Verified, format_number,
 };
+pub use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, SlotId, Value};
 
 mod external_modules;
@@ -43,7 +44,7 @@ mod intrinsics;
 mod native;
 mod vm;
 
-pub use native::{NativeEngine, NativeError, run_linked_program};
+pub use native::{NativeEngine, NativeError, run_linked_program, run_linked_program_with_cancel};
 
 const RUNTIME_HEAP_SEGMENT: u16 = 1;
 
@@ -128,6 +129,9 @@ pub enum ScriptCompileError {
         column: u32,
     },
     Capacity {
+        message: String,
+    },
+    Internal {
         message: String,
     },
 }
@@ -267,8 +271,12 @@ pub trait TimerProvider {
     /// Drains every currently expired timer into `output` without blocking.
     fn poll_expired(&mut self, output: &mut Vec<TimerWakeup>) -> Result<(), TimerError>;
 
-    /// Blocks until the next timer expires, or returns `None` when none pend.
-    fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError>;
+    /// Blocks until the next timer expires, returns `None` when none pend, or
+    /// returns `None` early if `cancel` is triggered.
+    fn wait_expired(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TimerWakeup>, TimerError>;
 
     /// Reports whether the provider has any armed timer.
     fn has_pending(&self) -> bool;
@@ -374,6 +382,8 @@ pub enum RuntimeErrorKind {
     RegexpStepBudgetExceeded {
         limit: usize,
     },
+    /// A caller-supplied cancellation token was triggered at a checkpoint.
+    Cancelled,
 }
 
 impl fmt::Display for RuntimeError {
@@ -481,6 +491,7 @@ impl fmt::Display for RuntimeError {
             RuntimeErrorKind::RegexpStepBudgetExceeded { limit } => {
                 write!(formatter, "regular expression step budget {limit} exceeded")
             }
+            RuntimeErrorKind::Cancelled => formatter.write_str("operation cancelled"),
         }
     }
 }
@@ -1730,6 +1741,10 @@ pub struct Machine<'a, H: Host> {
     /// Host-compiled programs retained for the machine lifetime so their
     /// closures remain executable after the originating Script object dies.
     dynamic: Vec<DynamicModule>,
+    /// Cooperative cancellation signal checked at fuel, microtask, timer, and
+    /// quiescence checkpoints. A fresh token (never cancelled) preserves the
+    /// behavior of the existing fresh-token wrapper APIs.
+    cancel: CancellationToken,
 }
 
 #[derive(Clone, Debug)]
@@ -1913,7 +1928,31 @@ impl<'a, H: Host> Machine<'a, H> {
             .module(program.entry())
             .expect("verified program entry exists")
             .code;
-        Self::build(Some(program), module, host, limits)
+        Self::build(
+            Some(program),
+            module,
+            host,
+            limits,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Constructs a machine bound to a caller-supplied cancellation token.
+    /// The token is checked at fuel, microtask, timer, and quiescence
+    /// checkpoints; triggering it aborts execution with
+    /// [`RuntimeErrorKind::Cancelled`].
+    #[must_use]
+    pub fn new_with_cancel(
+        program: &'a Program<Verified>,
+        host: &'a mut H,
+        limits: Limits,
+        cancel: CancellationToken,
+    ) -> Self {
+        let module = &program
+            .module(program.entry())
+            .expect("verified program entry exists")
+            .code;
+        Self::build(Some(program), module, host, limits, cancel)
     }
 
     fn build(
@@ -1921,6 +1960,7 @@ impl<'a, H: Host> Machine<'a, H> {
         module: &'a Module<Verified>,
         host: &'a mut H,
         limits: Limits,
+        cancel: CancellationToken,
     ) -> Self {
         let entry = module.entry().get() as usize;
         let module_id = program.map_or(ModuleId::new(0), Program::entry);
@@ -2059,6 +2099,7 @@ impl<'a, H: Host> Machine<'a, H> {
             current_new_target: Value::UNDEFINED,
             has_instance_symbol: None,
             intrinsics,
+            cancel,
         }
     }
 
@@ -2325,10 +2366,6 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// Blocks in the host provider until an expiry report is available.
     /// Returns whether at least one live timer became ready.
-    pub fn wait_for_timer_expiry(&mut self) -> Result<bool, RuntimeError> {
-        Ok(self.wait_for_timer_expiry_state()? == TimerWait::Ready)
-    }
-
     fn wait_for_timer_expiry_state(&mut self) -> Result<TimerWait, RuntimeError> {
         if self.timer_checkpoint_active {
             return Err(self.checkpoint_error(RuntimeErrorKind::TimerCheckpointReentry));
@@ -2336,10 +2373,13 @@ impl<'a, H: Host> Machine<'a, H> {
         if !self.ready_timers.is_empty() {
             return Ok(TimerWait::Ready);
         }
+        self.check_cancel()
+            .map_err(|kind| self.checkpoint_error(kind))?;
+        let cancel = self.cancel.clone();
         self.timer_checkpoint_active = true;
         let result = (|| {
             let wakeup = match self.host.timers() {
-                Some(provider) => provider.wait_expired(),
+                Some(provider) => provider.wait_expired(&cancel),
                 None => return Ok(TimerWait::Idle),
             }
             .map_err(|error| {
@@ -2348,7 +2388,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 })
             })?;
             let Some(wakeup) = wakeup else {
-                return Ok(TimerWait::Idle);
+                return if cancel.is_cancelled() {
+                    Err(self.checkpoint_error(RuntimeErrorKind::Cancelled))
+                } else {
+                    Ok(TimerWait::Idle)
+                };
             };
             self.promote_timer_wakeup(wakeup);
             Ok(if self.ready_timers.is_empty() {
@@ -2359,6 +2403,18 @@ impl<'a, H: Host> Machine<'a, H> {
         })();
         self.timer_checkpoint_active = false;
         result
+    }
+
+    /// Public convenience wrapper around [`Self::wait_for_timer_expiry_state`].
+    ///
+    /// Returns `true` if at least one live timer became ready, `false` if the
+    /// provider reports an empty or stale pending set, and aborts on provider
+    /// failure or cancellation.
+    pub fn wait_for_timer_expiry(&mut self) -> Result<bool, RuntimeError> {
+        match self.wait_for_timer_expiry_state()? {
+            TimerWait::Ready => Ok(true),
+            TimerWait::Stale | TimerWait::Idle => Ok(false),
+        }
     }
 
     /// Returns whether any machine-owned live timer remains.
@@ -2386,6 +2442,8 @@ impl<'a, H: Host> Machine<'a, H> {
     /// exhausted work fails with [`RuntimeErrorKind::FuelExhausted`].
     pub(crate) fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
         self.drain_microtasks_automatic()?;
+        self.check_cancel()
+            .map_err(|kind| self.checkpoint_error(kind))?;
         while self.has_pending_timers() {
             match self.wait_for_timer_expiry_state()? {
                 TimerWait::Ready => {}
@@ -2398,6 +2456,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     );
                 }
             }
+            self.check_cancel()
+                .map_err(|kind| self.checkpoint_error(kind))?;
             let run = self.run_one_expired_timer()?;
             if let Some(exception) = run.uncaught.into_iter().next() {
                 return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
@@ -6434,6 +6494,9 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn consume_fuel(&mut self, amount: u64) -> Result<(), RuntimeErrorKind> {
+        if self.cancel.is_cancelled() {
+            return Err(RuntimeErrorKind::Cancelled);
+        }
         if self.fuel < amount {
             self.fuel = 0;
             return Err(RuntimeErrorKind::FuelExhausted {
@@ -6442,6 +6505,16 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         self.fuel -= amount;
         Ok(())
+    }
+
+    /// Checks the cancellation token at a cooperative checkpoint. Returns
+    /// [`RuntimeErrorKind::Cancelled`] when the token has been triggered.
+    pub(crate) fn check_cancel(&self) -> Result<(), RuntimeErrorKind> {
+        if self.cancel.is_cancelled() {
+            Err(RuntimeErrorKind::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn reserve_native_activation(
@@ -22811,7 +22884,13 @@ mod tests {
             Ok(())
         }
 
-        fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError> {
+        fn wait_expired(
+            &mut self,
+            cancel: &CancellationToken,
+        ) -> Result<Option<TimerWakeup>, TimerError> {
+            if cancel.is_cancelled() {
+                return Ok(None);
+            }
             Ok(self.state.borrow_mut().reports.pop_front())
         }
 
@@ -22829,6 +22908,130 @@ mod tests {
         fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
             Some(&mut self.provider)
         }
+    }
+
+    /// A timer provider that blocks on a cross-thread wake channel and checks
+    /// the supplied [`CancellationToken`]. Used to prove that `Machine` timer
+    /// wait can be cancelled promptly from another thread.
+    struct BlockingTimerProvider {
+        started_tx: std::sync::mpsc::Sender<()>,
+        wake_rx: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl BlockingTimerProvider {
+        fn new() -> (
+            Self,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+            (
+                Self {
+                    started_tx,
+                    wake_rx,
+                },
+                started_rx,
+                wake_tx,
+            )
+        }
+    }
+
+    impl TimerProvider for BlockingTimerProvider {
+        fn schedule(&mut self, _id: u64, delay_ms: u32) -> Result<u64, TimerError> {
+            Ok(u64::from(delay_ms))
+        }
+
+        fn cancel(&mut self, _id: u64) -> Result<bool, TimerError> {
+            Ok(false)
+        }
+
+        fn poll_expired(&mut self, _output: &mut Vec<TimerWakeup>) -> Result<(), TimerError> {
+            Ok(())
+        }
+
+        fn wait_expired(
+            &mut self,
+            cancel: &CancellationToken,
+        ) -> Result<Option<TimerWakeup>, TimerError> {
+            // Notify the test that we have entered the blocking wait.
+            let _ = self.started_tx.send(());
+            loop {
+                if cancel.is_cancelled() {
+                    return Ok(None);
+                }
+                match self.wake_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(()) => {
+                        if cancel.is_cancelled() {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(TimerError::new("wake channel disconnected"));
+                    }
+                }
+            }
+        }
+
+        fn has_pending(&self) -> bool {
+            true
+        }
+    }
+
+    struct BlockingTimerTestHost {
+        provider: BlockingTimerProvider,
+    }
+
+    impl Host for BlockingTimerTestHost {
+        fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
+            Some(&mut self.provider)
+        }
+    }
+
+    #[test]
+    fn timer_wait_is_cancelled_promptly_from_another_thread() {
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+
+        let token = CancellationToken::new();
+        let (provider, started_rx, wake_tx) = BlockingTimerProvider::new();
+        let mut host = BlockingTimerTestHost { provider };
+        let mut machine =
+            Machine::new_with_cancel(&program, &mut host, Limits::default(), token.clone());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callback = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                context: None,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .schedule_timeout(callback, 1_000_000, Vec::new())
+            .unwrap();
+
+        let cancel_handle = std::thread::spawn(move || {
+            started_rx.recv().expect("provider entered wait");
+            token.cancel();
+            wake_tx.send(()).expect("wake the wait");
+        });
+
+        let error = machine
+            .run_to_quiescence()
+            .expect_err("cancelled wait aborts");
+        assert!(matches!(error.kind, RuntimeErrorKind::Cancelled));
+
+        cancel_handle.join().expect("cancel thread joins");
     }
 
     fn timer_program() -> Program<Verified> {

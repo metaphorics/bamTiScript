@@ -240,30 +240,7 @@ impl<'src> Binder<'src> {
             return;
         };
         let intrinsics = self.resolve_type_symbol(intrinsics_symbol);
-        let intrinsics = self.types.named_structural_view(intrinsics);
-        let target = if matches!(self.types.get(intrinsics), Type::AppliedClass { .. }) {
-            if let Some(view) = self.types.prepare_applied_class_view(intrinsics) {
-                if let Type::ObjectType(object) = self.types.get(view) {
-                    object
-                        .properties
-                        .iter()
-                        .find(|member| member.name() == tag_name)
-                        .map(|member| member.type_id())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else if let Type::ObjectType(object) = self.types.get(intrinsics) {
-            object
-                .properties
-                .iter()
-                .find(|member| member.name() == tag_name)
-                .map(|member| member.type_id())
-        } else {
-            None
-        };
+        let target = self.types.property_type(intrinsics, &tag_name);
         let Some(target) = target else {
             self.emit(
                 JSX_INTRINSIC_ELEMENT_NOT_FOUND,
@@ -325,6 +302,7 @@ impl<'src> Binder<'src> {
             | Type::AppliedClass { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
+            | Type::Record { .. }
             | Type::This { .. }
             | Type::Union(_) => None,
             Type::Never
@@ -378,8 +356,11 @@ impl<'src> Binder<'src> {
             if signature.inference_parameters.is_empty() {
                 (signature.parameters.first().copied(), signature.return_type)
             } else {
-                let mut context =
-                    InferenceContext::new(&mut self.types, &signature.inference_parameters);
+                let mut context = InferenceContext::new_with_cancel(
+                    &mut self.types,
+                    &signature.inference_parameters,
+                    self.cancel.clone(),
+                );
                 if let Some(first) = signature.parameters.first().copied() {
                     context.infer_from_argument(first, props, 0);
                 }
@@ -1087,5 +1068,14 @@ mod tests {
 
         let fragment = format!("{JSX_PREAMBLE} const x = <><div>text</div></>;");
         assert_clean(codes(&fragment));
+    }
+
+    // -- intrinsic type inventory --------------------------------------------------
+
+    #[test]
+    fn standard_intrinsic_json_math_atomics_resolve_in_type_position() {
+        assert_clean(codes(
+            "type JSONType = JSON; type MathType = Math; type AtomicsType = Atomics;",
+        ));
     }
 }

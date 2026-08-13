@@ -1,6 +1,6 @@
 {
   "name": "@bamti/cli-win32-x64",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "BamTS CLI binary for Windows x64",
   "license": "MIT",
   "repository": {
@@ -8,12 +8,31 @@
     "url": "git+https://github.com/metaphorics/bamTiScript.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "publishConfig": {
     "access": "public"
   },
   "os": ["win32"],
   "cpu": ["x64"],
-  "files": ["README.md", "bin/bamts.exe"]
+  "files": ["README.md", "bin/bamts.exe"],
+  "bamtiCli": {
+    "entry": "bin/bamts.exe",
+    "target": "x86_64-pc-windows-msvc",
+    "artifactKind": "cli-binary",
+    "sha256": "__BAMTI_SHA256__",
+    "cargoLockSha256": "__BAMTI_CARGO_LOCK_SHA256__",
+    "workflowRevision": "__BAMTI_WORKFLOW_REVISION__",
+    "toolchain": "__BAMTI_TOOLCHAIN__",
+    "builderRevision": "__BAMTI_BUILDER_REVISION__",
+    "runner": "windows-2025",
+    "release": {
+      "packageVersion": "0.2.0",
+      "sourceCommit": "__BAMTI_SOURCE_COMMIT__",
+      "nativeAbi": 1,
+      "cliProtocol": 1,
+      "buildSetId": "__BAMTI_BUILD_SET_ID__",
+      "releaseId": "__BAMTI_RELEASE_ID__"
+    }
+  }
 }

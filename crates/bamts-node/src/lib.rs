@@ -82,6 +82,9 @@ fn map_script_compile_error(
         bamts_compiler::ScriptCompileError::Capacity { message } => {
             bamts_runtime::ScriptCompileError::Capacity { message }
         }
+        bamts_compiler::ScriptCompileError::Internal { message } => {
+            bamts_runtime::ScriptCompileError::Internal { message }
+        }
     }
 }
 
@@ -1172,8 +1175,14 @@ mod timer_tests {
         assert!(early <= late, "smaller delay yields an earlier deadline");
         assert!(timers.has_pending());
 
-        let first = timers.wait_expired().expect("wait").expect("a wakeup");
-        let second = timers.wait_expired().expect("wait").expect("a wakeup");
+        let first = timers
+            .wait_expired(&bamts_runtime::CancellationToken::new())
+            .expect("wait")
+            .expect("a wakeup");
+        let second = timers
+            .wait_expired(&bamts_runtime::CancellationToken::new())
+            .expect("wait")
+            .expect("a wakeup");
         assert_eq!(first.id, 2, "the earlier deadline fires first");
         assert_eq!(second.id, 1);
         assert_eq!(first.deadline_ms, early);
@@ -1181,7 +1190,10 @@ mod timer_tests {
 
         assert!(!timers.has_pending());
         assert!(
-            timers.wait_expired().expect("wait").is_none(),
+            timers
+                .wait_expired(&bamts_runtime::CancellationToken::new())
+                .expect("wait")
+                .is_none(),
             "an empty pending set never blocks"
         );
     }
@@ -1204,10 +1216,18 @@ mod timer_tests {
             "an unknown id cancels to false"
         );
 
-        let wakeup = timers.wait_expired().expect("wait").expect("a wakeup");
+        let wakeup = timers
+            .wait_expired(&bamts_runtime::CancellationToken::new())
+            .expect("wait")
+            .expect("a wakeup");
         assert_eq!(wakeup.id, 11, "only the surviving timer fires");
         assert!(!timers.has_pending());
-        assert!(timers.wait_expired().expect("wait").is_none());
+        assert!(
+            timers
+                .wait_expired(&bamts_runtime::CancellationToken::new())
+                .expect("wait")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1228,7 +1248,12 @@ mod timer_tests {
         timers.poll_expired(&mut output).expect("poll");
         assert!(output.is_empty(), "a cancelled id is never delivered");
         assert!(!timers.has_pending());
-        assert!(timers.wait_expired().expect("wait").is_none());
+        assert!(
+            timers
+                .wait_expired(&bamts_runtime::CancellationToken::new())
+                .expect("wait")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1303,7 +1328,10 @@ mod timer_tests {
             .schedule(1, 2)
             .expect("schedule under ambient runtime");
         assert!(deadline >= 2);
-        let wakeup = timers.wait_expired().expect("wait").expect("a wakeup");
+        let wakeup = timers
+            .wait_expired(&bamts_runtime::CancellationToken::new())
+            .expect("wait")
+            .expect("a wakeup");
         assert_eq!(wakeup.id, 1);
         assert!(!timers.has_pending());
     }

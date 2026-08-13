@@ -49,6 +49,8 @@
 //! constraint. Each outcome is recorded as [`InferenceProvenance`] so future
 //! diagnostics can attribute a type argument to its source.
 
+use std::collections::HashSet;
+
 use super::binder::{
     ConstructEntry, FunctionParameter, FunctionSignature, IndexSignature, ObjectType, PropertyType,
     SymbolId, TupleShape, Type, TypeId, TypeParameterBounds, TypeTable,
@@ -160,6 +162,7 @@ pub struct InferredTypeArgument {
     symbol: SymbolId,
     type_id: TypeId,
     provenance: InferenceProvenance,
+    widen_literal_union: bool,
 }
 
 impl InferredTypeArgument {
@@ -188,6 +191,7 @@ impl InferredTypeArgument {
             symbol,
             type_id,
             provenance,
+            widen_literal_union: false,
         }
     }
 }
@@ -250,15 +254,9 @@ impl InferredTypeArguments {
                 .iter()
                 .find(|parameter| parameter.symbol() == argument.symbol())
                 .is_some_and(|parameter| parameter.constraint().is_none());
-            if unconstrained
-                && matches!(
-                    table.get(argument.type_id),
-                    Type::StringLiteral(_)
-                        | Type::NumberLiteral(_)
-                        | Type::BooleanLiteral(_)
-                        | Type::BigIntLiteral(_)
-                )
-            {
+            let literal_union = matches!(table.get(argument.type_id), Type::Union(_));
+            let should_widen = !literal_union || argument.widen_literal_union;
+            if unconstrained && should_widen && is_literal_union(table, argument.type_id) {
                 argument.type_id = table.widen(argument.type_id, false);
             }
         }
@@ -445,6 +443,11 @@ impl InferredTypeArguments {
                 let index = self.instantiate(table, index);
                 table.indexed_access(object, index)
             }
+            Type::Record { key, value } => {
+                let key = self.instantiate(table, key);
+                let value = self.instantiate(table, value);
+                table.record(key, value)
+            }
             Type::Error
             | Type::Any
             | Type::Unknown
@@ -538,6 +541,21 @@ impl InferredTypeArguments {
         )
     }
 }
+/// Returns true when `type_id` is a primitive literal or a union consisting
+/// only of primitive literals, so unconstrained generic inference can widen it
+/// to its base primitive type.
+fn is_literal_union(table: &TypeTable, type_id: TypeId) -> bool {
+    match table.get(type_id) {
+        Type::StringLiteral(_)
+        | Type::NumberLiteral(_)
+        | Type::BooleanLiteral(_)
+        | Type::BigIntLiteral(_) => true,
+        Type::Union(members) => members
+            .iter()
+            .all(|&member| is_literal_union(table, member)),
+        _ => false,
+    }
+}
 
 /// One inference session over an interned [`TypeTable`].
 ///
@@ -548,6 +566,9 @@ impl InferredTypeArguments {
 pub struct InferenceContext<'table> {
     table: &'table mut TypeTable,
     parameters: Vec<ParameterInference>,
+    fresh_literal_sources: HashSet<u32>,
+    /// Cooperative cancellation signal. `None` for the non-cancellable path.
+    cancel: Option<bamts_cancel::CancellationToken>,
 }
 
 struct ParameterInference {
@@ -556,9 +577,18 @@ struct ParameterInference {
 }
 
 impl<'table> InferenceContext<'table> {
-    /// Opens an inference session for `parameters`, in declaration order.
-    #[must_use]
     pub fn new(table: &'table mut TypeTable, parameters: &[InferenceParameter]) -> Self {
+        Self::new_with_cancel(table, parameters, None)
+    }
+
+    /// Opens an inference session that polls `cancel` during recursive type
+    /// walking. Pass `None` for the non-cancellable path.
+    #[must_use]
+    pub fn new_with_cancel(
+        table: &'table mut TypeTable,
+        parameters: &[InferenceParameter],
+        cancel: Option<bamts_cancel::CancellationToken>,
+    ) -> Self {
         Self {
             table,
             parameters: parameters
@@ -568,7 +598,15 @@ impl<'table> InferenceContext<'table> {
                     candidates: Vec::new(),
                 })
                 .collect(),
+            fresh_literal_sources: HashSet::new(),
+            cancel,
         }
+    }
+
+    /// Marks one call argument as a fresh literal whose nested literal
+    /// candidates use TypeScript's widening inference.
+    pub fn mark_fresh_literal_source(&mut self, source: u32) {
+        self.fresh_literal_sources.insert(source);
     }
 
     /// Records inferences from one argument against its declared parameter
@@ -611,6 +649,17 @@ impl<'table> InferenceContext<'table> {
                             (argument_index + offset) as u32,
                         );
                     }
+                } else if let Type::Tuple(shape) = self.table.get(parameter.type_id()).clone() {
+                    let rest_length = arguments.len() - argument_index;
+                    for (offset, &argument_type) in arguments[argument_index..].iter().enumerate() {
+                        for element in shape.element_types_at_length(offset, rest_length) {
+                            self.infer_from_argument(
+                                element,
+                                argument_type,
+                                (argument_index + offset) as u32,
+                            );
+                        }
+                    }
                 }
                 break;
             }
@@ -627,18 +676,23 @@ impl<'table> InferenceContext<'table> {
 
     /// Collapses every recorded candidate into the final type arguments,
     /// applying defaults and `extends` constraints as documented in the
-    /// module-level priority rules.
+    /// module-level priority rules. Resolution runs in declaration order and
+    /// each fallback is re-instantiated through the already resolved earlier
+    /// arguments, so a default like `<T = string, U = T>` stores the concrete
+    /// type for `U` rather than a bare `T` occurrence.
     #[must_use]
     pub fn resolve(mut self) -> InferredTypeArguments {
         let mut resolved = Vec::with_capacity(self.parameters.len());
         for index in 0..self.parameters.len() {
             let state = &self.parameters[index];
             let (parameter, candidates) = (state.parameter, state.candidates.clone());
-            let (type_id, provenance) = self.resolve_parameter(&parameter, &candidates);
+            let (type_id, provenance, widen_literal_union) =
+                self.resolve_parameter(&parameter, &candidates, &resolved);
             resolved.push(InferredTypeArgument {
                 symbol: parameter.symbol(),
                 type_id,
                 provenance,
+                widen_literal_union,
             });
         }
         InferredTypeArguments {
@@ -681,6 +735,14 @@ impl<'table> InferenceContext<'table> {
         variance: Variance,
         source: u32,
     ) {
+        // Poll the cancellation token on every recursive entry. A cancelled
+        // inference walk returns immediately; the binder's next `check_cancel`
+        // propagates the typed error.
+        if let Some(token) = &self.cancel
+            && token.is_cancelled()
+        {
+            return;
+        }
         let parameter = self.table.get(parameter_type).clone();
         match parameter {
             Type::Named(symbol) if self.is_inference_symbol(symbol) => {
@@ -990,27 +1052,64 @@ impl<'table> InferenceContext<'table> {
         &mut self,
         parameter: &InferenceParameter,
         candidates: &[InferenceCandidate],
-    ) -> (TypeId, InferenceProvenance) {
-        let Some(candidate) = self.combine_candidates(candidates) else {
+        earlier: &[InferredTypeArgument],
+    ) -> (TypeId, InferenceProvenance, bool) {
+        let Some((candidate, widen_literal_union)) = self.combine_candidates(candidates) else {
             return if let Some(default) = parameter.default() {
-                (default, InferenceProvenance::Default)
+                (
+                    self.substitute_earlier_arguments(default, earlier),
+                    InferenceProvenance::Default,
+                    false,
+                )
             } else if let Some(constraint) = parameter.constraint() {
-                (constraint, InferenceProvenance::Constraint)
+                (
+                    self.substitute_earlier_arguments(constraint, earlier),
+                    InferenceProvenance::Constraint,
+                    false,
+                )
             } else {
-                (self.table.unknown(), InferenceProvenance::Unknown)
+                (self.table.unknown(), InferenceProvenance::Unknown, false)
             };
         };
         if let Some(constraint) = parameter.constraint()
             && !TypeRelations::new(self.table).assignable(candidate, constraint)
         {
-            return (constraint, InferenceProvenance::Constraint);
+            return (
+                self.substitute_earlier_arguments(constraint, earlier),
+                InferenceProvenance::Constraint,
+                false,
+            );
         }
-        (candidate, InferenceProvenance::Inferred)
+        (
+            candidate,
+            InferenceProvenance::Inferred,
+            widen_literal_union,
+        )
+    }
+
+    /// Substitutes the already resolved earlier type arguments through a
+    /// fallback type. A default or constraint that names a parameter declared
+    /// earlier (`<T = string, U = T>`) must store the resolved argument
+    /// (`string`), not the bare occurrence — downstream instantiation only
+    /// substitutes the parameter under check, so an unresolved occurrence
+    /// would leak out of the call. Inferred and explicit results never route
+    /// here: they carry their own evidence. Occurrences of parameters declared
+    /// later pass through unchanged, preserving the existing forward-reference
+    /// behavior.
+    fn substitute_earlier_arguments(
+        &mut self,
+        fallback: TypeId,
+        earlier: &[InferredTypeArgument],
+    ) -> TypeId {
+        if earlier.is_empty() {
+            return fallback;
+        }
+        InferredTypeArguments::new(earlier.to_vec()).instantiate(self.table, fallback)
     }
 
     /// Combines the candidates of one parameter into a single type following
     /// the documented priority tiers. Returns `None` with no candidates.
-    fn combine_candidates(&mut self, candidates: &[InferenceCandidate]) -> Option<TypeId> {
+    fn combine_candidates(&mut self, candidates: &[InferenceCandidate]) -> Option<(TypeId, bool)> {
         let best_priority = candidates
             .iter()
             .map(|candidate| candidate.priority)
@@ -1030,8 +1129,11 @@ impl<'table> InferenceContext<'table> {
                 tier.push(candidate);
             }
         }
+        let widen_literal_union = tier
+            .iter()
+            .any(|candidate| self.fresh_literal_sources.contains(&candidate.source));
         if tier.len() == 1 {
-            return Some(tier[0].type_id);
+            return Some((tier[0].type_id, widen_literal_union));
         }
         let best = {
             let relations = TypeRelations::new(self.table);
@@ -1051,10 +1153,10 @@ impl<'table> InferenceContext<'table> {
             }
         };
         match (best_priority, best) {
-            (_, Some(best)) => Some(best),
+            (_, Some(best)) => Some((best, widen_literal_union)),
             // Contravariant candidates with no common subtype keep the first
             // candidate in encounter order; intersection types are not modeled.
-            (InferencePriority::Low, None) => Some(tier[0].type_id),
+            (InferencePriority::Low, None) => Some((tier[0].type_id, widen_literal_union)),
             // Covariant candidates from the same argument position must agree;
             // with no common supertype, keep the first candidate so the call
             // argument check reports the mismatch. Candidates from different
@@ -1064,12 +1166,13 @@ impl<'table> InferenceContext<'table> {
                     .iter()
                     .all(|candidate| candidate.source == tier[0].source)
                 {
-                    Some(tier[0].type_id)
+                    Some((tier[0].type_id, widen_literal_union))
                 } else {
-                    Some(
+                    Some((
                         self.table
                             .union(&tier.iter().map(|c| c.type_id).collect::<Vec<_>>()),
-                    )
+                        widen_literal_union,
+                    ))
                 }
             }
         }
@@ -1374,6 +1477,87 @@ mod tests {
         );
     }
 
+    /// `pick<T = string, U = T, V = U>` with no arguments: every default
+    /// references the parameter declared before it, so resolution walks the
+    /// chain in declaration order and stores the concrete `string` for each
+    /// parameter — not a bare occurrence of an earlier one.
+    #[test]
+    fn chained_defaults_resolve_through_earlier_parameters_in_declaration_order() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let u = table.named(parameter(2));
+        let string = table.string();
+        let context = InferenceContext::new(
+            &mut table,
+            &[
+                InferenceParameter::new(parameter(1)).with_default(string),
+                InferenceParameter::new(parameter(2)).with_default(t),
+                InferenceParameter::new(parameter(3)).with_default(u),
+            ],
+        );
+        let inferred = context.resolve();
+
+        for id in [1, 2, 3] {
+            assert_eq!(inferred.get(parameter(id)), Some(string));
+            assert_eq!(
+                inferred.provenance(parameter(id)),
+                Some(InferenceProvenance::Default)
+            );
+        }
+        // The contextual signature `(value: U) => U` instantiates end to end;
+        // with a bare-occurrence fallback the parameter type would stay an
+        // unresolved `T`.
+        let signature = table.function(vec![u], u);
+        let Type::Function(signature) = table.get(signature).clone() else {
+            panic!("function type");
+        };
+        let contextual = inferred.instantiate_signature(&mut table, &signature);
+        assert_eq!(contextual, table.function(vec![string], string));
+    }
+
+    /// An argument violating a constraint that references an earlier
+    /// parameter still falls back to the substituted constraint. The
+    /// resolution is neither `unknown`, `any`, nor `error`, so the binder's
+    /// assignability check — the one emitting the argument-not-assignable
+    /// call diagnostic — still rejects the invalid key/value.
+    #[test]
+    fn an_invalid_argument_keeps_the_substituted_constraint_fallback() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let u = table.named(parameter(2));
+        let number = table.number();
+        let constraint = table.object_type(vec![PropertyType::new("value", false, t)]);
+        let signature = table.function(vec![u], u);
+        let Type::Function(signature) = table.get(signature).clone() else {
+            panic!("function type");
+        };
+
+        let string = table.string();
+        let mut context = InferenceContext::new(
+            &mut table,
+            &[
+                InferenceParameter::new(parameter(1)).with_default(number),
+                InferenceParameter::new(parameter(2)).with_constraint(constraint),
+            ],
+        );
+        context.infer_from_arguments(&signature, &[string]);
+        let inferred = context.resolve();
+
+        let expected = table.object_type(vec![PropertyType::new("value", false, number)]);
+        let resolved = inferred.get(parameter(2)).expect("U resolves");
+        assert_eq!(resolved, expected);
+        assert_ne!(resolved, table.unknown());
+        assert_ne!(resolved, table.any());
+        assert_ne!(resolved, table.error_type());
+        assert_eq!(
+            inferred.provenance(parameter(2)),
+            Some(InferenceProvenance::Constraint)
+        );
+        // The invalid key/value still fails the relation behind the call
+        // diagnostic: `string` is not assignable to `{ value: number }`.
+        assert!(!TypeRelations::new(&table).assignable(string, resolved));
+    }
+
     /// An inferred candidate that violates the `extends` constraint is
     /// replaced by the constraint.
     #[test]
@@ -1559,5 +1743,123 @@ mod tests {
         let resolved = run();
         assert_eq!(resolved, Type::Number);
         assert_eq!(resolved, run());
+    }
+    /// A tuple-typed rest parameter infers each remaining argument against the
+    /// corresponding tuple element, not as a single array rest.
+    #[test]
+    fn tuple_typed_rest_parameter_infers_each_position() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let u = table.named(parameter(2));
+        let rest_tuple = table.tuple(vec![t, u]);
+        let rest = FunctionParameter::new("rest".to_owned(), rest_tuple, false, true);
+        let signature =
+            table.function_with_parameters(vec![parameter(1), parameter(2)], vec![rest], t);
+        let Type::Function(signature) = table.get(signature).clone() else {
+            panic!("function type");
+        };
+
+        let one = table.number_literal("1");
+        let string = table.string();
+        let mut context = InferenceContext::new(
+            &mut table,
+            &[
+                InferenceParameter::new(parameter(1)),
+                InferenceParameter::new(parameter(2)),
+            ],
+        );
+        context.infer_from_arguments(&signature, &[one, string]);
+        let inferred = context.resolve();
+
+        assert_eq!(inferred.get(parameter(1)), Some(one));
+        assert_eq!(inferred.get(parameter(2)), Some(string));
+    }
+
+    /// A tuple-typed rest parameter with an optional element skips the missing
+    /// position and still infers the intended type when the element is supplied.
+    #[test]
+    fn tuple_typed_rest_parameter_with_optional_element() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let u = table.named(parameter(2));
+        let rest_tuple = table.tuple_shape(TupleShape {
+            prefix: vec![t, u],
+            required: 1,
+            rest: None,
+            suffix: Vec::new(),
+        });
+        let rest = FunctionParameter::new("rest".to_owned(), rest_tuple, false, true);
+        let signature =
+            table.function_with_parameters(vec![parameter(1), parameter(2)], vec![rest], t);
+        let Type::Function(signature) = table.get(signature).clone() else {
+            panic!("function type");
+        };
+
+        let one = table.number_literal("1");
+        let mut context = InferenceContext::new(
+            &mut table,
+            &[
+                InferenceParameter::new(parameter(1)),
+                InferenceParameter::new(parameter(2)),
+            ],
+        );
+        context.infer_from_arguments(&signature, &[one]);
+        let inferred = context.resolve();
+        assert_eq!(inferred.get(parameter(1)), Some(one));
+        assert_eq!(inferred.get(parameter(2)), Some(table.unknown()));
+
+        let string = table.string();
+        let mut context = InferenceContext::new(
+            &mut table,
+            &[
+                InferenceParameter::new(parameter(1)),
+                InferenceParameter::new(parameter(2)),
+            ],
+        );
+        context.infer_from_arguments(&signature, &[one, string]);
+        let inferred = context.resolve();
+        assert_eq!(inferred.get(parameter(1)), Some(one));
+        assert_eq!(inferred.get(parameter(2)), Some(string));
+    }
+
+    /// A tuple-typed rest parameter with a tuple rest tail infers the leading
+    /// positions distinctly and collects the remaining positions as the rest
+    /// type argument.
+    #[test]
+    fn tuple_typed_rest_parameter_with_rest_tail() {
+        let mut table = TypeTable::new();
+        let t = table.named(parameter(1));
+        let u = table.named(parameter(2));
+        let rest_tuple = table.tuple_shape(TupleShape {
+            prefix: vec![t],
+            required: 1,
+            rest: Some(u),
+            suffix: Vec::new(),
+        });
+        let rest = FunctionParameter::new("rest".to_owned(), rest_tuple, false, true);
+        let signature =
+            table.function_with_parameters(vec![parameter(1), parameter(2)], vec![rest], t);
+        let Type::Function(signature) = table.get(signature).clone() else {
+            panic!("function type");
+        };
+
+        let one = table.number_literal("1");
+        let string = table.string();
+        let boolean = table.boolean();
+        let mut context = InferenceContext::new(
+            &mut table,
+            &[
+                InferenceParameter::new(parameter(1)),
+                InferenceParameter::new(parameter(2)),
+            ],
+        );
+        context.infer_from_arguments(&signature, &[one, string, boolean]);
+        let inferred = context.resolve();
+
+        assert_eq!(inferred.get(parameter(1)), Some(one));
+        assert_eq!(
+            inferred.get(parameter(2)),
+            Some(table.union(&[string, boolean]))
+        );
     }
 }

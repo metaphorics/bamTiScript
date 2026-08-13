@@ -21,7 +21,7 @@ use std::task::Poll;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use bamts_runtime::{TimerError, TimerProvider, TimerWakeup};
+use bamts_runtime::{CancellationToken, TimerError, TimerProvider, TimerWakeup};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::time::{DelayQueue, delay_queue};
@@ -318,15 +318,21 @@ impl TimerProvider for NodeTimers {
         }
     }
 
-    fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError> {
+    fn wait_expired(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TimerWakeup>, TimerError> {
         loop {
             // An empty pending set never blocks: nothing can arrive that we
             // would report, so return immediately.
             if self.pending.is_empty() {
                 return Ok(None);
             }
+            if cancel.is_cancelled() {
+                return Ok(None);
+            }
             let received = match self.worker.as_ref() {
-                Some(worker) => worker.expiry_rx.recv(),
+                Some(worker) => worker.expiry_rx.recv_timeout(Duration::from_millis(10)),
                 None => return Ok(None),
             };
             match received {
@@ -337,7 +343,10 @@ impl TimerProvider for NodeTimers {
                     // Stale wakeup for a cancelled or re-armed ID; keep waiting
                     // while live timers remain (re-checked at the top of the loop).
                 }
-                Err(_) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Re-check cancellation at the top of the loop.
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(TimerError::new("timer worker expiry channel disconnected"));
                 }
             }

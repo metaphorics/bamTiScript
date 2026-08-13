@@ -10,7 +10,7 @@ Before building bamTiScript from source, check that your system meets these requ
 - Rust toolchain: the repository pins Rust 1.97.1 with Cargo, rustfmt, and Clippy
 - Host C toolchain: a compiler driver selected by `$CC`, defaulting to `cc`, required only for AOT steps
 
-> **Note:** `bamti` and `bamti-cli` 0.1.0 are published on npm, but their platform binary packages are unavailable. Build the working CLI from source.
+> **Note:** `bamti` (the in-process Node 24+ interface) and `bamti-cli` (the standalone CLI transport) 0.1.0 are published on npm, but currently published packages do not contain prebuilt native binary artifacts. The source implementation of native Node-API bindings (`bamts-napi`) is unpublished, and real five-target release validation is blocked by GitHub billing. Build the working CLI binary from source with Cargo.
 
 ## 1. Clone the repository
 

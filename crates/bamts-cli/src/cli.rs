@@ -1,6 +1,10 @@
 use crate::args::{CliArgs, help_message, load_error_message, parse_args, version_message};
 use crate::context::ExecutionContext;
-use crate::driver::{CommandOutcome, DriverError, execute, execute_in_context};
+use crate::driver::{
+    CommandOutcome, DriverError, execute, execute_in_context, execute_in_context_with_cancel,
+    execute_with_cancel,
+};
+use bamts_cancel::CancellationToken;
 
 /// Runs one CLI invocation against the ambient process context.
 #[must_use]
@@ -15,6 +19,27 @@ pub fn cli_outcome_in_context(
     context: &ExecutionContext,
 ) -> CommandOutcome {
     cli_outcome_with(argv, |args| execute_in_context(args, context))
+}
+
+/// [`cli_outcome`] with a caller-supplied cancellation token.
+#[must_use]
+pub fn cli_outcome_with_cancel(
+    argv: impl IntoIterator<Item = String>,
+    cancel: CancellationToken,
+) -> CommandOutcome {
+    cli_outcome_with(argv, |args| execute_with_cancel(args, cancel.clone()))
+}
+
+/// [`cli_outcome_in_context`] with a caller-supplied cancellation token.
+#[must_use]
+pub fn cli_outcome_in_context_with_cancel(
+    argv: impl IntoIterator<Item = String>,
+    context: &ExecutionContext,
+    cancel: CancellationToken,
+) -> CommandOutcome {
+    cli_outcome_with(argv, |args| {
+        execute_in_context_with_cancel(args, context, cancel.clone())
+    })
 }
 
 fn cli_outcome_with(
@@ -134,6 +159,30 @@ mod tests {
                 .stderr
                 .windows(b"BAMTS-C".len())
                 .any(|window| window == b"BAMTS-C")
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_context_invocation_stops_before_entrypoint_work() {
+        let (_directory, context) = context();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = cli_outcome_in_context_with_cancel(
+            [
+                "bamts".to_owned(),
+                "check".to_owned(),
+                "does-not-exist.ts".to_owned(),
+            ],
+            &context,
+            cancel,
+        );
+        assert_eq!(
+            outcome,
+            CommandOutcome {
+                stderr: b"error: operation cancelled\n".to_vec(),
+                exit_code: 1,
+                ..CommandOutcome::default()
+            }
         );
     }
 }

@@ -5,6 +5,7 @@ use std::fmt;
 use std::time::Instant;
 
 use bamts_bytecode::{Program as BytecodeProgram, Verified};
+use bamts_cancel::{CancellationToken, Cancelled};
 use bamts_native::{
     AbiError, Completion, CompletionTag, JitEntry, NativeEntryTable, NativeHelper, ShadowFrame,
     require_frame_module_id,
@@ -15,7 +16,9 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError, default_libcall_names};
 
 use crate::jit_memory::{FinalizedMemory, WxByteTotals, WxMemoryHandle, WxMemoryProvider};
-use crate::{HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_program};
+use crate::{
+    HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_program_with_cancel,
+};
 
 /// A typed host-JIT compilation failure.
 #[derive(Debug)]
@@ -28,6 +31,8 @@ pub enum JitError {
     Module(Box<ModuleError>),
     /// Lowered IR named a runtime helper not present in the runtime helper table.
     UnknownHelper { index: u32 },
+    /// A caller-supplied cancellation token was triggered at a checkpoint.
+    Cancelled,
 }
 
 impl fmt::Display for JitError {
@@ -47,7 +52,14 @@ impl fmt::Display for JitError {
                     "lowered IR imports unknown runtime helper u1:{index}"
                 )
             }
+            JitError::Cancelled => formatter.write_str("operation cancelled"),
         }
+    }
+}
+
+impl From<Cancelled> for JitError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
     }
 }
 
@@ -55,7 +67,9 @@ impl Error for JitError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             JitError::Lower(error) => Some(error),
-            JitError::InvalidLoweredModule(_) | JitError::UnknownHelper { .. } => None,
+            JitError::InvalidLoweredModule(_)
+            | JitError::UnknownHelper { .. }
+            | JitError::Cancelled => None,
             JitError::Module(error) => Some(error.as_ref()),
         }
     }
@@ -154,6 +168,9 @@ pub struct JitTelemetry {
 /// Lowers, compiles, and finalizes every module of a verified canonical program
 /// for the current host. Module-local ids remain local and native entries are
 /// keyed by `(module_id, function_id)`.
+///
+/// This is a convenience wrapper that uses a fresh, never-cancelled token; for
+/// cancellation support use [`compile_jit_with_cancel`].
 pub fn compile_jit(bytecode: &BytecodeProgram<Verified>) -> Result<JitProgram, JitError> {
     compile_jit_with_telemetry(bytecode).map(|(program, _telemetry)| program)
 }
@@ -163,16 +180,41 @@ pub fn compile_jit(bytecode: &BytecodeProgram<Verified>) -> Result<JitProgram, J
 /// The returned [`JitProgram`] is identical to what [`compile_jit`] produces;
 /// the [`JitTelemetry`] times the whole lower/compile/finalize path and reports
 /// the page-rounded bytes the W^X provider allocated for each mapping kind.
+///
+/// This is a convenience wrapper that uses a fresh, never-cancelled token; for
+/// cancellation support use [`compile_jit_with_telemetry_cancel`].
 pub fn compile_jit_with_telemetry(
     bytecode: &BytecodeProgram<Verified>,
 ) -> Result<(JitProgram, JitTelemetry), JitError> {
+    compile_jit_with_telemetry_cancel(bytecode, &CancellationToken::new())
+}
+
+/// [`compile_jit`] with cooperative cancellation.
+///
+/// Cancellation is checked at the entry, after lowering, before/after every
+/// Cranelift `declare_function`/`define_function`/`finalize_definitions` call,
+/// and per lowered function/data item.
+pub fn compile_jit_with_cancel(
+    bytecode: &BytecodeProgram<Verified>,
+    cancel: &CancellationToken,
+) -> Result<JitProgram, JitError> {
+    compile_jit_with_telemetry_cancel(bytecode, cancel).map(|(program, _telemetry)| program)
+}
+
+/// [`compile_jit_with_cancel`] plus compile-wall and page-rounded W^X memory
+/// telemetry.
+pub fn compile_jit_with_telemetry_cancel(
+    bytecode: &BytecodeProgram<Verified>,
+    cancel: &CancellationToken,
+) -> Result<(JitProgram, JitTelemetry), JitError> {
+    cancel.check()?;
     let started = Instant::now();
-    let (module, memory, program_bytes) = build_module(bytecode)?;
-    let lowered = lower_program(bytecode, module.target_config())?;
+    let (module, memory, program_bytes) = build_module(bytecode, cancel)?;
+    let lowered = lower_program_with_cancel(bytecode, module.target_config(), cancel)?;
     // Keep a handle clone so byte totals stay readable after `compile_lowered`
     // consumes its own; both observe the same shared lifecycle counters.
     let memory_view = memory.clone();
-    let program = compile_lowered(module, memory, lowered, program_bytes)?;
+    let program = compile_lowered(module, memory, lowered, program_bytes, cancel)?;
     let bytes: WxByteTotals = memory_view.byte_totals();
     let telemetry = JitTelemetry {
         jit_compile_wall_ms: started.elapsed().as_secs_f64() * 1_000.0,
@@ -194,7 +236,9 @@ pub fn compile_jit_with_telemetry(
 /// the handle.
 fn build_module(
     bytecode: &BytecodeProgram<Verified>,
+    cancel: &CancellationToken,
 ) -> Result<(JITModule, WxMemoryHandle, Vec<u8>), JitError> {
+    cancel.check()?;
     let program_bytes = bytecode.encode();
     let mut builder = JITBuilder::new(default_libcall_names())?;
     let (provider, memory) = WxMemoryProvider::new();
@@ -211,50 +255,33 @@ fn compile_lowered(
     memory: WxMemoryHandle,
     lowered: LoweredProgram,
     program_bytes: Vec<u8>,
+    cancel: &CancellationToken,
 ) -> Result<JitProgram, JitError> {
-    let function_count = lowered
-        .modules
-        .iter()
-        .map(|module| module.functions.len())
-        .sum();
-    let mut functions = Vec::with_capacity(function_count);
-    let mut declared_functions = std::collections::HashMap::with_capacity(function_count);
-    for (module_index, lowered_module) in lowered.modules.iter().enumerate() {
-        let module_id = lowered_module.id.get();
-        if module_id as usize != module_index {
-            return Err(JitError::InvalidLoweredModule(format!(
-                "module {module_id} appears at index {module_index}"
-            )));
-        }
-        for (function_index, function) in lowered_module.functions.iter().enumerate() {
-            let function_id = function.id.get();
-            if function_id as usize != function_index {
-                return Err(JitError::InvalidLoweredModule(format!(
-                    "module {module_id} function {function_id} appears at local index {function_index}"
-                )));
-            }
-            let declared =
-                module.declare_function(&function.symbol, Linkage::Local, &function.signature)?;
-            if declared_functions
-                .insert((module_id, function_id), declared)
-                .is_some()
-            {
-                return Err(JitError::InvalidLoweredModule(format!(
-                    "duplicate declaration for module {module_id} function {function_id}"
-                )));
-            }
-            functions.push(JitUnit {
-                module_id,
-                function_id,
-                function: declared,
-            });
-        }
+    cancel.check()?;
+    let units = crate::validate_lowered_program(&lowered)
+        .map_err(|error| JitError::InvalidLoweredModule(error.to_string()))?;
+    let mut functions = Vec::with_capacity(units.len());
+    let mut declared_functions = std::collections::HashMap::with_capacity(units.len());
+    for (module_id, function_id) in units {
+        cancel.check()?;
+        let function = &lowered.modules[module_id as usize].functions[function_id as usize];
+        let declared =
+            module.declare_function(&function.symbol, Linkage::Local, &function.signature)?;
+        cancel.check()?;
+        declared_functions.insert((module_id, function_id), declared);
+        functions.push(JitUnit {
+            module_id,
+            function_id,
+            function: declared,
+        });
     }
 
     let call_conv = module.target_config().default_call_conv;
     let mut helpers = Vec::with_capacity(bamts_native::HELPER_COUNT as usize);
     for index in 0..bamts_native::HELPER_COUNT {
+        cancel.check()?;
         let helper = Helper::from_external_index(index).ok_or(JitError::UnknownHelper { index })?;
+        cancel.check()?;
         helpers.push(module.declare_function(
             helper.symbol(),
             Linkage::Import,
@@ -263,7 +290,9 @@ fn compile_lowered(
     }
 
     for lowered_module in lowered.modules {
+        cancel.check()?;
         for function in lowered_module.functions {
+            cancel.check()?;
             let declared = declared_functions
                 .get(&(lowered_module.id.get(), function.id.get()))
                 .copied()
@@ -277,10 +306,14 @@ fn compile_lowered(
             let mut clif = function.clif;
             rebind_helper_imports(&mut clif, &helpers)?;
             let mut context = Context::for_function(clif);
+            cancel.check()?;
             module.define_function(declared, &mut context)?;
+            cancel.check()?;
         }
     }
+    cancel.check()?;
     module.finalize_definitions()?;
+    cancel.check()?;
 
     // Publication requires the receipt. `finalize_definitions` returned `Ok`, so
     // the provider reached `Executable` only after every owned mapping
@@ -413,12 +446,14 @@ mod tests {
     };
     use cranelift_module::Module as _;
 
-    use crate::{Helper, lower_program};
+    use crate::{Helper, JitError, lower_program};
 
     use super::{
-        JitProgram, build_module, compile_jit, compile_jit_with_telemetry, compile_lowered,
+        JitProgram, build_module, compile_jit, compile_jit_with_cancel, compile_jit_with_telemetry,
+        compile_jit_with_telemetry_cancel, compile_lowered,
     };
     use crate::jit_memory::WxPhase;
+    use bamts_cancel::CancellationToken;
 
     struct SilentHost;
 
@@ -1159,9 +1194,11 @@ mod tests {
     #[test]
     fn compiled_jit_program_owns_executable_receipt_and_drops_to_freed() {
         let bytecode = two_module_program();
-        let (module, memory, program_bytes) = build_module(&bytecode).expect("module builds");
+        let cancel = CancellationToken::new();
+        let (module, memory, program_bytes) =
+            build_module(&bytecode, &cancel).expect("module builds");
         let lowered = lower_program(&bytecode, module.target_config()).expect("program lowers");
-        let program = compile_lowered(module, memory.clone(), lowered, program_bytes)
+        let program = compile_lowered(module, memory.clone(), lowered, program_bytes, &cancel)
             .expect("host JIT compiles");
 
         // The program was published, so it owns an executable receipt.
@@ -1211,12 +1248,14 @@ mod tests {
     #[test]
     fn compile_lowered_rejects_out_of_order_function_identity() {
         let bytecode = callback_reentry_program();
-        let (module, memory, program_bytes) = build_module(&bytecode).expect("module builds");
+        let cancel = CancellationToken::new();
+        let (module, memory, program_bytes) =
+            build_module(&bytecode, &cancel).expect("module builds");
         let mut lowered = lower_program(&bytecode, module.target_config()).expect("program lowers");
         lowered.modules[0].functions.swap(0, 1);
 
         assert!(matches!(
-            compile_lowered(module, memory, lowered, program_bytes),
+            compile_lowered(module, memory, lowered, program_bytes, &cancel),
             Err(super::JitError::InvalidLoweredModule(message))
                 if message.contains("function 1 appears at local index 0")
         ));
@@ -1414,5 +1453,23 @@ mod tests {
             .expect("JIT resolves local ImportDynamic");
         assert_eq!(outcome.exit_code, interpreter.outcome.exit_code);
         assert_eq!(jit_host.stdout, interpreter_host.stdout);
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_compile_jit() {
+        let bytecode = two_module_program();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = compile_jit_with_cancel(&bytecode, &cancel);
+        assert!(matches!(result, Err(JitError::Cancelled)));
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_compile_jit_with_telemetry() {
+        let bytecode = two_module_program();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = compile_jit_with_telemetry_cancel(&bytecode, &cancel);
+        assert!(matches!(result, Err(JitError::Cancelled)));
     }
 }

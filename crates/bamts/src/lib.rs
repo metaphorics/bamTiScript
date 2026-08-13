@@ -11,11 +11,13 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use bamts_cancel::{CancellationToken, Cancelled};
 use bamts_compiler::diagnostic::{Diagnostic, DiagnosticSeverity};
+use bamts_compiler::lint::{LintProfile, LintTable};
 use bamts_compiler::lower::LowerOptions;
-use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend};
+use bamts_compiler::pipeline::{FrontendMode, compile_program_frontend_with_cancel};
 use bamts_compiler::program::{
-    ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program,
+    ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program_with_cancel,
 };
 use bamts_compiler::project::{ConfigError, ProjectConfig, ProjectRoot};
 
@@ -60,6 +62,8 @@ pub struct ProgramOutput {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// The operation was cancelled.
+    Cancelled(Cancelled),
     /// The project configuration could not be read.
     ReadConfig {
         path: PathBuf,
@@ -83,6 +87,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
             Self::ReadConfig { path, source } => write!(
                 formatter,
                 "could not read project configuration `{}`: {source}",
@@ -110,6 +115,7 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::ReadConfig { source, .. } => Some(source),
             Self::ProjectConfig { source, .. } => Some(source),
             Self::ProgramLoad(error) => Some(error),
@@ -125,6 +131,12 @@ impl StdError for Error {
 impl From<ProgramLoadError> for Error {
     fn from(error: ProgramLoadError) -> Self {
         Self::ProgramLoad(error)
+    }
+}
+
+impl From<Cancelled> for Error {
+    fn from(error: Cancelled) -> Self {
+        Self::Cancelled(error)
     }
 }
 
@@ -166,15 +178,28 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub fn compile_source_file(
     path: impl AsRef<Path>,
 ) -> Result<bamts_compiler::program::ExecutableProgram> {
-    let path = canonical_entrypoint(path.as_ref())?;
+    compile_source_file_with_cancel(path, &CancellationToken::new())
+}
+
+/// Compiles an entrypoint and its complete local module graph with cancellation.
+pub fn compile_source_file_with_cancel(
+    path: impl AsRef<Path>,
+    cancel: &CancellationToken,
+) -> Result<bamts_compiler::program::ExecutableProgram> {
+    let path = canonical_entrypoint_with_cancel(path.as_ref(), cancel)?;
     let fallback_root = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "entrypoint has no parent directory",
         )))
     })?;
-    let resolved = resolve_project(&path, fallback_root)?;
-    let frontend = compile_program_frontend(&resolved.program, FrontendMode::Check);
+    let resolved = resolve_project_with_cancel(&path, fallback_root, cancel)?;
+    let frontend = compile_program_frontend_with_cancel(
+        &resolved.program,
+        FrontendMode::Check,
+        &LintTable::new(LintProfile::Default),
+        cancel,
+    )?;
     let diagnostics = frontend
         .modules()
         .iter()
@@ -185,12 +210,13 @@ pub fn compile_source_file(
     if !diagnostics.is_empty() {
         return Err(Error::Diagnostics { diagnostics });
     }
-    lower_program(
+    lower_program_with_cancel(
         &resolved.program,
         &frontend,
         LowerOptions {
             javascript_compatibility: true,
         },
+        cancel,
     )
     .map_err(Error::from)
 }
@@ -214,7 +240,7 @@ pub fn compile_source_file(
 /// ```
 #[cfg(feature = "node-host")]
 pub fn run_program(path: impl AsRef<Path>) -> Result<ProgramOutput> {
-    let executable = compile_source_file(path)?;
+    let executable = compile_source_file_with_cancel(path, &CancellationToken::new())?;
     let mut host = bamts_node::NodeHost::new();
     host.set_script_compiler(Box::new(ScriptCompiler));
     let outcome = bamts_runtime::run(
@@ -253,7 +279,7 @@ pub fn compile_native_object(
     path: impl AsRef<Path>,
     target: &str,
 ) -> Result<bamts_codegen::AotObject> {
-    let executable = compile_source_file(path)?;
+    let executable = compile_source_file_with_cancel(path, &CancellationToken::new())?;
     bamts_codegen::compile_aot(executable.wire(), target).map_err(Error::Aot)
 }
 
@@ -264,7 +290,11 @@ impl From<bamts_codegen::AotError> for Error {
     }
 }
 
-fn canonical_entrypoint(path: &Path) -> Result<PathBuf> {
+/// Resolves an entrypoint path with cancellation.
+pub fn canonical_entrypoint_with_cancel(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -272,12 +302,15 @@ fn canonical_entrypoint(path: &Path) -> Result<PathBuf> {
             .map(|directory| directory.join(path))
             .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?
     };
-    fs::canonicalize(&absolute).map_err(|source| {
+    cancel.check()?;
+    let canonical = fs::canonicalize(&absolute).map_err(|source| {
         Error::ProgramLoad(ProgramLoadError::Read {
             path: absolute,
             source,
         })
-    })
+    })?;
+    cancel.check()?;
+    Ok(canonical)
 }
 
 /// The root and compiler configuration selected for a canonical entrypoint.
@@ -305,20 +338,48 @@ impl ProjectDiscovery {
 /// ancestor. When neither exists, `fallback_root` defines the project.
 #[must_use]
 pub fn discover_project(entrypoint: &Path, fallback_root: PathBuf) -> ProjectDiscovery {
+    discover_project_with_cancel(entrypoint, fallback_root, &CancellationToken::new())
+        .expect("a fresh cancellation token cannot be cancelled")
+}
+
+/// Selects a project root and configuration with cancellation.
+pub fn discover_project_with_cancel(
+    entrypoint: &Path,
+    fallback_root: PathBuf,
+    cancel: &CancellationToken,
+) -> std::result::Result<ProjectDiscovery, Cancelled> {
     let ancestors = || entrypoint.parent().into_iter().flat_map(Path::ancestors);
-    let root = ancestors()
-        .find(|directory| directory.join("bamts.toml").is_file())
-        .or_else(|| ancestors().find(|directory| directory.join("tsconfig.json").is_file()))
-        .map_or(fallback_root, Path::to_path_buf);
-    let config = entrypoint
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .take_while(|directory| directory.starts_with(&root))
-        .map(|directory| directory.join("tsconfig.json"))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| root.join("tsconfig.json"));
-    ProjectDiscovery { root, config }
+    let mut root = None;
+    for directory in ancestors() {
+        cancel.check()?;
+        if directory.join("bamts.toml").is_file() {
+            root = Some(directory.to_path_buf());
+            break;
+        }
+    }
+    if root.is_none() {
+        for directory in ancestors() {
+            cancel.check()?;
+            if directory.join("tsconfig.json").is_file() {
+                root = Some(directory.to_path_buf());
+                break;
+            }
+        }
+    }
+    let root = root.unwrap_or(fallback_root);
+    let mut config = None;
+    for directory in ancestors().take_while(|directory| directory.starts_with(&root)) {
+        cancel.check()?;
+        let candidate = directory.join("tsconfig.json");
+        if candidate.is_file() {
+            config = Some(candidate);
+            break;
+        }
+    }
+    Ok(ProjectDiscovery {
+        config: config.unwrap_or_else(|| root.join("tsconfig.json")),
+        root,
+    })
 }
 
 /// The project root and loaded module graph selected for a canonical entrypoint.
@@ -330,112 +391,55 @@ pub struct ResolvedProject {
     pub program: ResolvedProgram,
 }
 
-/// A failure while selecting a project root and loading its module graph.
-///
-/// This enum is `#[non_exhaustive]`. Downstream matches must include a
-/// wildcard arm so that future variants can be added without a major bump.
-///
-/// ```compile_fail
-/// fn classify(err: bamts::ResolutionError) -> &'static str {
-///     match err {
-///         bamts::ResolutionError::InvalidRoot(_) => "root",
-///         bamts::ResolutionError::ReadConfig { .. } => "read",
-///         bamts::ResolutionError::Config { .. } => "config",
-///         bamts::ResolutionError::Load(_) => "load",
-///     }
-/// }
-/// ```
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ResolutionError {
-    /// The project root could not be canonicalized or is not absolute.
-    InvalidRoot(std::io::Error),
-    /// The project configuration file could not be read.
-    ReadConfig {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    /// The project configuration is invalid.
-    Config { path: PathBuf, source: ConfigError },
-    /// The entrypoint or one of its dependencies could not be loaded.
-    Load(ProgramLoadError),
-}
-
-impl fmt::Display for ResolutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidRoot(error) => write!(formatter, "invalid project root: {error}"),
-            Self::ReadConfig { path, source } => write!(
-                formatter,
-                "could not read project configuration `{}`: {source}",
-                path.display()
-            ),
-            Self::Config { path, source } => write!(
-                formatter,
-                "invalid project configuration `{}`: {source}",
-                path.display()
-            ),
-            Self::Load(error) => write!(formatter, "could not load program: {error}"),
-        }
-    }
-}
-
-impl StdError for ResolutionError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::InvalidRoot(error) => Some(error),
-            Self::ReadConfig { source, .. } => Some(source),
-            Self::Config { source, .. } => Some(source),
-            Self::Load(error) => Some(error),
-        }
-    }
-}
-
-impl From<ResolutionError> for Error {
-    fn from(error: ResolutionError) -> Self {
-        match error {
-            ResolutionError::InvalidRoot(io_error) => {
-                Error::ProgramLoad(ProgramLoadError::InvalidRoot(io_error))
-            }
-            ResolutionError::ReadConfig { path, source } => Error::ReadConfig { path, source },
-            ResolutionError::Config { path, source } => Error::ProjectConfig { path, source },
-            ResolutionError::Load(load_error) => Error::ProgramLoad(load_error),
-        }
-    }
-}
-
 /// Selects a project root, reads its configuration, and loads the complete
 /// module graph for a canonical entrypoint.
 ///
 /// `fallback_root` is used only when no `bamts.toml` or `tsconfig.json`
 /// ancestor exists; the caller chooses it (the CLI uses the current directory
 /// when the entrypoint is inside it, the facade uses the entrypoint's parent).
-pub fn resolve_project(
+pub fn resolve_project(entrypoint: &Path, fallback_root: PathBuf) -> Result<ResolvedProject> {
+    resolve_project_with_cancel(entrypoint, fallback_root, &CancellationToken::new())
+}
+
+/// Selects a project, reads its configuration, and loads it with cancellation.
+pub fn resolve_project_with_cancel(
     entrypoint: &Path,
     fallback_root: PathBuf,
-) -> Result<ResolvedProject, ResolutionError> {
-    let project = discover_project(entrypoint, fallback_root);
-    let canonical_root = fs::canonicalize(project.root()).map_err(ResolutionError::InvalidRoot)?;
+    cancel: &CancellationToken,
+) -> Result<ResolvedProject> {
+    let project = discover_project_with_cancel(entrypoint, fallback_root, cancel)?;
+    cancel.check()?;
+    let canonical_root = fs::canonicalize(project.root())
+        .map_err(|error| Error::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
+    cancel.check()?;
     let root = ProjectRoot::new(canonical_root).map_err(|error| {
-        ResolutionError::InvalidRoot(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+        Error::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            error,
+        )))
     })?;
     let config_path = project.config().to_owned();
     let config_source = if config_path.is_file() {
-        fs::read_to_string(&config_path).map_err(|source| ResolutionError::ReadConfig {
+        cancel.check()?;
+        let source = fs::read_to_string(&config_path).map_err(|source| Error::ReadConfig {
             path: config_path.clone(),
             source,
-        })?
+        })?;
+        cancel.check()?;
+        source
     } else {
         "{}".to_owned()
     };
     let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|source| {
-        ResolutionError::Config {
+        Error::ProjectConfig {
             path: config_path,
             source,
         }
     })?;
-    let loader = ProgramLoader::new(&root, config.options()).map_err(ResolutionError::Load)?;
-    let program = loader.load(entrypoint).map_err(ResolutionError::Load)?;
+    let loader = ProgramLoader::new(&root, config.options()).map_err(Error::ProgramLoad)?;
+    let program = loader
+        .load_with_cancel(entrypoint, cancel)
+        .map_err(Error::ProgramLoad)?;
     Ok(ResolvedProject { root, program })
 }
 

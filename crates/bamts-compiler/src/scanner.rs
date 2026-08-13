@@ -32,6 +32,9 @@ use std::sync::Arc;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::{Token, TokenKind, cook_identifier_text};
+use bamts_cancel::{CancellationToken, Cancelled};
+use std::error::Error;
+use std::fmt;
 
 /// Unterminated string literal.
 const UNTERMINATED_STRING: DiagnosticCode = DiagnosticCode::new("BAMTS-L001");
@@ -55,6 +58,37 @@ const INVALID_NUMERIC_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L009"
 const INVALID_BIGINT_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L010");
 /// A `#` that does not begin a private identifier.
 const INVALID_PRIVATE_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-L011");
+
+/// A scanner operation was interrupted before completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanError {
+    /// The caller requested cancellation.
+    Cancelled(Cancelled),
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScanError::Cancelled(_) => formatter.write_str("scan cancelled"),
+        }
+    }
+}
+
+impl Error for ScanError {}
+
+impl From<Cancelled> for ScanError {
+    fn from(cancelled: Cancelled) -> Self {
+        ScanError::Cancelled(cancelled)
+    }
+}
+
+impl From<ScanError> for Cancelled {
+    fn from(error: ScanError) -> Self {
+        match error {
+            ScanError::Cancelled(cancelled) => cancelled,
+        }
+    }
+}
 
 /// The immutable product of one lexical pass over a source file.
 ///
@@ -135,18 +169,46 @@ pub fn scan(
     script_kind: ScriptKind,
     source: Arc<SourceText>,
 ) -> Recovered<ScannedSource> {
+    match scan_with_cancel(source_id, script_kind, source, CancellationToken::new()) {
+        Ok(recovered) => recovered,
+        Err(_) => unreachable!("fresh token is never cancelled"),
+    }
+}
+
+/// Scans a whole source with cooperative cancellation.
+///
+/// A caller-supplied [`CancellationToken`] is checked before scanning, at every
+/// token boundary, and inside long character loops. Triggering it aborts
+/// scanning with [`ScanError::Cancelled`].
+pub fn scan_with_cancel(
+    source_id: SourceId,
+    script_kind: ScriptKind,
+    source: Arc<SourceText>,
+    cancel: CancellationToken,
+) -> Result<Recovered<ScannedSource>, ScanError> {
+    if cancel.is_cancelled() {
+        return Err(ScanError::Cancelled(Cancelled));
+    }
+
     let (tokens, eof, diagnostics) = {
-        let mut scanner = Scanner::new(source_id, script_kind, &source);
+        let mut scanner = Scanner::new_with_cancel(source_id, script_kind, &source, cancel.clone());
         let mut tokens = Vec::new();
         let eof = loop {
+            if scanner.is_cancelled() {
+                break scanner.make(TokenKind::EndOfFile, scanner.position().get());
+            }
             let token = scanner.next_token();
-            if token.kind() == TokenKind::EndOfFile {
+            if token.kind() == TokenKind::EndOfFile || scanner.is_cancelled() {
                 break token;
             }
             tokens.push(token);
         };
         (tokens, eof, scanner.into_diagnostics())
     };
+
+    if cancel.is_cancelled() {
+        return Err(ScanError::Cancelled(Cancelled));
+    }
 
     let product = ScannedSource {
         source_id,
@@ -155,7 +217,7 @@ pub fn scan(
         tokens,
         eof,
     };
-    Recovered::new(product, diagnostics)
+    Ok(Recovered::new(product, diagnostics))
 }
 
 /// The kind of an open brace the scanner is currently inside, used to segment
@@ -193,12 +255,25 @@ pub struct Scanner<'a> {
     last_start_utf16: usize,
     braces: Vec<PendingBrace>,
     diagnostics: Vec<Diagnostic>,
+    /// Cooperative cancellation signal checked at every token boundary.
+    cancel: CancellationToken,
 }
 
 impl<'a> Scanner<'a> {
     /// Creates a scanner positioned at the start of `source`.
     #[must_use]
     pub fn new(source_id: SourceId, script_kind: ScriptKind, source: &'a SourceText) -> Self {
+        Self::new_with_cancel(source_id, script_kind, source, CancellationToken::new())
+    }
+
+    /// Creates a scanner with a caller-supplied cancellation token.
+    #[must_use]
+    pub fn new_with_cancel(
+        source_id: SourceId,
+        script_kind: ScriptKind,
+        source: &'a SourceText,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             source_id,
             script_kind,
@@ -209,7 +284,14 @@ impl<'a> Scanner<'a> {
             last_start_utf16: 0,
             braces: Vec::new(),
             diagnostics: Vec::new(),
+            cancel,
         }
+    }
+
+    /// Returns whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     /// Returns the syntax this scanner lexes.
@@ -244,6 +326,9 @@ impl<'a> Scanner<'a> {
 
     /// Scans the next token, or an end-of-file token at the end of the source.
     pub fn next_token(&mut self) -> Token {
+        if self.is_cancelled() {
+            return self.make(TokenKind::EndOfFile, self.position().get());
+        }
         let start_b = self.byte_pos;
         let start_u = self.utf16_pos;
         self.last_start_byte = start_b;
@@ -352,6 +437,9 @@ impl<'a> Scanner<'a> {
         self.last_start_byte = self.byte_pos;
         self.last_start_utf16 = start_u;
         while let Some(c) = self.first() {
+            if self.is_cancelled() {
+                break;
+            }
             if c == '<' || c == '{' {
                 break;
             }
@@ -369,6 +457,9 @@ impl<'a> Scanner<'a> {
         if self.first().is_some_and(is_id_start) {
             self.bump();
             while let Some(c) = self.first() {
+                if self.is_cancelled() {
+                    break;
+                }
                 if c == '-' || is_id_continue(c) {
                     self.bump();
                 } else {
@@ -396,6 +487,9 @@ impl<'a> Scanner<'a> {
         };
         self.bump();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.first() {
                 None => {
                     self.error(
@@ -434,6 +528,9 @@ impl<'a> Scanner<'a> {
         // Elements and fragments whose children are still open.
         let mut depth: usize = 0;
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             if depth > 0 {
                 let text = self.scan_jsx_text();
                 if !text.range().is_empty() {
@@ -484,6 +581,9 @@ impl<'a> Scanner<'a> {
         }
         self.scan_jsx_name(out);
         loop {
+            if self.is_cancelled() {
+                break JsxTagKind::Opening;
+            }
             self.push_jsx_trivia(out);
             match self.first() {
                 None => return JsxTagKind::Opening,
@@ -515,6 +615,9 @@ impl<'a> Scanner<'a> {
         }
         out.push(name);
         while matches!(self.first(), Some('.') | Some(':')) {
+            if self.is_cancelled() {
+                break;
+            }
             out.push(self.next_token()); // `.` or `:`
             let part = self.scan_jsx_identifier();
             if part.range().is_empty() {
@@ -559,6 +662,9 @@ impl<'a> Scanner<'a> {
         out.push(self.next_token()); // `{`
         let mut depth: usize = 1;
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let token = self.next_token();
             match token.kind() {
                 TokenKind::EndOfFile => break,
@@ -581,6 +687,9 @@ impl<'a> Scanner<'a> {
     /// Emits whitespace and comment trivia so a JSX tag stays contiguous.
     fn push_jsx_trivia(&mut self, out: &mut Vec<Token>) {
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.first() {
                 Some(c) if is_whitespace(c) => out.push(self.next_token()),
                 Some('/') if matches!(self.second(), Some('/') | Some('*')) => {
@@ -609,6 +718,9 @@ impl<'a> Scanner<'a> {
 
     fn scan_whitespace(&mut self) -> TokenKind {
         while self.first().is_some_and(is_whitespace) {
+            if self.is_cancelled() {
+                break;
+            }
             self.bump();
         }
         TokenKind::Whitespace
@@ -618,6 +730,9 @@ impl<'a> Scanner<'a> {
         self.bump();
         self.bump();
         while let Some(c) = self.first() {
+            if self.is_cancelled() {
+                break;
+            }
             if is_line_terminator(c) {
                 break;
             }
@@ -630,6 +745,9 @@ impl<'a> Scanner<'a> {
         self.bump();
         self.bump();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.first() {
                 None => {
                     self.error(
@@ -656,6 +774,9 @@ impl<'a> Scanner<'a> {
     fn scan_string(&mut self, quote: char, start_u: usize) -> TokenKind {
         self.bump();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.first() {
                 None => {
                     self.error(
@@ -699,6 +820,9 @@ impl<'a> Scanner<'a> {
             TokenKind::NoSubstitutionTemplate
         };
         loop {
+            if self.is_cancelled() {
+                break closed;
+            }
             match self.first() {
                 None => {
                     self.error(
@@ -734,6 +858,9 @@ impl<'a> Scanner<'a> {
         self.bump();
         let mut in_class = false;
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.first() {
                 None => {
                     self.error(
@@ -789,6 +916,9 @@ impl<'a> Scanner<'a> {
             }
         }
         while self.first().is_some_and(is_id_continue) {
+            if self.is_cancelled() {
+                break;
+            }
             self.bump();
         }
         TokenKind::RegularExpressionLiteral
@@ -882,6 +1012,9 @@ impl<'a> Scanner<'a> {
         let mut last_was_digit = false;
         let mut trailing_separator = false;
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.first() {
                 Some(c) if c.is_digit(radix) => {
                     self.bump();
@@ -925,6 +1058,9 @@ impl<'a> Scanner<'a> {
             self.bump();
         }
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.first() {
                 Some('\\') if self.second() == Some('u') => {
                     self.scan_identifier_escape(false);
@@ -990,6 +1126,9 @@ impl<'a> Scanner<'a> {
             self.bump();
             self.bump();
             while let Some(c) = self.first() {
+                if self.is_cancelled() {
+                    break;
+                }
                 if is_line_terminator(c) {
                     break;
                 }
@@ -1011,6 +1150,9 @@ impl<'a> Scanner<'a> {
                 self.bump();
             }
             loop {
+                if self.is_cancelled() {
+                    break;
+                }
                 match self.first() {
                     Some('\\') if self.second() == Some('u') => self.scan_identifier_escape(false),
                     Some(c) if is_id_continue(c) => {
@@ -1075,6 +1217,9 @@ impl<'a> Scanner<'a> {
             let mut any = false;
             let mut overflow = false;
             while let Some(digit) = self.first().and_then(|c| c.to_digit(16)) {
+                if self.is_cancelled() {
+                    break;
+                }
                 self.bump();
                 any = true;
                 value = value.saturating_mul(16).saturating_add(digit);
@@ -1116,6 +1261,9 @@ impl<'a> Scanner<'a> {
             let mut value: u32 = 0;
             let mut count = 0;
             while count < 4 {
+                if self.is_cancelled() {
+                    break;
+                }
                 match self.first().and_then(|c| c.to_digit(16)) {
                     Some(digit) => {
                         self.bump();
@@ -1142,6 +1290,9 @@ impl<'a> Scanner<'a> {
     /// returning whether the full count was available.
     fn consume_fixed_hex(&mut self, count: usize) -> bool {
         for _ in 0..count {
+            if self.is_cancelled() {
+                break;
+            }
             match self.first() {
                 Some(c) if c.is_ascii_hexdigit() => {
                     self.bump();
@@ -1322,6 +1473,9 @@ impl<'a> Scanner<'a> {
 
     fn advance(&mut self, count: usize) {
         for _ in 0..count {
+            if self.is_cancelled() {
+                break;
+            }
             if self.bump().is_none() {
                 break;
             }
@@ -2098,6 +2252,20 @@ mod tests {
         assert!(
             regex_case_seen,
             "expected the regex-literal case to be present"
+        );
+    }
+
+    #[test]
+    fn scan_cancellation_returns_typed_error() {
+        let source =
+            Arc::new(SourceText::new("const x = 1;".to_owned()).expect("test source fits budget"));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result =
+            super::scan_with_cancel(SourceId::new(0), ScriptKind::TypeScript, source, cancel);
+        assert!(
+            matches!(result, Err(ScanError::Cancelled(_))),
+            "cancelled scan must return ScanError::Cancelled"
         );
     }
 }

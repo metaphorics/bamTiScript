@@ -455,22 +455,21 @@ fn join<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let values = elements(machine, this)?;
+    let length = machine.array_length(this)?;
     let separator = if args.is_empty() || args[0] == Value::UNDEFINED {
         EcmaString::encode(",")
     } else {
         machine.to_string(args[0])?
     };
     let mut output = bamts_bytecode::EcmaStringBuilder::new();
-    for (index, value) in values.into_iter().enumerate() {
+    for index in 0..length {
         if index != 0 {
             for &unit in separator.as_units() {
                 output.push_unit(unit);
             }
         }
-        if value != Value::HOLE
-            && !matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null))
-        {
+        let value = machine.get_named_property(this, &index.to_string())?;
+        if !matches!(value.decode(), Some(Decoded::Undefined | Decoded::Null)) {
             for &unit in machine.to_string(value)?.as_units() {
                 output.push_unit(unit);
             }
@@ -1917,5 +1916,56 @@ mod tests {
 
         let (done, _) = iter_next(&mut machine, iter);
         assert!(done);
+    }
+
+    fn join_length_getter<H: Host>(
+        machine: &mut Machine<'_, H>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.set_data_property(this, "length", Value::int32(1))?;
+        Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("mutated"),
+        )?))
+    }
+
+    #[test]
+    fn join_snapshots_length_and_reads_each_index_dynamically() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let array = allocate_array(
+            &mut machine,
+            vec![Value::int32(1), Value::HOLE, Value::int32(3)],
+        )
+        .unwrap();
+
+        let getter_id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "join length getter",
+            length: 0,
+            handler: join_length_getter::<TestHost>,
+        });
+        let getter = crate::intrinsics::native_function(
+            &mut machine.heap,
+            getter_id,
+            "join length getter",
+            0,
+        );
+
+        machine
+            .define_accessor(
+                array,
+                PropertyKey::Named(EcmaString::encode("1")),
+                getter,
+                crate::AccessorKind::Getter,
+            )
+            .unwrap();
+
+        let result = call_proto(&mut machine, "join", array);
+        let text = machine.string_value(result).expect("join returns a string");
+        assert_eq!(text, EcmaString::encode("1,mutated,"));
     }
 }

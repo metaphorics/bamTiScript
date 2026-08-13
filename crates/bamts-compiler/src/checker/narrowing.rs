@@ -312,13 +312,30 @@ impl FlowFacts {
 pub struct NarrowingContext<'a> {
     table: &'a mut TypeTable,
     facts: &'a mut FlowFacts,
+    /// Cooperative cancellation signal. `None` for the non-cancellable path.
+    cancel: Option<bamts_cancel::CancellationToken>,
 }
 
 impl<'a> NarrowingContext<'a> {
     /// Borrows `table` and `facts` for one narrowing step.
     #[must_use]
     pub fn new(table: &'a mut TypeTable, facts: &'a mut FlowFacts) -> Self {
-        Self { table, facts }
+        Self::new_with_cancel(table, facts, None)
+    }
+
+    /// Borrows `table` and `facts` for one narrowing step, polling `cancel`
+    /// during flow traversal loops. Pass `None` for the non-cancellable path.
+    #[must_use]
+    pub fn new_with_cancel(
+        table: &'a mut TypeTable,
+        facts: &'a mut FlowFacts,
+        cancel: Option<bamts_cancel::CancellationToken>,
+    ) -> Self {
+        Self {
+            table,
+            facts,
+            cancel,
+        }
     }
 
     /// Registers the declared type of a trackable symbol: the fallback every
@@ -397,6 +414,11 @@ impl<'a> NarrowingContext<'a> {
         let mut affected = Vec::new();
         let mut current = Some(flow);
         while let Some(id) = current {
+            if let Some(token) = &self.cancel
+                && token.is_cancelled()
+            {
+                return;
+            }
             let frame = &self.facts.frames[id.index()];
             for candidate in frame.facts.keys() {
                 if candidate.root == key.root
@@ -423,17 +445,50 @@ impl<'a> NarrowingContext<'a> {
         }
     }
 
+    /// The refined type of a reference at one program point, looking only at
+    /// the flow-frame facts and never falling back to a declared projection.
+    #[must_use]
+    pub fn refined_type_at(&mut self, flow: FlowNodeId, key: &FlowKey) -> Option<TypeId> {
+        let mut current = Some(flow);
+        while let Some(id) = current {
+            if let Some(token) = &self.cancel
+                && token.is_cancelled()
+            {
+                return None;
+            }
+            let frame = &self.facts.frames[id.index()];
+            if let Some(ty) = frame.facts.get(key) {
+                return Some(*ty);
+            }
+            current = frame.parent;
+        }
+        None
+    }
+
     /// The effective type of a reference at one program point: the nearest
     /// refinement walking up the frame chain, else the declared root type
     /// projected through the key's property path, else `None` for
     /// undeclared roots.
     #[must_use]
     pub fn type_at(&mut self, flow: FlowNodeId, key: &FlowKey) -> Option<TypeId> {
+        if let Some(ty) = self.refined_type_at(flow, key) {
+            return Some(ty);
+        }
         let mut current = Some(flow);
         while let Some(id) = current {
             let frame = &self.facts.frames[id.index()];
-            if let Some(ty) = frame.facts.get(key) {
-                return Some(*ty);
+            let ancestor = frame
+                .facts
+                .iter()
+                .filter(|(candidate, _)| {
+                    candidate.root_symbol() == key.root_symbol()
+                        && candidate.path().len() < key.path().len()
+                        && key.path().starts_with(candidate.path())
+                })
+                .max_by_key(|(candidate, _)| candidate.path().len())
+                .map(|(candidate, ty)| (*ty, candidate.path().len()));
+            if let Some((ty, prefix_len)) = ancestor {
+                return self.project(ty, &key.path()[prefix_len..]);
             }
             current = frame.parent;
         }
@@ -538,11 +593,13 @@ impl<'a> NarrowingContext<'a> {
     /// unchanged.
     #[must_use]
     pub fn narrow_typeof(&mut self, ty: TypeId, name: TypeofName, negated: bool) -> TypeId {
-        self.filter(ty, &|candidate| match candidate {
-            Type::Named(_) | Type::Object | Type::Keyof(_) | Type::IndexedAccess { .. } => {
-                Narrow::Keep
-            }
-            _ if typeof_matches(candidate, name) != negated => Narrow::Keep,
+        self.filter(ty, &|table, candidate| match candidate {
+            Type::Named(_)
+            | Type::Object
+            | Type::Keyof(_)
+            | Type::IndexedAccess { .. }
+            | Type::Record { .. } => Narrow::Keep,
+            _ if typeof_matches(table, candidate, name) != negated => Narrow::Keep,
             _ => Narrow::Drop,
         })
     }
@@ -565,7 +622,7 @@ impl<'a> NarrowingContext<'a> {
     /// both polarities; primitives can only take the negative branch.
     #[must_use]
     pub fn narrow_in(&mut self, ty: TypeId, property: &str, negated: bool) -> TypeId {
-        self.filter(ty, &|candidate| match candidate {
+        self.filter(ty, &|_, candidate| match candidate {
             Type::ObjectType(object) => {
                 let declares = object
                     .properties
@@ -608,7 +665,7 @@ impl<'a> NarrowingContext<'a> {
     #[must_use]
     pub fn narrow_truthiness(&mut self, ty: TypeId, negated: bool) -> TypeId {
         let boolean_replacement = self.table.boolean_literal(!negated);
-        self.filter(ty, &|candidate| {
+        self.filter(ty, &|_, candidate| {
             if matches!(candidate, Type::Boolean) {
                 return Narrow::Replace(boolean_replacement);
             }
@@ -682,7 +739,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
-            | Type::IndexedAccess { .. } => self.table.never(),
+            | Type::IndexedAccess { .. }
+            | Type::Record { .. } => self.table.never(),
         }
     }
 
@@ -732,7 +790,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
-            | Type::IndexedAccess { .. } => None,
+            | Type::IndexedAccess { .. }
+            | Type::Record { .. } => None,
         };
         let parameters: Vec<FunctionParameter> = parameters
             .iter()
@@ -809,7 +868,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
-            | Type::IndexedAccess { .. } => None,
+            | Type::IndexedAccess { .. }
+            | Type::Record { .. } => None,
         }
     }
 
@@ -860,6 +920,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
+            | Type::Record { .. }
             | Type::This { .. } => ty,
         }
     }
@@ -887,6 +948,11 @@ impl<'a> NarrowingContext<'a> {
         let mut facts = HashMap::new();
         let mut current = Some(descendant);
         while let Some(id) = current {
+            if let Some(token) = &self.cancel
+                && token.is_cancelled()
+            {
+                return facts;
+            }
             if id == ancestor {
                 return facts;
             }
@@ -921,13 +987,16 @@ impl<'a> NarrowingContext<'a> {
                         found.push(property);
                     }
                 }
-                match found.len() {
-                    0 => None,
-                    1 => Some(found[0]),
-                    _ => Some(self.table.intersection(found)),
-                }
+                let mut found = found.into_iter();
+                let first = found.next()?;
+                Some(found.fold(first, |combined, property| {
+                    self.intersect(combined, property)
+                }))
             }
-            _ => self.table.property_type(ty, name),
+            _ => match self.table.read_property_type(ty, name) {
+                Some(property) => Some(property),
+                None => self.table.property_type(ty, name),
+            },
         }
     }
     fn project(&mut self, mut ty: TypeId, path: &[Box<str>]) -> Option<TypeId> {
@@ -940,9 +1009,9 @@ impl<'a> NarrowingContext<'a> {
     /// Applies a keep/drop/replace decision member-wise. Opaque types
     /// (`any`, `unknown`, `error`) are returned unrefined, both as whole
     /// types and as union members.
-    fn filter(&mut self, ty: TypeId, decide: &dyn Fn(&Type) -> Narrow) -> TypeId {
+    fn filter(&mut self, ty: TypeId, decide: &dyn Fn(&TypeTable, &Type) -> Narrow) -> TypeId {
         match self.table.get(ty).clone() {
-            Type::This { constraint, .. } => match decide(self.table.get(constraint)) {
+            Type::This { constraint, .. } => match decide(self.table, self.table.get(constraint)) {
                 Narrow::Keep | Narrow::Replace(_) => ty,
                 Narrow::Drop => self.table.never(),
             },
@@ -954,7 +1023,7 @@ impl<'a> NarrowingContext<'a> {
                         kept.push(member);
                         continue;
                     }
-                    match decide(self.table.get(member)) {
+                    match decide(self.table, self.table.get(member)) {
                         Narrow::Keep => kept.push(member),
                         Narrow::Drop => {}
                         Narrow::Replace(replacement) => kept.push(replacement),
@@ -984,7 +1053,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
-            | Type::IndexedAccess { .. } => match decide(self.table.get(ty)) {
+            | Type::IndexedAccess { .. }
+            | Type::Record { .. } => match decide(self.table, self.table.get(ty)) {
                 Narrow::Keep => ty,
                 Narrow::Drop => self.table.never(),
                 Narrow::Replace(replacement) => replacement,
@@ -1064,6 +1134,7 @@ impl<'a> NarrowingContext<'a> {
                 | Type::NumericEnum(_)
                 | Type::Keyof(_)
                 | Type::IndexedAccess { .. }
+                | Type::Record { .. }
                 | Type::This { .. },
                 _,
             ) => self.table.never(),
@@ -1103,6 +1174,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
+            | Type::Record { .. }
             | Type::This { .. } => {}
         }
         match self.table.get(ty).clone() {
@@ -1141,6 +1213,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
+            | Type::Record { .. }
             | Type::This { .. } => ty,
         }
     }
@@ -1362,7 +1435,12 @@ fn typeof_guard(
 }
 
 /// The runtime `typeof` strings of the modeled types.
-fn typeof_matches(ty: &Type, name: TypeofName) -> bool {
+fn typeof_matches(table: &TypeTable, ty: &Type, name: TypeofName) -> bool {
+    if let Type::Intersection(members) = ty {
+        return members
+            .iter()
+            .any(|member| typeof_matches(table, table.get(*member), name));
+    }
     match name {
         TypeofName::String => matches!(ty, Type::String | Type::StringLiteral(_)),
         TypeofName::Number => {

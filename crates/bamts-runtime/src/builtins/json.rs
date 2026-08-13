@@ -89,11 +89,11 @@ fn walk_reviver<H: Host>(
 ) -> Result<Value, EvalFailure> {
     let property_key = PropertyKey::Named(key.clone());
     let value = machine.get_property_key(holder, &property_key)?;
-    if let Some(elements) = machine.array_elements(value)? {
+    if let Some(length) = machine.array_len(value)? {
         if depth >= MAX_JSON_DEPTH {
             return Err(json_depth_error());
         }
-        for index in 0..elements.len() {
+        for index in 0..length {
             let name = EcmaString::encode(&index.to_string());
             let child = walk_reviver(machine, value, name.clone(), reviver, depth + 1)?;
             let key = PropertyKey::Named(name);
@@ -253,8 +253,8 @@ fn serialize_property<H: Host>(
                 return Ok(None);
             }
             stack.push(value);
-            let result = if let Some(elements) = machine.array_elements(value)? {
-                serialize_array(machine, value, elements, options, depth, stack)
+            let result = if let Some(length) = machine.array_len(value)? {
+                serialize_array(machine, value, length, options, depth, stack)
             } else {
                 serialize_object(machine, value, options, depth, stack)
             };
@@ -268,13 +268,13 @@ fn serialize_property<H: Host>(
 fn serialize_array<H: Host>(
     machine: &mut Machine<'_, H>,
     array: Value,
-    elements: Vec<Value>,
+    length: usize,
     options: &SerializeOptions<'_>,
     depth: usize,
     stack: &mut Vec<Value>,
 ) -> Result<EcmaString, EvalFailure> {
-    let mut partial = Vec::with_capacity(elements.len());
-    for index in 0..elements.len() {
+    let mut partial = Vec::with_capacity(length);
+    for index in 0..length {
         partial.push(
             serialize_property(
                 machine,
@@ -969,6 +969,25 @@ mod tests {
                 .unwrap()
                 .eq_ascii("\"\\ud800\"")
         );
+    }
+
+    #[test]
+    fn stringify_preserves_sparse_array_order() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let stringify = machine.get_named_property(json, "stringify").unwrap();
+        let value = allocate_array(
+            &mut machine,
+            vec![Value::int32(1), Value::HOLE, Value::int32(3)],
+        )
+        .expect("array allocation succeeds");
+        let result = machine
+            .call_value(stringify, json, &[value])
+            .expect("stringify sparse array succeeds");
+        let text = machine.string_value(result).expect("result is a string");
+        assert!(text.eq_ascii("[1,null,3]"));
     }
 
     #[test]

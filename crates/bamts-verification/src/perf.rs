@@ -923,8 +923,10 @@ pub fn load_result(path: &Path) -> Result<MeasureResult> {
 ///
 /// # Errors
 /// - [`PerfErrorCode::InvalidHost`] if the machine no longer matches.
-/// - [`PerfErrorCode::NoBaseline`] if the slice is selected but the result has no baseline.
+/// - [`PerfErrorCode::NoBaseline`] if the baseline is missing or degenerate.
 /// - [`PerfErrorCode::BudgetBreach`] if any threshold is exceeded.
+/// - [`PerfErrorCode::HarnessError`] if the result is missing the required `total` phase
+///   or contains non-finite values.
 pub fn compare(
     result: &MeasureResult,
     policy: &BudgetPolicy,
@@ -937,8 +939,10 @@ pub fn compare(
 /// Evaluates only the budget thresholds (host identity assumed checked).
 ///
 /// # Errors
-/// - [`PerfErrorCode::NoBaseline`] if the slice is selected but the result has no baseline.
+/// - [`PerfErrorCode::NoBaseline`] if the baseline is missing or degenerate.
 /// - [`PerfErrorCode::BudgetBreach`] naming the first exceeded threshold.
+/// - [`PerfErrorCode::HarnessError`] if the result is missing the required `total` phase
+///   or contains non-finite values.
 pub fn evaluate_budgets(result: &MeasureResult, policy: &BudgetPolicy) -> Result<()> {
     if result.selected && result.baseline.is_none() {
         return Err(PerfError::new(
@@ -955,11 +959,15 @@ pub fn evaluate_budgets(result: &MeasureResult, policy: &BudgetPolicy) -> Result
         return Ok(());
     };
 
-    let candidate_wall = result
-        .phases
-        .get("total")
-        .copied()
-        .unwrap_or_else(Quantiles::zero);
+    // A measured result used for the budget gate must carry the `total` phase.
+    // Do not fall back to zero: a missing `total` would silently pass every
+    // wall-time budget.
+    let candidate_wall = result.phases.get("total").copied().ok_or_else(|| {
+        PerfError::harness(format!(
+            "measured result for slice `{}` (benchmark `{}`) is missing required `total` phase",
+            result.slice, result.benchmark_id
+        ))
+    })?;
 
     check_ratio(
         "wall.p50",
@@ -996,6 +1004,16 @@ pub fn evaluate_budgets(result: &MeasureResult, policy: &BudgetPolicy) -> Result
     )?;
 
     if let Some(release) = &baseline.release {
+        if !release.wall_p95_ratio.is_finite()
+            || !release.geomean_ratio.is_finite()
+            || release.wall_p95_ratio <= 0.0
+            || release.geomean_ratio <= 0.0
+        {
+            return Err(PerfError::new(
+                PerfErrorCode::NoBaseline,
+                "baseline release ratios are degenerate; cannot compare".to_owned(),
+            ));
+        }
         if release.wall_p95_ratio > policy.release.p95_ratio {
             return Err(budget_breach(
                 "release.p95",
@@ -1016,8 +1034,16 @@ pub fn evaluate_budgets(result: &MeasureResult, policy: &BudgetPolicy) -> Result
 }
 
 fn check_ratio(name: &str, candidate: f64, base: f64, ceiling: f64) -> Result<()> {
-    if base <= 0.0 {
-        return Ok(());
+    if !base.is_finite() || base <= 0.0 {
+        return Err(PerfError::new(
+            PerfErrorCode::NoBaseline,
+            format!("{name}: baseline value is degenerate ({base}); cannot compare"),
+        ));
+    }
+    if !candidate.is_finite() || candidate < 0.0 {
+        return Err(PerfError::harness(format!(
+            "{name}: candidate value is non-finite ({candidate}); cannot compare"
+        )));
     }
     let ratio = candidate / base;
     if ratio > ceiling {
@@ -1028,8 +1054,24 @@ fn check_ratio(name: &str, candidate: f64, base: f64, ceiling: f64) -> Result<()
 }
 
 fn check_abs_rel(name: &str, candidate: f64, base: f64, abs_floor: f64, rel: f64) -> Result<()> {
+    if !base.is_finite() || base < 0.0 {
+        return Err(PerfError::new(
+            PerfErrorCode::NoBaseline,
+            format!("{name}: baseline value is degenerate ({base}); cannot compare"),
+        ));
+    }
+    if !candidate.is_finite() || candidate < 0.0 {
+        return Err(PerfError::harness(format!(
+            "{name}: candidate value is non-finite ({candidate}); cannot compare"
+        )));
+    }
     let allowance = abs_floor.max(rel * base);
     let limit = base + allowance;
+    if !limit.is_finite() {
+        return Err(PerfError::harness(format!(
+            "{name}: computed budget limit is non-finite ({limit})"
+        )));
+    }
     if candidate > limit {
         Err(PerfError::new(
             PerfErrorCode::BudgetBreach,
@@ -1518,6 +1560,199 @@ mod tests {
         assert!(
             read.detail.contains("Linux"),
             "read error must name the platform"
+        );
+    }
+
+    #[test]
+    fn evaluate_budgets_rejects_missing_total_phase() {
+        let base = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let candidate = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let mut result = result_with_baseline(base, candidate);
+        result.selected = true;
+        result.phases.remove("total");
+        let error = evaluate_budgets(&result, &budget_policy()).unwrap_err();
+        assert_eq!(error.code, PerfErrorCode::HarnessError);
+        assert!(
+            error.detail.contains("total"),
+            "error must name the missing phase"
+        );
+        assert!(
+            error.detail.contains(&result.slice),
+            "error must name the slice"
+        );
+    }
+
+    #[test]
+    fn evaluate_budgets_rejects_zero_baseline_wall() {
+        let mut result = result_with_baseline(
+            Quantiles::zero(),
+            Quantiles {
+                p50: 100.0,
+                p95: 100.0,
+                p99: 100.0,
+            },
+        );
+        result.selected = true;
+        let error = evaluate_budgets(&result, &budget_policy()).unwrap_err();
+        assert_eq!(error.code, PerfErrorCode::NoBaseline);
+        assert!(
+            error.detail.contains("wall.p50"),
+            "error must name the field"
+        );
+        assert!(
+            error.detail.contains("degenerate"),
+            "error must identify the baseline as degenerate"
+        );
+    }
+
+    #[test]
+    fn evaluate_budgets_rejects_nan_baseline_wall() {
+        let mut base = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        base.p95 = f64::NAN;
+        let candidate = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let mut result = result_with_baseline(base, candidate);
+        result.selected = true;
+        let error = evaluate_budgets(&result, &budget_policy()).unwrap_err();
+        assert_eq!(error.code, PerfErrorCode::NoBaseline);
+        assert!(
+            error.detail.contains("wall.p95"),
+            "error must name the field"
+        );
+        assert!(error.detail.contains("NaN") || error.detail.contains("degenerate"));
+    }
+
+    #[test]
+    fn evaluate_budgets_rejects_infinite_baseline_wall() {
+        let mut result = result_with_baseline(
+            Quantiles {
+                p50: f64::INFINITY,
+                p95: 100.0,
+                p99: 100.0,
+            },
+            Quantiles {
+                p50: 100.0,
+                p95: 100.0,
+                p99: 100.0,
+            },
+        );
+        result.selected = true;
+        let error = evaluate_budgets(&result, &budget_policy()).unwrap_err();
+        assert_eq!(error.code, PerfErrorCode::NoBaseline);
+        assert!(
+            error.detail.contains("wall.p50"),
+            "error must name the field"
+        );
+        assert!(error.detail.contains("degenerate"));
+    }
+
+    #[test]
+    fn evaluate_budgets_rejects_nan_candidate_wall() {
+        let base = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let mut candidate = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        candidate.p99 = f64::NAN;
+        let mut result = result_with_baseline(base, candidate);
+        result.selected = true;
+        let error = evaluate_budgets(&result, &budget_policy()).unwrap_err();
+        assert_eq!(error.code, PerfErrorCode::HarnessError);
+        assert!(
+            error.detail.contains("wall.p99"),
+            "error must name the field"
+        );
+        assert!(error.detail.contains("non-finite"));
+    }
+
+    #[test]
+    fn evaluate_budgets_rejects_infinite_candidate_rss() {
+        let base = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let candidate = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let mut result = result_with_baseline(base, candidate);
+        result.selected = true;
+        result.rss_bytes.p95 = f64::INFINITY;
+        let error = evaluate_budgets(&result, &budget_policy()).unwrap_err();
+        assert_eq!(error.code, PerfErrorCode::HarnessError);
+        assert!(
+            error.detail.contains("rss.p95"),
+            "error must name the field"
+        );
+        assert!(error.detail.contains("non-finite"));
+    }
+
+    #[test]
+    fn evaluate_budgets_rejects_nan_release_ratio() {
+        let base = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let candidate = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let mut result = result_with_baseline(base, candidate);
+        result.selected = true;
+        result.baseline.as_mut().unwrap().release = Some(ReleaseBaseline {
+            comparator: "typescript@7.0.2".to_owned(),
+            wall_p95_ratio: f64::NAN,
+            geomean_ratio: 0.95,
+        });
+        let error = evaluate_budgets(&result, &budget_policy()).unwrap_err();
+        assert_eq!(error.code, PerfErrorCode::NoBaseline);
+        assert!(
+            error.detail.contains("release"),
+            "error must mention release ratios"
+        );
+    }
+
+    #[test]
+    fn evaluate_budgets_passes_valid_selected_baseline() {
+        let base = Quantiles {
+            p50: 100.0,
+            p95: 100.0,
+            p99: 100.0,
+        };
+        let candidate = Quantiles {
+            p50: 103.0,
+            p95: 108.0,
+            p99: 110.0,
+        };
+        let mut result = result_with_baseline(base, candidate);
+        result.selected = true;
+        assert!(
+            evaluate_budgets(&result, &budget_policy()).is_ok(),
+            "valid selected baseline must pass the budget gate"
         );
     }
 }

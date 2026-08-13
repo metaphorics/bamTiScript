@@ -1255,6 +1255,11 @@ fn render_type_grouped(model: &SemanticModel, type_id: TypeId, group: bool) -> S
             render_type_grouped(model, *object, true),
             render_type_grouped(model, *index, false)
         ),
+        Type::Record { key, value } => format!(
+            "Record<{}, {}>",
+            render_type_grouped(model, *key, false),
+            render_type_grouped(model, *value, false)
+        ),
         Type::This { .. } => "this".to_owned(),
         Type::Named(symbol) | Type::NumericEnum(symbol) => model.symbol(*symbol).name().to_owned(),
     }

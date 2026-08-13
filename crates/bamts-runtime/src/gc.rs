@@ -623,7 +623,8 @@ fn trace_runtime_error(
         | RuntimeErrorKind::InvalidVerifiedProgram { .. }
         | RuntimeErrorKind::InvalidRuntimeHeapReference { .. }
         | RuntimeErrorKind::ModuleEvaluationStalled { .. }
-        | RuntimeErrorKind::RegexpStepBudgetExceeded { .. } => {}
+        | RuntimeErrorKind::RegexpStepBudgetExceeded { .. }
+        | RuntimeErrorKind::Cancelled => {}
     }
 }
 

@@ -1,6 +1,6 @@
 # Architecture and component guide
 
-This document maps bamTiScript 0.1.0 components, data flow, string representation, safety policy, and host boundaries.
+This document maps bamTiScript 0.2.0 components, data flow, string representation, safety policy, and host boundaries.
 
 ## Component ownership
 
@@ -21,6 +21,8 @@ For technical contributors seeking to locate specific functionality, the followi
 | **JIT & AOT Codegen** | `bamts-codegen` | [`../../crates/bamts-codegen`](../../crates/bamts-codegen) | [`src/jit.rs`](../../crates/bamts-codegen/src/jit.rs), [`src/aot.rs`](../../crates/bamts-codegen/src/aot.rs), [`src/jit_memory.rs`](../../crates/bamts-codegen/src/jit_memory.rs) |
 | **Native ABI & Value Layout** | `bamts-native` | [`../../crates/bamts-native`](../../crates/bamts-native) | [`src/lib.rs`](../../crates/bamts-native/src/lib.rs), [`src/native_bridge.rs`](../../crates/bamts-native/src/native_bridge.rs) |
 | **Node Host & Capabilities** | `bamts-node` | [`../../crates/bamts-node`](../../crates/bamts-node) | [`src/lib.rs`](../../crates/bamts-node/src/lib.rs), [`src/timers.rs`](../../crates/bamts-node/src/timers.rs) |
+| **Cancellation Ownership** | `bamts-cancel` | [`../../crates/bamts-cancel`](../../crates/bamts-cancel) | [`src/lib.rs`](../../crates/bamts-cancel/src/lib.rs) |
+| **Node-API Native Addon** | `bamts-napi` (private) | [`../../crates/bamts-napi`](../../crates/bamts-napi) | [`src/lib.rs`](../../crates/bamts-napi/src/lib.rs) |
 | **Validation & Test Harness** | `bamts-verification` | [`../../crates/bamts-verification`](../../crates/bamts-verification) | [`src/lib.rs`](../../crates/bamts-verification/src/lib.rs), [`src/corpus.rs`](../../crates/bamts-verification/src/corpus.rs), [`src/formal_gates.rs`](../../crates/bamts-verification/src/formal_gates.rs) |
 
 ---
@@ -65,10 +67,20 @@ flowchart TD
   - AOT: [`src/aot.rs`](../../crates/bamts-codegen/src/aot.rs) compiles verified bytecode into the native object consumed by the CLI's host linker.
   - ABI and values: [`crates/bamts-native`](../../crates/bamts-native) owns the ABI structures and value representation shared by runtime calls and generated code.
 
-### 5. Host capabilities
+### 5. Host capabilities and Node.js interface
 - Implements the [`bamts_runtime::Host`](../../crates/bamts-runtime/src/lib.rs) trait for the Node-style capabilities that the runtime currently exposes, including process output, arguments, environment access, timers, and selected hashing operations.
 - Contains the process entry point used by AOT executables in [`src/lib.rs`](../../crates/bamts-node/src/lib.rs).
 - The host surface is a subset. It is not full Node.js or Node-API compatibility.
+- Exposes two distinct npm distribution surfaces:
+  - `bamti-cli`: The standalone CLI transport package that resolves and executes the `bamts` binary executable on disk.
+  - `bamti`: The in-process Node.js interface for Node.js 24 or later, embedding the compiler directly via native Node-API bindings (`bamts-napi`).
+- Target design and fail-closed loading:
+  - `bamti` specifies five optional native platform packages (`@bamti/bamti-linux-x64-gnu`, `@bamti/bamti-linux-arm64-gnu`, `@bamti/bamti-darwin-x64`, `@bamti/bamti-darwin-arm64`, `@bamti/bamti-win32-x64-msvc`).
+  - `native-loader.js` resolves the optional platform package matching the host OS and architecture, validating package manifests, binary SHA-256 digests, and release metadata.
+  - If the matching native package is missing or fails verification, artifact loading fails closed with an explicit error (`NativeArtifactNotFoundError` or `NativeArtifactLoadError`). It never falls back to downloading binaries or spawning the CLI.
+- Cancellation and environment teardown ownership:
+  - `bamts-cancel` owns atomic cancellation handles and execution interrupt triggers.
+  - `bamts-napi` (private crate) owns N-API native bindings, isolate memory management, and environment teardown.
 
 ### 6. Validation
 - Owns conformance classification, real-package differential execution, formal gates, and workspace guards. [Verification evidence and its limits](verification.md) are documented separately.
@@ -96,12 +108,15 @@ unsafe_code = "forbid"
 
 ### Policy boundaries
 1. Most workspace crates inherit the `forbid` default.
-2. `bamts-codegen`, `bamts-node`, and `bamts-verification` use `deny` with narrowly scoped exceptions. `bamts-native` contains documented unsafe FFI and native-bridge code.
+2. `bamts-codegen`, `bamts-node`, `bamts-verification`, and private `bamts-napi` use `deny` with narrowly scoped exceptions. `bamts-native` contains documented unsafe FFI and native-bridge code.
 3. These source policies and boundaries do not cover dependencies, system libraries, generated machine code, hardware, or the operating system. They are not an end-to-end memory-safety proof.
 
 ---
 
 ## Implementation status
 
-- Version `0.1.0` is pre-release.
-- Native Node-API bindings and a broader host embedding surface are not implemented.
+- Version `0.2.0` is pre-release.
+- `bamti` provides an in-process Node 24+ interface backed by Node-API bindings (`bamts-napi`) and an atomic cancellation handle (`bamts-cancel`), while `bamti-cli` acts as the standalone CLI transport.
+- Loading optional platform packages is fail-closed.
+- Currently published 0.1.0 npm packages do not contain prebuilt native binary artifacts. The native Node-API implementation is present in the source repository but is not yet published to npm.
+- Real five-target release validation remains blocked by GitHub billing and is unverified.

@@ -12,13 +12,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use bamts_cancel::{CancellationToken, Cancelled};
+
 use crate::checker::{
     self, ProgramCheckInput, ProgramCheckOptions, ResolvedModuleEdge, SemanticModel,
 };
 use crate::diagnostic::{Diagnostic, Recovered};
 use crate::emitter::{self, EmitOptions, EmitOutput};
 use crate::lint::{LintProfile, LintTable};
-use crate::parser;
+use crate::parser::{self, ParseError};
 use crate::program::{ModuleTarget, ResolvedProgram};
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
@@ -313,7 +315,14 @@ pub fn compile_program_frontend(
     program: &ResolvedProgram,
     mode: FrontendMode,
 ) -> ProgramFrontendOutput {
-    compile_program_frontend_with_lints(program, mode, &LintTable::new(LintProfile::Default))
+    let cancel = CancellationToken::new();
+    compile_program_frontend_with_cancel(
+        program,
+        mode,
+        &LintTable::new(LintProfile::Default),
+        &cancel,
+    )
+    .expect("a fresh cancellation token cannot be cancelled")
 }
 
 /// Runs the frontend for every module with caller-resolved lint levels.
@@ -323,21 +332,36 @@ pub fn compile_program_frontend_with_lints(
     mode: FrontendMode,
     levels: &LintTable,
 ) -> ProgramFrontendOutput {
+    let cancel = CancellationToken::new();
+    compile_program_frontend_with_cancel(program, mode, levels, &cancel)
+        .expect("a fresh cancellation token cannot be cancelled")
+}
+
+/// Runs the cancellable frontend pipeline for every module.
+pub fn compile_program_frontend_with_cancel(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+    levels: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<ProgramFrontendOutput, Cancelled> {
     Telemetry::measure(Phase::Total, || {
         let parsed = program
             .modules()
             .iter()
             .map(|module| {
+                cancel.check()?;
                 let source_id = module.source_id();
                 let script_kind = module.script_kind();
                 let source = Arc::clone(module.source());
                 let scanned = Telemetry::measure(Phase::Scan, || {
-                    scanner::scan(source_id, script_kind, source)
-                });
-                Telemetry::measure(Phase::Parse, || parser::parse(scanned))
+                    scanner::scan_with_cancel(source_id, script_kind, source, cancel.clone())
+                })?;
+                Telemetry::measure(Phase::Parse, || {
+                    parser::parse_with_cancel(scanned, cancel.clone())
+                })
             })
-            .collect::<Vec<_>>();
-        let edges = resolved_checker_edges(program, &parsed);
+            .collect::<Result<Vec<_>, ParseError>>()?;
+        let edges = resolved_checker_edges_with_cancel(program, &parsed, cancel)?;
         let checked = Telemetry::measure(Phase::Check, || {
             let options = if program.is_commonjs() {
                 ProgramCheckOptions::commonjs()
@@ -353,15 +377,16 @@ pub fn compile_program_frontend_with_lints(
             } else {
                 None
             });
-            checker::check_program_with_options(
+            checker::check_program_with_options_and_cancel(
                 ProgramCheckInput {
                     files: &parsed,
                     edges: &edges,
                 },
                 levels,
                 options,
+                cancel.clone(),
             )
-        });
+        })?;
         let (mut program_model, program_diagnostics) = checked.into_parts();
         // Partition program diagnostics once into source-keyed buckets that
         // preserve the canonical order from `Recovered`. The buckets are only
@@ -371,6 +396,7 @@ pub fn compile_program_frontend_with_lints(
         // the previous per-module filter behavior.
         let mut buckets: BTreeMap<SourceId, Vec<Diagnostic>> = BTreeMap::new();
         for diagnostic in program_diagnostics {
+            cancel.check()?;
             buckets
                 .entry(diagnostic.source_id())
                 .or_default()
@@ -379,6 +405,7 @@ pub fn compile_program_frontend_with_lints(
         let modules = parsed
             .into_iter()
             .map(|parsed| {
+                cancel.check()?;
                 let source_id = parsed.product().source_id();
                 let semantic_model = program_model
                     .remove_file(source_id)
@@ -388,6 +415,7 @@ pub fn compile_program_frontend_with_lints(
                         emitter::emit_checked(parsed.product(), &semantic_model, options)
                     })
                 });
+                cancel.check()?;
                 let (source_file, mut diagnostics) = parsed.into_parts();
                 if let Some(bucket) = buckets.remove(&source_id) {
                     diagnostics.extend(bucket);
@@ -395,63 +423,78 @@ pub fn compile_program_frontend_with_lints(
                 if let Some(output) = &emit {
                     diagnostics.extend(output.diagnostics.iter().cloned());
                 }
-                FrontendOutput {
+                Ok(FrontendOutput {
                     mode,
                     source_file,
                     semantic_model,
                     emit,
                     diagnostics: canonicalize(diagnostics),
-                }
+                })
             })
-            .collect();
-        ProgramFrontendOutput {
+            .collect::<Result<Vec<_>, Cancelled>>()?;
+        Ok(ProgramFrontendOutput {
             entrypoint: program.entrypoint_id(),
             modules,
-        }
+        })
     })
 }
 
+fn resolved_checker_edges_with_cancel(
+    program: &ResolvedProgram,
+    files: &[Recovered<SourceFile>],
+    cancel: &CancellationToken,
+) -> Result<Vec<ResolvedModuleEdge>, Cancelled> {
+    let files_by_source_id: HashMap<SourceId, &SourceFile> = files
+        .iter()
+        .map(|file| {
+            cancel.check()?;
+            Ok((file.product().source_id(), file.product()))
+        })
+        .collect::<Result<_, Cancelled>>()?;
+    let mut resolved = Vec::new();
+    for module in program.modules() {
+        cancel.check()?;
+        let source = *files_by_source_id
+            .get(&module.source_id())
+            .expect("resolved module has one parsed source");
+        let nodes = SourceEdgeNodeIndex::new(source);
+        for edge in module.dependencies() {
+            cancel.check()?;
+            let to = if let Some(ModuleTarget::Local(to)) = edge.type_target() {
+                *to
+            } else {
+                let ModuleTarget::Local(to) = edge.target() else {
+                    continue;
+                };
+                *to
+            };
+            resolved.push(ResolvedModuleEdge {
+                from: module.source_id(),
+                specifier: nodes
+                    .node_for(edge.range())
+                    .expect("every resolved edge specifier range belongs to its parsed source"),
+                to,
+            });
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
 fn resolved_checker_edges(
     program: &ResolvedProgram,
     files: &[Recovered<SourceFile>],
 ) -> Vec<ResolvedModuleEdge> {
-    let files_by_source_id: HashMap<SourceId, &SourceFile> = files
-        .iter()
-        .map(|file| (file.product().source_id(), file.product()))
-        .collect();
-    program
-        .modules()
-        .iter()
-        .flat_map(|module| {
-            let source = *files_by_source_id
-                .get(&module.source_id())
-                .expect("resolved module has one parsed source");
-            let nodes = SourceEdgeNodeIndex::new(source);
-            module.dependencies().iter().filter_map(move |edge| {
-                let to = if let Some(ModuleTarget::Local(to)) = edge.type_target() {
-                    *to
-                } else {
-                    let ModuleTarget::Local(to) = edge.target() else {
-                        return None;
-                    };
-                    *to
-                };
-                Some(ResolvedModuleEdge {
-                    from: module.source_id(),
-                    specifier: nodes
-                        .node_for(edge.range())
-                        .expect("every resolved edge specifier range belongs to its parsed source"),
-                    to,
-                })
-            })
-        })
-        .collect()
+    resolved_checker_edges_with_cancel(program, files, &CancellationToken::new())
+        .expect("a fresh cancellation token cannot be cancelled")
 }
 
 /// Runs the fixed frontend pipeline with settled default lint levels.
 #[must_use]
 pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
-    compile_frontend_with_lints(request, &LintTable::new(LintProfile::Default))
+    let cancel = CancellationToken::new();
+    compile_frontend_with_cancel(request, &LintTable::new(LintProfile::Default), &cancel)
+        .expect("a fresh cancellation token cannot be cancelled")
 }
 
 /// Runs the fixed scan -> parse -> check -> optional emit frontend pipeline
@@ -464,6 +507,17 @@ pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
 /// ordered, and de-duplicated into one vector.
 #[must_use]
 pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable) -> FrontendOutput {
+    let cancel = CancellationToken::new();
+    compile_frontend_with_cancel(request, levels, &cancel)
+        .expect("a fresh cancellation token cannot be cancelled")
+}
+
+/// Runs the cancellable scan -> parse -> check -> optional emit frontend pipeline.
+pub fn compile_frontend_with_cancel(
+    request: FrontendRequest,
+    levels: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<FrontendOutput, Cancelled> {
     Telemetry::measure(Phase::Total, || {
         let FrontendRequest {
             source_id,
@@ -473,19 +527,24 @@ pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable)
         } = request;
 
         let scanned = Telemetry::measure(Phase::Scan, || {
-            scanner::scan(source_id, script_kind, source)
-        });
-        let parsed = Telemetry::measure(Phase::Parse, || parser::parse(scanned));
-        let checked =
-            Telemetry::measure(Phase::Check, || checker::check_with_lints(&parsed, levels));
+            scanner::scan_with_cancel(source_id, script_kind, source, cancel.clone())
+        })?;
+        let parsed = Telemetry::measure(Phase::Parse, || {
+            parser::parse_with_cancel(scanned, cancel.clone())
+        })?;
+        let checked = Telemetry::measure(Phase::Check, || {
+            checker::check_source_with_lints_with_cancel(parsed.product(), levels, cancel.clone())
+        })?;
 
         // Emit consumes the recovered tree and this pass's semantic model; it never
         // gates on prior diagnostics.
+        cancel.check()?;
         let emit = mode.emit_options().map(|options| {
             Telemetry::measure(Phase::Emit, || {
                 emitter::emit_checked(parsed.product(), checked.product(), options)
             })
         });
+        cancel.check()?;
 
         let (source_file, parse_diagnostics) = parsed.into_parts();
         let (semantic_model, check_diagnostics) = checked.into_parts();
@@ -497,13 +556,13 @@ pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable)
         }
         let diagnostics = canonicalize(diagnostics);
 
-        FrontendOutput {
+        Ok(FrontendOutput {
             mode,
             source_file,
             semantic_model,
             emit,
             diagnostics,
-        }
+        })
     })
 }
 

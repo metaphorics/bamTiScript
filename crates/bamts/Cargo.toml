@@ -20,6 +20,7 @@ bamts-codegen = { workspace = true, optional = true }
 bamts-compiler.workspace = true
 bamts-node = { workspace = true, optional = true }
 bamts-runtime.workspace = true
+bamts-cancel.workspace = true
 
 [lints]
 workspace = true

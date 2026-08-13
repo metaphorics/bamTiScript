@@ -32,12 +32,16 @@ pub mod narrowing;
 pub mod relations;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 
 use bamts_bytecode::EcmaString;
+use bamts_cancel::{CancellationToken, Cancelled};
 
 pub(crate) use binder::{
-    ImportedSymbolType, bind_source, bind_source_with_environment,
-    bind_source_with_environment_and_imports, is_numeric_enum_initializer, source_is_module,
+    ImportedSymbolType, bind_source_with_cancel, bind_source_with_environment_and_cancel,
+    bind_source_with_environment_and_imports_with_cancel, is_numeric_enum_initializer,
+    source_is_module,
 };
 pub use binder::{
     PropertyType, Scope, ScopeId, ScopeKind, SemanticModel, Symbol, SymbolId, SymbolKind, Type,
@@ -55,7 +59,7 @@ pub use relations::{RelationHazard, TypeRelation};
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
 use crate::enum_plan::{self, EnumDeclarationBinding};
 use crate::lint::{LintProfile, LintTable};
-use crate::source::{ScriptKind, SourceId, TextRange};
+use crate::source::{ScriptKind, SourceId, TextRange, Utf16Pos};
 use crate::syntax::{
     IdentifierNode, ImportBinding, ModuleExportName, NodeId, SourceFile, Statement, TokenKind,
 };
@@ -284,6 +288,66 @@ const INVALID_INDEXED_ACCESS_KEY_MESSAGE: &str =
 const FOR_OF_ITERABLE_REQUIRED_MESSAGE: &str =
     "Type is not iterable; a 'for...of' statement requires an iterable value.";
 
+/// Diagnostic emitted when a cooperative cancellation request interrupts a
+/// checker pass. This is the diagnostic boundary for [`CheckCancelled`] errors
+/// that propagate out of `_with_cancel` entry points and must be mapped into a
+/// diagnostic stream at frontend/program/lower boundaries.
+pub const CANCELLATION_REQUESTED: DiagnosticCode = DiagnosticCode::new("BAMTS-C069");
+const CANCELLATION_REQUESTED_MESSAGE: &str = "Compilation was cancelled before completing.";
+/// Diagnostic emitted when `@ts-expect-error` suppresses no diagnostic.
+pub const UNUSED_EXPECT_ERROR: DiagnosticCode = DiagnosticCode::new("BAMTS-C070");
+const UNUSED_EXPECT_ERROR_MESSAGE: &str = "Unused '@ts-expect-error' directive.";
+
+/// One cooperative checker invocation was cancelled before completing.
+///
+/// The `_with_cancel` entry points return `Result<Recovered<T>, CheckCancelled>`
+/// so callers can distinguish cancellation from a completed (possibly
+/// diagnostic-laden) product. At boundaries that only carry diagnostics
+/// (frontend, program, lower), convert with [`CheckCancelled::to_diagnostic`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckCancelled(Cancelled);
+
+impl CheckCancelled {
+    /// Creates the cancellation error from the raw signal.
+    #[must_use]
+    pub const fn new(cancelled: Cancelled) -> Self {
+        Self(cancelled)
+    }
+
+    /// Returns a cancellation diagnostic anchored at `source_id` with a
+    /// zero-width range, for mapping into a diagnostic stream at boundaries
+    /// that do not carry `Result`.
+    #[must_use]
+    pub fn to_diagnostic(&self, source_id: SourceId) -> Diagnostic {
+        Diagnostic::error(
+            CANCELLATION_REQUESTED,
+            source_id,
+            TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is valid"),
+            CANCELLATION_REQUESTED_MESSAGE,
+        )
+    }
+}
+
+impl From<Cancelled> for CheckCancelled {
+    fn from(cancelled: Cancelled) -> Self {
+        Self(cancelled)
+    }
+}
+
+impl From<CheckCancelled> for Cancelled {
+    fn from(error: CheckCancelled) -> Self {
+        error.0
+    }
+}
+
+impl fmt::Display for CheckCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("checker operation cancelled")
+    }
+}
+
+impl Error for CheckCancelled {}
+
 /// Compact identity for one allocated object literal and its aliases.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObjectId(u32);
@@ -394,7 +458,20 @@ pub fn check_source_with_lints(
     source_file: &SourceFile,
     levels: &LintTable,
 ) -> Recovered<SemanticModel> {
-    let (mut model, mut diagnostics) = bind_source(source_file);
+    check_source_with_lints_with_cancel(source_file, levels, CancellationToken::new())
+        .expect("fresh token is never cancelled")
+}
+
+/// Analyzes one source using an already-resolved lint table, borrowing an
+/// existing product. Fails early with [`CheckCancelled`] when `cancel` is
+/// triggered during binding, fact collection, or semantic analysis.
+pub fn check_source_with_lints_with_cancel(
+    source_file: &SourceFile,
+    levels: &LintTable,
+    cancel: CancellationToken,
+) -> Result<Recovered<SemanticModel>, CheckCancelled> {
+    cancel.check()?;
+    let (mut model, mut diagnostics) = bind_source_with_cancel(source_file, cancel.clone())?;
     model.replace_facts(crate::rules::semantic::collect_facts(source_file, &model));
     diagnostics.extend(analyze_warnings(source_file, levels));
     diagnostics.extend(crate::rules::analyze_semantic(
@@ -403,7 +480,7 @@ pub fn check_source_with_lints(
         None,
         levels,
     ));
-    Recovered::new(model, diagnostics)
+    Ok(Recovered::new(model, diagnostics))
 }
 
 /// One resolved module edge supplied by the project loader.
@@ -605,6 +682,21 @@ pub fn check_program_with_options(
     levels: &LintTable,
     options: ProgramCheckOptions,
 ) -> Recovered<ProgramSemanticModel> {
+    check_program_with_options_and_cancel(input, levels, options, CancellationToken::new())
+        .expect("fresh token is never cancelled")
+}
+
+/// Checks a set of loaded files using the environment selected by module
+/// options. Fails early with [`CheckCancelled`] when `cancel` is triggered
+/// during any per-file binding pass, the fixed-point import-type iteration,
+/// fact collection, or the final semantic analysis loop.
+pub fn check_program_with_options_and_cancel(
+    input: ProgramCheckInput<'_>,
+    levels: &LintTable,
+    options: ProgramCheckOptions,
+    cancel: CancellationToken,
+) -> Result<Recovered<ProgramSemanticModel>, CheckCancelled> {
+    cancel.check()?;
     let source_ids: Vec<SourceId> = input
         .files
         .iter()
@@ -626,13 +718,15 @@ pub fn check_program_with_options(
 
     let mut files = BTreeMap::new();
     for recovered in input.files {
+        cancel.check()?;
         let source = recovered.product();
-        let (model, _) = bind_source_with_environment(
+        let (model, _) = bind_source_with_environment_and_cancel(
             source,
             options.environment(),
             source_is_module(source),
             options,
-        );
+            cancel.clone(),
+        )?;
         files.insert(source.source_id(), model);
     }
 
@@ -642,6 +736,7 @@ pub fn check_program_with_options(
 
     let worklist: Vec<SourceId> = source_ids.clone();
     for _ in 0..source_ids.len() {
+        cancel.check()?;
         let mut changed = false;
         for &source_id in &worklist {
             let Some(source) = input
@@ -663,13 +758,14 @@ pub fn check_program_with_options(
             if imported.is_empty() {
                 continue;
             }
-            let (model, _) = bind_source_with_environment_and_imports(
+            let (model, _) = bind_source_with_environment_and_imports_with_cancel(
                 source,
                 options.environment(),
                 source_is_module(source),
                 options,
                 &imported,
-            );
+                cancel.clone(),
+            )?;
             files.insert(source_id, model);
             changed = true;
         }
@@ -681,6 +777,7 @@ pub fn check_program_with_options(
     let mut diagnostics = Vec::new();
     let mut final_files = BTreeMap::new();
     for recovered in input.files {
+        cancel.check()?;
         let source = recovered.product();
         let source_id = source.source_id();
         let imported = collect_imported_types_for_source(
@@ -692,20 +789,22 @@ pub fn check_program_with_options(
             &files,
         );
         let (mut model, core_diagnostics) = if imported.is_empty() {
-            bind_source_with_environment(
+            bind_source_with_environment_and_cancel(
                 source,
                 options.environment(),
                 source_is_module(source),
                 options,
-            )
+                cancel.clone(),
+            )?
         } else {
-            bind_source_with_environment_and_imports(
+            bind_source_with_environment_and_imports_with_cancel(
                 source,
                 options.environment(),
                 source_is_module(source),
                 options,
                 &imported,
-            )
+                cancel.clone(),
+            )?
         };
         model.replace_facts(crate::rules::semantic::collect_facts(source, &model));
         if checked_sources.contains(&source_id) {
@@ -731,6 +830,7 @@ pub fn check_program_with_options(
         edges: input.edges.into(),
     };
     for recovered in input.files {
+        cancel.check()?;
         let source = recovered.product();
         let model = program
             .file(source.source_id())
@@ -742,7 +842,7 @@ pub fn check_program_with_options(
             levels,
         ));
     }
-    Recovered::new(program, diagnostics)
+    Ok(Recovered::new(program, diagnostics))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -887,11 +987,10 @@ fn resolve_export_for_type(
 }
 
 /// Builds the [`ImportedSymbolType`] facts for one source file by translating
-/// each non-type-only import binding into the structural type of its resolved
-/// source export. Named, default, and namespace imports all follow existing
-/// symbol identities; cross-table types are copied through
-/// [`TypeTable::import_type`] at bind time. Missing exports are skipped so the
-/// binder retains its current diagnostics.
+/// each import binding into the structural type of its resolved source export.
+/// Named, default, and namespace imports all follow existing symbol identities;
+/// cross-table types are copied through [`TypeTable::import_type`] at bind time.
+/// Missing exports are skipped so the binder retains its current diagnostics.
 fn collect_imported_types_for_source<'a>(
     source_id: SourceId,
     source: &SourceFile,
@@ -908,9 +1007,6 @@ fn collect_imported_types_for_source<'a>(
         let Statement::Import(import) = statement.data() else {
             continue;
         };
-        if import.type_only {
-            continue;
-        }
         let Some(clause) = &import.clause else {
             continue;
         };
@@ -946,15 +1042,13 @@ fn collect_imported_types_for_source<'a>(
                     symbol,
                     source_types: target_model.types(),
                     value_type_id: namespace_type,
+                    type_parameters: &[],
                     type_plane_id: None,
                 });
             }
             Some(ImportBinding::Named(specifiers)) => {
                 for specifier in specifiers {
                     let specifier_data = specifier.data();
-                    if specifier_data.mode == crate::syntax::ImportSpecifierMode::TypeOnly {
-                        continue;
-                    }
                     let Some(symbol) = lookup_identifier(model, source, &specifier_data.local)
                     else {
                         continue;
@@ -1018,12 +1112,16 @@ fn build_imported_symbol_type<'a>(
                 .filter(|_| signatures.all(|entry| entry.signature.return_type() == return_type))
             })
         }
+        (SymbolKind::Interface | SymbolKind::TypeAlias | SymbolKind::Enum, _) => {
+            Some(value_type_id)
+        }
         _ => None,
     };
     Some(ImportedSymbolType {
         symbol,
         source_types: source_model.types(),
         value_type_id,
+        type_parameters: source_model.generic_type_parameters(linked.symbol),
         type_plane_id,
     })
 }
@@ -1387,9 +1485,6 @@ fn collect_import_targets(
             let Statement::Import(import) = statement.data() else {
                 continue;
             };
-            if import.type_only {
-                continue;
-            }
             let Some(target_source) = edges
                 .get(&(source_id, statement.id()))
                 .or_else(|| edges.get(&(source_id, import.source.id())))
@@ -1426,9 +1521,6 @@ fn collect_import_targets(
                 Some(ImportBinding::Named(specifiers)) => {
                     for specifier in specifiers {
                         let specifier_data = specifier.data();
-                        if specifier_data.mode == crate::syntax::ImportSpecifierMode::TypeOnly {
-                            continue;
-                        }
                         let Some(symbol) = lookup_identifier(model, source, &specifier_data.local)
                         else {
                             continue;
@@ -1499,6 +1591,25 @@ fn collect_export_targets(
                                     ExportTarget::Local(symbol),
                                 );
                             }
+                        }
+                        let declaration = match inner.data() {
+                            Statement::Declare(declaration) => declaration.data(),
+                            declaration => declaration,
+                        };
+                        let type_name = match declaration {
+                            Statement::Interface(interface) => Some(&interface.name),
+                            Statement::TypeAlias(alias) => Some(&alias.name),
+                            _ => None,
+                        };
+                        if let Some(name) = type_name
+                            && let Some(name) = source.identifier_text(name.data().token())
+                            && let Some(symbol) =
+                                model.lookup_type(model.module_scope(), name.as_ref())
+                        {
+                            targets.insert(
+                                (source_id, EcmaString::encode(name.as_ref())),
+                                ExportTarget::Local(symbol),
+                            );
                         }
                     }
                     crate::syntax::ExportNamedDeclaration::Specifiers {
@@ -2857,6 +2968,272 @@ mod tests {
         );
         assert!(checker_codes(&result).is_empty());
     }
+    #[test]
+    fn intrinsic_collections_preserve_element_types_across_iteration() {
+        let result = check_text(
+            "interface Options { default?: Record<string, unknown>; }
+function check(options: Options = {}) {
+    const defaults = options.default || {};
+    const names = new Set<string>(['x']);
+    for (const name of names) {
+        defaults[name];
+    }
+    const aliases: Map<string, string> = new Map();
+    for (const [alias, main] of aliases.entries()) {
+        defaults[alias];
+        defaults[main];
+    }
+}",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+    #[test]
+    fn intrinsic_record_preserves_literal_keys_and_generic_constraints() {
+        let valid = check_text(
+            "type Pair = Record<'left' | 'right', number>;\
+             const pair: Pair = { left: 1, right: 2 };\
+             const left: number = pair.left;\
+             type Generic<K extends 'left' | 'right', V> = Record<K, V>;\
+             const one: Generic<'left', number> = { left: 1 };\
+             type Keyed<T, K extends keyof T, V> = Record<K, V>;\
+             type PropertyKeyed<K extends PropertyKey, V> = Record<K, V>;\
+             function read<K extends string, V>(record: Record<K, V>, key: K): V {\
+                 return record[key];\
+             }\
+             type Events = { ready: string; empty: void };\
+             function acceptsEvents<T extends Record<string | symbol, unknown>>() {}\
+             acceptsEvents<Events>();\
+             function readString<K extends string, V>(record: Record<string, V>, key: K): V {\
+                 return record[key];\
+             }\
+             function comparable<T extends string>(value: string, target: T) {\
+                 return value === target;\
+             }\
+             function readChained<Outer extends string, Inner extends Outer>(\
+                 record: Record<string, number>, key: Inner\
+             ): number { return record[key]; }",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid = check_text(
+            "type Invalid = Record<boolean, number>;\
+             type Indexed<T, K extends T[keyof T], V> = Record<K, V>;\
+             function rejectChained<Outer extends symbol, Inner extends Outer>(\
+                 record: Record<string, number>, key: Inner\
+             ) { return record[key]; }",
+        );
+        assert_eq!(
+            checker_codes(&invalid),
+            vec![ARGUMENT_NOT_ASSIGNABLE.as_str(); 2]
+                .into_iter()
+                .chain([super::INVALID_INDEXED_ACCESS_KEY.as_str()])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_reduces_concrete_intersection_keys() {
+        let result = check_text(
+            "type OnlyX = Record<string & 'x', number>;\
+             const value: OnlyX = { x: 1 };\
+             const x: number = value.x;\
+             const empty: Record<string & number, never> = {};",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn deferred_record_assignment_does_not_treat_constraints_as_members() {
+        let result = check_text(
+            "function assignments<K extends 'a' | 'b'>(source: Record<K, number>) {\
+                 const a: Record<'a', number> = source;\
+                 const both: Record<'a' | 'b', number> = source;\
+                 return [a, both];\
+             }",
+        );
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str(); 2]);
+    }
+
+    #[test]
+    fn record_index_signatures_satisfy_compatible_properties() {
+        let valid = check_text(
+            "const strings: Record<string, number> = { count: 1 };\
+             const stringTarget: { count: number } = strings;\
+             const numbers: Record<number, number> = { [-1]: 1 };\
+             const numberTarget: { '-1': number } = numbers;",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid = check_text(
+            "const numbers: Record<number, number> = { [-1]: 1 };\
+             const target: { count: number } = numbers;",
+        );
+        assert_eq!(checker_codes(&invalid), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+    #[test]
+    fn deferred_record_named_key_does_not_imply_a_specific_property() {
+        let result = check_text(
+            "function read<K extends string>(record: Record<K, number>) {\
+                 return record.foo;\
+             }",
+        );
+        assert_eq!(checker_codes(&result), [PROPERTY_DOES_NOT_EXIST.as_str()]);
+    }
+
+    #[test]
+    fn failed_overload_contextual_probes_emit_one_call_diagnostic() {
+        let result = check_text(
+            "function choose(value: { x: number }): void;\
+             function choose(value: { y: string }): void;\
+             function choose(value: { x: number } | { y: string }): void {}\
+             choose({ x: 'bad', extra: true });",
+        );
+        assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn intrinsic_collection_members_follow_standard_library_contracts() {
+        let result = check_text(
+            "const entries: [string, number][] = [['x', 1]];\
+             const map = new Map(entries);\
+             const inferred: Map<string, number> = new Map([['b', 2], ['a', 1]]);\
+             const chained: Map<string, number> = map.set('y', 2);\
+             const value: number | undefined = chained.get('x');\
+             const present: boolean = map.has('x');\
+             const removed: boolean = map.delete('x');\
+             const count: number = map.size;\
+             map.forEach((item: number, key: string, owner: Map<string, number>) => {\
+                 owner.set(key, item);\
+             });\
+             map.clear();\
+             const entry: [string, number] | undefined = map.entries().next().value;\
+             const key: string | undefined = map.keys().next().value;\
+             const item: number | undefined = map.values().next().value;\
+             const set = new Set(['x']);\
+             const same: Set<string> = set.add('y');\
+             set.forEach((first: string, second: string, owner: Set<string>) => {\
+                 owner.add(first); owner.add(second);\
+             });\
+             const pair: [string, string] | undefined = set.entries().next().value;\
+             const setKey: string | undefined = set.keys().next().value;\
+             const setValue: string | undefined = set.values().next().value;\
+             set.delete('x'); set.clear(); same.has('y');",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn collection_any_arguments_remain_assignable_to_concrete_arguments() {
+        let valid = check_text(
+            "type Events = { foo: string };\
+             type Handlers<E> = Map<keyof E | '*', Array<(event: E[keyof E]) => void>>;\
+             declare function accept<E>(handlers: Handlers<E>): void;\
+             const handlers = new Map();\
+             const initialHandler = (value: string): void => {};\
+             handlers.set('foo', [initialHandler]);\
+             accept<Events>(handlers);",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid = check_text(
+            "type Events = { foo: string };\
+             type Handlers<E> = Map<keyof E | '*', Array<(event: E[keyof E]) => void>>;\
+             declare function accept<E>(handlers: Handlers<E>): void;\
+             const handlers = new Map<number, string>();\
+             accept<Events>(handlers);",
+        );
+        assert_eq!(checker_codes(&invalid), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn readonly_collection_types_expose_only_read_operations() {
+        let result = check_text(
+            "declare const map: ReadonlyMap<string, number>;\
+             const value: number | undefined = map.get('x');\
+             const present: boolean = map.has('x');\
+             const count: number = map.size;\
+             map.entries().next().value;\
+             map.keys().next().value;\
+             map.values().next().value;\
+             declare const set: ReadonlySet<string>;\
+             set.has('x'); set.entries().next().value;\
+             set.keys().next().value; set.values().next().value;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+
+        let invalid = check_text(
+            "declare const map: ReadonlyMap<string, number>;\
+             map.set('x', 1); map.delete('x'); map.clear();\
+             declare const set: ReadonlySet<string>;\
+             set.add('x'); set.delete('x'); set.clear();",
+        );
+        assert_eq!(
+            checker_codes(&invalid),
+            vec![PROPERTY_DOES_NOT_EXIST.as_str(); 6]
+        );
+    }
+
+    #[test]
+    fn source_collection_declarations_shadow_intrinsics() {
+        let result = check_text(
+            "interface Map<K, V> { ownKey: K; ownValue: V; }\
+             interface Set<T> { own: T; }\
+             declare const map: Map<string, number>;\
+             declare const set: Set<boolean>;\
+             const key: string = map.ownKey;\
+             const value: number = map.ownValue;\
+             const own: boolean = set.own;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn set_constructor_widens_inferred_literal_unions() {
+        let result = check_text("declare const ch: string; new Set([':', '(']).has(ch);");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn set_constructor_keeps_explicit_literal_type_arguments() {
+        let result = check_text("new Set<'a'>(['a']).has('b');");
+        assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
 
     #[test]
     fn functions_bind_arguments_this_and_their_local_name() {
@@ -3018,6 +3395,150 @@ mod tests {
             checker_codes(&result),
             ["BAMTS-C053", "BAMTS-C053", "BAMTS-C053"]
         );
+    }
+
+    #[test]
+    fn unused_expect_error_directives_are_reported_in_source_order() {
+        let result = check_text(
+            "// @ts-expect-error\n\
+             const first = 1;\n\
+             // @ts-expect-error\n\
+             const second = 2;",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C070", "BAMTS-C070"]);
+    }
+
+    #[test]
+    fn nearest_expect_error_consumes_the_target_diagnostic() {
+        let result = check_text(
+            "declare function takesString(value: string): void;\n\
+             // @ts-expect-error first\n\
+             // @ts-expect-error nearest\n\
+             takesString(1);",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C070"]);
+    }
+
+    #[test]
+    fn ts_ignore_never_reports_an_unused_directive() {
+        let result = check_text("// @ts-ignore\nconst value = 1;");
+        assert!(checker_codes(&result).is_empty());
+    }
+    #[test]
+    fn dynamic_index_access_requires_an_index_signature() {
+        let result = check_text(
+            "const key: string = 'x';\n\
+             globalThis[key];\n\
+             class Container { read(name: string) { return this[name]; } }\n\
+             const loose = JSON.parse('{}');\n\
+             loose[key];",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C064", "BAMTS-C064"]);
+    }
+
+    #[test]
+    fn expect_error_consumes_dynamic_index_diagnostics() {
+        let result = check_text(
+            "const key: string = 'x';\n\
+             // @ts-expect-error\n\
+             globalThis[key];\n\
+             class Container {\n\
+                 read(name: string) {\n\
+                     // @ts-expect-error\n\
+                     return this[name];\n\
+                 }\n\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn unconstrained_index_keys_require_an_index_signature() {
+        let result = check_text(
+            "const key = JSON.parse('\"x\"');\n\
+             const closed: { x: number } = { x: 1 };\n\
+             const indexed: { [name: string]: number } = { x: 1 };\n\
+             closed[key];\n\
+             if (key !== '' && closed[key]) {}\n\
+             indexed[key];\n\
+             if (key !== '' && indexed[key]) {}",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C064", "BAMTS-C064"]);
+    }
+
+    #[test]
+    fn numeric_keys_use_string_index_signatures() {
+        let result = check_text(
+            "declare const dictionary: { [name: string]: number };\n\
+             declare const index: number;\n\
+             const value: number = dictionary[index];",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn dynamic_index_access_rejects_partially_indexable_unions() {
+        let result = check_text(
+            "declare const key: string;\n\
+             declare const mixed: { x: number } | { [name: string]: number };\n\
+             mixed[key];",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C064"]);
+    }
+
+    #[test]
+    fn indexed_access_preserves_preexisting_permissive_error_types() {
+        let result = check_text(
+            "interface Options { default?: Record<string, unknown> }\n\
+             declare const options: Options;\n\
+             declare const key: string;\n\
+             const defaults = options.default || {};\n\
+             defaults[key];",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn array_index_access_distinguishes_number_and_string_keys() {
+        let result = check_text(
+            "declare const index: number;\n\
+             declare const key: string;\n\
+             declare const values: number[];\n\
+             const value: number = values[index];\n\
+             values[key];",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C064"]);
+    }
+
+    #[test]
+    fn control_flow_expressions_are_type_checked() {
+        let sources = [
+            "if (closed[key]) {}",
+            "while (closed[key]) { break; }",
+            "do {} while (closed[key]);",
+            "for (; closed[key];) { break; }",
+            "switch (closed[key]) { default: break; }",
+            "throw closed[key];",
+        ];
+        for statement in sources {
+            let result = check_text(&format!(
+                "declare const key: string;\
+                 declare const closed: {{ x: number }};\
+                 {statement}"
+            ));
+            assert_eq!(checker_codes(&result), ["BAMTS-C064"], "{statement}");
+        }
+    }
+
+    #[test]
+    fn computed_member_keys_preserve_lone_surrogates() {
+        let result = check_text(
+            "const value: { \"\\uD800\": number; \"\\uFFFD\": string } = {\n\
+             \"\\uD800\": 1, \"\\uFFFD\": \"ok\"\n\
+             };\n\
+             const bad: string = value[\"\\uD800\"];",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
     }
 
     #[test]
@@ -5568,6 +6089,264 @@ mod tests {
     }
 
     #[test]
+    fn imported_generic_alias_instantiates_parameters_and_defaults() {
+        let checked = linked(
+            &[
+                "export type StringKey<T = { fallback: number }> = keyof T & string;",
+                "import type { StringKey } from './a';\
+                 class Hooks<T extends Record<string, any>, Name extends StringKey<T> = StringKey<T>> {\
+                     values: Record<string, number> = {};\
+                     read<Key extends Name>(key: Key): number { return this.values[key]; }\
+                     accept(value: Record<Name, number>): void {}\
+                 }\
+                 declare const values: { [key: string]: number };\
+                 declare const key: StringKey<{ value: number }>;\
+                 const value: number = values[key];\
+                 const fallback: StringKey = 'fallback';",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+        let invalid = linked(
+            &[
+                "export type StringKey<T> = keyof T & string;",
+                "import { type StringKey } from './a';\
+                 declare const key: StringKey<{ value: number }>;\
+                 const invalid: number = key;",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&invalid).contains(&super::TYPE_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            invalid.diagnostics()
+        );
+    }
+
+    #[test]
+    fn generic_alias_uses_its_parameters_inside_collection_types() {
+        let valid = check_text(
+            "type M<K extends string, V> = Map<K, V>;\
+             type S<K extends string> = Set<K>;\
+             declare const map: M<'a', number>;\
+             declare const set: S<'a'>;\
+             map.set('a', 1);\
+             const value: number | undefined = map.get('a');\
+             set.add('a');",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid = check_text(
+            "type M<K extends string, V> = Map<K, V>;\
+             declare const map: M<'a', number>;\
+             map.set('b', 1);",
+        );
+        assert_eq!(
+            checker_codes(&invalid),
+            [super::ARGUMENT_NOT_ASSIGNABLE.as_str()]
+        );
+    }
+
+    #[test]
+    fn imported_generic_interface_instantiates_member_types() {
+        let valid = linked(
+            &[
+                "export interface Ctx<T> { root: T; branch?: Ctx<T>; }",
+                "import type { Ctx } from './a';\
+                 const context: Ctx<string> = { root: 'x' };",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid = linked(
+            &[
+                "export interface Ctx<T> { root: T; branch?: Ctx<T>; }",
+                "import type { Ctx } from './a';\
+                 const context: Ctx<string> = { root: 1 };",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&invalid).contains(&super::TYPE_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            invalid.diagnostics()
+        );
+    }
+
+    #[test]
+    fn linked_recursive_generic_interfaces_preserve_applications() {
+        const TYPES: &str = "export interface RouterContext<T = unknown> {\n\
+                 root: Node<T>;\n\
+                 static: Record<string, Node<T> | undefined>;\n\
+             }\n\
+             export type MethodData<T = unknown> = { data: T; extra?: string[] };\n\
+             export interface Node<T = unknown> {\n\
+                 key: string;\n\
+                 static?: Record<string, Node<T>>;\n\
+                 param?: Node<T>;\n\
+                 wildcard?: Node<T>;\n\
+                 methods?: Record<string, MethodData<T>[] | undefined>;\n\
+             }";
+        const CONTEXT: &str = "import type { RouterContext } from './a';\n\
+             export function createRouter<T = unknown>(): RouterContext<T> {\n\
+                 return { root: { key: '' }, static: {} };\n\
+             }";
+        const ADD: &str = "import type { RouterContext } from './a';\n\
+             export function addRoute<T>(\n\
+                 ctx: RouterContext<T>, method: string = '', path: string, data?: T\n\
+             ): void {}";
+        const EDGES: &[(usize, usize, usize)] = &[(1, 0, 0), (2, 0, 0), (3, 0, 1), (3, 1, 2)];
+
+        let valid = linked(
+            &[
+                TYPES,
+                CONTEXT,
+                ADD,
+                "import { createRouter } from './b';\n\
+                 import { addRoute } from './c';\n\
+                 const router = createRouter<string>();\n\
+                 addRoute(router, 'GET', '/', 'root');",
+            ],
+            EDGES,
+        );
+        assert!(
+            program_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid = linked(
+            &[
+                TYPES,
+                CONTEXT,
+                ADD,
+                "import { createRouter } from './b';\n\
+                 import { addRoute } from './c';\n\
+                 const router = createRouter<number>();\n\
+                 addRoute<string>(router, 'GET', '/', 'root');",
+            ],
+            EDGES,
+        );
+        assert!(
+            program_codes(&invalid).contains(&super::ARGUMENT_NOT_ASSIGNABLE.as_str()),
+            "{:?}",
+            invalid.diagnostics()
+        );
+    }
+
+    #[test]
+    fn imported_generic_function_preserves_alias_wrapped_collection_parameters() {
+        let checked = linked(
+            &[
+                "type Handlers<E extends Record<string, unknown>> =\
+                     Map<keyof E | '*', Array<(event: E[keyof E]) => void>>;\
+                 export default function accept<E extends Record<string, unknown>>(\
+                     handlers: Handlers<E>\
+                 ): void {}",
+                "import accept from './a';\
+                 type Events = { foo: string };\
+                 const handlers = new Map();\
+                 const initialHandler = (value: string): void => {};\
+                 handlers.set('foo', [initialHandler]);\
+                 accept<Events>(handlers);",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            program_codes(&checked).is_empty(),
+            "{:?}",
+            checked.diagnostics()
+        );
+    }
+
+    #[test]
+    fn generic_key_intersection_survives_typeof_narrowing() {
+        let valid = check_text(
+            "type Key<T> = keyof T & string;\
+             type Dep<T> = { to: Key<T> };\
+             function save<T extends Record<string, any>, K extends Key<T>>(\
+               name: K, dep: Key<T> | Dep<T>\
+             ): void {\
+               const out: Record<string, Dep<T>> = {};\
+               if (typeof dep === 'string') {\
+                 out[name] = { to: dep };\
+               } else {\
+                 out[name] = dep;\
+               }\
+             }",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+    }
+
+    #[test]
+    fn nested_conditionals_preserve_a_shared_argument_type() {
+        let valid = check_text(
+            "type Matcher = { tag: number };\
+             declare function callMatcher(matcher: Matcher): void;\
+             function matchAt(\
+               prefix: Matcher[], suffix: Matcher[], rest: Matcher, i: number\
+             ): void {\
+               const entry = i < 1 ? prefix[i] : i > 2 ? suffix[i - 2] : rest;\
+               callMatcher(entry);\
+             }",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let rejected = check_text(
+            "type Matcher = { tag: number };\
+             declare function callMatcher(matcher: Matcher): void;\
+             declare const condition: boolean;\
+             declare const matcher: Matcher;\
+             callMatcher(condition ? matcher : 1);",
+        );
+        assert_eq!(
+            checker_codes(&rejected),
+            [super::ARGUMENT_NOT_ASSIGNABLE.as_str()]
+        );
+    }
+
+    #[test]
+    fn discriminant_exclusion_reduces_intersection_property_types() {
+        let valid = check_text(
+            "type Input = 'string' | 'number';\
+             abstract class Base { abstract name: string; }\
+             type Terminal =\
+               | (Base & { name: 'unknown' | 'string' | 'number' })\
+               | { name: 'literal' };\
+             function collect(terminal: Terminal, values: Map<Input, number>): void {\
+               if (terminal.name === 'unknown') {}\
+               else if (terminal.name === 'literal') {}\
+               else { values.get(terminal.name); }\
+             }",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+    }
+    #[test]
     fn imported_class_type_survives_named_alias_and_reexport() {
         let checked = linked(
             &[
@@ -7727,6 +8506,110 @@ mod tests {
     }
 
     #[test]
+    fn for_in_key_indexes_the_correlated_generic_object() {
+        let result = check_text(
+            "function values<T extends object>(obj: T) {\
+                 for (const key in obj) { obj[key]; }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "for-in key should remain correlated with its object: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn arbitrary_string_does_not_index_a_generic_object() {
+        let result = check_text(
+            "function value<T extends object>(obj: T, key: string) {\
+                 return obj[key];\
+             }",
+        );
+        assert_eq!(checker_codes(&result), ["BAMTS-C064"]);
+    }
+
+    #[test]
+    fn for_in_key_preserves_partial_record_key_parameter() {
+        let result = check_text(
+            "type Callback = () => void;\
+             declare function consume<K extends string>(key: K): void;\
+             function visit<K extends string>(callbacks: Partial<Record<K, Callback>>) {\
+                 for (const key in callbacks) { consume<K>(key); }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "for-in key should be compatible with the record key parameter: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn logical_right_operand_uses_left_truthiness_facts() {
+        let valid = check_text(
+            "declare const node: { values?: Record<string, number> } | undefined;\
+             declare const key: string;\
+             if (node && node.values) { const value: number | undefined = node.values[key]; }",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid = check_text(
+            "declare const node: { values?: { fixed: number } } | undefined;\
+             declare const key: string;\
+             if (node && node.values) { node.values[key]; }",
+        );
+        assert_eq!(
+            checker_codes(&invalid),
+            [super::INVALID_INDEXED_ACCESS_KEY.as_str()]
+        );
+    }
+
+    #[test]
+    fn partial_object_properties_are_optional_but_keep_their_value_type() {
+        let accepted = check_text_strict_null(
+            "const value: Partial<{ x: number }> = {};\
+             value.x = 1;\
+             const read: number | undefined = value.x;",
+        );
+        assert!(
+            checker_codes(&accepted).is_empty(),
+            "{:?}",
+            accepted.diagnostics()
+        );
+
+        let rejected = check_text_strict_null(
+            "const value: Partial<{ x: number }> = { x: 'bad' };\
+             const required: number = value.x;",
+        );
+        assert_eq!(
+            checker_codes(&rejected),
+            [
+                super::TYPE_NOT_ASSIGNABLE.as_str(),
+                super::TYPE_NOT_ASSIGNABLE.as_str()
+            ]
+        );
+    }
+
+    #[test]
+    fn source_partial_alias_shadows_the_intrinsic_utility() {
+        let result = check_text_strict_null(
+            "type Partial<T> = { wrapped: T };\
+             const value: Partial<number> = { wrapped: 1 };\
+             const read: number = value.wrapped;",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
     fn constrained_indexed_access_relates_through_its_base_constraint() {
         let accepted = check_text(
             "declare class AbstractType<Output = unknown> { abstract: Output; }\
@@ -7856,6 +8739,301 @@ mod tests {
         assert_eq!(
             checker_codes(&equivalent_literals),
             ["BAMTS-C004", "BAMTS-C004"]
+        );
+    }
+
+    #[test]
+    fn constrained_intersection_key_indexes_string_maps() {
+        let result = check_text(
+            "type HookKeys<T> = keyof T & string;\
+             class Hooks<\
+                 T extends Record<string, any>,\
+                 Name extends HookKeys<T> = HookKeys<T>\
+             > {\
+                 values: Record<string, number> = {};\
+                 read<Key extends Name>(key: Key): number { return this.values[key]; }\
+             }\
+             function read<T, Name extends keyof T & string>(\
+                 values: { [key: string]: number }, name: Name\
+             ): number {\
+                 return values[name];\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn constrained_generic_objects_use_their_index_signatures() {
+        let accepted = check_text(
+            "function omit<\
+               Shape extends Record<string, unknown>,\
+               Keys extends Array<string & keyof Shape>\
+             >(shape: Shape, keys: Keys): void {\
+               for (const key of keys) { delete shape[key]; }\
+             }\
+             function copy<Shape extends Record<string, unknown>>(shape: Shape): void {\
+               for (const key of Object.keys(shape)) { shape[key]; }\
+             }",
+        );
+        assert!(
+            checker_codes(&accepted).is_empty(),
+            "{:?}",
+            accepted.diagnostics()
+        );
+
+        let rejected = check_text(
+            "function read<Shape extends { x: number }>(shape: Shape, key: string): void {\
+               shape[key];\
+             }",
+        );
+        assert_eq!(
+            checker_codes(&rejected),
+            [super::INVALID_INDEXED_ACCESS_KEY.as_str()]
+        );
+    }
+
+    #[test]
+    fn generic_record_spread_retains_its_index_signature() {
+        let valid = check_text(
+            "function copy<T extends Record<string, unknown>>(value: T, key: string): unknown {\
+                 const spread = { ...value };\
+                 return spread[key];\
+             }",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid = check_text(
+            "function copy<T extends { fixed: number }>(value: T, key: string): void {\
+                 const spread = { ...value };\
+                 spread[key];\
+             }",
+        );
+        assert_eq!(
+            checker_codes(&invalid),
+            [super::INVALID_INDEXED_ACCESS_KEY.as_str()]
+        );
+    }
+
+    #[test]
+    fn record_keys_accept_string_intersections_and_preserve_for_in_correlation() {
+        let result = check_text(
+            "type StringKeys<T> = keyof T & string;\
+             type Deprecated<T> = { to: StringKeys<T> };\
+             declare function consume<K extends string>(key: K): void;\
+             function visit<\
+                 T extends Record<string, unknown>,\
+                 K extends StringKeys<T>\
+             >(values: Partial<Record<K, Deprecated<T>>>): void {\
+                 for (const key in values) { consume<K>(key); }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn imported_intersection_keys_satisfy_record_constraints() {
+        let result = linked(
+            &[
+                "export type StringKeys<T> = keyof T & string;\
+                 export type Deprecated<T> = { to: StringKeys<T> };",
+                "import type { Deprecated, StringKeys } from './types';\
+                 class Hooks<\
+                     T extends Record<string, unknown>,\
+                     K extends StringKeys<T>\
+                 > {\
+                     visit(values: Partial<Record<K, Deprecated<T>>>): void {\
+                         for (const key in values) { this.consume(key); }\
+                     }\
+                     consume<Name extends K>(name: Name): void {}\
+                 }",
+            ],
+            &[(1, 0, 0)],
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn generic_record_spreads_keep_their_index_signature() {
+        let result = check_text(
+            "function omit<Shape extends Record<string, unknown>>(\
+                 value: Shape, key: string & keyof Shape\
+             ): void {\
+                 const copy = { ...value };\
+                 delete copy[key];\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn identical_generic_class_applications_relate_without_materialized_views() {
+        let result = check_text(
+            "declare class Box<T> { value: T; }\
+             function wrap(): { item: Box<string> } {\
+                 const item = new Box<string>();\
+                 return { item };\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn equivalent_alias_arguments_preserve_generic_collection_identity() {
+        let result = check_text(
+            "type Key = 'string' | 'number';\
+             interface Item { value: number; }\
+             function group(): { types: Map<Key, Item[]> } {\
+                 const types = new Map<Key, Item[]>();\
+                 return { types };\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn generic_collection_fields_preserve_annotated_return_shapes() {
+        for source in [
+            "abstract class Item {}\
+             function only(value: Map<unknown, Item[]>): { value: Map<unknown, Item[]> } {\
+                 return { value };\
+             }",
+            "abstract class Item {}\
+             declare function dedup<T>(values: T[]): T[];\
+             function only(value: Item[]): { value: Item[] } {\
+                 return { value: dedup(value) };\
+             }",
+            "type Input = 'object' | 'array' | 'null' | 'undefined'\
+                 | 'string' | 'number' | 'bigint' | 'boolean';\
+             declare function dedup<T>(values: T[]): T[];\
+             function only(value: Input[]): { value: Input[] } {\
+                 return { value: dedup(value) };\
+             }",
+        ] {
+            let isolated = check_text(source);
+            assert!(
+                checker_codes(&isolated).is_empty(),
+                "{:?}",
+                isolated.diagnostics()
+            );
+        }
+        let result = check_text(
+            "type Input = 'object' | 'array' | 'null' | 'undefined'\
+                 | 'string' | 'number' | 'bigint' | 'boolean';\
+             abstract class Item {}\
+             declare function dedup<T>(values: T[]): T[];\
+             function group(): {\
+                 types: Map<Input, Item[]>;\
+                 literals: Map<unknown, Item[]>;\
+                 unknowns: Item[];\
+                 optionals: Item[];\
+                 expectedTypes: Input[];\
+             } {\
+                 const types = new Map<Input, Item[]>();\
+                 const literals = new Map<unknown, Item[]>();\
+                 const unknowns = [] as Item[];\
+                 const optionals = [] as Item[];\
+                 const expectedTypes = [] as Input[];\
+                 return {\
+                     types,\
+                     literals,\
+                     unknowns: dedup(unknowns),\
+                     optionals: dedup(optionals),\
+                     expectedTypes: dedup(expectedTypes),\
+                 };\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+    #[test]
+    fn logical_guards_narrow_nested_optional_index_targets() {
+        let result = check_text(
+            "interface Node {\
+                 child?: Node;\
+                 methods?: Record<string, number | undefined>;\
+             }\
+             function read(node: Node, key: string): number | undefined {\
+                 if (node.child && node.child.methods) {\
+                     return node.child.methods[key];\
+                 }\
+                 return undefined;\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn nested_array_selection_preserves_a_shared_element_type() {
+        let result = check_text(
+            "declare const marker: unique symbol;\
+             interface Matcher { tag: number; }\
+             abstract class Item { abstract readonly [marker]: Matcher; }\
+             declare function fallback(): Matcher;\
+             declare function consume(matcher: Matcher): void;\
+             class Selection<\
+                 Head extends Item[],\
+                 Rest extends Item | undefined,\
+                 Tail extends Item[]\
+             > {\
+                 constructor(\
+                     readonly head: Head,\
+                     readonly restType: Rest | undefined,\
+                     readonly tail: Tail\
+                 ) {}\
+                 run(index: number): void {\
+                     const prefix = this.head.map((item) => item[marker]);\
+                     const suffix = this.tail.map((item) => item[marker]);\
+                     const rest = this.restType?.[marker] ?? fallback();\
+                     const headEnd = prefix.length;\
+                     const tailStart = suffix.length;\
+                     const entry = index < headEnd\
+                         ? prefix[index]\
+                         : index >= tailStart\
+                             ? suffix[index - tailStart]\
+                             : rest;\
+                     consume(entry);\
+                 }\
+             }",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
         );
     }
 
@@ -8690,6 +9868,80 @@ mod tests {
     fn array_numeric_index_write_rejects_incompatible_source() {
         let result = check_text("declare const values: number[]; values[0] = 'bad';");
         assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn reg_exp_type_supports_array_index_assignment() {
+        let result =
+            check_text("function f(a: RegExp[], i: number, r: RegExp): void { a[i] = r; }");
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn reg_exp_array_index_rejects_incompatible_source() {
+        let result =
+            check_text("function f(a: RegExp[], i: number, r: string): void { a[i] = r; }");
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn reg_exp_instance_members_have_intrinsic_types() {
+        let result = check_text(
+            "function inspect(r: RegExp, input: string): boolean {\
+                 const source: string = r.source;\
+                 const flags: string = r.flags;\
+                 const match = r.exec(input);\
+                 if (match) { const first: string = match[0]; }\
+                 return r.test(input);\
+             }\
+             function acceptsPattern(value: string | RegExp): void {}\
+             const literal: RegExp = /x/;\
+             acceptsPattern(/x/);",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+
+        let missing = check_text("declare const r: RegExp; r.missing;");
+        assert_eq!(checker_codes(&missing), [PROPERTY_DOES_NOT_EXIST.as_str()]);
+    }
+
+    #[test]
+    fn string_numeric_index_yields_string() {
+        let result = check_text(
+            "declare const p: string; declare const j: number; const a: string = p[j]; const b: string = p[0];",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn string_numeric_index_rejects_non_string_target() {
+        let result =
+            check_text("declare const p: string; declare const j: number; const a: number = p[j];");
+        assert_eq!(checker_codes(&result), ["BAMTS-C004"]);
+    }
+
+    #[test]
+    fn string_literal_numeric_index_yields_string() {
+        let valid = check_text(
+            "declare const p: 'abc'; declare const i: number; const value: string = p[i];",
+        );
+        assert!(
+            checker_codes(&valid).is_empty(),
+            "{:?}",
+            valid.diagnostics()
+        );
+
+        let invalid_type = check_text(
+            "declare const p: 'abc'; declare const i: number; const value: number = p[i];",
+        );
+        assert_eq!(checker_codes(&invalid_type), [TYPE_NOT_ASSIGNABLE.as_str()]);
     }
 
     #[test]
@@ -9596,5 +10848,30 @@ mod tests {
              interface Derived extends Left, Right { value: number; }",
         );
         assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn guarded_optional_record_property_narrows_in_truthy_branch() {
+        let result = check_text(
+            "declare const n: { methods?: Record<string, string[]> };\
+             const m: string = '';\
+             if (n.methods) {\
+                 const arr: string[] = n.methods[m];\
+             }",
+        );
+        assert!(checker_codes(&result).is_empty());
+    }
+
+    #[test]
+    fn unguarded_optional_record_indexed_access_is_rejected() {
+        let result = check_text(
+            "declare const n: { methods?: Record<string, string[]> };\
+             const m: string = '';\
+             const arr: string[] = n.methods[m];",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            [super::INVALID_INDEXED_ACCESS_KEY.as_str()]
+        );
     }
 }

@@ -238,14 +238,67 @@ pub(crate) fn cook_escapes(input: &str) -> EcmaString {
 }
 
 fn radix_value(digits: &str, radix: u32) -> Option<f64> {
-    let mut value = 0.0_f64;
+    let bits_per_digit = radix.trailing_zeros();
     let mut any = false;
+    let mut significant = false;
+    let mut bit_length = 0_usize;
+    // Retain the 53-bit binary64 significand plus its guard bit. Every later
+    // one bit contributes only to the sticky bit, so the final rounding is
+    // performed exactly once regardless of the source integer's length.
+    let mut prefix = 0_u64;
+    let mut sticky = false;
+
     for character in digits.chars().filter(|character| *character != '_') {
         let digit = character.to_digit(radix)?;
-        value = value * f64::from(radix) + f64::from(digit);
         any = true;
+        for bit_index in (0..bits_per_digit).rev() {
+            let bit = (digit >> bit_index) & 1;
+            if !significant {
+                if bit == 0 {
+                    continue;
+                }
+                significant = true;
+            }
+            bit_length = bit_length.saturating_add(1);
+            if bit_length <= 54 {
+                prefix = (prefix << 1) | u64::from(bit);
+            } else {
+                sticky |= bit != 0;
+            }
+        }
     }
-    any.then_some(value)
+
+    if !any {
+        return None;
+    }
+    if !significant {
+        return Some(0.0);
+    }
+
+    let mut exponent = bit_length - 1;
+    let mut significand = if bit_length <= 53 {
+        prefix << (53 - bit_length)
+    } else {
+        let guard = prefix & 1 != 0;
+        let mut rounded = prefix >> 1;
+        if guard && (sticky || rounded & 1 != 0) {
+            rounded += 1;
+        }
+        if rounded == 1 << 53 {
+            exponent = exponent.saturating_add(1);
+            rounded >>= 1;
+        }
+        rounded
+    };
+
+    if exponent > 1023 {
+        return Some(f64::INFINITY);
+    }
+    debug_assert!((1 << 52..1 << 53).contains(&significand));
+    significand &= (1 << 52) - 1;
+    Some(f64::from_bits(
+        ((exponent as u64 + 1023) << 52) | significand,
+    ))
 }
 
 fn cook_unicode_escape(
@@ -311,6 +364,103 @@ mod tests {
         assert_eq!(cook_escapes("\\uD800").as_units(), [0xD800]);
         assert_eq!(cook_escapes("\\u{1F603}").as_units(), [0xD83D, 0xDE03]);
     }
+
+    #[test]
+    fn non_decimal_numbers_round_once_to_binary64() {
+        assert_eq!(
+            number_value("0x20000000000001"),
+            Some(9_007_199_254_740_992.0)
+        );
+        assert_eq!(
+            number_value("0x20000000000003"),
+            Some(9_007_199_254_740_996.0)
+        );
+        assert_eq!(
+            number_value("0b100000000000000000000000000000000000000000000000000011"),
+            Some(9_007_199_254_740_996.0)
+        );
+        assert_eq!(
+            number_value(&format!("0x1{}", "0".repeat(256))),
+            Some(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn non_decimal_radix_bit_patterns() {
+        // Leading zeros and separators are ignored without changing the value.
+        assert_eq!(number_value("0x0000000000000001"), Some(1.0));
+        assert_eq!(number_value("0x0000_0000_0000_0001"), Some(1.0));
+        assert_eq!(number_value("0o000000000000000000001"), Some(1.0));
+        assert_eq!(
+            number_value("0b00000000000000000000000000000000000000000000000000001"),
+            Some(1.0)
+        );
+        assert_eq!(number_value("0x0"), Some(0.0));
+        assert_eq!(number_value("0x0_0"), Some(0.0));
+
+        // 53-bit integers are represented exactly even when the leading 1 is
+        // not the most-significant bit of its source digit.
+        assert_eq!(
+            number_value("0x1fffffffffffff"),
+            Some(9_007_199_254_740_991.0)
+        );
+        assert_eq!(
+            number_value("0x20000000000000"),
+            Some(9_007_199_254_740_992.0)
+        );
+
+        // >53-bit halfway cases round to nearest, ties to even.
+        assert_eq!(
+            number_value("0x20000000000001"),
+            Some(9_007_199_254_740_992.0)
+        );
+        assert_eq!(
+            number_value("0x20000000000003"),
+            Some(9_007_199_254_740_996.0)
+        );
+        assert_eq!(
+            number_value("0x20000000000005"),
+            Some(9_007_199_254_740_996.0)
+        );
+
+        // Rounding carry propagates to the exponent when all retained bits are 1.
+        assert_eq!(
+            number_value("0x3fffffffffffff"),
+            Some(18_014_398_509_481_984.0)
+        );
+
+        // 2^54 - 2 is exactly representable.
+        assert_eq!(
+            number_value("0x3ffffffffffffe"),
+            Some(18_014_398_509_481_982.0)
+        );
+
+        // A large but still-finite integer rounds up to the next power of two.
+        assert_eq!(
+            number_value("0x3fffffffffffffff"),
+            Some(4_611_686_018_427_387_904.0)
+        );
+
+        // Arbitrary-length inputs overflow to Infinity without fixed-width
+        // integer conversion.
+        assert_eq!(
+            number_value(&format!("0x1{}", "0".repeat(300))),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(
+            number_value(&format!("0x{}", "f".repeat(300))),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(
+            number_value(&format!("0b1{}", "0".repeat(1024))),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(
+            number_value(&format!("0o1{}", "0".repeat(342))),
+            Some(f64::INFINITY)
+        );
+    }
+
     #[test]
     fn cooks_line_continuations() {
         assert_eq!(

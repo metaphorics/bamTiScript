@@ -20,6 +20,7 @@ default = []
 aot-main = []
 
 [dependencies]
+bamts-cancel.workspace = true
 bamts-bytecode.workspace = true
 bamts-native = { workspace = true, features = ["gc"] }
 

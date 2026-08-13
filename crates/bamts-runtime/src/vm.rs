@@ -386,6 +386,7 @@ fn compile_error<H: Host>(machine: &mut Machine<'_, H>, error: ScriptCompileErro
         ScriptCompileError::Syntax { message, .. }
         | ScriptCompileError::Unsupported { message, .. } => ("SyntaxError", message),
         ScriptCompileError::Capacity { message } => ("RangeError", message),
+        ScriptCompileError::Internal { message } => ("Error", message),
     };
     let id = machine
         .intrinsics
@@ -452,11 +453,18 @@ fn contextify_global<H: Host>(
     // runInNewContext can resolve Object, Array, etc. without falling
     // back to the outer global object. The intrinsic objects themselves
     // remain shared (same Value); only the property bindings are copied.
+    // Host-only globals such as `process` and `console` are not copied
+    // unless they are already present on an explicitly supplied context object.
     let intrinsic_names: Vec<EcmaString> = machine
         .intrinsics
         .globals
         .keys()
-        .filter(|name| !name.eq_ascii("globalThis") && !name.eq_ascii("global"))
+        .filter(|name| {
+            !name.eq_ascii("globalThis")
+                && !name.eq_ascii("global")
+                && !name.eq_ascii("process")
+                && !name.eq_ascii("console")
+        })
         .cloned()
         .collect();
     for name in intrinsic_names {
@@ -1193,14 +1201,91 @@ mod tests {
         );
     }
 
-    /// Program that checks global isolation: TypeOfGlobal on a host-only
-    /// name (should be "undefined") and on a standard intrinsic (should be
-    /// "function"), returning [typeof hostOnly, typeof Object].
+    /// Program that checks global isolation: TypeOfGlobal on host-only
+    /// names (should be "undefined") and on a standard intrinsic (should be
+    /// "function"), returning [typeof hostOnly, typeof process, typeof console, typeof Object].
     fn program_checking_global_isolation() -> Program<Verified> {
         let constants = vec![
             Constant::String(EcmaString::encode("hostOnly")),
+            Constant::String(EcmaString::encode("process")),
+            Constant::String(EcmaString::encode("console")),
             Constant::String(EcmaString::encode("Object")),
             Constant::String(EcmaString::encode("<isolation>")),
+        ];
+        let code = Module::new(
+            constants,
+            vec![Function::new(
+                None,
+                0,
+                0,
+                5,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(0),
+                        name: ConstantId::new(0),
+                    },
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(1),
+                        name: ConstantId::new(1),
+                    },
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(2),
+                        name: ConstantId::new(2),
+                    },
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(3),
+                        name: ConstantId::new(3),
+                    },
+                    Instruction::CreateArray {
+                        dst: Register::new(4),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(4),
+                        value: Register::new(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(4),
+                        value: Register::new(1),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(4),
+                        value: Register::new(2),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(4),
+                        value: Register::new(3),
+                    },
+                    Instruction::Return {
+                        value: Register::new(4),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test bytecode is verified");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(4),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("test program links")
+    }
+
+    /// Program that returns the values of explicitly-supplied `process`
+    /// and `console` globals: [process, console].
+    fn program_returning_supplied_globals() -> Program<Verified> {
+        let constants = vec![
+            Constant::String(EcmaString::encode("process")),
+            Constant::String(EcmaString::encode("console")),
+            Constant::String(EcmaString::encode("<explicit>")),
         ];
         let code = Module::new(
             constants,
@@ -1211,11 +1296,11 @@ mod tests {
                 3,
                 FunctionFlags::default(),
                 vec![
-                    Instruction::TypeOfGlobal {
+                    Instruction::LoadGlobal {
                         dst: Register::new(0),
                         name: ConstantId::new(0),
                     },
-                    Instruction::TypeOfGlobal {
+                    Instruction::LoadGlobal {
                         dst: Register::new(1),
                         name: ConstantId::new(1),
                     },
@@ -1290,7 +1375,7 @@ mod tests {
             .call_value(run, Value::UNDEFINED, &[source])
             .expect("runInNewContext call succeeds");
 
-        // The host-only global must NOT leak into the new context.
+        // The host-only globals must NOT leak into the new context.
         let typeof_host_only = machine.get_named_property(result, "0").unwrap();
         assert!(
             machine
@@ -1298,8 +1383,22 @@ mod tests {
                 .is_some_and(|text| text.eq_ascii("undefined")),
             "host-only global is absent inside runInNewContext"
         );
+        let typeof_process = machine.get_named_property(result, "1").unwrap();
+        assert!(
+            machine
+                .string_value(typeof_process)
+                .is_some_and(|text| text.eq_ascii("undefined")),
+            "process is absent inside runInNewContext"
+        );
+        let typeof_console = machine.get_named_property(result, "2").unwrap();
+        assert!(
+            machine
+                .string_value(typeof_console)
+                .is_some_and(|text| text.eq_ascii("undefined")),
+            "console is absent inside runInNewContext"
+        );
         // Standard intrinsics must remain usable in the new context.
-        let typeof_object = machine.get_named_property(result, "1").unwrap();
+        let typeof_object = machine.get_named_property(result, "3").unwrap();
         assert!(
             machine
                 .string_value(typeof_object)
@@ -1312,6 +1411,65 @@ mod tests {
             machine.test_global("hostOnly"),
             Some(Value::int32(42)),
             "main-context lookup is unchanged"
+        );
+    }
+
+    #[test]
+    fn run_in_new_context_keeps_explicit_context_properties() {
+        let program = program_returning(0);
+        let mut host = ScriptHost {
+            compiler: Some(FakeCompiler {
+                program: Arc::new(program_returning_supplied_globals()),
+                sources: Vec::new(),
+            }),
+        };
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+
+        let run = machine
+            .registry
+            .external
+            .get(&EcmaString::encode("node:vm"))
+            .expect("node:vm is installed")
+            .exports
+            .get(&EcmaString::encode("runInNewContext"))
+            .expect("runInNewContext is exported")
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::encode(
+                "explicit context check",
+            )))
+            .unwrap();
+
+        // Allocate a context object and explicitly provide `process` and `console`.
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(context, "process", Value::int32(123))
+            .unwrap();
+        machine
+            .set_data_property(context, "console", Value::int32(456))
+            .unwrap();
+
+        let result = machine
+            .call_value(run, Value::UNDEFINED, &[source, context])
+            .expect("runInNewContext call succeeds");
+
+        assert_eq!(
+            machine.get_named_property(result, "0").unwrap(),
+            Value::int32(123),
+            "explicit process property is visible inside runInNewContext"
+        );
+        assert_eq!(
+            machine.get_named_property(result, "1").unwrap(),
+            Value::int32(456),
+            "explicit console property is visible inside runInNewContext"
         );
     }
 

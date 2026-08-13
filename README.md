@@ -10,8 +10,8 @@ bamTiScript is a pre-release Rust toolchain that type-checks, runs, and compiles
 
 - Repository: `bamTiScript`
 - CLI binary: `bamts`
-- Workspace crates: `bamts`, `bamts-cli`, `bamts-compiler`, `bamts-runtime`, `bamts-codegen`, `bamts-bytecode`, `bamts-native`, `bamts-node`, and `bamts-verification`
-- npm packages: `bamti` and `bamti-cli` 0.1.0 are published, but their platform binary packages are unavailable
+- Workspace crates: `bamts`, `bamts-cli`, `bamts-compiler`, `bamts-cancel`, `bamts-bytecode`, `bamts-runtime`, `bamts-codegen`, `bamts-native`, `bamts-node`, `bamts-verification`, and private `bamts-napi`
+- npm packages: `bamti` (in-process Node 24+ interface) and `bamti-cli` (standalone CLI transport). Currently published 0.1.0 packages on npm do not provide native binary artifacts; the source implementation of Node-API bindings is not yet published.
 
 ## Quickstart
 
@@ -33,28 +33,30 @@ target/release/bamts compile --target aot -o hello hello.ts
 
 ## Project status
 
-- Version `0.1.0` is pre-release.
-- npm package shims are published, but their platform binary packages are unavailable. Build the working CLI from source with Cargo.
+- Version `0.2.0` is pre-release.
+- `bamti` provides an in-process Node 24+ interface backed by native Node-API bindings (`bamts-napi`) and atomic cancellation (`bamts-cancel`), while `bamti-cli` is the standalone CLI transport.
+- The native addon design targets five host platform packages (`@bamti/bamti-linux-x64-gnu`, `@bamti/bamti-linux-arm64-gnu`, `@bamti/bamti-darwin-x64`, `@bamti/bamti-darwin-arm64`, `@bamti/bamti-win32-x64-msvc`) with fail-closed optional artifact loading.
+- Currently published 0.1.0 npm packages do not contain prebuilt native binary artifacts. Real five-target release validation remains blocked by GitHub billing and is unverified. Build the working CLI from source with Cargo on Linux x64.
 - The documented runtime target is Linux x64. AOT steps use the C compiler driver selected by `$CC`, defaulting to `cc`.
-
 ## Current capabilities
 
 - Type checking with `text`, `pretty`, `json`, `github`, and `compact` diagnostic output
 - JIT execution with `run --target jit`
 - AOT execution and native binary compilation with `--target aot`
 - UTF-16 code-unit indexing for ECMAScript strings
+- In-process Node.js 24+ interface via native Node-API bindings (`bamts-napi`) with atomic cancellation control (`bamts-cancel`)
 - A limited Node-style host surface that includes `process.stdout.write`
-
 ## Explicit limitations
 
 - TypeScript 7.0.2 is the compatibility oracle and target, not a completed compatibility claim.
 - `compile` accepts one entrypoint per invocation and only the AOT target. `-o` selects the output path. Declaration generation and source-map output are rejected.
+- `bamti` requires Node.js 24 or later. Currently published `0.1.0` npm packages do not contain compiled native artifacts; the source-tree native addon implementation is unpublished.
+- `bamti` optional native package loading is fail-closed. Real five-target runtime release verification is blocked by GitHub billing and has not passed.
 - The host runtime implements a limited Node-style API surface. It does not provide full Node.js compatibility.
 - AOT output targets the host architecture. Cross-compilation and non-Linux runtime behavior are not verified.
-- The root workspace policy defaults to `unsafe_code = "forbid"`. Most crates inherit it. Native code generation, host export, verification, and FFI crates contain narrowly scoped, documented exceptions. This policy is not an end-to-end formal memory-safety guarantee.
+- The root workspace policy defaults to `unsafe_code = "forbid"`. Most crates inherit it. Native code generation, host export, verification, FFI, and private `bamts-napi` crates contain narrowly scoped, documented exceptions. This policy is not an end-to-end formal memory-safety guarantee.
 - The project publishes no performance benchmark or production-readiness claim.
 - Formal source artifacts target named properties. The current acceptance state is recorded in the proof ledger; complete compiler and runtime correctness is not proven.
-
 ## Documentation
 
 * [Quickstart Guide](docs/tutorials/quickstart.md): Step-by-step source build and execution tutorial.

@@ -19,7 +19,9 @@
 //! helper ABI, the panic- and nesting-safe [`native_bridge::NativeOps`]
 //! dispatch seam, and the feature-gated JIT/AOT linkage surfaces — lives in
 //! [`native_bridge`], which centralizes every `unsafe` operation the generated
-//! code requires.
+//! code requires. The feature-gated Windows cache capability lives in
+//! [`cache_guard`], whose Win32 implementation isolates its `unsafe` operations
+//! in `cache_guard/windows.rs`.
 
 use core::num::{NonZeroU16, NonZeroU32};
 
@@ -472,6 +474,8 @@ const _: () = {
 
 // -- Native runtime bridge ---------------------------------------------------
 
+#[cfg(feature = "cache-guard")]
+pub mod cache_guard;
 pub mod native_bridge;
 pub use native_bridge::*;
 

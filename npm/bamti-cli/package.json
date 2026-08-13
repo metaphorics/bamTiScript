@@ -1,6 +1,6 @@
 {
   "name": "bamti-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "BamTS compiler command-line interface",
   "license": "MIT",
   "repository": {
@@ -8,13 +8,13 @@
     "url": "git+https://github.com/metaphorics/bamTiScript.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "type": "module",
   "exports": "./index.js",
   "types": "./index.d.ts",
   "scripts": {
-    "prepublishOnly": "node ../scripts/preflight.mjs --registry-only"
+    "prepublishOnly": "node --input-type=module -e \"import { accessSync } from 'node:fs'; accessSync('cli-release-table.json')\" && node ../scripts/preflight.mjs --registry-only"
   },
   "bin": {
     "bamts": "bin/bamts.js"
@@ -22,14 +22,15 @@
   "files": [
     "README.md",
     "bin/bamts.js",
+    "cli-release-table.json",
     "index.d.ts",
     "index.js"
   ],
   "optionalDependencies": {
-    "@bamti/cli-darwin-arm64": "0.1.0",
-    "@bamti/cli-darwin-x64": "0.1.0",
-    "@bamti/cli-linux-arm64": "0.1.0",
-    "@bamti/cli-linux-x64": "0.1.0",
-    "@bamti/cli-win32-x64": "0.1.0"
+    "@bamti/cli-darwin-arm64": "0.2.0",
+    "@bamti/cli-darwin-x64": "0.2.0",
+    "@bamti/cli-linux-arm64": "0.2.0",
+    "@bamti/cli-linux-x64": "0.2.0",
+    "@bamti/cli-win32-x64": "0.2.0"
   }
 }

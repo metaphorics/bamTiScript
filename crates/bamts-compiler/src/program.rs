@@ -12,6 +12,7 @@ use bamts_bytecode::{
     EdgeId, EdgeKind, EdgeTarget, Export, ExportSource, ModuleId, Program as BytecodeProgram,
     ProgramModule, ProgramVerifyError, Verified,
 };
+use bamts_cancel::{CancellationToken, Cancelled};
 
 use crate::{
     diagnostic::DiagnosticCode,
@@ -314,6 +315,7 @@ pub const MAX_SESSION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 /// Fail-fast program loading errors. No partially resolved graph is exposed.
 #[derive(Debug)]
 pub enum ProgramLoadError {
+    Cancelled(Cancelled),
     InvalidRoot(io::Error),
     EntryOutsideRoot(PathBuf),
     TraversalRejected {
@@ -354,6 +356,7 @@ pub enum ProgramLoadError {
 impl fmt::Display for ProgramLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
             Self::InvalidRoot(error) => {
                 write!(formatter, "cannot canonicalize project root: {error}")
             }
@@ -433,9 +436,32 @@ impl ProgramLoadError {
     }
 }
 
+impl From<Cancelled> for ProgramLoadError {
+    fn from(error: Cancelled) -> Self {
+        Self::Cancelled(error)
+    }
+}
+
+impl From<crate::scanner::ScanError> for ProgramLoadError {
+    fn from(error: crate::scanner::ScanError) -> Self {
+        match error {
+            crate::scanner::ScanError::Cancelled(cancelled) => Self::Cancelled(cancelled),
+        }
+    }
+}
+
+impl From<crate::parser::ParseError> for ProgramLoadError {
+    fn from(error: crate::parser::ParseError) -> Self {
+        match error {
+            crate::parser::ParseError::Cancelled(cancelled) => Self::Cancelled(cancelled),
+        }
+    }
+}
+
 impl std::error::Error for ProgramLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::InvalidRoot(error) | Self::Read { source: error, .. } => Some(error),
             Self::InvalidSpecifier { source, .. } => Some(source),
             Self::InvalidPackage { source, .. } => Some(source),
@@ -466,12 +492,23 @@ impl ProgramLoader {
 
     /// Resolves and loads an entrypoint. The entrypoint may be root-relative or absolute.
     pub fn load(&self, entrypoint: impl AsRef<Path>) -> Result<ResolvedProgram, ProgramLoadError> {
+        let cancel = CancellationToken::new();
+        self.load_with_cancel(entrypoint, &cancel)
+    }
+
+    /// Resolves and loads an entrypoint with cooperative cancellation.
+    pub fn load_with_cancel(
+        &self,
+        entrypoint: impl AsRef<Path>,
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedProgram, ProgramLoadError> {
+        cancel.check()?;
         let requested = self
             .root
             .resolve(entrypoint.as_ref())
             .map_err(|_| ProgramLoadError::EntryOutsideRoot(entrypoint.as_ref().to_path_buf()))?;
         let entrypoint = self
-            .select_absolute(&requested, ResolutionFlavor::Runtime)?
+            .select_absolute(&requested, ResolutionFlavor::Runtime, cancel)?
             .ok_or_else(|| ProgramLoadError::Read {
                 path: requested,
                 source: io::Error::new(io::ErrorKind::NotFound, "entrypoint does not exist"),
@@ -479,14 +516,15 @@ impl ProgramLoader {
 
         let mut state = LoadState {
             loader: self,
+            cancel,
             identities: HashMap::new(),
             modules: Vec::new(),
             overlay_worklist: Vec::new(),
             type_overlays: Vec::new(),
             session_bytes: 0,
         };
-        let entrypoint = state.visit(entrypoint)?;
-        state.load_declaration_overlays()?;
+        let entrypoint = state.visit_with_cancel(entrypoint)?;
+        state.load_declaration_overlays_with_cancel()?;
         let module_indices = state
             .modules
             .iter()
@@ -517,6 +555,7 @@ impl ProgramLoader {
         &self,
         requested: &Path,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
         let relative = requested.strip_prefix(self.root.path()).map_err(|_| {
             ProgramLoadError::TraversalRejected {
@@ -543,35 +582,53 @@ impl ProgramLoader {
             ),
             source,
         })?;
-        self.canonical_selection(plan.candidates(), flavor)
+        self.canonical_selection(plan.candidates(), flavor, cancel)
     }
 
     fn canonical_selection(
         &self,
         candidates: &[PathBuf],
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
         if flavor == ResolutionFlavor::Runtime {
             for candidate in candidates {
-                if is_declaration_path(candidate) || !candidate.is_file() {
+                cancel.check()?;
+                if is_declaration_path(candidate) {
                     continue;
                 }
-                return self.canonical_candidate(candidate).map(Some);
+                cancel.check()?;
+                let is_file = candidate.is_file();
+                cancel.check()?;
+                if !is_file {
+                    continue;
+                }
+                return self.canonical_candidate(candidate, cancel).map(Some);
             }
         }
         for candidate in candidates {
-            if candidate.is_file() {
-                return self.canonical_candidate(candidate).map(Some);
+            cancel.check()?;
+            cancel.check()?;
+            let is_file = candidate.is_file();
+            cancel.check()?;
+            if is_file {
+                return self.canonical_candidate(candidate, cancel).map(Some);
             }
         }
         Ok(None)
     }
 
-    fn canonical_candidate(&self, candidate: &Path) -> Result<PathBuf, ProgramLoadError> {
+    fn canonical_candidate(
+        &self,
+        candidate: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<PathBuf, ProgramLoadError> {
+        cancel.check()?;
         let canonical = fs::canonicalize(candidate).map_err(|source| ProgramLoadError::Read {
             path: candidate.to_path_buf(),
             source,
         })?;
+        cancel.check()?;
         if !canonical.starts_with(self.root.path()) {
             return Err(ProgramLoadError::TraversalRejected {
                 path: canonical,
@@ -585,7 +642,9 @@ impl ProgramLoader {
         &self,
         importer: &Path,
         edge: &UnresolvedEdge,
+        cancel: &CancellationToken,
     ) -> Result<ResolvedEdge, ProgramLoadError> {
+        cancel.check()?;
         if edge.specifier.starts_with("node:") {
             return Ok(ResolvedEdge {
                 target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
@@ -598,8 +657,8 @@ impl ProgramLoader {
         } else {
             ResolutionFlavor::Runtime
         };
-        if let Some(target) = self.resolve_local(importer, edge, flavor)? {
-            let type_overlay = self.type_overlay(importer, edge, &target);
+        if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
+            let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
             return Ok(ResolvedEdge {
                 target,
                 type_overlay,
@@ -624,7 +683,9 @@ impl ProgramLoader {
         importer: &Path,
         edge: &UnresolvedEdge,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
+        cancel.check()?;
         if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
             let plan = plan_relative_module(
                 &self.root,
@@ -638,18 +699,20 @@ impl ProgramLoader {
                 source,
             })?;
             return Ok(self
-                .canonical_selection(plan.candidates(), flavor)?
+                .canonical_selection(plan.candidates(), flavor, cancel)?
                 .map(ResolvedEdgeTarget::Local));
         }
         if edge.specifier.starts_with('#') {
-            return self.resolve_package_import(importer, edge, flavor);
+            return self.resolve_package_import(importer, edge, flavor, cancel);
         }
-        Ok(match self.resolve_mapped(&edge.specifier, flavor)? {
-            Some(mapped) => Some(ResolvedEdgeTarget::Local(mapped)),
-            None => self
-                .resolve_package(importer, edge, flavor)?
-                .map(ResolvedEdgeTarget::Local),
-        })
+        Ok(
+            match self.resolve_mapped(&edge.specifier, flavor, cancel)? {
+                Some(mapped) => Some(ResolvedEdgeTarget::Local(mapped)),
+                None => self
+                    .resolve_package(importer, edge, flavor, cancel)?
+                    .map(ResolvedEdgeTarget::Local),
+            },
+        )
     }
 
     fn type_overlay(
@@ -657,33 +720,39 @@ impl ProgramLoader {
         importer: &Path,
         edge: &UnresolvedEdge,
         runtime_target: &ResolvedEdgeTarget,
-    ) -> Option<PathBuf> {
+        cancel: &CancellationToken,
+    ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        cancel.check()?;
         if edge.kind == ModuleEdgeKind::TypeOnly || is_declaration_path(importer) {
-            return None;
+            return Ok(None);
         }
         let ResolvedEdgeTarget::Local(runtime_path) = runtime_target else {
-            return None;
+            return Ok(None);
         };
-        let Ok(Some(ResolvedEdgeTarget::Local(type_path))) =
-            self.resolve_local(importer, edge, ResolutionFlavor::Types)
+        let Some(ResolvedEdgeTarget::Local(type_path)) =
+            self.resolve_local(importer, edge, ResolutionFlavor::Types, cancel)?
         else {
-            return None;
+            return Ok(None);
         };
-        (type_path != *runtime_path).then_some(type_path)
+        Ok((type_path != *runtime_path).then_some(type_path))
     }
 
     fn resolve_mapped(
         &self,
         specifier: &str,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        cancel.check()?;
         for mapping in self.options.paths() {
+            cancel.check()?;
             let Some(capture) = pattern_capture(mapping.pattern(), specifier) else {
                 continue;
             };
             for target in mapping.targets() {
+                cancel.check()?;
                 let target = PathBuf::from(target.to_string_lossy().replace('*', capture));
-                if let Some(selected) = self.select_absolute(&target, flavor)? {
+                if let Some(selected) = self.select_absolute(&target, flavor, cancel)? {
                     return Ok(Some(selected));
                 }
             }
@@ -696,23 +765,31 @@ impl ProgramLoader {
         importer: &Path,
         edge: &UnresolvedEdge,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        cancel.check()?;
         let Some((package_name, subpath)) = split_package_specifier(&edge.specifier) else {
             return Ok(None);
         };
         let mut directory = importer.parent();
         while let Some(current) = directory {
+            cancel.check()?;
             if !current.starts_with(self.root.path()) {
                 break;
             }
             let package_directory = current.join("node_modules").join(package_name);
             let package_path = package_directory.join("package.json");
-            if package_path.is_file() {
+            cancel.check()?;
+            let is_file = package_path.is_file();
+            cancel.check()?;
+            if is_file {
+                cancel.check()?;
                 let package_source =
                     fs::read_to_string(&package_path).map_err(|source| ProgramLoadError::Read {
                         path: package_path.clone(),
                         source,
                     })?;
+                cancel.check()?;
                 let package = PackageJson::parse(&self.root, &package_path, &package_source)
                     .map_err(|source| ProgramLoadError::InvalidPackage {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
@@ -730,7 +807,7 @@ impl ProgramLoader {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
                         source,
                     })?;
-                return self.select_absolute(&target, flavor);
+                return self.select_absolute(&target, flavor, cancel);
             }
             if current == self.root.path() {
                 break;
@@ -744,19 +821,26 @@ impl ProgramLoader {
         importer: &Path,
         edge: &UnresolvedEdge,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
         let mut directory = importer.parent();
         while let Some(current) = directory {
+            cancel.check()?;
             if !current.starts_with(self.root.path()) {
                 break;
             }
             let package_path = current.join("package.json");
-            if package_path.is_file() {
+            cancel.check()?;
+            let is_file = package_path.is_file();
+            cancel.check()?;
+            if is_file {
+                cancel.check()?;
                 let package_source =
                     fs::read_to_string(&package_path).map_err(|source| ProgramLoadError::Read {
                         path: package_path.clone(),
                         source,
                     })?;
+                cancel.check()?;
                 let package = PackageJson::parse(&self.root, &package_path, &package_source)
                     .map_err(|source| ProgramLoadError::InvalidPackage {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
@@ -776,7 +860,7 @@ impl ProgramLoader {
                     })?;
                 return match target {
                     PackageTarget::Path(path) => Ok(self
-                        .select_absolute(&path, flavor)?
+                        .select_absolute(&path, flavor, cancel)?
                         .map(ResolvedEdgeTarget::Local)),
                     PackageTarget::External(specifier) => {
                         let external = UnresolvedEdge {
@@ -784,9 +868,11 @@ impl ProgramLoader {
                             specifier,
                             range: edge.range,
                         };
-                        match self.resolve_mapped(&external.specifier, flavor)? {
+                        match self.resolve_mapped(&external.specifier, flavor, cancel)? {
                             Some(mapped) => Ok(Some(ResolvedEdgeTarget::Local(mapped))),
-                            None => match self.resolve_package(importer, &external, flavor)? {
+                            None => match self
+                                .resolve_package(importer, &external, flavor, cancel)?
+                            {
                                 Some(package) => Ok(Some(ResolvedEdgeTarget::Local(package))),
                                 None => Ok(Some(ResolvedEdgeTarget::External(external.specifier))),
                             },
@@ -834,6 +920,7 @@ fn accumulate_session_bytes(session_bytes: usize, added: usize) -> Result<usize,
 
 struct LoadState<'a> {
     loader: &'a ProgramLoader,
+    cancel: &'a CancellationToken,
     identities: HashMap<PathBuf, SourceId>,
     modules: Vec<ResolvedModule>,
     overlay_worklist: Vec<PathBuf>,
@@ -875,13 +962,14 @@ impl LoadState<'_> {
         }
     }
 
-    fn load_declaration_overlays(&mut self) -> Result<(), ProgramLoadError> {
+    fn load_declaration_overlays_with_cancel(&mut self) -> Result<(), ProgramLoadError> {
         let mut next = 0;
         while next < self.overlay_worklist.len() {
+            self.cancel.check()?;
             let path = self.overlay_worklist[next].clone();
             next += 1;
             if !self.identities.contains_key(&path) {
-                self.visit(path)?;
+                self.visit_with_cancel(path)?;
             }
         }
 
@@ -892,6 +980,7 @@ impl LoadState<'_> {
             .map(|(index, module)| (module.source_id(), index))
             .collect();
         for (importer, dependency_index, path) in &self.type_overlays {
+            self.cancel.check()?;
             let type_source_id = *self
                 .identities
                 .get(path)
@@ -911,7 +1000,7 @@ impl LoadState<'_> {
     /// appended in DFS postorder. Local edges are resolved left-to-right; a path
     /// already present in `identities` is reused immediately, which both
     /// deduplicates diamonds and retains cycle edges without re-entering.
-    fn visit(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
+    fn visit_with_cancel(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
         enum Resume {
             Enter(PathBuf),
             Advance,
@@ -921,6 +1010,7 @@ impl LoadState<'_> {
         let mut resume = Resume::Enter(entrypoint);
 
         loop {
+            self.cancel.check()?;
             match resume {
                 Resume::Enter(path) => {
                     if let Some(&source_id) = self.identities.get(&path) {
@@ -949,11 +1039,13 @@ impl LoadState<'_> {
 
                     let script_kind = script_kind(&path)
                         .ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
+                    self.cancel.check()?;
                     let text =
                         fs::read_to_string(&path).map_err(|source| ProgramLoadError::Read {
                             path: path.clone(),
                             source,
                         })?;
+                    self.cancel.check()?;
                     let len = text.len();
                     let source = SourceText::new(text)
                         .map_err(|_| ProgramLoadError::SourceTooLarge {
@@ -967,8 +1059,13 @@ impl LoadState<'_> {
                             total,
                         })?;
                     let source = Arc::new(source);
-                    let parsed =
-                        parser::parse(scanner::scan(source_id, script_kind, Arc::clone(&source)));
+                    let scanned = scanner::scan_with_cancel(
+                        source_id,
+                        script_kind,
+                        Arc::clone(&source),
+                        self.cancel.clone(),
+                    )?;
+                    let parsed = parser::parse_with_cancel(scanned, self.cancel.clone())?;
                     let unresolved = collect_edges(parsed.product()).map_err(|range| {
                         ProgramLoadError::IllFormedModuleSpecifier {
                             importer: path.clone(),
@@ -993,10 +1090,12 @@ impl LoadState<'_> {
                             .last_mut()
                             .expect("Advance always runs with a frame on the stack");
                         loop {
+                            self.cancel.check()?;
                             let Some(edge) = frame.remaining.next() else {
                                 break None;
                             };
-                            let resolved = self.loader.resolve_edge(&frame.path, &edge)?;
+                            let resolved =
+                                self.loader.resolve_edge(&frame.path, &edge, self.cancel)?;
                             let target = resolved.target;
                             let type_overlay = resolved.type_overlay;
                             match target {
@@ -1883,6 +1982,7 @@ pub enum ProgramLowerPhase {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramLowerErrorKind {
+    Cancelled(Cancelled),
     FrontendEntrypointMismatch {
         resolved: SourceId,
         frontend: SourceId,
@@ -1915,22 +2015,36 @@ pub struct ProgramLowerError {
 
 impl fmt::Display for ProgramLowerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "program lowering failed in {} during {:?}: {:?}",
-            self.module.display(),
-            self.phase,
-            self.kind
-        )
+        match &self.kind {
+            ProgramLowerErrorKind::Cancelled(error) => error.fmt(formatter),
+            _ => write!(
+                formatter,
+                "program lowering failed in {} during {:?}: {:?}",
+                self.module.display(),
+                self.phase,
+                self.kind
+            ),
+        }
     }
 }
 
 impl std::error::Error for ProgramLowerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
+            ProgramLowerErrorKind::Cancelled(error) => Some(error),
             ProgramLowerErrorKind::Lower(error) => Some(error),
             ProgramLowerErrorKind::Link(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+impl From<Cancelled> for ProgramLowerError {
+    fn from(error: Cancelled) -> Self {
+        Self {
+            module: PathBuf::new(),
+            phase: ProgramLowerPhase::Frontend,
+            kind: ProgramLowerErrorKind::Cancelled(error),
         }
     }
 }
@@ -1998,6 +2112,17 @@ pub fn lower_program(
     frontend: &ProgramFrontendOutput,
     options: LowerOptions,
 ) -> Result<ExecutableProgram, ProgramLowerError> {
+    lower_program_with_cancel(resolved, frontend, options, &CancellationToken::new())
+}
+
+/// Lowers one canonical resolved program with cooperative cancellation.
+pub fn lower_program_with_cancel(
+    resolved: &ResolvedProgram,
+    frontend: &ProgramFrontendOutput,
+    options: LowerOptions,
+    cancel: &CancellationToken,
+) -> Result<ExecutableProgram, ProgramLowerError> {
+    cancel.check()?;
     if frontend.entrypoint_id() != resolved.entrypoint_id() {
         return Err(program_lower_error(
             resolved.entrypoint().path(),
@@ -2009,6 +2134,7 @@ pub fn lower_program(
         ));
     }
     for output in frontend.modules() {
+        cancel.check()?;
         let source = output.source_file().source_id();
         if resolved.module(source).is_none() {
             return Err(program_lower_error(
@@ -2027,6 +2153,7 @@ pub fn lower_program(
         .collect();
     let mut raw_modules = Vec::with_capacity(resolved.modules().len());
     for module in resolved.modules() {
+        cancel.check()?;
         let output = frontend.module(module.source_id()).ok_or_else(|| {
             program_lower_error(
                 module.path(),
@@ -2051,9 +2178,13 @@ pub fn lower_program(
             name,
             &module_ids,
         )?);
+        cancel.check()?;
     }
+    cancel.check()?;
     resolve_import_equals_bindings(&mut raw_modules);
+    cancel.check()?;
     expand_star_exports(&mut raw_modules);
+    cancel.check()?;
 
     let mut linked_modules = Vec::with_capacity(raw_modules.len());
     let mut provenance = Vec::with_capacity(raw_modules.len());
@@ -2063,6 +2194,7 @@ pub fn lower_program(
         .zip(raw_modules.iter())
         .enumerate()
     {
+        cancel.check()?;
         let output = frontend
             .module(resolved_module.source_id())
             .expect("frontend presence checked above");
@@ -2089,6 +2221,7 @@ pub fn lower_program(
                 ProgramLowerErrorKind::Lower(error),
             )
         })?;
+        cancel.check()?;
         linked_modules.push(materialize_program_module(code, raw));
         provenance.push(ExecutableModuleProvenance {
             module: ModuleId::new(index as u32),
@@ -2096,6 +2229,7 @@ pub fn lower_program(
             edges: Arc::from(resolved_module.dependencies()),
         });
     }
+    cancel.check()?;
     let entry = module_ids[&resolved.entrypoint_id()];
     let wire = BytecodeProgram::link(linked_modules, entry).map_err(|error| {
         let path = error
@@ -2108,6 +2242,7 @@ pub fn lower_program(
             ProgramLowerErrorKind::Link(error),
         )
     })?;
+    cancel.check()?;
     Ok(ExecutableProgram { wire, provenance })
 }
 

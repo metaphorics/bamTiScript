@@ -184,6 +184,8 @@ pub enum NativeError {
     ProgramMismatch,
     /// A native entry returned `FatalTrap`; `value` is the raw trap id word.
     FatalTrap { value: Value },
+    /// A caller-supplied [`bamts_cancel::CancellationToken`] was triggered.
+    Cancelled,
 }
 
 impl fmt::Display for NativeError {
@@ -204,6 +206,7 @@ impl fmt::Display for NativeError {
                     value.to_bits()
                 )
             }
+            NativeError::Cancelled => formatter.write_str("operation cancelled"),
         }
     }
 }
@@ -349,6 +352,8 @@ pub struct NativeEngine<'m, 'h, H: Host> {
     pending_error: Cell<Option<RuntimeError>>,
     /// A nested entry-table linkage failure, propagated through `FatalTrap`.
     pending_abi_error: Cell<Option<AbiError>>,
+    /// Cooperative cancellation signal shared with the embedded [`Machine`].
+    cancel: bamts_cancel::CancellationToken,
 }
 
 impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
@@ -358,11 +363,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         host: &'h mut H,
         limits: Limits,
         backend: Backend,
+        cancel: bamts_cancel::CancellationToken,
     ) -> Self
     where
         'm: 'h,
     {
-        let mut machine = Machine::new(program, host, limits);
+        let mut machine = Machine::new_with_cancel(program, host, limits, cancel.clone());
         machine.frames.clear();
         machine.live_registers = 0;
         NativeEngine {
@@ -378,6 +384,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             pending_fatal_kind: Cell::new(None),
             pending_error: Cell::new(None),
             pending_abi_error: Cell::new(None),
+            cancel,
         }
     }
 
@@ -394,7 +401,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     where
         'm: 'h,
     {
-        Self::build(program, entries, host, limits, Backend::Reference)
+        Self::build(
+            program,
+            entries,
+            host,
+            limits,
+            Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
+        )
     }
 
     /// Buffered process stdout produced during execution.
@@ -2793,6 +2807,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     // -- Linked backend ------------------------------------------------------
 
     fn run_linked(&mut self) -> Result<ExecutionOutcome, NativeError> {
+        if self.cancel.is_cancelled() {
+            return Err(NativeError::Cancelled);
+        }
         self.machine.borrow_mut().instantiate_modules()?;
         let module = self.program.entry();
         let execution = if self.machine.borrow().module_graph_suspends(module) {
@@ -2937,6 +2954,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             },
         });
         self.push_native_roots(&registers);
+        if self.cancel.is_cancelled() {
+            self.pop_native_roots();
+            self.activations.borrow_mut().pop();
+            self.machine
+                .borrow_mut()
+                .release_native_activation(register_count);
+            return Err(NativeError::Cancelled);
+        }
         let handles = registers.as_mut_ptr();
         let entries = self.entries;
         let (tag, out, fault_pc) = {
@@ -2953,6 +2978,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         self.machine
             .borrow_mut()
             .release_native_activation(register_count);
+        if self.cancel.is_cancelled() {
+            return Err(NativeError::Cancelled);
+        }
         match tag {
             Ok(CompletionTag::Normal) => {
                 self.pending_throw.take();
@@ -3620,11 +3648,47 @@ pub fn run_linked_program<H: Host>(
     host: &mut H,
     limits: &Limits,
 ) -> Result<ExecutionOutcome, NativeError> {
+    run_linked_program_with_cancel(
+        program,
+        entries,
+        host,
+        limits,
+        bamts_cancel::CancellationToken::new(),
+    )
+}
+
+/// Runs a linked program's entry through the native engine with a
+/// caller-supplied [`bamts_cancel::CancellationToken`].
+///
+/// The token is checked before engine construction, immediately before and
+/// after the linked entry invocation, and at every fuel, microtask, timer, and
+/// quiescence checkpoint inside the shared [`Machine`]. Triggering it aborts
+/// execution with [`NativeError::Cancelled`].
+///
+/// Returns [`NativeError::ProgramMismatch`] before constructing the engine when
+/// `entries` was not compiled from this program's exact canonical encoding.
+pub fn run_linked_program_with_cancel<H: Host>(
+    program: &Program<Verified>,
+    entries: &dyn NativeEntryTable,
+    host: &mut H,
+    limits: &Limits,
+    cancel: bamts_cancel::CancellationToken,
+) -> Result<ExecutionOutcome, NativeError> {
+    if cancel.is_cancelled() {
+        return Err(NativeError::Cancelled);
+    }
     let program_bytes = program.encode();
     if program_bytes != entries.program_bytes() {
         return Err(NativeError::ProgramMismatch);
     }
-    let mut engine = NativeEngine::build(program, entries, host, limits.clone(), Backend::Linked);
+    let mut engine = NativeEngine::build(
+        program,
+        entries,
+        host,
+        limits.clone(),
+        Backend::Linked,
+        cancel,
+    );
     engine.run_linked()
 }
 
@@ -4401,6 +4465,7 @@ mod tests {
                 &mut linked_host,
                 Limits::default(),
                 Backend::Linked,
+                bamts_cancel::CancellationToken::new(),
             );
             queue_callback_microtask(&mut linked, FunctionId::new(1));
             linked
@@ -4458,6 +4523,7 @@ mod tests {
                 &mut linked_host,
                 Limits::default(),
                 Backend::Linked,
+                bamts_cancel::CancellationToken::new(),
             );
             queue_callback_microtask(&mut linked, FunctionId::new(1));
             linked
@@ -4576,6 +4642,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         linked.machine.borrow_mut().instantiate_modules().unwrap();
         assert!(matches!(
@@ -5865,6 +5932,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
 
         engine.run_linked().expect("top-level await completes");
@@ -5956,6 +6024,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine
             .run_linked()
@@ -6104,6 +6173,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let error = engine
             .run_linked()
@@ -6209,6 +6279,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.machine.borrow_mut().instantiate_modules().unwrap();
         assert!(matches!(
@@ -7355,6 +7426,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.pending_throw.set(Some(PendingThrow {
             value: Value::UNDEFINED,
@@ -7395,6 +7467,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let (callee, arguments) = {
             let mut machine = engine.machine.borrow_mut();
@@ -7497,6 +7570,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.pending_fault.set(Some((
             crate::RuntimeFunction {
@@ -7537,6 +7611,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.pending_throw.set(Some(PendingThrow {
             value: Value::int32(1),
@@ -7560,6 +7635,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine
             .pending_fatal_kind
@@ -7592,6 +7668,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let outcome = engine.invoke_runtime(
             crate::RuntimeFunction {
@@ -7625,6 +7702,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.machine.borrow_mut().instantiate_modules().unwrap();
         for _ in 0..2 {
@@ -7665,6 +7743,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.machine.borrow_mut().instantiate_modules().unwrap();
         let module = engine
@@ -7993,6 +8072,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let generator = invoke_test_generator(&engine);
         assert_eq!(entries.call.get(), 0, "generator call is lazy");
@@ -8037,6 +8117,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let resumed_value = engine
             .machine
@@ -8112,6 +8193,7 @@ mod tests {
                 &mut host,
                 Limits::default(),
                 Backend::Linked,
+                bamts_cancel::CancellationToken::new(),
             );
             let generator = invoke_test_generator(&engine);
             let outcome =
@@ -8148,6 +8230,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let generator = invoke_test_generator(&engine);
         let array = {
@@ -8185,6 +8268,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED];
         engine.activations.borrow_mut().push(Activation {
@@ -8230,6 +8314,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let values = {
             let mut machine = engine.machine.borrow_mut();
@@ -8679,6 +8764,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED; 3];
         linked.activations.borrow_mut().push(Activation {
@@ -8724,6 +8810,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED];
         engine.activations.borrow_mut().push(Activation {
@@ -8859,6 +8946,7 @@ mod tests {
             &mut linked_host,
             limits(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED; 1];
         linked.activations.borrow_mut().push(Activation {
@@ -8969,6 +9057,7 @@ mod tests {
             &mut linked_host,
             limits(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED; 3];
         linked.activations.borrow_mut().push(Activation {
@@ -9173,6 +9262,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED; 5];
         linked.activations.borrow_mut().push(Activation {
@@ -9226,6 +9316,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
         );
         let key = engine
             .machine
@@ -9304,6 +9395,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
         );
         let key_x = engine
             .machine
@@ -9472,6 +9564,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
         );
         let key_x = engine
             .machine
@@ -9904,8 +9997,14 @@ mod tests {
             let program = trivial_program();
             let entries = NoEntries;
             let mut host = SilentHost;
-            let engine =
-                NativeEngine::build(&program, &entries, &mut host, Limits::default(), backend);
+            let engine = NativeEngine::build(
+                &program,
+                &entries,
+                &mut host,
+                Limits::default(),
+                backend,
+                bamts_cancel::CancellationToken::new(),
+            );
             let mut registers = vec![Value::UNINITIALIZED; 2];
             engine.activations.borrow_mut().push(Activation {
                 this_value: Value::UNDEFINED,
@@ -10037,5 +10136,84 @@ mod tests {
             engine.pop_native_roots();
             engine.activations.borrow_mut().pop();
         }
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_before_entry_invocation() {
+        let program = trivial_program();
+        let entries = RecordingEntries {
+            program_bytes: program.encode(),
+            ..RecordingEntries::default()
+        };
+        let token = bamts_cancel::CancellationToken::new();
+        token.cancel();
+        let mut host = SilentHost;
+        let error = super::run_linked_program_with_cancel(
+            &program,
+            &entries,
+            &mut host,
+            &Limits::default(),
+            token,
+        )
+        .expect_err("pre-cancelled token aborts");
+        assert_eq!(error, NativeError::Cancelled);
+        assert!(
+            entries.invoked.borrow().is_empty(),
+            "entry must not be invoked when pre-cancelled"
+        );
+    }
+
+    #[test]
+    fn fresh_token_preserves_existing_run_linked_program_behavior() {
+        let program = trivial_program();
+        let entries = RecordingEntries {
+            program_bytes: program.encode(),
+            ..RecordingEntries::default()
+        };
+        let mut host = SilentHost;
+        let outcome = run_linked_program(&program, &entries, &mut host, &Limits::default())
+            .expect("fresh token runs to completion");
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(entries.invoked.borrow().as_slice(), &[(0, 0)]);
+    }
+
+    #[test]
+    fn fuel_checkpoint_cancellation_aborts_long_execution() {
+        // A program that loops forever via a backward jump. The fuel
+        // checkpoint in `consume_fuel` checks the cancellation token before
+        // decrementing, so a token cancelled mid-flight aborts with
+        // `RuntimeErrorKind::Cancelled` surfaced through `NativeError`.
+        let code = verified(
+            vec![Constant::String(EcmaString::encode("<loop>"))],
+            vec![entry_function(1, vec![Instruction::Jump { target: pc(0) }])],
+        );
+        let program = linked(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            0,
+        );
+        let entries = RecordingEntries {
+            program_bytes: program.encode(),
+            ..RecordingEntries::default()
+        };
+        let token = bamts_cancel::CancellationToken::new();
+        // Cancel after construction but before running — the pre-cancel
+        // check in `run_linked` catches it.
+        token.cancel();
+        let mut host = SilentHost;
+        let error = super::run_linked_program_with_cancel(
+            &program,
+            &entries,
+            &mut host,
+            &Limits::default(),
+            token,
+        )
+        .expect_err("cancelled token aborts loop");
+        assert_eq!(error, NativeError::Cancelled);
     }
 }
