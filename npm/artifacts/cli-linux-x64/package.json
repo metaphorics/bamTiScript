@@ -1,5 +1,5 @@
 {
-  "name": "@bamti/cli-linux-x64",
+  "name": "bamti-cli-linux-x64",
   "version": "0.2.0",
   "description": "BamTS CLI binary for Linux x64",
   "license": "MIT",

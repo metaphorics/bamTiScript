@@ -1,4 +1,4 @@
-# @bamti/cli-linux-x64
+# bamti-cli-linux-x64
 
 Linux x64 artifact package for `bamti-cli`.
 

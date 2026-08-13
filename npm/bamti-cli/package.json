@@ -27,10 +27,10 @@
     "index.js"
   ],
   "optionalDependencies": {
-    "@bamti/cli-darwin-arm64": "0.2.0",
-    "@bamti/cli-darwin-x64": "0.2.0",
-    "@bamti/cli-linux-arm64": "0.2.0",
-    "@bamti/cli-linux-x64": "0.2.0",
-    "@bamti/cli-win32-x64": "0.2.0"
+    "bamti-cli-darwin-arm64": "0.2.0",
+    "bamti-cli-darwin-x64": "0.2.0",
+    "bamti-cli-linux-arm64": "0.2.0",
+    "bamti-cli-linux-x64": "0.2.0",
+    "bamti-cli-win32-x64": "0.2.0"
   }
 }

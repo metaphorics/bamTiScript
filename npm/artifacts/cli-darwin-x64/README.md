@@ -1,4 +1,4 @@
-# @bamti/cli-darwin-x64
+# bamti-cli-darwin-x64
 
 macOS x64 artifact package for `bamti-cli`.
 
