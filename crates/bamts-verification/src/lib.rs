@@ -1,6 +1,7 @@
 pub mod check_cells;
 pub mod corpus;
 pub mod facets;
+pub mod fixtures;
 pub mod formal_bridge;
 pub mod formal_gates;
 pub mod ledger;
@@ -15,14 +16,19 @@ pub use facets::{
     compare_dts, compare_js, compare_js_cases, compare_symbols, compare_types,
     load_diagnostic_code_map, parse_diagnostic_code_map,
 };
+pub use fixtures::{
+    FixtureVerification, MaterializedFixture, TreeHash, generate_boundary, hash_file, hash_tree,
+    materialize_fixtures, verify_fixtures,
+};
 pub use oracle_pins::{OraclePins, verify_oracle_pins};
 pub use perf::{
-    ArtifactPolicy, Baseline, Benchmark, BenchmarkManifest, BudgetPolicy, HostConditions,
-    HostFingerprint, HostManifest, MachineFingerprint, MeasureOptions, MeasureResult,
-    ObservedConditions, PerfError, PerfErrorCode, Quantiles, ReleaseBaseline, ReleasePolicy,
-    RssPolicy, WallRatioPolicy, compare as compare_perf, evaluate_budgets, load_host,
-    load_manifest as load_perf_manifest, load_policy, load_result, measure, nearest_rank,
-    read_machine_fingerprint,
+    ArtifactPolicy, Baseline, Benchmark, BenchmarkManifest, BudgetPolicy, Fixture, FixtureGroup,
+    FixtureOrigin, FixtureScore, HostConditions, HostFingerprint, HostManifest, MachineFingerprint,
+    MeasureOptions, MeasureResult, ObservedConditions, PerfError, PerfErrorCode, Quantiles,
+    ReleaseBaseline, ReleasePolicy, RssPolicy, Scorecard, ScorecardOptions, WallRatioPolicy,
+    bless_baseline, capture_scorecard, check_baseline, compare as compare_perf, evaluate_budgets,
+    load_host, load_manifest as load_perf_manifest, load_policy, load_result, load_scorecard,
+    measure, nearest_rank, read_machine_fingerprint, validate_scorecard,
 };
 pub use suite::{
     AssetKind, BackendFilter, CellResult, CiMode, CiOptions, FailureClass, IndexEntry,

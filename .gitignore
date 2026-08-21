@@ -5,3 +5,4 @@
 **/.lake/
 verification/ts-suite/
 verification/ts-suite-ledger.json
+perf/fixtures/boundary/
