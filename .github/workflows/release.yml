@@ -1,0 +1,20 @@
+name: release
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publication-disabled:
+    runs-on: ubuntu-24.04
+    steps:
+      - shell: bash
+        run: |
+          echo "::error::Publication remains locked until U11.7 and the §20 final audit pass."
+          exit 1
