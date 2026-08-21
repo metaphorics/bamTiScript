@@ -4,6 +4,7 @@ pub mod facets;
 pub mod fixtures;
 pub mod formal_bridge;
 pub mod formal_gates;
+pub mod jit_runner;
 pub mod ledger;
 pub mod oracle_pins;
 pub mod perf;
@@ -20,6 +21,7 @@ pub use fixtures::{
     FixtureVerification, MaterializedFixture, TreeHash, generate_boundary, hash_file, hash_tree,
     materialize_fixtures, verify_fixtures,
 };
+pub use jit_runner::{JitError, JitErrorCode, ProvisionArgs, ProvisionOutcome, provision};
 pub use oracle_pins::{OraclePins, verify_oracle_pins};
 pub use perf::{
     ArtifactPolicy, Baseline, Benchmark, BenchmarkManifest, BudgetPolicy, Fixture, FixtureGroup,
