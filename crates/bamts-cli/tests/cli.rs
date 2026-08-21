@@ -1032,6 +1032,62 @@ fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     assert!(first_position < second_position, "{stderr}");
 }
 
+#[test]
+fn check_terminates_on_self_referential_generic_heritage() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"interface Base<T> {
+    first<U>(): Base<U>;
+    second<U>(): Base<U>;
+    third<U>(): Base<U>;
+    fourth<U>(): Base<U>;
+    fifth<U>(): Base<U>;
+}
+
+interface Derived<T> extends Base<T> {
+    first<U>(): Derived<U>;
+    second<U>(): Derived<U>;
+    third<U>(): Derived<U>;
+    fourth<U>(): Derived<U>;
+    fifth<U>(): Derived<U>;
+}
+
+class Implementation<T> implements Derived<T> {
+    first<U>(): Concrete<U> { return undefined as never; }
+    second<U>(): Concrete<U> { return undefined as never; }
+    third<U>(): Concrete<U> { return undefined as never; }
+    fourth<U>(): Concrete<U> { return undefined as never; }
+    fifth<U>(): Concrete<U> { return undefined as never; }
+}
+
+class Concrete<T> extends Implementation<T> {}
+"#,
+    );
+
+    let output = project.check("main.ts");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("main.ts:9:30"), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("error[BAMTS-C004]"))
+            .count(),
+        1,
+        "expected exactly one heritage error: {stderr}",
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("warning[BAMTS-W019]"))
+            .count(),
+        5,
+        "expected five return-assertion warnings: {stderr}",
+    );
+}
+
 fn bamts_binary() -> &'static str {
     env!("CARGO_BIN_EXE_bamts")
 }
