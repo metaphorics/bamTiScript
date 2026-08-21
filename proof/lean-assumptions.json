@@ -234,7 +234,7 @@
     },
     {
       "file": "Bamti/JitLifecycle.lean",
-      "name": "Bamti.provider_finalization_failure_reclaims"
+      "name": "Bamti.provider_finalization_failure_frees"
     },
     {
       "file": "Bamti/JitLifecycle.lean",
@@ -334,6 +334,6 @@
     }
   ],
   "schema": "bamti.lean-assumptions/v1",
-  "source_sha256": "41eaf14f0f359e4479793bd0af9c8754526d18a66b7405314b64f805f58f4d05",
+  "source_sha256": "4dd9d7ed6e3c7703c13b9ca58a3b174f691a570940fdf4aeb13fa6f2de6af0f3",
   "user_axioms": []
 }
