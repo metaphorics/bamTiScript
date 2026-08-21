@@ -697,12 +697,22 @@ impl<'a> NarrowingContext<'a> {
         literal: TypeId,
         negated: bool,
     ) -> TypeId {
+        if let Some(view) = self.table.prepare_applied_alias_view(ty)
+            && view != ty
+        {
+            return self.narrow_discriminant(view, property, literal, negated);
+        }
         match self.table.get(ty).clone() {
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => ty,
             Type::Union(members) => {
                 let mut kept = Vec::with_capacity(members.len());
                 for member in members {
-                    if self.discriminant_keeps(member, property, literal, negated) {
+                    if matches!(self.table.get(member), Type::AppliedAlias { .. }) {
+                        let narrowed = self.narrow_discriminant(member, property, literal, negated);
+                        if !matches!(self.table.get(narrowed), Type::Never) {
+                            kept.push(narrowed);
+                        }
+                    } else if self.discriminant_keeps(member, property, literal, negated) {
                         kept.push(member);
                     }
                 }
@@ -716,6 +726,7 @@ impl<'a> NarrowingContext<'a> {
                     ty
                 }
             }
+            Type::AppliedAlias { .. } => ty,
             _ if self.discriminant_keeps(ty, property, literal, negated) => ty,
             Type::Never
             | Type::Void
@@ -759,6 +770,11 @@ impl<'a> NarrowingContext<'a> {
         body_return: TypeId,
         is_async: bool,
     ) -> TypeId {
+        if let Some(view) = self.table.prepare_applied_alias_view(contextual)
+            && view != contextual
+        {
+            return self.contextual_function(view, parameters, body_return, is_async);
+        }
         let contextual_signature = match self.table.get(contextual) {
             Type::This { constraint, .. } => {
                 return self.contextual_function(*constraint, parameters, body_return, is_async);
@@ -788,6 +804,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::ObjectType(_)
             | Type::Named(_)
             | Type::AppliedClass { .. }
+            | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
@@ -833,6 +850,11 @@ impl<'a> NarrowingContext<'a> {
     /// unions.
     #[must_use]
     pub fn contextual_element_type(&mut self, contextual: TypeId) -> Option<TypeId> {
+        if let Some(view) = self.table.prepare_applied_alias_view(contextual)
+            && view != contextual
+        {
+            return self.contextual_element_type(view);
+        }
         match self.table.get(contextual).clone() {
             Type::This { constraint, .. } => self.contextual_element_type(constraint),
             Type::Array(element) => Some(element),
@@ -866,6 +888,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::Function(_)
             | Type::Named(_)
             | Type::AppliedClass { .. }
+            | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
@@ -885,6 +908,11 @@ impl<'a> NarrowingContext<'a> {
     /// so awaiting distributes over unions and is the identity otherwise.
     #[must_use]
     pub fn awaited_type(&mut self, ty: TypeId) -> TypeId {
+        if let Some(view) = self.table.prepare_applied_alias_view(ty)
+            && view != ty
+        {
+            return self.awaited_type(view);
+        }
         match self.table.get(ty).clone() {
             Type::Union(members) => {
                 let awaited: Vec<TypeId> = members
@@ -917,6 +945,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::Function(_)
             | Type::Named(_)
             | Type::AppliedClass { .. }
+            | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
@@ -969,6 +998,11 @@ impl<'a> NarrowingContext<'a> {
     /// when any member cannot supply the property — the access is then not
     /// flow-trackable through this path.
     fn property_type(&mut self, ty: TypeId, name: &str) -> Option<TypeId> {
+        if let Some(view) = self.table.prepare_applied_alias_view(ty)
+            && view != ty
+        {
+            return self.property_type(view, name);
+        }
         if let Some(view) = self.table.prepare_applied_class_view(ty) {
             return self.property_type(view, name);
         }
@@ -993,6 +1027,7 @@ impl<'a> NarrowingContext<'a> {
                     self.intersect(combined, property)
                 }))
             }
+            Type::AppliedAlias { .. } => None,
             _ => match self.table.read_property_type(ty, name) {
                 Some(property) => Some(property),
                 None => self.table.property_type(ty, name),
@@ -1010,17 +1045,30 @@ impl<'a> NarrowingContext<'a> {
     /// (`any`, `unknown`, `error`) are returned unrefined, both as whole
     /// types and as union members.
     fn filter(&mut self, ty: TypeId, decide: &dyn Fn(&TypeTable, &Type) -> Narrow) -> TypeId {
+        if let Some(view) = self.table.prepare_applied_alias_view(ty)
+            && view != ty
+        {
+            return self.filter(view, decide);
+        }
         match self.table.get(ty).clone() {
             Type::This { constraint, .. } => match decide(self.table, self.table.get(constraint)) {
                 Narrow::Keep | Narrow::Replace(_) => ty,
                 Narrow::Drop => self.table.never(),
             },
+            Type::AppliedAlias { .. } => ty,
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => ty,
             Type::Union(members) => {
                 let mut kept = Vec::with_capacity(members.len());
                 for member in members {
                     if matches!(self.table.get(member), Type::Error) {
                         kept.push(member);
+                        continue;
+                    }
+                    if matches!(self.table.get(member), Type::AppliedAlias { .. }) {
+                        let narrowed = self.filter(member, decide);
+                        if !matches!(self.table.get(narrowed), Type::Never) {
+                            kept.push(narrowed);
+                        }
                         continue;
                     }
                     match decide(self.table, self.table.get(member)) {
@@ -1068,6 +1116,26 @@ impl<'a> NarrowingContext<'a> {
     /// inputs are returned unrefined, both as whole types and as union
     /// members.
     fn intersect(&mut self, ty: TypeId, other: TypeId) -> TypeId {
+        if matches!(self.table.get(ty), Type::AppliedAlias { .. }) {
+            let Some(view) = self.table.prepare_applied_alias_view(ty) else {
+                return ty;
+            };
+            return if view == ty {
+                ty
+            } else {
+                self.intersect(view, other)
+            };
+        }
+        if matches!(self.table.get(other), Type::AppliedAlias { .. }) {
+            let Some(view) = self.table.prepare_applied_alias_view(other) else {
+                return ty;
+            };
+            return if view == other {
+                ty
+            } else {
+                self.intersect(ty, view)
+            };
+        }
         match self.table.get(ty) {
             Type::Error | Type::Any | Type::Unknown | Type::Never => return ty,
             _ => {}
@@ -1131,6 +1199,7 @@ impl<'a> NarrowingContext<'a> {
                 | Type::Function(_)
                 | Type::Named(_)
                 | Type::AppliedClass { .. }
+                | Type::AppliedAlias { .. }
                 | Type::NumericEnum(_)
                 | Type::Keyof(_)
                 | Type::IndexedAccess { .. }
@@ -1148,6 +1217,24 @@ impl<'a> NarrowingContext<'a> {
     /// provably, so the input passes through unchanged, and `error` union
     /// members are never dropped.
     fn subtract(&mut self, ty: TypeId, excluded: TypeId) -> TypeId {
+        if matches!(self.table.get(excluded), Type::AppliedAlias { .. }) {
+            let Some(view) = self.table.prepare_applied_alias_view(excluded) else {
+                return ty;
+            };
+            if view == excluded {
+                return ty;
+            }
+            return self.subtract(ty, view);
+        }
+        if matches!(self.table.get(ty), Type::AppliedAlias { .. }) {
+            let Some(view) = self.table.prepare_applied_alias_view(ty) else {
+                return ty;
+            };
+            if view == ty {
+                return ty;
+            }
+            return self.subtract(view, excluded);
+        }
         match self.table.get(excluded) {
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown => return ty,
             Type::Never
@@ -1171,6 +1258,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::Function(_)
             | Type::Named(_)
             | Type::AppliedClass { .. }
+            | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
@@ -1210,6 +1298,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::Function(_)
             | Type::Named(_)
             | Type::AppliedClass { .. }
+            | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }

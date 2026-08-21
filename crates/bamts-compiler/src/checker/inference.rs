@@ -284,6 +284,13 @@ impl InferredTypeArguments {
     /// result. Types that mention no inferred type parameter intern back to
     /// their original [`TypeId`].
     pub fn instantiate(&self, table: &mut TypeTable, ty: TypeId) -> TypeId {
+        let marker = table.substituted_alias_marker();
+        let instantiated = self.instantiate_inner(table, ty);
+        table.prepare_substituted_aliases(marker);
+        instantiated
+    }
+
+    fn instantiate_inner(&self, table: &mut TypeTable, ty: TypeId) -> TypeId {
         match table.get(ty).clone() {
             Type::Named(symbol) => self.get(symbol).unwrap_or(ty),
             Type::This { owner, constraint } => {
@@ -292,25 +299,27 @@ impl InferredTypeArguments {
                 {
                     receiver
                 } else {
-                    let constraint = self.instantiate(table, constraint);
+                    let constraint = self.instantiate_inner(table, constraint);
                     table.this_type(owner, constraint)
                 }
             }
             Type::Array(element) => {
-                let element = self.instantiate(table, element);
+                let element = self.instantiate_inner(table, element);
                 table.array(element)
             }
             Type::Tuple(shape) => {
                 let prefix = shape
                     .prefix
                     .iter()
-                    .map(|&element| self.instantiate(table, element))
+                    .map(|&element| self.instantiate_inner(table, element))
                     .collect();
-                let rest = shape.rest.map(|element| self.instantiate(table, element));
+                let rest = shape
+                    .rest
+                    .map(|element| self.instantiate_inner(table, element));
                 let suffix = shape
                     .suffix
                     .iter()
-                    .map(|&element| self.instantiate(table, element))
+                    .map(|&element| self.instantiate_inner(table, element))
                     .collect();
                 table.tuple_shape(TupleShape {
                     prefix,
@@ -322,14 +331,14 @@ impl InferredTypeArguments {
             Type::Union(members) => {
                 let members: Vec<TypeId> = members
                     .iter()
-                    .map(|member| self.instantiate(table, *member))
+                    .map(|member| self.instantiate_inner(table, *member))
                     .collect();
                 table.union(&members)
             }
             Type::Intersection(members) => {
                 let members = members
                     .iter()
-                    .map(|member| self.instantiate(table, *member))
+                    .map(|member| self.instantiate_inner(table, *member))
                     .collect();
                 table.intersection_ordered(members)
             }
@@ -341,7 +350,7 @@ impl InferredTypeArguments {
                         PropertyType::new(
                             property.name(),
                             property.optional(),
-                            self.instantiate(table, property.type_id()),
+                            self.instantiate_inner(table, property.type_id()),
                         )
                         .with_readonly(property.readonly())
                         .with_getter_only(property.getter_only())
@@ -394,25 +403,25 @@ impl InferredTypeArguments {
                             .map(|parameter| {
                                 FunctionParameter::new(
                                     parameter.name().to_owned(),
-                                    self.instantiate(table, parameter.type_id()),
+                                    self.instantiate_inner(table, parameter.type_id()),
                                     parameter.optional(),
                                     parameter.rest(),
                                 )
                             })
                             .collect(),
-                        value_type: self.instantiate(table, signature.value_type),
+                        value_type: self.instantiate_inner(table, signature.value_type),
                         declaring_types: signature.declaring_types.clone(),
                     })
                     .collect();
                 let generator_return = object
                     .generator_return
-                    .map(|return_type| self.instantiate(table, return_type));
+                    .map(|return_type| self.instantiate_inner(table, return_type));
                 let iterator_property = object.iterator_property.as_ref().map(|property| {
-                    property.with_type_id(self.instantiate(table, property.type_id()))
+                    property.with_type_id(self.instantiate_inner(table, property.type_id()))
                 });
                 let async_iterator_property =
                     object.async_iterator_property.as_ref().map(|property| {
-                        property.with_type_id(self.instantiate(table, property.type_id()))
+                        property.with_type_id(self.instantiate_inner(table, property.type_id()))
                     });
                 table.object_type_with_members(ObjectType {
                     properties,
@@ -430,22 +439,29 @@ impl InferredTypeArguments {
             Type::AppliedClass { symbol, arguments } => {
                 let arguments = arguments
                     .iter()
-                    .map(|&argument| self.instantiate(table, argument))
+                    .map(|&argument| self.instantiate_inner(table, argument))
                     .collect();
                 table.applied_class(symbol, arguments)
             }
+            Type::AppliedAlias { symbol, arguments } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|&argument| self.instantiate_inner(table, argument))
+                    .collect();
+                table.intern_substituted_alias(symbol, arguments)
+            }
             Type::Keyof(operand) => {
-                let operand = self.instantiate(table, operand);
+                let operand = self.instantiate_inner(table, operand);
                 table.keyof(operand)
             }
             Type::IndexedAccess { object, index } => {
-                let object = self.instantiate(table, object);
-                let index = self.instantiate(table, index);
+                let object = self.instantiate_inner(table, object);
+                let index = self.instantiate_inner(table, index);
                 table.indexed_access(object, index)
             }
             Type::Record { key, value } => {
-                let key = self.instantiate(table, key);
-                let value = self.instantiate(table, value);
+                let key = self.instantiate_inner(table, key);
+                let value = self.instantiate_inner(table, value);
                 table.record(key, value)
             }
             Type::Error
@@ -477,7 +493,10 @@ impl InferredTypeArguments {
         table: &mut TypeTable,
         signature: &FunctionSignature,
     ) -> TypeId {
-        self.instantiate_function(table, &[], signature)
+        let marker = table.substituted_alias_marker();
+        let instantiated = self.instantiate_function(table, &[], signature);
+        table.prepare_substituted_aliases(marker);
+        instantiated
     }
 
     /// Shared core of [`Self::instantiate`] and [`Self::instantiate_signature`]:
@@ -498,7 +517,7 @@ impl InferredTypeArguments {
             .map(|parameter| {
                 FunctionParameter::new(
                     parameter.name().to_owned(),
-                    self.instantiate(table, parameter.type_id()),
+                    self.instantiate_inner(table, parameter.type_id()),
                     parameter.optional(),
                     parameter.rest(),
                 )
@@ -513,14 +532,14 @@ impl InferredTypeArguments {
             for bound in signature.type_parameter_bounds() {
                 let constraint = bound
                     .constraint()
-                    .map(|constraint| self.instantiate(table, constraint));
+                    .map(|constraint| self.instantiate_inner(table, constraint));
                 let default = bound
                     .default()
-                    .map(|default| self.instantiate(table, default));
+                    .map(|default| self.instantiate_inner(table, default));
                 bounds.push(TypeParameterBounds::new(constraint, default));
             }
         }
-        let return_type = self.instantiate(table, signature.return_type());
+        let return_type = self.instantiate_inner(table, signature.return_type());
         let type_id = table.function_with_parameter_bounds(
             type_parameters.to_vec(),
             bounds,
@@ -563,10 +582,18 @@ fn is_literal_union(table: &TypeTable, type_id: TypeId) -> bool {
 /// call through [`InferenceContext::infer_from_argument`] (or
 /// [`InferenceContext::infer_from_arguments`] for a whole signature), then
 /// consume the context with [`InferenceContext::resolve`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AliasInferenceKey {
+    Pair(SymbolId, SymbolId),
+    Target(SymbolId, TypeId),
+}
+
 pub struct InferenceContext<'table> {
     table: &'table mut TypeTable,
     parameters: Vec<ParameterInference>,
     fresh_literal_sources: HashSet<u32>,
+    active_pairs: HashSet<(TypeId, TypeId)>,
+    active_aliases: HashSet<AliasInferenceKey>,
     /// Cooperative cancellation signal. `None` for the non-cancellable path.
     cancel: Option<bamts_cancel::CancellationToken>,
 }
@@ -599,6 +626,8 @@ impl<'table> InferenceContext<'table> {
                 })
                 .collect(),
             fresh_literal_sources: HashSet::new(),
+            active_pairs: HashSet::new(),
+            active_aliases: HashSet::new(),
             cancel,
         }
     }
@@ -743,6 +772,35 @@ impl<'table> InferenceContext<'table> {
         {
             return;
         }
+        let pair = (parameter_type, argument_type);
+        if !self.active_pairs.insert(pair) {
+            return;
+        }
+        let alias_key = match self.table.get(parameter_type) {
+            Type::AppliedAlias {
+                symbol: parameter_symbol,
+                ..
+            } => Some(match self.table.get(argument_type) {
+                Type::AppliedAlias {
+                    symbol: argument_symbol,
+                    ..
+                } => AliasInferenceKey::Pair(*parameter_symbol, *argument_symbol),
+                _ => AliasInferenceKey::Target(*parameter_symbol, argument_type),
+            }),
+            _ => None,
+        };
+        if alias_key.is_some_and(|key| !self.active_aliases.insert(key)) {
+            self.active_pairs.remove(&pair);
+            return;
+        }
+        let parameter_type = self
+            .table
+            .prepare_applied_alias_view(parameter_type)
+            .unwrap_or(parameter_type);
+        let argument_type = self
+            .table
+            .prepare_applied_alias_view(argument_type)
+            .unwrap_or(argument_type);
         let parameter = self.table.get(parameter_type).clone();
         match parameter {
             Type::Named(symbol) if self.is_inference_symbol(symbol) => {
@@ -1005,6 +1063,10 @@ impl<'table> InferenceContext<'table> {
                 }
             }
             _ => {}
+        }
+        self.active_pairs.remove(&pair);
+        if let Some(key) = alias_key {
+            self.active_aliases.remove(&key);
         }
     }
     fn sync_iterator_yield(&mut self, method: TypeId) -> Option<TypeId> {

@@ -189,6 +189,8 @@ impl<'src> Binder<'src> {
                     view
                 } else if let Some(class_view) = self.types.prepare_applied_class_view(element) {
                     class_view
+                } else if let Some(alias_view) = self.types.prepare_applied_alias_view(element) {
+                    alias_view
                 } else {
                     element
                 }
@@ -290,6 +292,57 @@ impl<'src> Binder<'src> {
                     self.check_jsx_props_assignable(range, props, target);
                 }
                 Some(signature.return_type())
+            }
+            // An alias may expand to a callable component (function) or an
+            // element/property object shape. Expand the view and re-classify;
+            // a missing in-progress view stays opaque without inventing a
+            // not-callable diagnostic.
+            Type::AppliedAlias { .. } => {
+                if let Some(view) = self.types.prepare_applied_alias_view(callee) {
+                    match self.types.get(view) {
+                        Type::Function(signature) => {
+                            let signature = signature.clone();
+                            if let Some(target) = signature
+                                .parameters()
+                                .first()
+                                .map(FunctionParameter::type_id)
+                            {
+                                self.check_jsx_props_assignable(range, props, target);
+                            }
+                            Some(signature.return_type())
+                        }
+                        Type::Never
+                        | Type::Void
+                        | Type::Null
+                        | Type::Undefined
+                        | Type::Boolean
+                        | Type::Number
+                        | Type::BigInt
+                        | Type::String
+                        | Type::Symbol
+                        | Type::Object
+                        | Type::BooleanLiteral(_)
+                        | Type::NumberLiteral(_)
+                        | Type::StringLiteral(_)
+                        | Type::BigIntLiteral(_)
+                        | Type::Array(_)
+                        | Type::Tuple(_)
+                        | Type::ObjectType(_)
+                        | Type::NumericEnum(_) => {
+                            self.emit(
+                                JSX_ELEMENT_TYPE_NOT_CALLABLE,
+                                range,
+                                JSX_ELEMENT_TYPE_NOT_CALLABLE_MESSAGE,
+                            );
+                            None
+                        }
+                        // Expanded alias to an opaque/nominal/union type:
+                        // accepted unchecked (same policy as Named).
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
             }
             // Opaque recovery types must not cascade; nominal types (classes,
             // type parameters) have no visible construct/call side in this

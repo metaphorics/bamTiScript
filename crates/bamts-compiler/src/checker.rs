@@ -297,6 +297,12 @@ const CANCELLATION_REQUESTED_MESSAGE: &str = "Compilation was cancelled before c
 /// Diagnostic emitted when `@ts-expect-error` suppresses no diagnostic.
 pub const UNUSED_EXPECT_ERROR: DiagnosticCode = DiagnosticCode::new("BAMTS-C070");
 const UNUSED_EXPECT_ERROR_MESSAGE: &str = "Unused '@ts-expect-error' directive.";
+/// Diagnostic emitted when a type parameter's default resolves through itself.
+pub const TYPE_PARAMETER_CIRCULAR_DEFAULT: DiagnosticCode = DiagnosticCode::new("BAMTS-C071");
+const TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE: &str = "Type parameter has a circular default.";
+/// Diagnostic emitted when a type alias expands directly or mutually to itself.
+pub const TYPE_ALIAS_CIRCULAR: DiagnosticCode = DiagnosticCode::new("BAMTS-C072");
+const TYPE_ALIAS_CIRCULAR_MESSAGE: &str = "Type alias circularly references itself.";
 
 /// One cooperative checker invocation was cancelled before completing.
 ///
@@ -1040,7 +1046,7 @@ fn collect_imported_types_for_source<'a>(
                 let namespace_type = target_model.types().object();
                 imported_types.push(ImportedSymbolType {
                     symbol,
-                    source_types: target_model.types(),
+                    source_model: target_model,
                     value_type_id: namespace_type,
                     type_parameters: &[],
                     type_plane_id: None,
@@ -1119,7 +1125,7 @@ fn build_imported_symbol_type<'a>(
     };
     Some(ImportedSymbolType {
         symbol,
-        source_types: source_model.types(),
+        source_model,
         value_type_id,
         type_parameters: source_model.generic_type_parameters(linked.symbol),
         type_plane_id,
@@ -2009,8 +2015,8 @@ mod tests {
         PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
         ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
         SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
-        TYPE_NOT_ASSIGNABLE, Type, TypeId, TypeTable, WITH_STATEMENT_NOT_ALLOWED, check,
-        check_program, check_program_with_options,
+        TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
+        TypeTable, WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -4537,6 +4543,11 @@ function check(options: Options = {}) {
 
         let duplicate = check_text("namespace N {} namespace N {} var N;");
         assert_eq!(checker_codes(&duplicate), [DUPLICATE_DECLARATION.as_str()]);
+    }
+    #[test]
+    fn duplicate_classes_report_without_refinalizing_the_first_class() {
+        let result = check_text("class c3 { public foo() {} } class c3 { public bar() {} }");
+        assert_eq!(checker_codes(&result), [DUPLICATE_DECLARATION.as_str()]);
     }
 
     #[test]
@@ -10531,6 +10542,280 @@ function check(options: Options = {}) {
         );
 
         assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn recursive_interface_constraint_from_same_parameter_list_terminates() {
+        let result = check_text("interface I1<T, U extends I1<T, any>> {}");
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn final_recursive_interface_constraint_rejects_invalid_argument() {
+        let result = check_text("interface I1<T extends string, U extends I1<number, any>> {}");
+
+        assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn recursive_interface_reference_preserves_declared_defaults() {
+        let result = check_text(
+            "interface I<T extends string = string, U extends I = any> { value: T }
+             declare const value: I;
+             const accepted: string = value.value;
+             const wrong: number = value.value;",
+        );
+
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn circular_type_parameter_default_reports_once() {
+        let result = check_text("interface SelfReference<T = SelfReference> {}");
+
+        assert_eq!(
+            checker_codes(&result),
+            [TYPE_PARAMETER_CIRCULAR_DEFAULT.as_str()]
+        );
+    }
+
+    #[test]
+    fn merged_interface_uses_default_from_later_declaration() {
+        let result = check_text(
+            "interface Box<T> {}
+             interface Box<T = string> { value: T }
+             declare const box: Box;
+             const accepted: string = box.value;
+             const wrong: number = box.value;",
+        );
+
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn inconsistent_interface_merge_arity_does_not_corrupt_metadata() {
+        drop(check_text(
+            "interface I {}
+             interface I<T> {}
+             interface I<T = number> {}
+             interface I<T = number, U = string> {}",
+        ));
+    }
+
+    #[test]
+    fn recovered_labeled_class_uses_a_local_class_scope() {
+        let result = check_text("\"use strict\"; label: class C {}");
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn recursive_generic_alias_bound_materializes_transparently() {
+        let result = check_text(
+            "type A1<T, U extends A1<any, any>> = [T, U];
+             declare const alias: A1<string, [number, number]>;
+             declare const tuple: [string, [number, number]];
+             const from_tuple: A1<string, [number, number]> = tuple;
+             const from_alias: [string, [number, number]] = alias;",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn recursive_generic_alias_bound_rejects_invalid_argument_once() {
+        let result = check_text(
+            "type A1<T, U extends A1<any, any>> = [T, U];
+             declare const invalid: A1<string, number>;",
+        );
+
+        assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn primitive_alias_keeps_primitive_relations_and_narrowing() {
+        let result = check_text(
+            "type Id<T> = T;
+             declare const value: Id<string>;
+             const wrong: object = value;
+             if (typeof value === 'string') {
+                 const accepted: string = value;
+             }",
+        );
+
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn function_alias_remains_callable() {
+        let result = check_text(
+            "type Fn<T> = (value: T) => T;
+             declare const fn: Fn<number>;
+             const accepted: number = fn(1);
+             fn('wrong');",
+        );
+
+        assert_eq!(checker_codes(&result), [ARGUMENT_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn inference_decomposes_generic_alias_structurally() {
+        let result = check_text(
+            "type Box<T> = { value: T };
+             declare function unbox<T>(box: Box<T>): T;
+             const value = unbox({ value: 1 });
+             const accepted: number = value;",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn inference_through_transformed_recursive_alias_terminates() {
+        let result = check_text(
+            "type RecursiveBox<T> = { value: T; next: RecursiveBox<T[]> };
+             declare function infer<T>(box: RecursiveBox<T>): T;
+             declare const source: RecursiveBox<string>;
+             const value = infer(source);
+             const accepted: string = value;",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn relations_through_transformed_recursive_aliases_terminate() {
+        let result = check_text(
+            "type Recursive<T> = { value: T; next: Recursive<T[]> };
+             declare const narrow: Recursive<'value'>;
+             declare const invalid: Recursive<number>;
+             const accepted: Recursive<string> = narrow;
+             const wrong: Recursive<string> = invalid;",
+        );
+
+        assert_eq!(checker_codes(&result), [TYPE_NOT_ASSIGNABLE.as_str()]);
+    }
+
+    #[test]
+    fn nested_same_alias_arguments_publish_each_finite_view() {
+        let result = check_text(
+            "type Recursive<T> = { value: T; nested: Recursive<Recursive<T>> };
+             declare const value: Recursive<string>;
+             const accepted: string = value.nested.value.value;",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+    #[test]
+    fn recursive_alias_rhs_expands_lazily() {
+        let result = check_text(
+            "type Tree<T> = { value: T; children: Tree<T>[] };
+             declare const tree: Tree<number>;
+             const accepted: number = tree.children[0].value;",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn bare_circular_aliases_report_each_participant() {
+        let result = check_text(
+            "type A = A;
+             type B = C;
+             type C = B;
+             type D = E[];
+             type E = D[];",
+        );
+
+        assert_eq!(
+            checker_codes(&result),
+            [
+                TYPE_ALIAS_CIRCULAR.as_str(),
+                TYPE_ALIAS_CIRCULAR.as_str(),
+                TYPE_ALIAS_CIRCULAR.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn transformed_direct_alias_cycle_terminates() {
+        let result = check_text(
+            "type Expanding<T> = Expanding<T[]>;
+             type Structural<T> = { next: Structural<T[]> };
+             declare const valid: Structural<string>;",
+        );
+
+        assert_eq!(checker_codes(&result), [TYPE_ALIAS_CIRCULAR.as_str()]);
+    }
+
+    #[test]
+    fn alias_cycle_prefix_is_not_a_cycle_participant() {
+        let result = check_text(
+            "type Prefix<T> = Loop<T[]>;
+             type Loop<T> = Loop<T[]>;",
+        );
+
+        assert_eq!(checker_codes(&result), [TYPE_ALIAS_CIRCULAR.as_str()]);
+    }
+
+    #[test]
+    fn alias_defaults_substitute_prior_parameters() {
+        let result = check_text(
+            "type Defaulted<T, U = T[]> = [T, U];
+             declare const value: Defaulted<string>;
+             const accepted: [string, string[]] = value;",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn interface_extends_object_alias() {
+        let result = check_text(
+            "type Properties<T> = { value: T };
+             interface Extended extends Properties<number> { label: string }
+             declare const value: Extended;
+             const accepted: number = value.value;",
+        );
+
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
     }
 
     #[test]
