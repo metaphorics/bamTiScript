@@ -8,7 +8,9 @@ use super::{
     to_integer_or_infinity, type_error,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
+use crate::{
+    EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey, PropertyMap,
+};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -16,12 +18,29 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
+    builtins.set_uint8array_prototype(prototype);
     let constructor = install_function(heap, builtins, "Uint8Array", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     define_data(heap, prototype, "constructor", constructor);
+    let length = install_function(heap, builtins, "get length", 0, length_getter::<H>);
+    define_getter(heap, prototype, "length", length);
     let join = install_function(heap, builtins, "join", 1, join::<H> as BuiltinHandler<H>);
     define_data(heap, prototype, "join", join);
-    let tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Uint8Array")));
+    let iterator = install_function(
+        heap,
+        builtins,
+        "[Symbol.iterator]",
+        0,
+        values::<H> as BuiltinHandler<H>,
+    );
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
+        unreachable!("Uint8Array prototype is ordinary")
+    };
+    properties.insert(
+        PropertyKey::Symbol(heap_index(builtins.symbol_iterator()) as u32),
+        builtin_property(iterator),
+    );
+    let tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Uint8Array")));
     let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
         unreachable!("Uint8Array prototype is ordinary")
     };
@@ -29,7 +48,7 @@ pub(super) fn install<H: Host>(
         PropertyKey::Symbol(heap_index(builtins.symbol_to_string_tag()) as u32),
         builtin_property(tag),
     );
-    globals.insert(EcmaString::from_utf8("Uint8Array"), constructor);
+    globals.insert(EcmaString::encode("Uint8Array"), constructor);
 }
 
 fn constructor<H: Host>(
@@ -41,36 +60,40 @@ fn constructor<H: Host>(
     if !constructing {
         return Err(type_error("Uint8Array constructor requires 'new'"));
     }
-    let (length, values) = match args.first().copied() {
-        None | Some(Value::UNDEFINED) => (0, None),
-        Some(source) if !machine.is_object(source) => (typed_array_length(machine, source)?, None),
+    let (length, values, copied_bytes) = match args.first().copied() {
+        None | Some(Value::UNDEFINED) => (0, None, None),
+        Some(source) if !machine.is_object(source) => {
+            (typed_array_length(machine, source)?, None, None)
+        }
         Some(source) => {
-            let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
-            let iterator_key = machine.to_property_key(iterator_symbol)?;
-            let iterator_method = machine.get_property_key(source, &iterator_key)?;
-            match iterator_method.decode() {
-                Some(Decoded::Undefined | Decoded::Null) => {
-                    let values = array_like_values(machine, source)?;
-                    (values.len(), Some(values))
+            let copied_bytes = match machine.runtime_slot(source).map_err(EvalFailure::Runtime)? {
+                Some(slot) => match &machine.heap[slot] {
+                    HeapEntry::Uint8Array { bytes, .. } => Some(bytes.clone()),
+                    _ => None,
+                },
+                None => None,
+            };
+            if let Some(bytes) = copied_bytes {
+                (bytes.len(), None, Some(bytes))
+            } else {
+                let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+                let iterator_key = machine.to_property_key(iterator_symbol)?;
+                let iterator_method = machine.get_property_key(source, &iterator_key)?;
+                match iterator_method.decode() {
+                    Some(Decoded::Undefined | Decoded::Null) => {
+                        let values = array_like_values(machine, source)?;
+                        (values.len(), Some(values), None)
+                    }
+                    _ if machine.is_callable(iterator_method)? => {
+                        let values = machine.iterable_values(source)?;
+                        (values.len(), Some(values), None)
+                    }
+                    _ => return Err(type_error("value is not iterable")),
                 }
-                _ if machine.is_callable(iterator_method)? => {
-                    let values = machine.iterable_values(source)?;
-                    (values.len(), Some(values))
-                }
-                _ => return Err(type_error("value is not iterable")),
             }
         }
     };
-    let mut properties = PropertyMap::default();
-    properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("length")),
-        Property::Data {
-            value: crate::number_value(length as f64),
-            writable: false,
-            enumerable: false,
-            configurable: false,
-        },
-    );
+    let properties = PropertyMap::default();
     machine
         .ensure_allocation_capacity(
             1,
@@ -79,21 +102,37 @@ fn constructor<H: Host>(
                 .saturating_add(1),
         )
         .map_err(EvalFailure::Runtime)?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(length).map_err(|_| {
-        EvalFailure::Runtime(crate::RuntimeErrorKind::HeapByteLimitExceeded {
-            limit: machine.limits.max_heap_bytes,
-        })
-    })?;
-    match values {
-        Some(values) => {
-            for value in values {
-                bytes.push(to_uint8(machine, value)?);
+    let bytes = if let Some(copied) = copied_bytes {
+        copied
+    } else {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|_| {
+            EvalFailure::Runtime(crate::RuntimeErrorKind::HeapByteLimitExceeded {
+                limit: machine.limits.max_heap_bytes,
+            })
+        })?;
+        match values {
+            Some(values) => {
+                for value in values {
+                    bytes.push(to_uint8(machine, value)?);
+                }
             }
+            None => bytes.resize(length, 0),
         }
-        None => bytes.resize(length, 0),
-    }
-    let prototype = constructor_prototype(machine)?;
+        bytes
+    };
+    let default_prototype = machine.intrinsics.builtins.uint8array_prototype();
+    let new_target = machine.current_new_target();
+    let prototype = if new_target != Value::UNDEFINED {
+        let candidate = machine.get_named_property(new_target, "prototype")?;
+        if machine.is_object(candidate) {
+            candidate
+        } else {
+            default_prototype
+        }
+    } else {
+        default_prototype
+    };
     let value = machine
         .allocate(HeapEntry::Uint8Array {
             bytes,
@@ -103,6 +142,43 @@ fn constructor<H: Host>(
         })
         .map_err(EvalFailure::Runtime)?;
     Ok(BuiltinOutcome::Value(value))
+}
+
+fn length_getter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let index = machine
+        .runtime_slot(this)
+        .map_err(EvalFailure::Runtime)?
+        .ok_or_else(|| {
+            type_error("Uint8Array.prototype.length getter called on incompatible receiver")
+        })?;
+    let HeapEntry::Uint8Array { bytes, .. } = &machine.heap[index] else {
+        return Err(type_error(
+            "Uint8Array.prototype.length getter called on incompatible receiver",
+        ));
+    };
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        bytes.len() as f64
+    )))
+}
+
+fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
+        panic!("accessor target must be an ordinary object");
+    };
+    properties.insert(
+        PropertyKey::Named(EcmaString::encode(name)),
+        Property::Accessor {
+            getter: Some(getter),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        },
+    );
 }
 
 /// ToIndex for the TypedArray(length) constructor: ToIntegerOrInfinity, then
@@ -129,17 +205,23 @@ fn array_like_values<H: Host>(
         .map_err(EvalFailure::Runtime)?;
     let mut values = Vec::with_capacity(length);
     for index in 0..length {
-        values.push(machine.get_named_property(source, &index.to_string())?);
+        let value = machine.get_named_property(source, &index.to_string())?;
+        values.push(Value::int32(u32::from(to_uint8(machine, value)?)));
     }
     Ok(values)
 }
 fn array_like_length<H: Host>(
-    machine: &Machine<'_, H>,
+    machine: &mut Machine<'_, H>,
     value: Value,
 ) -> Result<usize, EvalFailure> {
     const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-    let integer = to_integer_or_infinity(machine, value)?;
-    let length = if integer.is_nan() || integer <= 0.0 {
+    let number = super::value_number(machine.coerce_number_observable(value)?);
+    let integer = if number.is_nan() || number == 0.0 {
+        0.0
+    } else {
+        number.trunc()
+    };
+    let length = if integer <= 0.0 {
         0.0
     } else if integer.is_infinite() {
         MAX_SAFE_INTEGER
@@ -194,11 +276,13 @@ fn join<H: Host>(
         ));
     }
     let separator = match args.first().copied() {
-        None | Some(Value::UNDEFINED) => EcmaString::from_utf8(","),
+        None | Some(Value::UNDEFINED) => EcmaString::encode(","),
         Some(value) => machine.coerce_string_observable(value)?,
     };
     let HeapEntry::Uint8Array { bytes, .. } = &machine.heap[slot] else {
-        unreachable!("Uint8Array brand was checked")
+        return Err(type_error(
+            "Uint8Array.prototype.join called on incompatible receiver",
+        ));
     };
     let mut output = EcmaStringBuilder::new();
     for (index, byte) in bytes.iter().copied().enumerate() {
@@ -215,22 +299,29 @@ fn join<H: Host>(
     )?))
 }
 
-fn constructor_prototype<H: Host>(machine: &Machine<'_, H>) -> Result<Value, EvalFailure> {
-    let constructor = machine
-        .intrinsics
-        .global("Uint8Array")
-        .ok_or_else(|| type_error("missing Uint8Array constructor"))?;
-    let index = machine
-        .runtime_slot(constructor)
-        .map_err(EvalFailure::Runtime)?
-        .ok_or_else(|| type_error("invalid Uint8Array constructor"))?;
-    let HeapEntry::NativeFunction { properties, .. } = &machine.heap[index] else {
-        return Err(type_error("invalid Uint8Array constructor"));
+/// `Uint8Array.prototype[Symbol.iterator]` — yields each current byte lazily in
+/// index order, matching `%TypedArray%.prototype.values`.
+fn values<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let Some(slot) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
+        return Err(type_error(
+            "Uint8Array.prototype[Symbol.iterator] called on incompatible receiver",
+        ));
     };
-    match properties.get(&PropertyKey::Named(EcmaString::from_utf8("prototype"))) {
-        Some(Property::Data { value, .. }) => Ok(*value),
-        _ => Err(type_error("missing Uint8Array prototype")),
+    if !matches!(machine.heap[slot], HeapEntry::Uint8Array { .. }) {
+        return Err(type_error(
+            "Uint8Array.prototype[Symbol.iterator] called on incompatible receiver",
+        ));
     }
+    Ok(BuiltinOutcome::Value(super::collections::iterator(
+        machine,
+        this,
+        IterationKind::Value,
+    )?))
 }
 
 #[cfg(test)]
@@ -244,6 +335,9 @@ mod tests {
 
     static NEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
     static ITERATION_COMPLETE: AtomicBool = AtomicBool::new(false);
+
+    static LENGTH_VALUE_OF_CALLED: AtomicBool = AtomicBool::new(false);
+    static INDEX_ONE_READS: AtomicUsize = AtomicUsize::new(0);
 
     fn native(
         machine: &mut Machine<'_, TestHost>,
@@ -265,6 +359,17 @@ mod tests {
         _: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         Ok(BuiltinOutcome::Value(this))
+    }
+
+    fn throwing_iterator(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "source Symbol.iterator called",
+        }))
     }
 
     fn iterator_next(
@@ -316,6 +421,65 @@ mod tests {
         Ok(BuiltinOutcome::Value(Value::int32(257)))
     }
 
+    fn array_like_length_value_of(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        LENGTH_VALUE_OF_CALLED.store(true, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(Value::int32(2)))
+    }
+
+    fn index_one_getter(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        INDEX_ONE_READS.fetch_add(1, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(Value::int32(42)))
+    }
+
+    fn abrupt_value_of(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "abrupt ToUint8 valueOf",
+        }))
+    }
+
+    fn zero_getter_returns_abrupt(
+        machine: &mut Machine<'_, TestHost>,
+        _: Value,
+        _: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let abrupt = ordinary_object(machine);
+        let value_of = native(machine, "abrupt valueOf", abrupt_value_of);
+        machine.set_data_property(abrupt, "valueOf", value_of)?;
+        Ok(BuiltinOutcome::Value(abrupt))
+    }
+
+    fn separator_mutates_first_byte(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let target = machine
+            .test_global("joinTarget")
+            .expect("test installs join target");
+        machine.set_data_property(target, "0", Value::int32(9))?;
+        Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("-"),
+        )?))
+    }
+
     fn construct(machine: &mut Machine<'_, TestHost>, argument: Value) -> Value {
         let constructor = machine
             .intrinsics
@@ -339,6 +503,41 @@ mod tests {
             panic!("constructor returns an object")
         };
         value
+    }
+
+    #[test]
+    fn uint8array_length_is_an_inherited_branded_accessor() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let typed = construct(&mut machine, Value::int32(3));
+        let key = PropertyKey::Named(EcmaString::encode("length"));
+
+        assert!(machine.own_descriptor(typed, &key).unwrap().is_none());
+        assert_eq!(
+            machine.get_named_property(typed, "length").unwrap(),
+            Value::int32(3)
+        );
+
+        let prototype = machine.intrinsics.builtins.uint8array_prototype();
+        let descriptor = machine
+            .own_descriptor(prototype, &key)
+            .unwrap()
+            .expect("prototype has length accessor");
+        let Property::Accessor {
+            getter: Some(getter),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        } = descriptor
+        else {
+            panic!("length is a configurable, non-enumerable getter");
+        };
+        let plain = ordinary_object(&mut machine);
+        assert!(matches!(
+            machine.call_value(getter, plain, &[]),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
     }
 
     #[test]
@@ -563,6 +762,32 @@ mod tests {
             ));
         });
     }
+
+    #[test]
+    fn uint8array_copies_typed_array_without_calling_symbol_iterator() {
+        with_machine(|machine| {
+            let source_values = array_of(
+                machine,
+                &[Value::int32(3), Value::int32(17), Value::int32(255)],
+            );
+            let source = construct(machine, source_values);
+            let iterator = native(machine, "throwing [Symbol.iterator]", throwing_iterator);
+            let iterator_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                .unwrap();
+            machine
+                .set_data_property_key(source, iterator_key, iterator)
+                .unwrap();
+
+            let copy = construct(machine, source);
+
+            assert_eq!(int(machine, copy, "length"), 3);
+            assert_eq!(int(machine, copy, "0"), 3);
+            assert_eq!(int(machine, copy, "1"), 17);
+            assert_eq!(int(machine, copy, "2"), 255);
+        });
+    }
+
     #[test]
     fn uint8array_preflights_dedicated_backing_storage() {
         let program = blank_program("<test>");
@@ -613,8 +838,8 @@ mod tests {
         // ToNumber. Node: U8(3.5)=3, U8(NaN)=0, U8(true)=1, U8(null)=0,
         // U8("3")=3, U8("abc")=0.
         with_machine(|machine| {
-            let s3 = allocate_string(machine, EcmaString::from_utf8("3")).unwrap();
-            let sabc = allocate_string(machine, EcmaString::from_utf8("abc")).unwrap();
+            let s3 = allocate_string(machine, EcmaString::encode("3")).unwrap();
+            let sabc = allocate_string(machine, EcmaString::encode("abc")).unwrap();
             let cases: &[(Value, u32)] = &[
                 (Value::int32(0), 0),
                 (Value::number(3.5), 3),
@@ -725,6 +950,341 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    #[test]
+    fn uint8array_array_like_length_observes_valueof() {
+        LENGTH_VALUE_OF_CALLED.store(false, Ordering::SeqCst);
+        with_machine(|machine| {
+            let length_box = ordinary_object(machine);
+            let value_of = native(machine, "length valueOf", array_like_length_value_of);
+            machine
+                .set_data_property(length_box, "valueOf", value_of)
+                .unwrap();
+
+            let source = ordinary_object(machine);
+            machine
+                .set_data_property(source, "0", Value::int32(257))
+                .unwrap();
+            machine
+                .set_data_property(source, "1", Value::int32(2))
+                .unwrap();
+            machine
+                .set_data_property(source, "length", length_box)
+                .unwrap();
+
+            let typed = construct(machine, source);
+            assert!(
+                LENGTH_VALUE_OF_CALLED.load(Ordering::SeqCst),
+                "length valueOf must be observed"
+            );
+            assert_eq!(int(machine, typed, "length"), 2);
+            assert_eq!(int(machine, typed, "0"), 1);
+            assert_eq!(int(machine, typed, "1"), 2);
+        });
+    }
+
+    #[test]
+    fn uint8array_array_like_values_interleave_get_and_touint8() {
+        INDEX_ONE_READS.store(0, Ordering::SeqCst);
+        with_machine(|machine| {
+            let source = ordinary_object(machine);
+            let getter0 = native(machine, "zero getter", zero_getter_returns_abrupt);
+            let getter1 = native(machine, "one getter", index_one_getter);
+            machine
+                .define_accessor(
+                    source,
+                    PropertyKey::Named(EcmaString::encode("0")),
+                    getter0,
+                    bamts_bytecode::AccessorKind::Getter,
+                )
+                .unwrap();
+            machine
+                .define_accessor(
+                    source,
+                    PropertyKey::Named(EcmaString::encode("1")),
+                    getter1,
+                    bamts_bytecode::AccessorKind::Getter,
+                )
+                .unwrap();
+            machine
+                .set_data_property(source, "length", Value::int32(2))
+                .unwrap();
+
+            assert!(matches!(
+                try_construct(machine, source),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+            assert_eq!(
+                INDEX_ONE_READS.load(Ordering::SeqCst),
+                0,
+                "index 1 getter must not be read after abrupt ToUint8"
+            );
+        });
+    }
+
+    #[test]
+    fn uint8array_prototype_symbol_iterator_yields_elements_in_order() {
+        // Symbol.iterator must be installed on Uint8Array.prototype so that
+        // for...of and spread consume the bytes in index order. iterable_values
+        // is the exact path for...of/spread take (create_iterator + next loop).
+        with_machine(|machine| {
+            let source = array_of(
+                machine,
+                &[Value::int32(10), Value::int32(20), Value::int32(255)],
+            );
+            let typed = construct(machine, source);
+            assert_eq!(int(machine, typed, "length"), 3);
+            // for...of / spread equivalent
+            let collected = machine.iterable_values(typed).expect("iteration succeeds");
+            assert_eq!(
+                collected,
+                vec![Value::int32(10), Value::int32(20), Value::int32(255)],
+                "for...of yields bytes in order"
+            );
+            // Spread into a new array: Array.from uses the iterator too.
+            let array = machine.intrinsics.global("Array").unwrap();
+            let from = machine.get_named_property(array, "from").unwrap();
+            let spread = machine
+                .call_value(from, array, &[typed])
+                .expect("Array.from succeeds");
+            let elements = machine.array_elements(spread).unwrap().unwrap();
+            assert_eq!(
+                elements,
+                vec![Value::int32(10), Value::int32(20), Value::int32(255)],
+                "spread/Array.from yields bytes in order"
+            );
+            // Empty Uint8Array iterates zero times.
+            let empty = construct(machine, Value::int32(0));
+            assert!(
+                machine
+                    .iterable_values(empty)
+                    .expect("empty iteration")
+                    .is_empty()
+            );
+            // Incompatible receiver throws TypeError.
+            let plain = ordinary_object(machine);
+            let prototype = machine
+                .get_named_property(
+                    machine.intrinsics.global("Uint8Array").unwrap(),
+                    "prototype",
+                )
+                .unwrap();
+            let iterator_fn = machine
+                .get_property_key(
+                    prototype,
+                    &machine
+                        .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                machine.call_value(iterator_fn, plain, &[]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        });
+    }
+
+    #[test]
+    fn uint8array_iterator_is_lazy_and_observes_live_bytes() {
+        with_machine(|machine| {
+            let prototype = machine.intrinsics.builtins.uint8array_prototype();
+            let iterator_fn = machine
+                .get_property_key(
+                    prototype,
+                    &machine
+                        .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+                        .unwrap(),
+                )
+                .unwrap();
+            let empty = construct(machine, Value::int32(0));
+            let before_probe = machine.heap_bytes;
+            machine.call_value(iterator_fn, empty, &[]).unwrap();
+            let iterator_charge = machine.heap_bytes - before_probe;
+
+            let typed = construct(machine, Value::int32(1024));
+            let before_iterator = machine.heap_bytes;
+            machine.limits.max_heap_bytes = before_iterator + iterator_charge;
+            let iterator = machine
+                .call_value(iterator_fn, typed, &[])
+                .expect("iterator creation has constant memory cost");
+            assert_eq!(machine.heap_bytes, before_iterator + iterator_charge);
+
+            machine.limits.max_heap_bytes = usize::MAX;
+            machine
+                .set_data_property(typed, "0", Value::int32(77))
+                .unwrap();
+            let next = machine.get_named_property(iterator, "next").unwrap();
+            let result = machine.call_value(next, iterator, &[]).unwrap();
+            assert_eq!(
+                machine.get_named_property(result, "value").unwrap(),
+                Value::int32(77)
+            );
+        });
+    }
+
+    #[test]
+    fn uint8array_join_rereads_bytes_after_separator_coercion() {
+        with_machine(|machine| {
+            let source = array_of(machine, &[Value::int32(1), Value::int32(2)]);
+            let typed = construct(machine, source);
+            machine.test_set_global("joinTarget", typed);
+            let separator = ordinary_object(machine);
+            let to_string = native(machine, "separator toString", separator_mutates_first_byte);
+            machine
+                .set_data_property(separator, "toString", to_string)
+                .unwrap();
+            let join = machine
+                .get_named_property(machine.intrinsics.builtins.uint8array_prototype(), "join")
+                .unwrap();
+
+            let output = machine.call_value(join, typed, &[separator]).unwrap();
+
+            assert_eq!(
+                machine.string_value(output),
+                Some(EcmaString::encode("9-2"))
+            );
+        });
+    }
+
+    #[test]
+    fn uint8array_prototype_is_cached_not_global_lookup() {
+        // The prototype must be read from BuiltinTable, not via a mutable
+        // globals map lookup, so deleting the global does not break construction.
+        with_machine(|machine| {
+            let ctor_before = machine
+                .intrinsics
+                .global("Uint8Array")
+                .expect("Uint8Array global exists before removal");
+            machine
+                .intrinsics
+                .globals
+                .remove(&EcmaString::encode("Uint8Array"));
+            // Construct via the saved constructor value, not via global lookup
+            let idx = machine
+                .runtime_slot(ctor_before)
+                .expect("valid constructor")
+                .expect("heap");
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } = machine.heap[idx]
+            else {
+                panic!("Uint8Array is native");
+            };
+            let BuiltinOutcome::Value(typed) = machine
+                .call_builtin(id, Value::UNDEFINED, &[Value::int32(2)], true)
+                .expect("constructor succeeds")
+            else {
+                panic!("constructor returns an object");
+            };
+            assert_eq!(int(machine, typed, "length"), 2);
+            // Verify the typed array's internal prototype slot is the cached prototype
+            let idx = machine
+                .runtime_slot(typed)
+                .expect("typed array has slot")
+                .expect("slot exists");
+            let HeapEntry::Uint8Array { prototype, .. } = &machine.heap[idx] else {
+                panic!("typed array brand");
+            };
+            assert_eq!(
+                *prototype,
+                Some(machine.intrinsics.builtins.uint8array_prototype())
+            );
+            // And the cached prototype's "constructor" is still the Uint8Array constructor
+            let proto_val = machine.intrinsics.builtins.uint8array_prototype();
+            let ctor = machine
+                .get_named_property(proto_val, "constructor")
+                .expect("prototype has constructor");
+            assert_eq!(ctor, ctor_before);
+        });
+    }
+
+    #[test]
+    fn uint8array_constructor_honors_new_target_for_subclass_prototype() {
+        let module = blank_program("<uint8array-subclass-test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let uint8array_prototype = machine.intrinsics.builtins.uint8array_prototype();
+
+        // Build a subclass prototype that inherits from Uint8Array.prototype.
+        let subclass_prototype =
+            super::super::ordinary_runtime(&mut machine, Some(uint8array_prototype)).unwrap();
+        machine
+            .set_data_property(subclass_prototype, "myMethod", Value::int32(42))
+            .unwrap();
+
+        // Build a new_target whose .prototype is the subclass prototype.
+        let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        machine
+            .set_data_property(new_target, "prototype", subclass_prototype)
+            .unwrap();
+
+        let uint8array_id = machine.intrinsics.builtins.id_named("Uint8Array").unwrap();
+        let BuiltinOutcome::Value(typed) = machine
+            .call_builtin_with_new_target(
+                uint8array_id,
+                Value::UNDEFINED,
+                &[Value::int32(4)],
+                true,
+                new_target,
+            )
+            .unwrap()
+        else {
+            panic!("Uint8Array construct returns a value");
+        };
+
+        // The typed array must inherit from the subclass prototype, not the intrinsic one.
+        let idx = machine
+            .runtime_slot(typed)
+            .expect("typed array has slot")
+            .expect("slot exists");
+        let HeapEntry::Uint8Array { prototype, .. } = &machine.heap[idx] else {
+            panic!("typed array brand");
+        };
+        assert_eq!(*prototype, Some(subclass_prototype));
+        // Subclass methods are visible on the instance.
+        assert_eq!(
+            machine.get_named_property(typed, "myMethod").unwrap(),
+            Value::int32(42)
+        );
+        assert_eq!(int(&mut machine, typed, "length"), 4);
+    }
+
+    #[test]
+    fn uint8array_new_target_primitive_prototype_falls_back_to_default() {
+        // When newTarget.prototype is not an object, constructed_prototype
+        // must fall back to the intrinsic %Uint8Array.prototype%.
+        with_machine(|machine| {
+            let new_target = super::super::ordinary_runtime(machine, None).unwrap();
+            machine
+                .set_data_property(new_target, "prototype", Value::int32(42))
+                .unwrap();
+            let uint8array_id = machine.intrinsics.builtins.id_named("Uint8Array").unwrap();
+            let BuiltinOutcome::Value(typed) = machine
+                .call_builtin_with_new_target(
+                    uint8array_id,
+                    Value::UNDEFINED,
+                    &[Value::int32(1)],
+                    true,
+                    new_target,
+                )
+                .unwrap()
+            else {
+                panic!("Uint8Array construct returns a value");
+            };
+            let idx = machine
+                .runtime_slot(typed)
+                .expect("typed array has slot")
+                .expect("slot exists");
+            let HeapEntry::Uint8Array { prototype, .. } = &machine.heap[idx] else {
+                panic!("typed array brand");
+            };
+            assert_eq!(
+                *prototype,
+                Some(machine.intrinsics.builtins.uint8array_prototype())
+            );
         });
     }
 }

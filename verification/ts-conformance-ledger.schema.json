@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/metaphorics/bamTiScript/schemas/ts-conformance-ledger.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "oracle", "snapshot", "entries", "totals"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["npm", "compiler", "suite"],
+      "properties": {
+        "npm": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["specifier", "integrity", "publishedAt"],
+          "properties": {
+            "specifier": { "const": "typescript@7.0.2" },
+            "integrity": { "type": "string", "pattern": "^sha512-" },
+            "publishedAt": { "type": "string", "format": "date-time" }
+          }
+        },
+        "compiler": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "commit", "tag"],
+          "properties": {
+            "repository": { "const": "https://github.com/microsoft/typescript-go" },
+            "commit": { "const": "2bd066d87f5bafd315be9f40889d0a60b9e58e0b" },
+            "tag": { "const": "typescript/v7.0.2" }
+          }
+        },
+        "suite": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "commit", "caseRoot", "baselineRoot"],
+          "properties": {
+            "repository": { "const": "https://github.com/microsoft/TypeScript" },
+            "commit": { "const": "4d4f005c8541e0255a9d8791205fdce326e462bc" },
+            "caseRoot": { "const": "tests/cases" },
+            "baselineRoot": { "const": "tests/baselines/reference" }
+          }
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "generatedAt", "entryCount", "inputCount"],
+      "properties": {
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "generatedAt": { "type": "string", "format": "date-time" },
+        "entryCount": { "type": "integer", "minimum": 1 },
+        "inputCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id", "input", "partition", "facet", "status",
+          "surface", "reasonCode", "evidence", "backends",
+          "timeoutClass", "shardKey"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "input": { "type": "string", "minLength": 1 },
+          "partition": {
+            "enum": [
+              "compiler", "conformance", "project", "projects", "transpile",
+              "unittests", "api", "astnav", "config", "fourslash", "lsp",
+              "tsbuild", "tsbuildWatch", "tsc", "tscWatch", "tsoptions", "other"
+            ]
+          },
+          "facet": {
+            "enum": [
+              "parse", "diagnostics", "types", "symbols", "jsEmit", "dtsEmit",
+              "moduleResolution", "config", "cli", "build", "watch", "nodeApi",
+              "languageService", "harness", "implementation"
+            ]
+          },
+          "status": { "enum": ["included", "deferred", "excluded"] },
+          "surface": { "type": "string", "minLength": 1 },
+          "reasonCode": {
+            "enum": [
+              "PROMISED_COMPILER_CONTRACT", "PROMISED_NODE_API_CONTRACT",
+              "PROMISED_NOT_IMPLEMENTED", "LANGUAGE_SERVICE_NOT_PROMISED",
+              "UPSTREAM_IMPLEMENTATION_ONLY", "UPSTREAM_HARNESS_ONLY",
+              "RELEASE_INFRASTRUCTURE_ONLY"
+            ]
+          },
+          "backends": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "enum": ["check", "interpreter", "jit", "aot"] }
+          },
+          "timeoutClass": {
+            "enum": ["frontend", "execute", "project", "watch"]
+          },
+          "shardKey": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{16}$",
+            "description": "first 16 hex chars of sha256(id|facet|sorted backends)"
+          },
+          "expected": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "sha256"],
+              "properties": {
+                "path": { "type": "string" },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "nativeDifferenceClass": {
+                  "enum": ["none", "accepted", "triaged", "unclassified"]
+                }
+              }
+            }
+          },
+          "blockedBy": { "type": "array", "items": { "type": "string" } },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["tier", "confidence", "url"],
+              "properties": {
+                "tier": { "type": "integer", "minimum": 1, "maximum": 5 },
+                "confidence": { "enum": ["Verified", "Probable", "Speculative"] },
+                "url": { "type": "string", "format": "uri" },
+                "note": { "type": "string" }
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "status": { "const": "deferred" } } },
+            "then": {
+              "required": ["blockedBy"],
+              "properties": { "blockedBy": { "minItems": 1 } }
+            }
+          },
+          {
+            "if": { "properties": { "status": { "const": "included" } } },
+            "then": {
+              "properties": {
+                "reasonCode": {
+                  "enum": [
+                    "PROMISED_COMPILER_CONTRACT",
+                    "PROMISED_NODE_API_CONTRACT"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["discoveredInputs", "entries", "included", "deferred", "excluded"],
+      "properties": {
+        "discoveredInputs": { "type": "integer", "minimum": 0 },
+        "entries": { "type": "integer", "minimum": 0 },
+        "included": { "type": "integer", "minimum": 0 },
+        "deferred": { "type": "integer", "minimum": 0 },
+        "excluded": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

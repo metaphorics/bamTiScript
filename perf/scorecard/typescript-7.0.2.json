@@ -1,0 +1,143 @@
+{
+  "schema": 2,
+  "comparator": "typescript@7.0.2",
+  "node_version": "v24.18.0",
+  "host": "BH1",
+  "fingerprint": {
+    "kernel_release": "7.0.0-30-generic",
+    "kernel_version": "#30-Ubuntu SMP PREEMPT_DYNAMIC",
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz",
+    "sockets": 2,
+    "cores_per_socket": 20,
+    "microcode": "0x2007006"
+  },
+  "conditions_expected": {
+    "governor": "powersave",
+    "swap_total_kib": 403979000,
+    "cpu_affinity": "0-19",
+    "memory_policy": "bind",
+    "memory_nodes": "0"
+  },
+  "conditions_observed": {
+    "governor": "powersave",
+    "swap_total_kib": 403979000,
+    "cpu_affinity": "0-19",
+    "memory_policy": "bind",
+    "memory_nodes": "0"
+  },
+  "conditions_match": true,
+  "repeats": 30,
+  "fixtures": {
+    "bench-checker-ts": {
+      "wall_ms": {
+        "p50": 656.979982,
+        "p95": 674.79327,
+        "p99": 676.069849
+      },
+      "rss_bytes": {
+        "p50": 154873856.0,
+        "p95": 163123200.0,
+        "p99": 164184064.0
+      },
+      "argv": [
+        "--noEmit",
+        "--pretty",
+        "false",
+        "--allowJs",
+        "--jsx",
+        "preserve",
+        "perf/fixtures/upstream/checker.ts"
+      ],
+      "exit_code": 1
+    },
+    "bench-dom-dts": {
+      "wall_ms": {
+        "p50": 670.894519,
+        "p95": 693.607616,
+        "p99": 703.7791020000001
+      },
+      "rss_bytes": {
+        "p50": 201216000.0,
+        "p95": 210296832.0,
+        "p99": 210411520.0
+      },
+      "argv": [
+        "--noEmit",
+        "--pretty",
+        "false",
+        "--allowJs",
+        "--jsx",
+        "preserve",
+        "perf/fixtures/upstream/dom.generated.d.ts"
+      ],
+      "exit_code": 2
+    },
+    "bench-empty-ts": {
+      "wall_ms": {
+        "p50": 496.85197800000003,
+        "p95": 518.6823499999999,
+        "p99": 528.28123
+      },
+      "rss_bytes": {
+        "p50": 92884992.0,
+        "p95": 96530432.0,
+        "p99": 96641024.0
+      },
+      "argv": [
+        "--noEmit",
+        "--pretty",
+        "false",
+        "--allowJs",
+        "--jsx",
+        "preserve",
+        "perf/fixtures/upstream/empty.ts"
+      ],
+      "exit_code": 0
+    },
+    "bench-herebyfile": {
+      "wall_ms": {
+        "p50": 500.646385,
+        "p95": 521.200241,
+        "p99": 524.578416
+      },
+      "rss_bytes": {
+        "p50": 94420992.0,
+        "p95": 98545664.0,
+        "p99": 98910208.0
+      },
+      "argv": [
+        "--noEmit",
+        "--pretty",
+        "false",
+        "--allowJs",
+        "--jsx",
+        "preserve",
+        "perf/fixtures/upstream/Herebyfile.mjs"
+      ],
+      "exit_code": 1
+    },
+    "bench-jsx-complexity": {
+      "wall_ms": {
+        "p50": 507.88048100000003,
+        "p95": 524.161624,
+        "p99": 538.3753690000001
+      },
+      "rss_bytes": {
+        "p50": 93360128.0,
+        "p95": 97538048.0,
+        "p99": 97611776.0
+      },
+      "argv": [
+        "--noEmit",
+        "--pretty",
+        "false",
+        "--allowJs",
+        "--jsx",
+        "preserve",
+        "perf/fixtures/upstream/jsxComplexSignatureHasApplicabilityError.tsx"
+      ],
+      "exit_code": 1
+    }
+  }
+}

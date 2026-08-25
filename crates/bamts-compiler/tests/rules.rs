@@ -274,13 +274,17 @@ fn run_program_with_options(
         .filter_map(|(index, source)| {
             let target = source.resolves_to()?;
             let file = files[index].product();
-            let specifier = file.statements().iter().find_map(|statement| {
-                matches!(
-                    statement.data(),
-                    Statement::Import(_) | Statement::Export(_)
-                )
-                .then_some(statement.id())
-            })?;
+            let specifier = file
+                .statements()
+                .iter()
+                .find_map(|statement| {
+                    matches!(
+                        statement.data(),
+                        Statement::Import(_) | Statement::Export(_)
+                    )
+                    .then_some(statement.id())
+                })
+                .expect("a source declaring resolves_to must contain an import or export");
             Some(ResolvedModuleEdge {
                 from: SourceId::new(u32::try_from(index).expect("example source index fits u32")),
                 specifier,
@@ -306,6 +310,6 @@ fn parse(index: usize, source: RuleExampleSource) -> Recovered<SourceFile> {
     parser::parse(scanner::scan(
         SourceId::new(u32::try_from(index).expect("example source index fits u32")),
         source.script_kind(),
-        Arc::new(SourceText::new(source.text())),
+        Arc::new(SourceText::new(source.text()).expect("test source fits the per-file budget")),
     ))
 }

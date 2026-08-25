@@ -8,14 +8,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::{Table, Value};
 
-const MEMBERS: [(&str, &str); 9] = [
+const MEMBERS: [(&str, &str); 11] = [
     ("bamts-compiler", "crates/bamts-compiler"),
     ("bamts-bytecode", "crates/bamts-bytecode"),
+    ("bamts-cancel", "crates/bamts-cancel"),
     ("bamts-runtime", "crates/bamts-runtime"),
     ("bamts-native", "crates/bamts-native"),
     ("bamts-node", "crates/bamts-node"),
     ("bamts-codegen", "crates/bamts-codegen"),
     ("bamts-cli", "crates/bamts-cli"),
+    ("bamts-napi", "crates/bamts-napi"),
     ("bamts-verification", "crates/bamts-verification"),
     ("bamts", "crates/bamts"),
 ];
@@ -294,7 +296,7 @@ fn validate_member_manifest(expected_name: &str, manifest: &Value, path: &Path) 
     require_exact_bool(
         package,
         "publish",
-        expected_name != "bamts-verification",
+        !matches!(expected_name, "bamts-napi" | "bamts-verification"),
         &format!("{} [package]", path.display()),
     )?;
     validate_member_lints(expected_name, manifest, &path.display().to_string())?;
@@ -332,7 +334,10 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
 
     // These crates own tightly-scoped unsafe boundaries, so they pin a local
     // `deny` policy instead of inheriting the workspace-wide `forbid`.
-    if matches!(name, "bamts-native" | "bamts-node" | "bamts-codegen") {
+    if matches!(
+        name,
+        "bamts-native" | "bamts-node" | "bamts-codegen" | "bamts-napi" | "bamts-verification"
+    ) {
         if lints.contains_key("workspace") {
             return Err(workspace_error(format!(
                 "{context}: {name} must not inherit workspace lints"
@@ -393,10 +398,17 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
 fn validate_native_features(manifest: &Value, context: &str) -> Result<()> {
     let root = root_table(manifest, context)?;
     let features = required_table(root, "features", context)?;
-    let expected: BTreeSet<String> = ["default", "gc", "node-host", "jit-entry", "aot-image"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let expected: BTreeSet<String> = [
+        "default",
+        "gc",
+        "node-host",
+        "jit-entry",
+        "aot-image",
+        "cache-guard",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     let actual: BTreeSet<String> = features.keys().cloned().collect();
     if actual != expected {
         return Err(workspace_error(format!(
@@ -416,6 +428,7 @@ fn validate_native_features(manifest: &Value, context: &str) -> Result<()> {
         &["dep:cranelift-jit", "dep:cranelift-module"],
         context,
     )?;
+    require_feature_set(features, "cache-guard", &["dep:windows"], context)?;
 
     Ok(())
 }
@@ -967,10 +980,14 @@ fn validate_internal_graph(graph: &InternalGraph) -> Result<()> {
 fn expected_internal_graph() -> InternalGraph {
     let mut graph = BTreeMap::new();
     graph.insert("bamts-bytecode".to_owned(), BTreeMap::new());
+    graph.insert("bamts-cancel".to_owned(), BTreeMap::new());
     graph.insert("bamts-native".to_owned(), BTreeMap::new());
     graph.insert(
         "bamts-compiler".to_owned(),
-        BTreeMap::from([("bamts-bytecode".to_owned(), internal_dependency(false, &[]))]),
+        BTreeMap::from([
+            ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
+        ]),
     );
     graph.insert(
         "bamts-runtime".to_owned(),
@@ -980,6 +997,7 @@ fn expected_internal_graph() -> InternalGraph {
                 "bamts-native".to_owned(),
                 internal_dependency(false, &["gc"]),
             ),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
         ]),
     );
     graph.insert(
@@ -997,6 +1015,7 @@ fn expected_internal_graph() -> InternalGraph {
         "bamts-codegen".to_owned(),
         BTreeMap::from([
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
             (
                 "bamts-native".to_owned(),
@@ -1012,6 +1031,7 @@ fn expected_internal_graph() -> InternalGraph {
             ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
             ("bamts-node".to_owned(), internal_dependency(true, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
         ]),
     );
     graph.insert(
@@ -1031,6 +1051,18 @@ fn expected_internal_graph() -> InternalGraph {
                 "bamts-node".to_owned(),
                 internal_dependency(false, &["aot-main", "script-compiler"]),
             ),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
+            (
+                "bamts-native".to_owned(),
+                internal_dependency(false, &["cache-guard"]),
+            ),
+        ]),
+    );
+    graph.insert(
+        "bamts-napi".to_owned(),
+        BTreeMap::from([
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cli".to_owned(), internal_dependency(false, &[])),
         ]),
     );
     graph.insert(
@@ -1117,14 +1149,14 @@ fn visit_graph(
 }
 
 fn validate_feature_closures(root: &Path) -> Result<()> {
-    // Positive check: unified workspace metadata closure.
-    let metadata = cargo_metadata(root, None)?;
-    let closure = codegen_closure(&metadata)?;
-    require_enabled_feature(&closure, "bamts-cli", "aot")?;
-    require_enabled_feature(&closure, "bamts-cli", "host-jit")?;
-    require_present_package(&closure, "bamts-cli", "cranelift-object")?;
-    require_present_package(&closure, "bamts-cli", "cranelift-jit")?;
-    require_present_package(&closure, "bamts-cli", "bamts-native")?;
+    // Positive check: package-selected `bamts-cli` cargo metadata closure.
+    let closure = cli_closure(root)?;
+    let mode = "bamts-cli";
+    require_enabled_feature(&closure, mode, "bamts-codegen", "aot")?;
+    require_enabled_feature(&closure, mode, "bamts-codegen", "host-jit")?;
+    require_present_package(&closure, mode, "cranelift-object")?;
+    require_present_package(&closure, mode, "cranelift-jit")?;
+    require_present_package(&closure, mode, "bamts-native")?;
 
     // Package-selected closure checks via `cargo tree`.
     //
@@ -1216,44 +1248,37 @@ fn validate_feature_closures(root: &Path) -> Result<()> {
     //
     // `bamts-codegen/host-jit`: host-jit is a feature of bamts-codegen, so
     // cargo_metadata + codegen_closure resolves correctly from bamts-codegen.
-    let meta = cargo_metadata(root, Some("bamts-codegen/host-jit"))?;
+    let meta = cargo_metadata(root, None, Some("bamts-codegen/host-jit"))?;
     let closure = codegen_closure(&meta)?;
-    require_enabled_feature(&closure, "bamts-codegen/host-jit", "host-jit")?;
+    require_enabled_feature(
+        &closure,
+        "bamts-codegen/host-jit",
+        "bamts-codegen",
+        "host-jit",
+    )?;
     // `bamts-native/jit-entry` is activated transitively by
     // `bamts-codegen/host-jit`; verify it on bamts-native's features.
-    let native_features = closure
-        .package_features
-        .get("bamts-native")
-        .ok_or_else(|| {
-            workspace_error("bamts-codegen/host-jit closure does not contain bamts-native features")
-        })?;
-    if !native_features.contains("jit-entry") {
-        return Err(workspace_error(
-            "bamts-codegen/host-jit closure does not enable bamts-native/jit-entry",
-        ));
-    }
+    require_enabled_feature(
+        &closure,
+        "bamts-codegen/host-jit",
+        "bamts-native",
+        "jit-entry",
+    )?;
 
     // `bamts/host-jit`: host-jit is a feature of bamts (the facade), so we
     // must resolve from `bamts`, not `bamts-codegen`.
-    let meta = cargo_metadata(root, Some("bamts/host-jit"))?;
+    let meta = cargo_metadata(root, None, Some("bamts/host-jit"))?;
     let closure = resolve_closure_from(&meta, "bamts")?;
-    // Verify host-jit reaches bamts-codegen with host-jit enabled.
-    let codegen_features = closure
-        .package_features
-        .get("bamts-codegen")
-        .ok_or_else(|| {
-            workspace_error("bamts/host-jit closure does not contain bamts-codegen features")
-        })?;
-    if !codegen_features.contains("host-jit") {
-        return Err(workspace_error(
-            "bamts/host-jit closure does not enable bamts-codegen/host-jit",
-        ));
-    }
+    require_enabled_feature(&closure, "bamts/host-jit", "bamts-codegen", "host-jit")?;
 
     Ok(())
 }
 
-fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
+fn cargo_metadata(
+    root: &Path,
+    manifest: Option<&Path>,
+    feature: Option<&str>,
+) -> Result<CargoMetadata> {
     let cargo = match env::var_os("CARGO") {
         Some(path) => path,
         None => "cargo".into(),
@@ -1267,6 +1292,9 @@ fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
         .arg("--locked")
         .arg("--offline")
         .arg("--no-default-features");
+    if let Some(manifest) = manifest {
+        command.arg("--manifest-path").arg(manifest);
+    }
     if let Some(feature) = feature {
         command.arg("--features").arg(feature);
     }
@@ -1300,18 +1328,29 @@ fn cargo_metadata(root: &Path, feature: Option<&str>) -> Result<CargoMetadata> {
     })
 }
 
+fn cli_closure(root: &Path) -> Result<ResolvedClosure> {
+    let manifest = root.join("crates/bamts-cli/Cargo.toml");
+    let metadata = cargo_metadata(root, Some(manifest.as_path()), None)?;
+    resolve_closure_from(&metadata, "bamts-cli")
+}
+
 fn codegen_closure(metadata: &CargoMetadata) -> Result<ResolvedClosure> {
     resolve_closure_from(metadata, "bamts-codegen")
 }
 
-fn require_enabled_feature(closure: &ResolvedClosure, mode: &str, feature: &str) -> Result<()> {
+fn require_enabled_feature(
+    closure: &ResolvedClosure,
+    mode: &str,
+    package: &str,
+    feature: &str,
+) -> Result<()> {
     let active = closure
         .package_features
-        .get("bamts-codegen")
-        .ok_or_else(|| workspace_error("codegen closure lacks bamts-codegen features"))?;
+        .get(package)
+        .ok_or_else(|| workspace_error(format!("{mode} closure lacks `{package}` features")))?;
     if !active.contains(feature) {
         return Err(workspace_error(format!(
-            "{mode} metadata closure does not enable bamts-codegen feature `{feature}`"
+            "{mode} metadata closure does not enable `{package}` feature `{feature}`"
         )));
     }
 
@@ -1888,5 +1927,137 @@ host-jit = [
 
         // Must not error — the exact set matches.
         validate_codegen_features(&manifest, "fixture").expect("host-jit feature set");
+    }
+
+    fn mock_bamts_cli_metadata() -> CargoMetadata {
+        CargoMetadata {
+            packages: vec![
+                CargoPackage {
+                    id: "cli".to_owned(),
+                    name: "bamts-cli".to_owned(),
+                },
+                CargoPackage {
+                    id: "cg".to_owned(),
+                    name: "bamts-codegen".to_owned(),
+                },
+                CargoPackage {
+                    id: "native".to_owned(),
+                    name: "bamts-native".to_owned(),
+                },
+                CargoPackage {
+                    id: "obj".to_owned(),
+                    name: "cranelift-object".to_owned(),
+                },
+                CargoPackage {
+                    id: "jit".to_owned(),
+                    name: "cranelift-jit".to_owned(),
+                },
+            ],
+            resolve: Some(CargoResolve {
+                nodes: vec![
+                    CargoNode {
+                        id: "cli".to_owned(),
+                        features: vec![],
+                        deps: vec![
+                            CargoNodeDependency {
+                                pkg: "cg".to_owned(),
+                                dep_kinds: vec![CargoDependencyKind { kind: None }],
+                            },
+                            CargoNodeDependency {
+                                pkg: "native".to_owned(),
+                                dep_kinds: vec![CargoDependencyKind { kind: None }],
+                            },
+                        ],
+                    },
+                    CargoNode {
+                        id: "cg".to_owned(),
+                        features: vec!["aot".to_owned(), "host-jit".to_owned()],
+                        deps: vec![
+                            CargoNodeDependency {
+                                pkg: "obj".to_owned(),
+                                dep_kinds: vec![CargoDependencyKind { kind: None }],
+                            },
+                            CargoNodeDependency {
+                                pkg: "jit".to_owned(),
+                                dep_kinds: vec![CargoDependencyKind { kind: None }],
+                            },
+                            CargoNodeDependency {
+                                pkg: "native".to_owned(),
+                                dep_kinds: vec![CargoDependencyKind { kind: None }],
+                            },
+                        ],
+                    },
+                    CargoNode {
+                        id: "native".to_owned(),
+                        features: vec![],
+                        deps: vec![],
+                    },
+                    CargoNode {
+                        id: "obj".to_owned(),
+                        features: vec![],
+                        deps: vec![],
+                    },
+                    CargoNode {
+                        id: "jit".to_owned(),
+                        features: vec![],
+                        deps: vec![],
+                    },
+                ],
+            }),
+        }
+    }
+
+    #[test]
+    fn bamts_cli_closure_starts_at_cli_and_reaches_codegen_features() {
+        let metadata = mock_bamts_cli_metadata();
+        let closure = resolve_closure_from(&metadata, "bamts-cli").expect("resolve cli");
+
+        assert!(
+            closure.package_names.contains("bamts-cli"),
+            "root package is present"
+        );
+        assert!(closure.package_names.contains("bamts-codegen"));
+        assert!(closure.package_names.contains("bamts-native"));
+        assert!(closure.package_names.contains("cranelift-object"));
+        assert!(closure.package_names.contains("cranelift-jit"));
+
+        let codegen = closure
+            .package_features
+            .get("bamts-codegen")
+            .expect("codegen features");
+        assert!(codegen.contains("aot"));
+        assert!(codegen.contains("host-jit"));
+
+        require_enabled_feature(&closure, "bamts-cli", "bamts-codegen", "aot")
+            .expect("aot enabled");
+        require_enabled_feature(&closure, "bamts-cli", "bamts-codegen", "host-jit")
+            .expect("host-jit enabled");
+        require_present_package(&closure, "bamts-cli", "cranelift-object")
+            .expect("cranelift-object present");
+        require_present_package(&closure, "bamts-cli", "cranelift-jit")
+            .expect("cranelift-jit present");
+        require_present_package(&closure, "bamts-cli", "bamts-native")
+            .expect("bamts-native present");
+    }
+
+    #[test]
+    fn bamts_cli_closure_is_distinct_from_codegen_closure() {
+        let metadata = mock_bamts_cli_metadata();
+        let cli = resolve_closure_from(&metadata, "bamts-cli").expect("cli");
+        let codegen = resolve_closure_from(&metadata, "bamts-codegen").expect("codegen");
+
+        assert!(cli.package_names.contains("bamts-cli"));
+        assert!(
+            !codegen.package_names.contains("bamts-cli"),
+            "codegen closure must not include the CLI package"
+        );
+        assert!(codegen.package_names.contains("bamts-native"));
+        assert!(
+            codegen
+                .package_features
+                .get("bamts-codegen")
+                .expect("codegen features")
+                .contains("host-jit")
+        );
     }
 }

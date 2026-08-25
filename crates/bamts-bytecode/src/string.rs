@@ -12,9 +12,13 @@ use std::sync::Arc;
 pub struct EcmaString(Arc<[u16]>);
 
 impl EcmaString {
-    /// Encodes a well-formed UTF-8 string as ECMAScript UTF-16 code units.
+    /// Encodes a Rust string as ECMAScript UTF-16 code units.
+    ///
+    /// Named `encode` rather than `from_utf8`: the input is an already-validated
+    /// `&str`, so unlike std's `from_utf8` this consumes no bytes and cannot
+    /// fail. Takes `&str` so a `&String` argument coerces at the call site.
     #[must_use]
-    pub fn from_utf8(value: &str) -> Self {
+    pub fn encode(value: &str) -> Self {
         Self(Arc::from(value.encode_utf16().collect::<Vec<_>>()))
     }
 
@@ -152,6 +156,14 @@ impl EcmaString {
             }
         }
         None
+    }
+}
+
+/// Delegates to [`EcmaString::encode`]; see that method for why the conversion
+/// is named `encode` rather than `from_utf8` or `from_str`.
+impl From<&str> for EcmaString {
+    fn from(value: &str) -> Self {
+        Self::encode(value)
     }
 }
 
@@ -353,7 +365,7 @@ mod tests {
 
     #[test]
     fn slices_reject_invalid_ranges_without_panicking() {
-        let string = EcmaString::from_utf8("ab");
+        let string = EcmaString::encode("ab");
 
         assert_eq!(string.slice_units(2..3), None);
         let start = string.len_units() - 1;
@@ -384,8 +396,8 @@ mod tests {
 
     #[test]
     fn ascii_comparison_rejects_non_ascii_values() {
-        let ascii = EcmaString::from_utf8("ascii");
-        let non_ascii = EcmaString::from_utf8("é");
+        let ascii = EcmaString::encode("ascii");
+        let non_ascii = EcmaString::encode("é");
 
         assert!(ascii.eq_ascii("ascii"));
         assert!(!ascii.eq_ascii("ASCII"));

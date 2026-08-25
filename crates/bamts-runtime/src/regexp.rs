@@ -1,7 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use bamts_bytecode::EcmaString;
+
+/// Backstop for non-dedupable state blowups inside a repetition (e.g.
+/// `((a)|(a))*` where branches set different capture groups). Exposed so the
+/// builtin boundary can attach the limit to the runtime error it raises when
+/// the budget is exhausted — exhaustion must surface as a failure, not a
+/// silent non-match.
+pub(crate) const STEP_BUDGET: usize = 100_000;
+
+/// Identity of a backtracking state: input position plus capture bindings. Two
+/// states sharing one continue identically, so a repetition level keeps only the
+/// first — that is what stops equivalent alternatives multiplying per level.
+type StateKey = (usize, Vec<Option<(usize, usize)>>);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Flags {
@@ -61,20 +73,58 @@ impl Flags {
     }
 }
 
+/// Canonicalize a flags string into the standard `gimsuy` order without
+/// compiling the pattern. Reuses `Flags::parse` and `Flags::canonical` so
+/// the ordering stays identical to the compile-based path. The flags on a
+/// stored RegExp were validated at construction, so parse never fails in
+/// practice; the fallback returns the stored string verbatim rather than
+/// inventing output for an impossible state.
+pub(crate) fn canonical_flags(flags: &EcmaString) -> EcmaString {
+    match Flags::parse(flags) {
+        Ok(parsed) => parsed.canonical(),
+        Err(_) => flags.clone(),
+    }
+}
+
+/// Distinguishes a compile-time syntax/flag error from a runtime step-budget
+/// exhaustion. Compile errors surface as a thrown `SyntaxError`; budget
+/// exhaustion surfaces as a `RuntimeErrorKind` so a caller can tell an aborted
+/// match apart from a genuine non-match instead of misreading it as `false`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegexErrorKind {
+    Compile,
+    BudgetExhausted,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegexError {
     message: String,
+    kind: RegexErrorKind,
 }
 
 impl RegexError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: RegexErrorKind::Compile,
+        }
+    }
+
+    /// Step budget exhausted by a pathologically complex pattern. The matcher
+    /// gave up rather than completing — this must not be read as a non-match.
+    fn budget_exhausted() -> Self {
+        Self {
+            message: "regular expression step budget exhausted".into(),
+            kind: RegexErrorKind::BudgetExhausted,
         }
     }
 
     pub(crate) fn message(&self) -> &str {
         &self.message
+    }
+
+    pub(crate) fn kind(&self) -> RegexErrorKind {
+        self.kind
     }
 }
 
@@ -113,10 +163,14 @@ impl Regex {
         self.flags
     }
 
-    pub(crate) fn exec(&self, input: &EcmaString, start: usize) -> Option<Match> {
+    pub(crate) fn exec(
+        &self,
+        input: &EcmaString,
+        start: usize,
+    ) -> Result<Option<Match>, RegexError> {
         let input = input.as_units();
         if start > input.len() {
-            return None;
+            return Ok(None);
         }
         let mut position = start;
         loop {
@@ -125,7 +179,7 @@ impl Regex {
                 captures: vec![None; self.capture_count + 1],
             };
             if let Some(mut matched) = self
-                .match_node(&self.expression, input, state)
+                .match_node(&self.expression, input, state)?
                 .into_iter()
                 .next()
             {
@@ -135,72 +189,81 @@ impl Regex {
                     .iter()
                     .map(|(name, index)| (name.clone(), matched.captures[*index].clone()))
                     .collect();
-                return Some(Match {
+                return Ok(Some(Match {
                     range: position..matched.position,
                     captures: matched.captures,
                     named,
-                });
+                }));
             }
             if self.flags.sticky || position == input.len() {
-                return None;
+                return Ok(None);
             }
             position += next_code_point(input, position, self.flags.unicode).1;
         }
     }
 
-    fn match_node(&self, node: &Node, input: &[u16], state: State) -> Vec<State> {
+    fn match_node(
+        &self,
+        node: &Node,
+        input: &[u16],
+        state: State,
+    ) -> Result<Vec<State>, RegexError> {
         match node {
             Node::Sequence(nodes) => self.match_sequence(nodes, input, state),
-            Node::Alternation(branches) => branches
-                .iter()
-                .flat_map(|branch| self.match_node(branch, input, state.clone()))
-                .collect(),
+            Node::Alternation(branches) => {
+                let mut out = Vec::new();
+                for branch in branches {
+                    out.extend(self.match_node(branch, input, state.clone())?);
+                }
+                Ok(out)
+            }
             Node::Literal(expected) => {
                 if state.position == input.len() {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
-                self.code_point_eq(actual, *expected)
+                Ok(self
+                    .code_point_eq(actual, *expected)
                     .then(|| state.advanced(width))
                     .into_iter()
-                    .collect()
+                    .collect())
             }
             Node::Dot => {
                 if state.position == input.len() {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
-                (self.flags.dot_all || !is_line_terminator(actual))
+                Ok((self.flags.dot_all || !is_line_terminator(actual))
                     .then(|| state.advanced(width))
                     .into_iter()
-                    .collect()
+                    .collect())
             }
             Node::Class(class) => {
                 if state.position == input.len() {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 let (actual, width) = next_code_point(input, state.position, self.flags.unicode);
-                class
+                Ok(class
                     .matches(actual, self.flags.ignore_case, self.flags.unicode)
                     .then(|| state.advanced(width))
                     .into_iter()
-                    .collect()
+                    .collect())
             }
-            Node::Start => {
-                let at_start = state.position == 0
-                    || (self.flags.multiline
-                        && state.position > 0
-                        && is_line_terminator(u32::from(input[state.position - 1])));
-                at_start.then_some(state).into_iter().collect()
-            }
-            Node::End => {
-                let at_end = state.position == input.len()
-                    || (self.flags.multiline
-                        && input
-                            .get(state.position)
-                            .is_some_and(|value| is_line_terminator(u32::from(*value))));
-                at_end.then_some(state).into_iter().collect()
-            }
+            Node::Start => Ok((state.position == 0
+                || (self.flags.multiline
+                    && state.position > 0
+                    && is_line_terminator(u32::from(input[state.position - 1]))))
+            .then_some(state)
+            .into_iter()
+            .collect()),
+            Node::End => Ok((state.position == input.len()
+                || (self.flags.multiline
+                    && input
+                        .get(state.position)
+                        .is_some_and(|value| is_line_terminator(u32::from(*value)))))
+            .then_some(state)
+            .into_iter()
+            .collect()),
             Node::WordBoundary(positive) => {
                 let left = if state.position == 0 {
                     false
@@ -222,14 +285,15 @@ impl Regex {
                     .is_some_and(|value| {
                         is_word(value, self.flags.ignore_case, self.flags.unicode)
                     });
-                ((left != right) == *positive)
+                Ok(((left != right) == *positive)
                     .then_some(state)
                     .into_iter()
-                    .collect()
+                    .collect())
             }
             Node::Group { index, body } => {
                 let begin = state.position;
-                self.match_node(body, input, state)
+                Ok(self
+                    .match_node(body, input, state)?
                     .into_iter()
                     .map(|mut matched| {
                         if let Some(index) = index {
@@ -237,17 +301,18 @@ impl Regex {
                         }
                         matched
                     })
-                    .collect()
+                    .collect())
             }
             Node::BackReference(index) => {
                 let Some(range) = state.captures.get(*index).and_then(Clone::clone) else {
-                    return vec![state];
+                    return Ok(vec![state]);
                 };
-                self.match_backreference(input, range, state)
+                Ok(self.match_backreference(input, range, state))
             }
-            Node::NamedBackReference(name) => self.names.get(name).map_or_else(Vec::new, |index| {
-                self.match_node(&Node::BackReference(*index), input, state)
-            }),
+            Node::NamedBackReference(name) => match self.names.get(name) {
+                Some(index) => Ok(self.match_node(&Node::BackReference(*index), input, state)?),
+                None => Ok(Vec::new()),
+            },
             Node::Look {
                 body,
                 behind,
@@ -260,7 +325,7 @@ impl Regex {
                         let mut initial = state.clone();
                         initial.position = begin;
                         candidates.extend(
-                            self.match_node(body, input, initial)
+                            self.match_node(body, input, initial)?
                                 .into_iter()
                                 .filter(|matched| matched.position == state.position),
                         );
@@ -274,9 +339,9 @@ impl Regex {
                     }
                     candidates
                 } else {
-                    self.match_node(body, input, state.clone())
+                    self.match_node(body, input, state.clone())?
                 };
-                if *positive {
+                Ok(if *positive {
                     candidates
                         .into_iter()
                         .map(|mut matched| {
@@ -288,7 +353,7 @@ impl Regex {
                     vec![state]
                 } else {
                     Vec::new()
-                }
+                })
             }
             Node::Repeat { .. } => unreachable!("repeat is handled by its containing sequence"),
         }
@@ -313,9 +378,14 @@ impl Regex {
         vec![state.advanced(width)]
     }
 
-    fn match_sequence(&self, nodes: &[Node], input: &[u16], state: State) -> Vec<State> {
+    fn match_sequence(
+        &self,
+        nodes: &[Node],
+        input: &[u16],
+        state: State,
+    ) -> Result<Vec<State>, RegexError> {
         let Some((first, rest)) = nodes.split_first() else {
-            return vec![state];
+            return Ok(vec![state]);
         };
         if let Node::Repeat {
             body,
@@ -324,20 +394,56 @@ impl Regex {
             greedy,
         } = first
         {
+            // Deduplicate states within each repetition level by (position,
+            // captures).  Equivalent alternatives like (a|a|a) produce k
+            // identical states at every level — without dedup these multiply to
+            // k^n states, each cloning its captures Vec.  Two states that share
+            // position and captures yield identical continuations, so collapsing
+            // duplicates is lossless.
+            //
+            // The hash set is allocated once and cleared per level so its bucket
+            // capacity is reused — ordinary patterns (1 state per level) pay one
+            // allocation for the whole repeat, not one per level.  Dedup is kept
+            // even for single-source levels because the body itself can be an
+            // alternation (e.g. (a|a)*) whose branches yield duplicate
+            // (position, captures) states from one prior — skipping would let
+            // those duplicates through and reintroduce the multiplication.
+            //
+            // The step budget remains as a backstop for non-dedupable blowups
+            // (e.g. ((a)|(a))* where branches set different capture groups).
+            // On exhaustion it returns a distinct error rather than an empty
+            // result, so a caller can tell an aborted match from a real non-match.
             let mut levels = vec![vec![state]];
             let limit = max.unwrap_or(input.len().saturating_add(*min).saturating_add(1));
+            let mut total_states: usize = 1;
+            let mut seen: HashSet<StateKey> = HashSet::new();
             for count in 0..limit {
                 let mut next = Vec::new();
+                seen.clear();
                 for prior in &levels[count] {
-                    for matched in self.match_node(body, input, prior.clone()) {
+                    for matched in self.match_node(body, input, prior.clone())? {
                         if matched.position == prior.position && count + 1 >= *min {
                             continue;
                         }
-                        next.push(matched);
+                        let key = (
+                            matched.position,
+                            matched
+                                .captures
+                                .iter()
+                                .map(|c| c.as_ref().map(|r| (r.start, r.end)))
+                                .collect(),
+                        );
+                        if seen.insert(key) {
+                            next.push(matched);
+                        }
                     }
                 }
                 if next.is_empty() {
                     break;
+                }
+                total_states += next.len();
+                if total_states > STEP_BUDGET {
+                    return Err(RegexError::budget_exhausted());
                 }
                 levels.push(next);
             }
@@ -348,16 +454,20 @@ impl Regex {
             };
             let mut result = Vec::new();
             for count in counts {
-                for candidate in levels[count].clone() {
-                    result.extend(self.match_sequence(rest, input, candidate));
+                // Move ownership instead of cloning: each level is visited
+                // exactly once, so the deep copy of every captures allocation
+                // on each iteration was pure waste.
+                for candidate in std::mem::take(&mut levels[count]) {
+                    result.extend(self.match_sequence(rest, input, candidate)?);
                 }
             }
-            result
+            Ok(result)
         } else {
-            self.match_node(first, input, state)
-                .into_iter()
-                .flat_map(|matched| self.match_sequence(rest, input, matched))
-                .collect()
+            let mut result = Vec::new();
+            for matched in self.match_node(first, input, state)? {
+                result.extend(self.match_sequence(rest, input, matched)?);
+            }
+            Ok(result)
         }
     }
 
@@ -1211,11 +1321,11 @@ fn combine_surrogates(high: u16, low: u16) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::Regex;
+    use super::{Regex, RegexErrorKind};
     use bamts_bytecode::EcmaString;
 
     fn text(value: &str) -> EcmaString {
-        EcmaString::from_utf8(value)
+        EcmaString::encode(value)
     }
 
     fn regex(pattern: &str, flags: &str) -> Regex {
@@ -1225,6 +1335,7 @@ mod tests {
     fn ranges(pattern: &str, flags: &str, input: &str) -> Vec<Option<std::ops::Range<usize>>> {
         regex(pattern, flags)
             .exec(&text(input), 0)
+            .unwrap()
             .unwrap()
             .captures
     }
@@ -1236,12 +1347,24 @@ mod tests {
             escaped
                 .exec(&text(r"\ ^ $ * + ? . ( ) | { } [ ] -"), 0)
                 .unwrap()
+                .unwrap()
                 .range,
             0..29
         );
-        assert_eq!(regex(r"\x2d", "u").exec(&text("-"), 0).unwrap().range, 0..1);
         assert_eq!(
-            regex(r"\\", "g").exec(&text(r"a\b"), 0).unwrap().range,
+            regex(r"\x2d", "u")
+                .exec(&text("-"), 0)
+                .unwrap()
+                .unwrap()
+                .range,
+            0..1
+        );
+        assert_eq!(
+            regex(r"\\", "g")
+                .exec(&text(r"a\b"), 0)
+                .unwrap()
+                .unwrap()
+                .range,
             1..2
         );
     }
@@ -1251,15 +1374,27 @@ mod tests {
         assert!(
             regex(r"^(?:[^/]*?)\.js$", "")
                 .exec(&text("a.js"), 0)
+                .unwrap()
                 .is_some()
         );
         assert!(
             regex(r"^(?:.*?)\/?\.ts$", "")
                 .exec(&text("src/a/b.ts"), 0)
+                .unwrap()
                 .is_some()
         );
-        assert!(regex(r"[abc]at", "").exec(&text("cat"), 0).is_some());
-        assert!(regex(r"^(a|b)\.js$", "").exec(&text("b.js"), 0).is_some());
+        assert!(
+            regex(r"[abc]at", "")
+                .exec(&text("cat"), 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            regex(r"^(a|b)\.js$", "")
+                .exec(&text("b.js"), 0)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1270,6 +1405,7 @@ mod tests {
             "",
         )
         .exec(&input, 0)
+        .unwrap()
         .unwrap();
 
         assert_eq!(matched.range, 0..input.as_units().len());
@@ -1288,18 +1424,24 @@ mod tests {
         assert!(
             regex(r"(?<=foo)bar(?=$)", "")
                 .exec(&text("foobar"), 0)
+                .unwrap()
                 .is_some()
         );
-        assert!(regex(r"foo(?!bar)", "").exec(&text("foobaz"), 0).is_some());
+        assert!(
+            regex(r"foo(?!bar)", "")
+                .exec(&text("foobaz"), 0)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn lazy_and_sticky_matching() {
         let lazy = regex("a.*?b", "s");
-        assert_eq!(lazy.exec(&text("a1b2b"), 0).unwrap().range, 0..3);
+        assert_eq!(lazy.exec(&text("a1b2b"), 0).unwrap().unwrap().range, 0..3);
         let sticky = regex("b", "y");
-        assert!(sticky.exec(&text("ab"), 0).is_none());
-        assert_eq!(sticky.exec(&text("ab"), 1).unwrap().range, 1..2);
+        assert!(sticky.exec(&text("ab"), 0).unwrap().is_none());
+        assert_eq!(sticky.exec(&text("ab"), 1).unwrap().unwrap().range, 1..2);
     }
 
     #[test]
@@ -1312,14 +1454,17 @@ mod tests {
     fn dot_uses_code_units_without_u_and_code_points_with_u() {
         let input = text("😀");
         let plain = regex(".", "g");
-        assert_eq!(plain.exec(&input, 0).unwrap().range, 0..1);
-        assert_eq!(plain.exec(&input, 1).unwrap().range, 1..2);
-        assert_eq!(regex(".", "u").exec(&input, 0).unwrap().range, 0..2);
+        assert_eq!(plain.exec(&input, 0).unwrap().unwrap().range, 0..1);
+        assert_eq!(plain.exec(&input, 1).unwrap().unwrap().range, 1..2);
+        assert_eq!(
+            regex(".", "u").exec(&input, 0).unwrap().unwrap().range,
+            0..2
+        );
     }
 
     #[test]
     fn captures_and_match_indices_are_code_unit_offsets() {
-        let matched = regex("(x)", "").exec(&text("😀x"), 0).unwrap();
+        let matched = regex("(x)", "").exec(&text("😀x"), 0).unwrap().unwrap();
         assert_eq!(matched.range, 2..3);
         assert_eq!(matched.captures[1], Some(2..3));
     }
@@ -1328,6 +1473,7 @@ mod tests {
     fn unicode_classes_support_supplementary_ranges() {
         let matched = regex(r"[\u{1F600}-\u{1F64F}]", "u")
             .exec(&text("😀"), 0)
+            .unwrap()
             .unwrap();
         assert_eq!(matched.range, 0..2);
     }
@@ -1339,6 +1485,7 @@ mod tests {
         let matched = Regex::compile(&pattern, &text(""))
             .unwrap()
             .exec(&input, 0)
+            .unwrap()
             .unwrap();
         assert_eq!(matched.range, 0..1);
         assert_eq!(input.as_units(), &[0xd800]);
@@ -1348,49 +1495,107 @@ mod tests {
     fn sticky_offsets_are_code_units() {
         let sticky = regex("x", "y");
         let input = text("😀x");
-        assert!(sticky.exec(&input, 1).is_none());
-        assert_eq!(sticky.exec(&input, 2).unwrap().range, 2..3);
+        assert!(sticky.exec(&input, 1).unwrap().is_none());
+        assert_eq!(sticky.exec(&input, 2).unwrap().unwrap().range, 2..3);
     }
 
     #[test]
     fn escaped_surrogate_pairs_combine_only_in_unicode_mode() {
         let input = text("😀");
         assert_eq!(
-            regex(r"\uD83D\uDE00", "u").exec(&input, 0).unwrap().range,
+            regex(r"\uD83D\uDE00", "u")
+                .exec(&input, 0)
+                .unwrap()
+                .unwrap()
+                .range,
             0..2
         );
         assert_eq!(
-            regex(r"\uD83D\uDE00", "").exec(&input, 0).unwrap().range,
+            regex(r"\uD83D\uDE00", "")
+                .exec(&input, 0)
+                .unwrap()
+                .unwrap()
+                .range,
             0..2
         );
     }
 
     #[test]
     fn ignore_case_uses_legacy_and_unicode_canonicalization() {
-        assert!(regex("^k$", "i").exec(&text("K"), 0).is_some());
+        assert!(regex("^k$", "i").exec(&text("K"), 0).unwrap().is_some());
         for (pattern, value) in [("^k$", "K"), ("^s$", "ſ")] {
-            assert!(regex(pattern, "iu").exec(&text(value), 0).is_some());
-            assert!(regex(pattern, "i").exec(&text(value), 0).is_none());
+            assert!(
+                regex(pattern, "iu")
+                    .exec(&text(value), 0)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(regex(pattern, "i").exec(&text(value), 0).unwrap().is_none());
         }
-        assert!(regex("^å$", "i").exec(&text("Å"), 0).is_some());
-        assert!(regex(r"^(K)\1$", "iu").exec(&text("Kk"), 0).is_some());
+        assert!(regex("^å$", "i").exec(&text("Å"), 0).unwrap().is_some());
+        assert!(
+            regex(r"^(K)\1$", "iu")
+                .exec(&text("Kk"), 0)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn ignore_case_ranges_keep_the_original_endpoints() {
-        assert!(regex(r"^[E-f]$", "i").exec(&text("["), 0).is_some());
-        assert!(regex(r"^[a-c]$", "iu").exec(&text("B"), 0).is_some());
-        assert!(regex(r"^[K-K]$", "i").exec(&text("K"), 0).is_some());
-        assert!(regex(r"^[K-K]$", "iu").exec(&text("K"), 0).is_some());
-        assert!(regex(r"^[K-K]$", "i").exec(&text("K"), 0).is_none());
+        assert!(
+            regex(r"^[E-f]$", "i")
+                .exec(&text("["), 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            regex(r"^[a-c]$", "iu")
+                .exec(&text("B"), 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            regex(r"^[K-K]$", "i")
+                .exec(&text("K"), 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            regex(r"^[K-K]$", "iu")
+                .exec(&text("K"), 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            regex(r"^[K-K]$", "i")
+                .exec(&text("K"), 0)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn unicode_ignore_case_extends_word_characters_and_boundaries() {
-        assert!(regex(r"^\b\w\b$", "i").exec(&text("K"), 0).is_some());
+        assert!(
+            regex(r"^\b\w\b$", "i")
+                .exec(&text("K"), 0)
+                .unwrap()
+                .is_some()
+        );
         for value in ["K", "ſ"] {
-            assert!(regex(r"^\b\w\b$", "iu").exec(&text(value), 0).is_some());
-            assert!(regex(r"^\b\w\b$", "i").exec(&text(value), 0).is_none());
+            assert!(
+                regex(r"^\b\w\b$", "iu")
+                    .exec(&text(value), 0)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                regex(r"^\b\w\b$", "i")
+                    .exec(&text(value), 0)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -1402,12 +1607,95 @@ mod tests {
 
     #[test]
     fn braced_and_identity_escapes_follow_unicode_mode() {
-        assert!(regex(r"^\u{61}$", "u").exec(&text("a"), 0).is_some());
-        assert!(regex(r"^\u{61}$", "").exec(&text("a"), 0).is_none());
-        assert!(regex(r"^\u{3}$", "").exec(&text("uuu"), 0).is_some());
-        assert!(regex(r"^\a$", "").exec(&text("a"), 0).is_some());
+        assert!(
+            regex(r"^\u{61}$", "u")
+                .exec(&text("a"), 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            regex(r"^\u{61}$", "")
+                .exec(&text("a"), 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            regex(r"^\u{3}$", "")
+                .exec(&text("uuu"), 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(regex(r"^\a$", "").exec(&text("a"), 0).unwrap().is_some());
         assert!(Regex::compile(&text(r"\a"), &text("u")).is_err());
         assert!(Regex::compile(&text(r"[\a]"), &text("u")).is_err());
-        assert!(regex(r"^[\-]$", "u").exec(&text("-"), 0).is_some());
+        assert!(regex(r"^[\-]$", "u").exec(&text("-"), 0).unwrap().is_some());
+    }
+
+    #[test]
+    fn exponential_alternation_under_star_fails_within_step_budget() {
+        // (a|a|a)*b on 40 'a's: without a step budget this builds ~3^40 states
+        // (each with its own captures allocation) and exhausts memory before a
+        // single candidate is tested against the trailing literal.  With dedup
+        // the three alternatives collapse to one state per level (40 total),
+        // well under the budget — the match completes and correctly reports a
+        // non-match (no 'b' in the input).  The step budget must still abort
+        // non-dedupable blowups, but this pattern is dedup-friendly.
+        use std::time::Instant;
+        let re = regex("(a|a|a)*b", "");
+        let input = text(&"a".repeat(40));
+        let start = Instant::now();
+        let result = re.exec(&input, 0);
+        let elapsed = start.elapsed();
+        assert!(
+            result.as_ref().is_ok_and(|matched| matched.is_none()),
+            "dedup-friendly pattern should report a genuine non-match, not an error: {result:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "match took {elapsed:?}, expected step budget to abort quickly"
+        );
+    }
+
+    #[test]
+    fn step_budget_exhaustion_surfaces_as_error_not_false_non_match() {
+        // A hostile pattern that exceeds the step budget must surface as an
+        // error (BudgetExhausted), NOT as a false non-match.  Without this
+        // distinction a validation path built on RegExp.test() gets a wrong
+        // answer (false) instead of a failure it can handle.
+        //
+        // ((a)|(a))* sets different capture groups per branch, so the dedup
+        // HashSet cannot collapse the states — the state count grows linearly
+        // per level (2 states/level) and exceeds the 100_000 budget at ~50_000
+        // input units.  The input has 50_001 units so the budget is hit.
+        let re = regex("((a)|(a))*", "");
+        let input = text(&"a".repeat(50_001));
+        let result = re.exec(&input, 0);
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.kind() == RegexErrorKind::BudgetExhausted),
+            "budget exhaustion must surface as an error, not a false non-match: {result:?}"
+        );
+    }
+
+    #[test]
+    fn repeat_dedup_collapses_equivalent_states_and_stays_linear() {
+        // (a|a)* on 5_000 'a's: each level's single source produces two
+        // identical (position, captures) states that must collapse to one.
+        // Without dedup the state count doubles every level (2^5000) and the
+        // match never finishes; with dedup (hoisted or not) it stays at 1
+        // state per level and completes instantly.  This guards the dedup
+        // semantics that the HashSet hoisting must preserve.
+        use std::time::Instant;
+        let re = regex("(a|a)*", "");
+        let input = text(&"a".repeat(5_000));
+        let start = Instant::now();
+        let matched = re.exec(&input, 0).unwrap().unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(matched.range, 0..5_000);
+        assert!(
+            elapsed.as_millis() < 500,
+            "dedup should keep this linear; took {elapsed:?}"
+        );
     }
 }

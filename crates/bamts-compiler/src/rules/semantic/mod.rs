@@ -314,6 +314,19 @@ impl<'a> AstFactCollector<'a> {
                 )) => inner.data(),
                 other => other,
             };
+            if let Statement::Export(ExportDeclaration::Default(default)) = statement {
+                if let ExportDefaultValue::Interface(interface) = &default.value
+                    && interface
+                        .members
+                        .iter()
+                        .any(|member| matches!(member.data(), TypeMember::Index(_)))
+                {
+                    self.index_signature_types
+                        .insert(self.identifier(&interface.name).into_owned());
+                }
+                continue;
+            }
+
             match statement {
                 Statement::Interface(interface) => {
                     if interface
@@ -406,32 +419,7 @@ impl<'a> AstFactCollector<'a> {
             Statement::Function(function) => {
                 self.collect_calls_body(function.function.body.as_ref())
             }
-            Statement::Class(class) => {
-                for member in &class.members {
-                    match member.data() {
-                        ClassMember::Constructor(constructor) => {
-                            self.collect_called_names(&constructor.body.data().statements)
-                        }
-                        ClassMember::Method(method) => {
-                            self.collect_calls_body(method.function.body.as_ref())
-                        }
-                        ClassMember::Property(property) => {
-                            if let Some(initializer) = &property.initializer {
-                                self.collect_calls_expr(initializer);
-                            }
-                        }
-                        ClassMember::AutoAccessor(accessor) => {
-                            if let Some(initializer) = &accessor.initializer {
-                                self.collect_calls_expr(initializer);
-                            }
-                        }
-                        ClassMember::StaticBlock(block) => {
-                            self.collect_called_names(&block.data().statements)
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            Statement::Class(class) => self.collect_calls_class(class),
             Statement::If(branch) => {
                 self.collect_calls_expr(&branch.test);
                 self.collect_calls_statement(&branch.consequent);
@@ -448,10 +436,130 @@ impl<'a> AstFactCollector<'a> {
                 inner,
             )))
             | Statement::Declare(inner) => self.collect_calls_statement(inner),
+            Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
+                ExportDefaultValue::Function(function) => {
+                    self.collect_calls_body(function.body.as_ref())
+                }
+                ExportDefaultValue::Class(class) => self.collect_calls_class(class),
+                ExportDefaultValue::Expression(expression) => self.collect_calls_expr(expression),
+                ExportDefaultValue::Interface(_) | ExportDefaultValue::Missing(_) => {}
+            },
+            Statement::Export(ExportDeclaration::Assignment(expression)) => {
+                self.collect_calls_expr(expression)
+            }
             Statement::Namespace(namespace) => {
                 self.collect_called_names(&namespace.body.data().statements)
             }
-            _ => {}
+            Statement::Switch(switch) => {
+                self.collect_calls_expr(&switch.discriminant);
+                for case in &switch.cases {
+                    if let Some(test) = &case.data().test {
+                        self.collect_calls_expr(test);
+                    }
+                    self.collect_called_names(&case.data().consequent);
+                }
+            }
+            Statement::For(statement) => {
+                if let Some(initializer) = &statement.initializer {
+                    match initializer {
+                        ForInitializer::Variable(variable) => {
+                            for declaration in &variable.declarations {
+                                if let Some(initializer) = &declaration.data().initializer {
+                                    self.collect_calls_expr(initializer);
+                                }
+                            }
+                        }
+                        ForInitializer::Expression(expression) => {
+                            self.collect_calls_expr(expression)
+                        }
+                    }
+                }
+                if let Some(test) = &statement.test {
+                    self.collect_calls_expr(test);
+                }
+                if let Some(update) = &statement.update {
+                    self.collect_calls_expr(update);
+                }
+                self.collect_calls_statement(&statement.body);
+            }
+            Statement::ForIn(statement) => {
+                self.collect_calls_expr(&statement.object);
+                self.collect_calls_statement(&statement.body);
+            }
+            Statement::ForOf(statement) => {
+                self.collect_calls_expr(&statement.iterable);
+                self.collect_calls_statement(&statement.body);
+            }
+            Statement::While(statement) => {
+                self.collect_calls_expr(&statement.test);
+                self.collect_calls_statement(&statement.body);
+            }
+            Statement::DoWhile(statement) => {
+                self.collect_calls_statement(&statement.body);
+                self.collect_calls_expr(&statement.test);
+            }
+            Statement::Try(statement) => {
+                self.collect_called_names(&statement.block.data().statements);
+                if let Some(handler) = &statement.handler {
+                    self.collect_called_names(&handler.data().body.data().statements);
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    self.collect_called_names(&finalizer.data().statements);
+                }
+            }
+            Statement::With(statement) => {
+                self.collect_calls_expr(&statement.object);
+                self.collect_calls_statement(&statement.body);
+            }
+            Statement::Labeled(statement) => self.collect_calls_statement(&statement.body),
+            Statement::Throw(statement) => self.collect_calls_expr(&statement.argument),
+            Statement::Enum(enumeration) => {
+                for member in &enumeration.members {
+                    if let Some(initializer) = &member.data().initializer {
+                        self.collect_calls_expr(initializer);
+                    }
+                }
+            }
+            Statement::Import(_)
+            | Statement::ImportEquals(_)
+            | Statement::Export(ExportDeclaration::All(_))
+            | Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                ..
+            }))
+            | Statement::Interface(_)
+            | Statement::TypeAlias(_)
+            | Statement::Empty
+            | Statement::Break(_)
+            | Statement::Continue(_)
+            | Statement::Debugger
+            | Statement::Missing(_) => {}
+        }
+    }
+
+    fn collect_calls_class(&mut self, class: &ClassDeclaration) {
+        for member in &class.members {
+            match member.data() {
+                ClassMember::Constructor(constructor) => {
+                    self.collect_called_names(&constructor.body.data().statements)
+                }
+                ClassMember::Method(method) => {
+                    self.collect_calls_body(method.function.body.as_ref())
+                }
+                ClassMember::Property(property) => {
+                    if let Some(initializer) = &property.initializer {
+                        self.collect_calls_expr(initializer);
+                    }
+                }
+                ClassMember::AutoAccessor(accessor) => {
+                    if let Some(initializer) = &accessor.initializer {
+                        self.collect_calls_expr(initializer);
+                    }
+                }
+                ClassMember::StaticBlock(block) => {
+                    self.collect_called_names(&block.data().statements)
+                }
+                _ => {}
+            }
         }
     }
 
@@ -597,6 +705,7 @@ impl<'a> AstFactCollector<'a> {
                     self.visit_expr(expression, in_constructor)
                 }
                 ExportDefaultValue::Missing(_) => {}
+                ExportDefaultValue::Interface(_) => {}
             },
             Statement::Export(ExportDeclaration::Assignment(expression)) => {
                 self.visit_expr(expression, in_constructor)
@@ -1441,6 +1550,14 @@ struct CommonJsExports {
     named: HashSet<String>,
 }
 
+/// Returns whether `identifier` denotes the host-provided CommonJS global
+/// (`module` or `exports`) rather than a user declaration that shadows it.
+fn is_commonjs_global(model: &SemanticModel, identifier: &IdentifierNode) -> bool {
+    model
+        .reference(identifier.id())
+        .is_none_or(|symbol| model.symbol(symbol).kind() == SymbolKind::IntrinsicValue)
+}
+
 fn commonjs_exports(source: &SourceFile, model: &SemanticModel) -> CommonJsExports {
     let mut exports = CommonJsExports {
         is_commonjs: false,
@@ -1477,9 +1594,7 @@ fn commonjs_exports(source: &SourceFile, model: &SemanticModel) -> CommonJsExpor
                 .unwrap_or_default();
             if module_name == "module"
                 && namespace_name == "exports"
-                && !model
-                    .reference(module.id())
-                    .is_some_and(|symbol| model.symbol(symbol).kind() != SymbolKind::IntrinsicValue)
+                && is_commonjs_global(model, module)
             {
                 exports.is_commonjs = true;
                 exports.named.insert(property_name.into_owned());
@@ -1492,10 +1607,9 @@ fn commonjs_exports(source: &SourceFile, model: &SemanticModel) -> CommonJsExpor
         let object_name = source
             .identifier_text(object.data().token())
             .unwrap_or_default();
-        if model.reference(object.id()).is_some_and(|symbol| {
-            model.symbol(symbol).kind() != SymbolKind::IntrinsicValue
-                || !matches!(object_name.as_ref(), "module" | "exports")
-        }) {
+        if !is_commonjs_global(model, object)
+            || !matches!(object_name.as_ref(), "module" | "exports")
+        {
             continue;
         }
         match (object_name.as_ref(), property_name.as_ref()) {
@@ -1564,13 +1678,15 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        checker::{ProgramCheckInput, ResolvedModuleEdge, check_program, check_with_lints},
+        checker::{
+            ProgramCheckInput, ProgramCheckOptions, ResolvedModuleEdge, check_program,
+            check_program_with_options, check_with_lints,
+        },
         lint::{LintProfile, LintTable},
         parser, scanner,
         source::{ScriptKind, SourceId, SourceText},
         syntax::SourceFile,
     };
-
     fn parsed(
         source_id: u32,
         source: &str,
@@ -1579,7 +1695,7 @@ mod tests {
         parser::parse(scanner::scan(
             SourceId::new(source_id),
             kind,
-            Arc::new(SourceText::new(source)),
+            Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
         ))
     }
 
@@ -1881,6 +1997,59 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .all(|diagnostic| diagnostic.code().as_str() != "BAMTS-W019")
+        );
+    }
+
+    #[test]
+    fn user_shadow_of_module_global_is_not_treated_as_commonjs() {
+        // In a CommonJS environment `module` is an intrinsic. A user-declared
+        // `const module = ...` shadows it, so `module.exports.x = 1` must NOT
+        // be classified as a CommonJS export — otherwise W037/W086 fire falsely.
+        let files = [
+            parsed(
+                0,
+                "const module = { exports: {} }; module.exports.x = 1;",
+                ScriptKind::JavaScript,
+            ),
+            parsed(1, "export const y = 1;", ScriptKind::TypeScript),
+        ];
+        let edge = [ResolvedModuleEdge {
+            from: SourceId::new(0),
+            specifier: files[0].product().statements()[0].id(),
+            to: SourceId::new(1),
+        }];
+        let result = check_program_with_options(
+            ProgramCheckInput {
+                files: &files,
+                edges: &edge,
+            },
+            &LintTable::new(LintProfile::Pedantic),
+            ProgramCheckOptions::commonjs(),
+        );
+        assert!(
+            !result
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code().as_str() == "BAMTS-W086"),
+            "a user-shadowed `module` must not be treated as the CommonJS global"
+        );
+    }
+
+    #[test]
+    fn sorted_object_keys_inside_loop_is_not_flagged_w072() {
+        let source = "for (const _ of xs) { Object.keys({ b: 1, \"2\": 2 }).sort(); }";
+        assert!(
+            !codes(source).contains(&"BAMTS-W072"),
+            "Object.keys(...).sort() inside a loop must not be flagged when keys are sorted"
+        );
+    }
+
+    #[test]
+    fn detached_method_inside_try_block_is_detected_w010() {
+        let source = "try { const f = obj.method; f(); } catch (e) {}";
+        assert!(
+            codes(source).contains(&"BAMTS-W010"),
+            "a detached method call inside a try block must be detected by the call-collection walk"
         );
     }
 }

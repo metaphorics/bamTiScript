@@ -35,7 +35,7 @@ pub(super) fn install<H: Host>(
     let stringify = install_function(heap, builtins, "stringify", 3, stringify::<H>);
     define_data(heap, json, "parse", parse);
     define_data(heap, json, "stringify", stringify);
-    globals.insert(EcmaString::from_utf8("JSON"), json);
+    globals.insert(EcmaString::encode("JSON"), json);
 }
 
 fn parse<H: Host>(
@@ -72,7 +72,7 @@ fn parse<H: Host>(
             })
             .map_err(EvalFailure::Runtime)?;
         let key = EcmaString::default();
-        machine.set_data_property_key(root, PropertyKey::Named(key.clone()), value)?;
+        machine.create_data_property_key(root, PropertyKey::Named(key.clone()), value)?;
         return Ok(BuiltinOutcome::Value(walk_reviver(
             machine, root, key, reviver, 0,
         )?));
@@ -89,18 +89,18 @@ fn walk_reviver<H: Host>(
 ) -> Result<Value, EvalFailure> {
     let property_key = PropertyKey::Named(key.clone());
     let value = machine.get_property_key(holder, &property_key)?;
-    if let Some(elements) = machine.array_elements(value)? {
+    if let Some(length) = machine.array_len(value)? {
         if depth >= MAX_JSON_DEPTH {
             return Err(json_depth_error());
         }
-        for index in 0..elements.len() {
-            let name = EcmaString::from_utf8(&index.to_string());
+        for index in 0..length {
+            let name = EcmaString::encode(&index.to_string());
             let child = walk_reviver(machine, value, name.clone(), reviver, depth + 1)?;
             let key = PropertyKey::Named(name);
             if child == Value::UNDEFINED {
                 machine.delete_property(value, &key)?;
             } else {
-                machine.set_data_property_key(value, key, child)?;
+                machine.create_data_property_key(value, key, child)?;
             }
         }
     } else if machine.is_object(value) {
@@ -113,7 +113,7 @@ fn walk_reviver<H: Host>(
             if child == Value::UNDEFINED {
                 machine.delete_property(value, &key)?;
             } else {
-                machine.set_data_property_key(value, key, child)?;
+                machine.create_data_property_key(value, key, child)?;
             }
         }
     }
@@ -135,10 +135,10 @@ fn stringify<H: Host>(
     let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
     let gap = match space.decode() {
         Some(Decoded::Int32(number)) => {
-            EcmaString::from_utf8(&" ".repeat(((number as i32).max(0) as usize).min(10)))
+            EcmaString::encode(&" ".repeat(((number as i32).max(0) as usize).min(10)))
         }
         Some(Decoded::Number(number)) => {
-            EcmaString::from_utf8(&" ".repeat((number.max(0.0) as usize).min(10)))
+            EcmaString::encode(&" ".repeat((number.max(0.0) as usize).min(10)))
         }
         Some(Decoded::HeapRef(_)) => {
             let text = machine.to_string(machine.unbox_primitive_or_self(space)?)?;
@@ -182,7 +182,7 @@ fn stringify<H: Host>(
         })
         .map_err(EvalFailure::Runtime)?;
     let root_key = EcmaString::default();
-    machine.set_data_property_key(wrapper, PropertyKey::Named(root_key.clone()), value)?;
+    machine.create_data_property_key(wrapper, PropertyKey::Named(root_key.clone()), value)?;
     let options = SerializeOptions {
         replacer: callable_replacer,
         property_list: property_list.as_deref(),
@@ -227,20 +227,20 @@ fn serialize_property<H: Host>(
     }
     value = machine.unbox_primitive_or_self(value)?;
     match value.decode() {
-        Some(Decoded::Null) => Ok(Some(EcmaString::from_utf8("null"))),
-        Some(Decoded::Boolean(value)) => Ok(Some(EcmaString::from_utf8(if value {
+        Some(Decoded::Null) => Ok(Some(EcmaString::encode("null"))),
+        Some(Decoded::Boolean(value)) => Ok(Some(EcmaString::encode(if value {
             "true"
         } else {
             "false"
         }))),
-        Some(Decoded::Int32(value)) => Ok(Some(EcmaString::from_utf8(&(value as i32).to_string()))),
+        Some(Decoded::Int32(value)) => Ok(Some(EcmaString::encode(&(value as i32).to_string()))),
         Some(Decoded::Number(value)) => {
             let text = if value.is_finite() {
                 crate::format_number(value)
             } else {
                 "null".to_owned()
             };
-            Ok(Some(EcmaString::from_utf8(&text)))
+            Ok(Some(EcmaString::encode(&text)))
         }
         Some(Decoded::HeapRef(_)) => {
             if let Some(text) = machine.string_value(value) {
@@ -253,8 +253,8 @@ fn serialize_property<H: Host>(
                 return Ok(None);
             }
             stack.push(value);
-            let result = if let Some(elements) = machine.array_elements(value)? {
-                serialize_array(machine, value, elements, options, depth, stack)
+            let result = if let Some(length) = machine.array_len(value)? {
+                serialize_array(machine, value, length, options, depth, stack)
             } else {
                 serialize_object(machine, value, options, depth, stack)
             };
@@ -268,23 +268,23 @@ fn serialize_property<H: Host>(
 fn serialize_array<H: Host>(
     machine: &mut Machine<'_, H>,
     array: Value,
-    elements: Vec<Value>,
+    length: usize,
     options: &SerializeOptions<'_>,
     depth: usize,
     stack: &mut Vec<Value>,
 ) -> Result<EcmaString, EvalFailure> {
-    let mut partial = Vec::with_capacity(elements.len());
-    for index in 0..elements.len() {
+    let mut partial = Vec::with_capacity(length);
+    for index in 0..length {
         partial.push(
             serialize_property(
                 machine,
                 array,
-                EcmaString::from_utf8(&index.to_string()),
+                EcmaString::encode(&index.to_string()),
                 options,
                 depth + 1,
                 stack,
             )?
-            .unwrap_or_else(|| EcmaString::from_utf8("null")),
+            .unwrap_or_else(|| EcmaString::encode("null")),
         );
     }
     Ok(compose(b'[', b']', partial, options.gap, depth))
@@ -677,7 +677,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let value = self.value(machine, depth + 1)?;
             machine
-                .set_data_property_key(object, PropertyKey::Named(key), value)
+                .create_data_property_key(object, PropertyKey::Named(key), value)
                 .map_err(ParseFailure::Runtime)?;
             self.ws();
             match self.peek() {
@@ -729,7 +729,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
-    use crate::{Limits, RuntimeErrorKind};
+    use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
 
     fn call_json(machine: &mut Machine<'_, TestHost>, method: &str, source: EcmaString) -> Value {
         let json = machine.intrinsics.global("JSON").expect("JSON exists");
@@ -793,7 +793,7 @@ mod tests {
             .expect("object allocation succeeds");
 
         for reviver in [Value::NULL, Value::FALSE, object] {
-            let source = allocate_string(&mut machine, EcmaString::from_utf8("1"))
+            let source = allocate_string(&mut machine, EcmaString::encode("1"))
                 .expect("string allocation succeeds");
             let value = machine
                 .call_value(parse, json, &[source, reviver])
@@ -807,12 +807,12 @@ mod tests {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
-        let lone = call_json(&mut machine, "parse", EcmaString::from_utf8("\"\\uD83D\""));
+        let lone = call_json(&mut machine, "parse", EcmaString::encode("\"\\uD83D\""));
         assert_eq!(machine.string_value(lone).unwrap().as_units(), &[0xD83D]);
         let pair = call_json(
             &mut machine,
             "parse",
-            EcmaString::from_utf8("\"\\uD83D\\uDE03\""),
+            EcmaString::encode("\"\\uD83D\\uDE03\""),
         );
         assert_eq!(
             machine.string_value(pair).unwrap().as_units(),
@@ -829,7 +829,7 @@ mod tests {
         let parse = machine
             .get_named_property(json, "parse")
             .expect("JSON.parse exists");
-        let source = allocate_string(&mut machine, EcmaString::from_utf8("{]"))
+        let source = allocate_string(&mut machine, EcmaString::encode("{]"))
             .expect("string allocation succeeds");
         let error = machine
             .call_value(parse, json, &[source])
@@ -867,7 +867,7 @@ mod tests {
         let parse = machine
             .get_named_property(json, "parse")
             .expect("JSON.parse exists");
-        let source = allocate_string(&mut machine, EcmaString::from_utf8("\"x\""))
+        let source = allocate_string(&mut machine, EcmaString::encode("\"x\""))
             .expect("input consumes the final slot");
         assert!(matches!(
             machine.call_value(parse, json, &[source]),
@@ -883,7 +883,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let source = format!("{}0{}", "[".repeat(16), "]".repeat(16));
-        let value = call_json(&mut machine, "parse", EcmaString::from_utf8(&source));
+        let value = call_json(&mut machine, "parse", EcmaString::encode(&source));
         let json = machine.intrinsics.global("JSON").expect("JSON exists");
         let stringify = machine
             .get_named_property(json, "stringify")
@@ -913,7 +913,7 @@ mod tests {
         let parse = machine
             .get_named_property(json, "parse")
             .expect("JSON.parse exists");
-        let source = allocate_string(&mut machine, EcmaString::from_utf8(&source))
+        let source = allocate_string(&mut machine, EcmaString::encode(&source))
             .expect("string allocation succeeds");
         assert!(matches!(
             machine.call_value(parse, json, &[source]),
@@ -933,7 +933,7 @@ mod tests {
             .expect("wrapper allocation succeeds");
         let key = EcmaString::default();
         machine
-            .set_data_property_key(wrapper, PropertyKey::Named(key.clone()), value)
+            .create_data_property_key(wrapper, PropertyKey::Named(key.clone()), value)
             .expect("wrapper property set succeeds");
         let reviver = native(&mut machine, "identityReviver", identity_reviver);
         assert!(matches!(
@@ -969,5 +969,55 @@ mod tests {
                 .unwrap()
                 .eq_ascii("\"\\ud800\"")
         );
+    }
+
+    #[test]
+    fn stringify_preserves_sparse_array_order() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let json = machine.intrinsics.global("JSON").expect("JSON exists");
+        let stringify = machine.get_named_property(json, "stringify").unwrap();
+        let value = allocate_array(
+            &mut machine,
+            vec![Value::int32(1), Value::HOLE, Value::int32(3)],
+        )
+        .expect("array allocation succeeds");
+        let result = machine
+            .call_value(stringify, json, &[value])
+            .expect("stringify sparse array succeeds");
+        let text = machine.string_value(result).expect("result is a string");
+        assert!(text.eq_ascii("[1,null,3]"));
+    }
+
+    #[test]
+    fn parse_creates_own_property_ignoring_prototype_setter() {
+        use bamts_bytecode::AccessorKind;
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        // Install a throwing setter on Object.prototype for "x".
+        // If JSON.parse used [[Set]], parsing {"x":1} would invoke this setter and throw.
+        // With CreateDataProperty ([[DefineOwnProperty]]) it must create an own data property.
+        let setter = native(&mut machine, "evilSetter", |_, _, _, _| {
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "prototype setter called",
+            }))
+        });
+        machine
+            .define_accessor(
+                machine.intrinsics.object_prototype,
+                PropertyKey::Named(EcmaString::encode("x")),
+                setter,
+                AccessorKind::Setter,
+            )
+            .expect("define setter succeeds");
+        let value = call_json(&mut machine, "parse", EcmaString::encode("{\"x\":1}"));
+        assert!(machine.is_object(value));
+        let x = machine
+            .get_property_key(value, &PropertyKey::Named(EcmaString::encode("x")))
+            .expect("get succeeds");
+        assert_eq!(x, Value::int32(1));
     }
 }

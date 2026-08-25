@@ -27,10 +27,10 @@
 //! reference rewriting are the checker's responsibility and are intentionally
 //! out of scope here.
 
-use std::{fmt::Write as _, sync::Arc};
+use std::fmt::Write as _;
 
 use crate::checker::{self, SemanticModel};
-use crate::diagnostic::{Diagnostic, DiagnosticCode, Recovered};
+use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
 use crate::source::{SourceId, SourceText, TextRange};
 use crate::syntax::*;
@@ -63,6 +63,16 @@ pub mod codes {
     pub const NAMESPACE_UNLOWERED: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1011");
     /// A runtime enum declaration has no matching checked enum plan.
     pub const ENUM_FACTS_UNAVAILABLE: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1013");
+    /// `export =` cannot be lowered to JavaScript without a module target.
+    ///
+    /// `export =` is the CommonJS single-module-value form: TypeScript emits
+    /// `module.exports = x` for CommonJS targets and rejects it for ESM. The
+    /// emitter's [`EmitOptions`] carries no module-target or interop setting, so
+    /// the correct runtime form is unknowable here. Silently rewriting it to an
+    /// ESM `export default` would change the module shape, so we report this
+    /// instead of guessing. Declaration (`.d.ts`) emit preserves `export =`.
+    pub const EXPORT_ASSIGNMENT_NO_MODULE_TARGET: DiagnosticCode =
+        DiagnosticCode::new("TS-EMIT-1014");
 }
 
 /// Which surface the emitter prints.
@@ -169,18 +179,7 @@ impl EmitOutput {
 /// Prints `file` to JavaScript or a declaration file per `options`.
 #[must_use]
 pub fn emit(file: &SourceFile, options: EmitOptions) -> EmitOutput {
-    let checked_file = Recovered::clean(SourceFile::new(
-        file.id(),
-        file.source_id(),
-        file.script_kind(),
-        file.range(),
-        Arc::new(file.source_text().clone()),
-        file.tokens().to_vec(),
-        file.statements().to_vec(),
-        *file.eof(),
-        file.diagnostics().to_vec(),
-    ));
-    let checked = checker::check(&checked_file);
+    let checked = checker::check_source(file);
     emit_checked(file, checked.product(), options)
 }
 
@@ -901,12 +900,20 @@ impl<'a> Emitter<'a> {
                     );
                     false
                 }
+                ExportDefaultValue::Interface(_) => false,
             },
-            ExportDeclaration::Assignment(expression) => {
-                self.raw("export default ");
-                self.emit_expression_prec(expression, P_ASSIGN);
-                self.raw(";");
-                true
+            ExportDeclaration::Assignment(_) => {
+                // `export =` is a CommonJS single-module-value form. Its
+                // JavaScript lowering depends on the module target
+                // (`module.exports = x` for CommonJS; rejected for ESM), which
+                // EmitOptions does not carry. Refuse to emit rather than
+                // silently rewrite it to an ESM `export default`, which would
+                // change the module shape. Declaration emit preserves it.
+                self.diag_here(
+                    codes::EXPORT_ASSIGNMENT_NO_MODULE_TARGET,
+                    "export = cannot be lowered to JavaScript without a module target",
+                );
+                false
             }
         }
     }
@@ -1041,7 +1048,9 @@ impl<'a> Emitter<'a> {
                 } else if value == f64::NEG_INFINITY {
                     self.raw("-Infinity");
                 } else {
-                    write!(self.out, "{value}").expect("writing to a String cannot fail");
+                    let mut text = String::new();
+                    write!(text, "{value}").expect("writing to a String cannot fail");
+                    self.raw(&text);
                 }
             }
             EnumScalar::String(value) => self.emit_enum_string(value),
@@ -1059,10 +1068,16 @@ impl<'a> Emitter<'a> {
                 0x0D => self.raw("\\r"),
                 0x22 => self.raw("\\\""),
                 0x5C => self.raw("\\\\"),
-                0x20..=0x7E => self
-                    .out
-                    .push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
-                _ => write!(self.out, "\\u{unit:04X}").expect("writing to a String cannot fail"),
+                0x20..=0x7E => {
+                    let ch = char::from_u32(u32::from(unit)).expect("ASCII unit");
+                    let mut buf = [0u8; 4];
+                    self.raw(ch.encode_utf8(&mut buf));
+                }
+                _ => {
+                    let mut text = String::new();
+                    write!(text, "\\u{unit:04X}").expect("writing to a String cannot fail");
+                    self.raw(&text);
+                }
             }
         }
         self.raw("\"");
@@ -1183,7 +1198,10 @@ impl<'a> Emitter<'a> {
 
     fn emit_decorator(&mut self, decorator: &DecoratorNode) {
         self.raw("@");
-        self.emit_expression_prec(&decorator.data().expression, P_ASSIGN);
+        // Decorator grammar only permits a call/member expression (or a
+        // parenthesized one); emit with that precedence so lower-precedence
+        // inner expressions are parenthesized.
+        self.emit_expression_prec(&decorator.data().expression, P_CALL_MEMBER);
     }
 
     fn emit_decorators_inline(&mut self, decorators: &[DecoratorNode]) {
@@ -1449,6 +1467,15 @@ impl<'a> Emitter<'a> {
             return;
         }
         match expression.data() {
+            Expression::JsxElement(_)
+            | Expression::JsxFragment(_)
+            | Expression::JsxSelfClosingElement(_) => {
+                self.diag_here(
+                    codes::MISSING_EXPRESSION,
+                    "cannot emit a JSX expression node",
+                );
+                self.raw("void 0");
+            }
             Expression::Identifier(ident) => self.emit_ident_expression(ident),
             Expression::This => self.raw("this"),
             Expression::Super => self.raw("super"),
@@ -2407,6 +2434,11 @@ impl<'a> Emitter<'a> {
                     );
                     false
                 }
+                ExportDefaultValue::Interface(interface) => {
+                    self.raw("export default ");
+                    self.emit_interface_decl(interface);
+                    true
+                }
             },
             ExportDeclaration::Assignment(expression) => {
                 self.raw("export = ");
@@ -2696,8 +2728,20 @@ impl<'a> Emitter<'a> {
 
     fn emit_namespace_decl(&mut self, namespace: &NamespaceDeclaration) {
         self.emit_declare_prefix();
-        self.raw("namespace ");
-        self.emit_ident(&namespace.name);
+        match &namespace.name {
+            NamespaceName::Identifier { name, keyword } => {
+                self.raw(keyword.as_str());
+                self.raw(" ");
+                self.emit_ident(name);
+            }
+            NamespaceName::StringLiteral(literal) => {
+                self.raw("module ");
+                self.emit_string(literal);
+            }
+            NamespaceName::Global { .. } => {
+                self.raw("global");
+            }
+        }
         self.raw(" {");
         let body = namespace.body.data();
         if body.statements.is_empty() {
@@ -3300,7 +3344,7 @@ fn is_low_precedence_type(ty: &Ty) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{ScriptKind, Utf16Pos};
+    use crate::source::{ScriptKind, SourceId, SourceText, Utf16Pos};
     use std::sync::Arc;
 
     /// Builds an AST with token ranges that point into a real source string, so
@@ -3358,7 +3402,8 @@ mod tests {
         }
 
         fn finish(self, statements: Vec<Stmt>) -> SourceFile {
-            let source = Arc::new(SourceText::new(self.text));
+            let source =
+                Arc::new(SourceText::new(self.text).expect("test source fits the per-file budget"));
             let len = source.len_utf16();
             let full = TextRange::new(Utf16Pos::ZERO, len).expect("range");
             let eof = Token::new(
@@ -3551,6 +3596,7 @@ mod tests {
             },
         );
         let declaration = stmt(Statement::Variable(VariableDeclaration {
+            range: dummy(),
             kind: VariableKind::Let,
             declarations: vec![declarator],
         }));
@@ -3586,6 +3632,23 @@ mod tests {
         let file = b.finish(vec![first, second]);
         let output = emit(&file, EmitOptions::javascript().with_newline(Newline::CrLf));
         assert_eq!(output.code, "a;\r\nb;\r\n");
+    }
+
+    #[test]
+    fn const_enum_scalar_use_keeps_block_indentation() {
+        // A const-enum member used as a bare expression statement inside an
+        // indented block is inlined to its numeric scalar. That scalar must
+        // flow through the indentation machinery (`raw`) like every other
+        // emitted token, so the line keeps its leading spaces.
+        let source = Arc::new(
+            SourceText::new("const enum K { X = 2 }\n{ K.X; }")
+                .expect("test source fits the per-file budget"),
+        );
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        let output = emit(parsed.product(), EmitOptions::javascript());
+        // The const enum declaration is erased; only the inlined block remains.
+        assert_eq!(output.code, "{\n    2;\n}\n");
     }
 
     #[test]
@@ -3674,7 +3737,13 @@ mod tests {
                 statements: Vec::new(),
             },
         );
-        let declaration = stmt(Statement::Namespace(NamespaceDeclaration { name, body }));
+        let declaration = stmt(Statement::Namespace(NamespaceDeclaration {
+            name: NamespaceName::Identifier {
+                name,
+                keyword: NamespaceKeyword::Namespace,
+            },
+            body,
+        }));
         let file = b.finish(vec![declaration]);
         let output = emit_js(&file);
         assert_eq!(output.code, "");
@@ -3802,6 +3871,7 @@ mod tests {
                     dummy(),
                     TypeNode::Keyword(KeywordType::Void),
                 )),
+                return_type_missing: false,
             }),
         );
         let number = Node::new(
@@ -3926,31 +3996,34 @@ mod tests {
     }
 
     #[test]
-    fn export_assignment_emits_default_export_in_javascript_mode() {
+    fn export_assignment_reports_diagnostic_in_javascript_mode() {
+        // `export =` is a CommonJS single-module-value form. Without a module
+        // target the emitter cannot know whether to print `module.exports = x`
+        // (CommonJS) or reject it (ESM), so it must report a diagnostic rather
+        // than silently rewrite the construct to an ESM `export default`.
         let input = "const answer = 42;
 export = answer;";
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
-            Arc::new(SourceText::new(input)),
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
         ));
         assert!(parsed.diagnostics().is_empty());
 
         let output = emit_js(parsed.product());
-        assert!(!output.has_errors());
-        assert_eq!(
-            output.code,
-            "const answer = 42;
-export default answer;
-"
-        );
 
-        let reparsed = crate::parser::parse(crate::scanner::scan(
-            SourceId::new(0),
-            ScriptKind::TypeScript,
-            Arc::new(SourceText::new(output.code.as_str())),
-        ));
-        assert!(reparsed.diagnostics().is_empty());
+        // The non-export statement still emits; only the unsupported construct
+        // is dropped.
+        assert_eq!(output.code, "const answer = 42;\n");
+        // Exactly one diagnostic, and it is the module-target error — not a
+        // silent `export default` rewrite.
+        assert_eq!(output.diagnostics.len(), 1);
+        assert_eq!(
+            output.diagnostics[0].code(),
+            codes::EXPORT_ASSIGNMENT_NO_MODULE_TARGET
+        );
+        assert!(output.has_errors());
+        assert!(!output.code.contains("export default"));
     }
 
     #[test]
@@ -3968,7 +4041,7 @@ export default answer;
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
-            Arc::new(SourceText::new(input)),
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
         ));
         assert!(parsed.diagnostics().is_empty());
 
@@ -3999,7 +4072,10 @@ export default answer;
         let reparsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
-            Arc::new(SourceText::new(output.code.as_str())),
+            Arc::new(
+                SourceText::new(output.code.as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
         ));
         assert!(reparsed.diagnostics().is_empty());
         let file = reparsed.product();
@@ -4067,5 +4143,150 @@ export default answer;
             decorator_texts(&accessor.decorators),
             ["@accessorFirst", "@accessorSecond"]
         );
+    }
+    #[test]
+    fn parenthesized_decorator_expression_emits_with_preserved_precedence() {
+        let input = concat!(
+            "const a = 1, b = 1, c = 1;\n",
+            "@(a + b) class C {\n",
+            "    x = a + b * c;\n",
+            "}\n",
+        );
+        let source =
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget"));
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        assert!(parsed.diagnostics().is_empty());
+
+        let output = emit_js(parsed.product());
+        assert!(!output.has_errors());
+        assert_eq!(
+            output.code,
+            concat!(
+                "const a = 1, b = 1, c = 1;\n",
+                "@(a + b)\n",
+                "class C {\n",
+                "    x = a + b * c;\n",
+                "}\n",
+            ),
+        );
+
+        let reparsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(output.code.as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
+        ));
+        assert!(reparsed.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn plain_decorator_expression_and_neighbor_stay_unparenthesized() {
+        let input = concat!(
+            "const a = 1, b = 1, c = 1;\n",
+            "@foo class C {\n",
+            "    x = a + b * c;\n",
+            "}\n",
+        );
+        let source =
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget"));
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        assert!(parsed.diagnostics().is_empty());
+
+        let output = emit_js(parsed.product());
+        assert!(!output.has_errors());
+        assert_eq!(
+            output.code,
+            concat!(
+                "const a = 1, b = 1, c = 1;\n",
+                "@foo\n",
+                "class C {\n",
+                "    x = a + b * c;\n",
+                "}\n",
+            ),
+        );
+
+        let reparsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(output.code.as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
+        ));
+        assert!(reparsed.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn declaration_mode_emits_ambient_module_forms() {
+        let source = Arc::new(SourceText::new(
+            "declare module \"pkg\" { export interface X {} }\ndeclare global { interface Window { x: number } }\ndeclare namespace Foo {}\ndeclare module Bar {}",
+        ).expect("test source fits the per-file budget"));
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        let output = emit(parsed.product(), EmitOptions::declaration());
+        assert!(
+            output.code.contains("declare module \"pkg\""),
+            "got: {}",
+            output.code
+        );
+        assert!(
+            output.code.contains("declare global"),
+            "got: {}",
+            output.code
+        );
+        assert!(
+            output.code.contains("declare namespace Foo"),
+            "got: {}",
+            output.code
+        );
+        assert!(
+            output.code.contains("declare module Bar"),
+            "identifier-named module must round-trip module keyword, got: {}",
+            output.code
+        );
+        assert!(
+            !output.code.contains("declare namespace Bar"),
+            "module Bar must not be rewritten to namespace, got: {}",
+            output.code
+        );
+    }
+
+    #[test]
+    fn javascript_mode_reports_unlowered_for_string_and_global_namespaces() {
+        let source = Arc::new(
+            SourceText::new("module \"pkg\" {}").expect("test source fits the per-file budget"),
+        );
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = crate::parser::parse(scanned);
+        let string_out = emit_js(parsed.product());
+        assert_eq!(string_out.code, "");
+        assert!(
+            string_out
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == codes::NAMESPACE_UNLOWERED)
+        );
+
+        let b = Builder::new();
+        let body = Node::new(
+            NodeId::new(0),
+            dummy(),
+            Block {
+                statements: Vec::new(),
+            },
+        );
+        let declaration = stmt(Statement::Namespace(NamespaceDeclaration {
+            name: NamespaceName::Global { range: dummy() },
+            body,
+        }));
+        let global_file = b.finish(vec![declaration]);
+        let global_out = emit_js(&global_file);
+        assert_eq!(global_out.code, "");
+        assert_eq!(global_out.diagnostics.len(), 1);
+        assert_eq!(global_out.diagnostics[0].code(), codes::NAMESPACE_UNLOWERED);
     }
 }

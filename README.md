@@ -2,115 +2,86 @@
 
 ![bamTiScript compiler pipeline from TypeScript source through an abstract syntax tree and bytecode to native output](.github/social-preview.png)
 
-[![PR checks](https://github.com/metaphorics/bamTiScript/actions/workflows/pr.yml/badge.svg)](https://github.com/metaphorics/bamTiScript/actions/workflows/pr.yml)
-![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-38424a)
-[![MIT license](https://img.shields.io/badge/license-MIT-0f766e)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust Edition: 2024](https://img.shields.io/badge/Rust_Edition-2024-orange.svg)](Cargo.toml)
+[![MSRV: 1.97.1](https://img.shields.io/badge/MSRV-1.97.1-blue.svg)](Cargo.toml)
 
-bamTiScript is a clean-room Rust implementation of TypeScript 7.0.2 with a `tsc`-compatible command line, type checking, JavaScript execution, native code generation, and formal models.
+bamTiScript is a pre-release Rust toolchain that type-checks, runs, and compiles TypeScript. TypeScript 7.0.2 compatibility is in progress.
 
-> [!WARNING]
-> bamTiScript is pre-release software. The repository contains active compatibility work. Treat passing checks and recorded receipts as evidence for specific behavior, not as a claim of complete TypeScript parity.
+## Naming conventions
 
-## What is in the repository
+- Repository: `bamTiScript`
+- CLI binary: `bamts`
+- Workspace crates: `bamts`, `bamts-cli`, `bamts-compiler`, `bamts-cancel`, `bamts-bytecode`, `bamts-runtime`, `bamts-codegen`, `bamts-native`, `bamts-node`, `bamts-verification`, and private `bamts-napi`
+- npm packages: `bamti` (in-process Node 24+ interface) and `bamti-cli` (standalone CLI transport). Currently published 0.1.0 packages on npm do not provide native binary artifacts; the source implementation of Node-API bindings is not yet published.
 
-- A TypeScript parser, binder, checker, emitter, project system, and language-service surface.
-- A JavaScript bytecode runtime with interpreter, JIT, and AOT execution paths.
-- A Node.js 24 host layer and a source-built `bamts` command that accepts TypeScript compiler arguments.
-- Compatibility catalogs, corpus cases, target-cell records, performance guards, and formal models.
+## Quickstart
 
-The `.references/` directory is study material. bamTiScript does not copy implementation code from it.
-
-## Quick start
-
-You need Git and Rust 1.97.1. The workspace uses Rust 2024.
+Build the CLI from source, create a TypeScript entrypoint, type-check it, and run it:
 
 ```bash
-git clone https://github.com/metaphorics/bamTiScript.git
-cd bamTiScript
-printf 'const answer: number = 42;\nanswer;\n' > hello.ts
-cargo run -p bamts-cli -- --noEmit --pretty false hello.ts
+cargo build --release -p bamts-cli
+
+cat > hello.ts <<'EOF'
+const message: string = "hello from bamts";
+process.stdout.write(`${message}\n`);
+EOF
+
+target/release/bamts check hello.ts
+target/release/bamts run --target jit hello.ts
+target/release/bamts compile --target aot -o hello hello.ts
+./hello
 ```
 
-On success, `bamts` emits no TypeScript diagnostics and exits with status 0. Remove the sample when you finish:
+## Project status
 
-```bash
-rm hello.ts
-```
+- Version `0.2.0` is pre-release.
+- `bamti` provides an in-process Node 24+ interface backed by native Node-API bindings (`bamts-napi`) and atomic cancellation (`bamts-cancel`), while `bamti-cli` is the standalone CLI transport.
+- The native addon design targets five host platform packages (`@bamti/bamti-linux-x64-gnu`, `@bamti/bamti-linux-arm64-gnu`, `@bamti/bamti-darwin-x64`, `@bamti/bamti-darwin-arm64`, `@bamti/bamti-win32-x64-msvc`) with fail-closed optional artifact loading.
+- Currently published 0.1.0 npm packages do not contain prebuilt native binary artifacts. Real five-target release validation remains blocked by GitHub billing and is unverified. Build the working CLI from source with Cargo on Linux x64.
+- The documented runtime target is Linux x64. AOT steps use the C compiler driver selected by `$CC`, defaulting to `cc`.
+## Current capabilities
 
-## Install from source
+- Type checking with `text`, `pretty`, `json`, `github`, and `compact` diagnostic output
+- JIT execution with `run --target jit`
+- AOT execution and native binary compilation with `--target aot`
+- UTF-16 code-unit indexing for ECMAScript strings
+- In-process Node.js 24+ interface via native Node-API bindings (`bamts-napi`) with atomic cancellation control (`bamts-cancel`)
+- A limited Node-style host surface that includes `process.stdout.write`
+## Explicit limitations
 
-The project does not publish a stable registry release yet. Install the current command from the checkout:
+- TypeScript 7.0.2 is the compatibility oracle and target, not a completed compatibility claim.
+- `compile` accepts one entrypoint per invocation and only the AOT target. `-o` selects the output path. Declaration generation and source-map output are rejected.
+- `bamti` requires Node.js 24 or later. Currently published `0.1.0` npm packages do not contain compiled native artifacts; the source-tree native addon implementation is unpublished.
+- `bamti` optional native package loading is fail-closed. Real five-target runtime release verification is blocked by GitHub billing and has not passed.
+- The host runtime implements a limited Node-style API surface. It does not provide full Node.js compatibility.
+- AOT output targets the host architecture. Cross-compilation and non-Linux runtime behavior are not verified.
+- The root workspace policy defaults to `unsafe_code = "forbid"`. Most crates inherit it. Native code generation, host export, verification, FFI, and private `bamts-napi` crates contain narrowly scoped, documented exceptions. This policy is not an end-to-end formal memory-safety guarantee.
+- The project publishes no performance benchmark or production-readiness claim.
+- Formal source artifacts target named properties. The current acceptance state is recorded in the proof ledger; complete compiler and runtime correctness is not proven.
+## Documentation
 
-```bash
-cargo install --path crates/bamts-cli
-bamts --version
-```
-
-The command reports the compatibility target:
-
-```text
-Version 7.0.2
-```
-
-## Usage
-
-Check one or more files without emitting JavaScript:
-
-```bash
-bamts --noEmit --pretty false src/index.ts
-```
-
-Compile the project selected by a `tsconfig.json` file:
-
-```bash
-bamts -p ./path/to/tsconfig.json
-```
-
-Print the command reference:
-
-```bash
-bamts --help
-```
-
-The current help output identifies the command as the TypeScript compiler compatibility surface and documents file compilation, project compilation, build mode, initialization, help, and version flags.
-
-## Workspace map
-
-| Path | Responsibility |
-| --- | --- |
-| `crates/bamts-compiler` | TypeScript syntax, binding, checking, emitting, projects, and services |
-| `crates/bamts-bytecode` | Verified bytecode format and decoder |
-| `crates/bamts-runtime` | JavaScript values, built-ins, modules, event loop, and interpreter |
-| `crates/bamts-codegen` | JIT and AOT lowering |
-| `crates/bamts-native` | Native execution bridge |
-| `crates/bamts-node` | Node.js host behavior used by the product |
-| `crates/bamts-cli` | `bamts` command-line driver and API transport |
-| `crates/bamts-verification` | Catalogs, suites, evidence, targets, performance, and completion checks |
-| `formal` | Racket, Lean 4, and Quint models and bindings |
-| `corpus` | TypeScript projects and focused compatibility cases |
-
-## Verification
-
-Run the Rust workspace checks from the repository root:
-
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-```
-
-The GitHub workflows add catalog, corpus, formal, target, and release checks. See [`.github/workflows/pr.yml`](.github/workflows/pr.yml), [`.github/workflows/nightly.yml`](.github/workflows/nightly.yml), and [`.github/workflows/weekly-audit.yml`](.github/workflows/weekly-audit.yml) for the commands that each lane runs.
-
-Generate local API documentation with:
-
-```bash
-cargo doc --workspace --no-deps
-```
+* [Quickstart Guide](docs/tutorials/quickstart.md): Step-by-step source build and execution tutorial.
+* [CLI Reference](docs/reference/cli.md): Command flags, execution targets, exit codes, and budget limits.
+* [Diagnostics Reference](docs/reference/diagnostics.md): Diagnostic codes, output formats, UTF-16 column indexing, and error limits.
+* [Architecture Explanation](docs/explanation/architecture.md): High-level system architecture and component boundaries.
+* [Verification Explanation](docs/explanation/verification.md): Conformance testing, differential corpus, and formal verification models.
+* [Compiler Rules](crates/bamts-compiler/RULES.md): Type checker invariants and diagnostic rules.
+* [UTF-16 String Encoding Pattern](docs/solutions/architecture-patterns/exact-ecmascript-utf16-strings.md): UTF-16 string representation and runtime design.
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a change. A good report includes a minimal TypeScript input, the observed diagnostic or runtime result, the expected TypeScript 7.0.2 result, and the exact command used to reproduce it.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local environment setup (Rust 1.97.1, Edition 2024) and mandatory unpiped validation gates:
+
+```bash
+cargo fmt --all --check
+cargo check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Every commit must implement one logical concern and compile cleanly.
 
 ## License
 
-bamTiScript is available under the [MIT License](LICENSE).
+Distributed under the [MIT License](LICENSE).

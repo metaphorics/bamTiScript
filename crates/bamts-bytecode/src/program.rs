@@ -297,11 +297,41 @@ impl Program<Verified> {
     }
 
     /// Resolves a verified export by its exact ECMAScript name.
+    ///
+    /// # Termination
+    ///
+    /// This walk has no visit set. It terminates because a `Program<Verified>`
+    /// can only be produced by [`Program::link`], which runs
+    /// `verify_export_resolutions` and rejects every export cycle before this
+    /// method can ever run. The two hop kinds handled below --
+    /// `ExportSource::Local` through a `BindingKind::Imported` over a local
+    /// edge, and `ExportSource::Indirect` over a local edge -- are exactly the
+    /// hops `verify_export_resolutions` walks when detecting cycles. Any new
+    /// hop kind added here must also be covered there, or the bound below
+    /// turns the divergence into a `None` instead of a hang.
+    ///
+    /// The bound is the total number of export entries across every module,
+    /// not the module count. Re-export chains may re-enter the same module
+    /// under a different exported name on each hop -- for example,
+    /// `m0.a -> m1.b -> m0.c -> m1.d -> m0.e`. A module-count bound would
+    /// treat the re-entries as already visited and stop short. Because
+    /// `verify_export_resolutions` rejects cycles, any walk that reaches this
+    /// point follows a strict partial order on (module, exported name) pairs
+    /// and can visit each export at most once. The saturating sum makes the
+    /// bound safe even when the module list is large.
     #[must_use]
     pub fn resolve_export(&self, module: ModuleId, name: &EcmaString) -> Option<ResolvedExport> {
         let mut module_id = module;
         let mut linked_name = None;
-        loop {
+        let export_count = self
+            .modules
+            .iter()
+            .map(|module| module.exports.len())
+            .fold(0usize, |total, len| total.saturating_add(len));
+        // Bound by the saturating sum of all export counts: an acyclic walk
+        // can consume at most one export entry per step, so this is
+        // unreachable while the invariant above holds.
+        for _ in 0..=export_count {
             let current = self.module(module_id)?;
             let export_name = linked_name.unwrap_or(name);
             let export = current
@@ -357,6 +387,7 @@ impl Program<Verified> {
                 }
             }
         }
+        None
     }
 }
 
@@ -414,7 +445,6 @@ pub enum ProgramDecodeErrorKind {
     UnsupportedVersion {
         version: u8,
     },
-    MalformedInteger,
     NonCanonicalInteger,
     IntegerOverflow,
     InvalidEdgeTarget {
@@ -458,9 +488,6 @@ impl fmt::Display for ProgramDecodeError {
             ),
             ProgramDecodeErrorKind::UnsupportedVersion { version } => {
                 write!(formatter, "unsupported program version {version}")
-            }
-            ProgramDecodeErrorKind::MalformedInteger => {
-                formatter.write_str("malformed LEB128 integer")
             }
             ProgramDecodeErrorKind::NonCanonicalInteger => {
                 formatter.write_str("noncanonical LEB128 integer")
@@ -650,7 +677,183 @@ impl fmt::Display for ProgramVerifyError {
         if let Some(module) = self.module {
             write!(formatter, "module {}: ", module.get())?;
         }
-        write!(formatter, "{:?}", self.kind)
+        match &self.kind {
+            ProgramVerifyErrorKind::EmptyProgram => formatter.write_str("program has no modules"),
+            ProgramVerifyErrorKind::TooManyModules { count } => {
+                write!(formatter, "{count} modules exceed the program limit")
+            }
+            ProgramVerifyErrorKind::EntryModuleOutOfBounds {
+                entry,
+                module_count,
+            } => write!(
+                formatter,
+                "entry module {entry} is outside {module_count} modules"
+            ),
+            ProgramVerifyErrorKind::Module(verify_error) => {
+                write!(formatter, "{verify_error}")
+            }
+            ProgramVerifyErrorKind::ModuleNameOutOfBounds { constant } => write!(
+                formatter,
+                "module name constant {} is out of bounds",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::ModuleNameNotString { constant } => write!(
+                formatter,
+                "module name constant {} is not a string",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::InvalidModuleName => {
+                formatter.write_str("module name is not a normalized module name")
+            }
+            ProgramVerifyErrorKind::MetadataStringIllFormed { constant } => write!(
+                formatter,
+                "metadata string constant {} is ill-formed UTF-16",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::DuplicateModuleName { first } => write!(
+                formatter,
+                "duplicate module name, first seen at module {}",
+                first.get()
+            ),
+            ProgramVerifyErrorKind::TooManyEdges { count } => {
+                write!(formatter, "{count} edges exceed the per-module limit")
+            }
+            ProgramVerifyErrorKind::TooManyBindings { count } => {
+                write!(formatter, "{count} bindings exceed the per-module limit")
+            }
+            ProgramVerifyErrorKind::TooManyExports { count } => {
+                write!(formatter, "{count} exports exceed the per-module limit")
+            }
+            ProgramVerifyErrorKind::SpecifierOutOfBounds { edge, constant } => write!(
+                formatter,
+                "edge {} specifier constant {} is out of bounds",
+                edge.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::SpecifierNotString { edge, constant } => write!(
+                formatter,
+                "edge {} specifier constant {} is not a string",
+                edge.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::AbsoluteSpecifier { edge } => {
+                write!(formatter, "edge {} has an absolute specifier", edge.get())
+            }
+            ProgramVerifyErrorKind::DuplicateSpecifier { first, second } => write!(
+                formatter,
+                "edges {} and {} share one specifier",
+                first.get(),
+                second.get()
+            ),
+            ProgramVerifyErrorKind::LocalTargetOutOfBounds { edge, target } => write!(
+                formatter,
+                "edge {} targets module {} which is out of bounds",
+                edge.get(),
+                target.get()
+            ),
+            ProgramVerifyErrorKind::BindingNameOutOfBounds { binding, constant } => write!(
+                formatter,
+                "binding {} name constant {} is out of bounds",
+                binding.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::BindingNameNotString { binding, constant } => write!(
+                formatter,
+                "binding {} name constant {} is not a string",
+                binding.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::BindingEdgeOutOfBounds { binding, edge } => write!(
+                formatter,
+                "binding {} references edge {} which is out of bounds",
+                binding.get(),
+                edge.get()
+            ),
+            ProgramVerifyErrorKind::ImportedNameOutOfBounds { binding, constant } => write!(
+                formatter,
+                "binding {} imported name constant {} is out of bounds",
+                binding.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::ImportedNameNotString { binding, constant } => write!(
+                formatter,
+                "binding {} imported name constant {} is not a string",
+                binding.get(),
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::DuplicateBinding { first, second } => write!(
+                formatter,
+                "bindings {} and {} share one name",
+                first.get(),
+                second.get()
+            ),
+            ProgramVerifyErrorKind::StaticBindingRequiresStaticEdge { binding, edge } => write!(
+                formatter,
+                "binding {} requires a static edge but edge {} is not static",
+                binding.get(),
+                edge.get()
+            ),
+            ProgramVerifyErrorKind::IndirectExportRequiresStaticEdge { export, edge } => write!(
+                formatter,
+                "export {export} requires a static edge but edge {} is not static",
+                edge.get()
+            ),
+            ProgramVerifyErrorKind::MissingImportedExport { binding } => write!(
+                formatter,
+                "binding {} imports a name not exported by its edge",
+                binding.get()
+            ),
+            ProgramVerifyErrorKind::ExportNameOutOfBounds { export, constant } => write!(
+                formatter,
+                "export {export} name constant {} is out of bounds",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::ExportNameNotString { export, constant } => write!(
+                formatter,
+                "export {export} name constant {} is not a string",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::DuplicateExport { first, second } => {
+                write!(formatter, "exports {first} and {second} share one name")
+            }
+            ProgramVerifyErrorKind::ExportBindingOutOfBounds { export, binding } => write!(
+                formatter,
+                "export {export} references binding {} which is out of bounds",
+                binding.get()
+            ),
+            ProgramVerifyErrorKind::ExportEdgeOutOfBounds { export, edge } => write!(
+                formatter,
+                "export {export} references edge {} which is out of bounds",
+                edge.get()
+            ),
+            ProgramVerifyErrorKind::IndirectNameOutOfBounds { export, constant } => write!(
+                formatter,
+                "export {export} indirect name constant {} is out of bounds",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::IndirectNameNotString { export, constant } => write!(
+                formatter,
+                "export {export} indirect name constant {} is not a string",
+                constant.get()
+            ),
+            ProgramVerifyErrorKind::DynamicImportMissingEdge { specifier } => write!(
+                formatter,
+                "dynamic import specifier constant {} has no matching edge",
+                specifier.get()
+            ),
+            ProgramVerifyErrorKind::SnapshotExportInstruction { function, pc } => write!(
+                formatter,
+                "function {function} at instruction {pc} performs a snapshot export, which is not executable"
+            ),
+            ProgramVerifyErrorKind::MissingIndirectExport { export } => write!(
+                formatter,
+                "export {export} is an indirect export with no resolution"
+            ),
+            ProgramVerifyErrorKind::IndirectExportCycle { export } => write!(
+                formatter,
+                "export {export} is part of an indirect export cycle"
+            ),
+        }
     }
 }
 
@@ -979,21 +1182,14 @@ impl<'a> ProgramDecoder<'a> {
 
     fn u32(&mut self) -> Result<u32, ProgramDecodeError> {
         let start = self.offset;
-        let mut value = 0_u32;
-        for group in 0..5 {
-            let byte = self.byte()?;
-            if group == 4 && byte & 0xf0 != 0 {
-                return Err(self.error_at(start, ProgramDecodeErrorKind::IntegerOverflow));
-            }
-            value |= u32::from(byte & 0x7f) << (group * 7);
-            if byte & 0x80 == 0 {
-                if group != 0 && byte == 0 {
-                    return Err(self.error_at(start, ProgramDecodeErrorKind::NonCanonicalInteger));
-                }
-                return Ok(value);
-            }
-        }
-        Err(self.error_at(start, ProgramDecodeErrorKind::MalformedInteger))
+        read_leb128(self.bytes, &mut self.offset).map_err(|error| {
+            let kind = match error {
+                Leb128Error::UnexpectedEof => ProgramDecodeErrorKind::UnexpectedEof,
+                Leb128Error::IntegerOverflow => ProgramDecodeErrorKind::IntegerOverflow,
+                Leb128Error::NonCanonicalInteger => ProgramDecodeErrorKind::NonCanonicalInteger,
+            };
+            self.error_at(start, kind)
+        })
     }
 
     const fn error(&self, kind: ProgramDecodeErrorKind) -> ProgramDecodeError {
@@ -1002,6 +1198,55 @@ impl<'a> ProgramDecoder<'a> {
 
     const fn error_at(&self, offset: usize, kind: ProgramDecodeErrorKind) -> ProgramDecodeError {
         ProgramDecodeError { offset, kind }
+    }
+}
+
+/// Failure modes for canonical unsigned LEB128 `u32` decoding.
+///
+/// This is the sole LEB128 error taxonomy in the crate: both
+/// [`ProgramDecoder`](struct@ProgramDecoder) and [`crate::Decoder`] delegate to
+/// [`read_leb128`] and map these variants into their own error enums.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Leb128Error {
+    UnexpectedEof,
+    IntegerOverflow,
+    NonCanonicalInteger,
+}
+
+/// Reads one canonical unsigned LEB128 `u32` from `bytes` starting at
+/// `*offset`, advancing `*offset` past the consumed bytes.
+///
+/// Rejects EOF mid-integer, overlong (trailing-zero) encodings, and values
+/// exceeding 32 bits. On error `*offset` is left at the point of failure;
+/// callers that need the original position for diagnostics should save it
+/// before calling.
+pub(crate) fn read_leb128(bytes: &[u8], offset: &mut usize) -> Result<u32, Leb128Error> {
+    let start = *offset;
+    let mut result: u32 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let byte = *bytes.get(*offset).ok_or(Leb128Error::UnexpectedEof)?;
+        *offset += 1;
+        if shift == 28 {
+            // Fifth group: only the low four bits may be set, and the
+            // continuation bit must be clear (else overflow); a zero final
+            // group would be overlong.
+            if byte & 0x80 != 0 || byte > 0x0f {
+                return Err(Leb128Error::IntegerOverflow);
+            }
+            if byte == 0 {
+                return Err(Leb128Error::NonCanonicalInteger);
+            }
+            return Ok(result | (u32::from(byte) << 28));
+        }
+        result |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            if byte == 0 && *offset - start > 1 {
+                return Err(Leb128Error::NonCanonicalInteger);
+            }
+            return Ok(result);
+        }
+        shift += 7;
     }
 }
 
@@ -1060,8 +1305,28 @@ fn verify_program_metadata(
         }
         verify_module_metadata(modules, module_id, module)?;
     }
-    verify_export_resolutions(modules)?;
-    verify_imported_bindings(modules)
+    // Built once and shared by both verifiers so they cannot disagree about
+    // what "exported" means. `verify_module_metadata` already rejected
+    // out-of-bounds/non-string export names above, so the lookup is total.
+    let export_indices: Vec<HashMap<&EcmaString, usize>> = modules
+        .iter()
+        .map(|module| {
+            module
+                .exports
+                .iter()
+                .enumerate()
+                .map(|(index, export)| {
+                    (
+                        string(&module.code, export.name)
+                            .expect("metadata verifier checked export name"),
+                        index,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    verify_export_resolutions(modules, &export_indices)?;
+    verify_imported_bindings(modules, &export_indices)
 }
 
 fn verify_module_metadata(
@@ -1360,7 +1625,10 @@ fn require_edge(
     })
 }
 
-fn verify_imported_bindings(modules: &[ProgramModule<Verified>]) -> Result<(), ProgramVerifyError> {
+fn verify_imported_bindings(
+    modules: &[ProgramModule<Verified>],
+    export_indices: &[HashMap<&EcmaString, usize>],
+) -> Result<(), ProgramVerifyError> {
     for (module_index, module) in modules.iter().enumerate() {
         let module_id = ModuleId::new(module_index as u32);
         for (binding_index, binding) in module.bindings.iter().enumerate() {
@@ -1372,11 +1640,10 @@ fn verify_imported_bindings(modules: &[ProgramModule<Verified>]) -> Result<(), P
             };
             let imported_name =
                 string(&module.code, name).expect("metadata verifier checked imported name");
-            let target = &modules[target.get() as usize];
-            if !target.exports.iter().any(|export| {
-                string(&target.code, export.name).expect("metadata verifier checked export name")
-                    == imported_name
-            }) {
+            // O(1) lookup against the shared index instead of a linear scan of
+            // the target's exports; the index is the same one
+            // `verify_export_resolutions` resolves through.
+            if !export_indices[target.get() as usize].contains_key(imported_name) {
                 return Err(module_error(
                     module_id,
                     ProgramVerifyErrorKind::MissingImportedExport {
@@ -1391,24 +1658,8 @@ fn verify_imported_bindings(modules: &[ProgramModule<Verified>]) -> Result<(), P
 
 fn verify_export_resolutions(
     modules: &[ProgramModule<Verified>],
+    export_indices: &[HashMap<&EcmaString, usize>],
 ) -> Result<(), ProgramVerifyError> {
-    let export_indices: Vec<HashMap<&EcmaString, usize>> = modules
-        .iter()
-        .map(|module| {
-            module
-                .exports
-                .iter()
-                .enumerate()
-                .map(|(index, export)| {
-                    (
-                        string(&module.code, export.name)
-                            .expect("metadata verifier checked export name"),
-                        index,
-                    )
-                })
-                .collect()
-        })
-        .collect();
     let mut states: Vec<Vec<u8>> = modules
         .iter()
         .map(|module| vec![0; module.exports.len()])
@@ -1577,11 +1828,11 @@ mod tests {
     use crate::{Function, FunctionFlags, FunctionId, Register};
 
     fn verified_module(name: &str, extra: &[&str]) -> Module<Verified> {
-        let mut constants = vec![Constant::String(EcmaString::from_utf8(name))];
+        let mut constants = vec![Constant::String(EcmaString::encode(name))];
         constants.extend(
             extra
                 .iter()
-                .map(|value| Constant::String(EcmaString::from_utf8(value))),
+                .map(|value| Constant::String(EcmaString::encode(value))),
         );
         Module::new(
             constants,
@@ -1693,7 +1944,7 @@ mod tests {
         let decoded = decode_verified_program(&encoded, &ProgramDecodeLimits::default()).unwrap();
         assert_eq!(decoded.encode(), encoded);
         assert_eq!(
-            decoded.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            decoded.resolve_export(ModuleId::new(0), &EcmaString::encode("x")),
             Some(ResolvedExport::Local {
                 module: ModuleId::new(0),
                 binding: BindingId::new(0),
@@ -2173,7 +2424,7 @@ mod tests {
     fn every_metadata_string_reference_checks_bounds_and_kind() {
         let code = Module::new(
             vec![
-                Constant::String(EcmaString::from_utf8("main")),
+                Constant::String(EcmaString::encode("main")),
                 Constant::Int32(7),
             ],
             vec![Function::new(
@@ -2395,7 +2646,7 @@ mod tests {
         };
         let program = Program::link(vec![module], ModuleId::new(0)).unwrap();
         assert_eq!(
-            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            program.resolve_export(ModuleId::new(0), &EcmaString::encode("x")),
             Some(ResolvedExport::External {
                 module: ModuleId::new(0),
                 edge: EdgeId::new(0),
@@ -2431,8 +2682,8 @@ mod tests {
     fn dynamic_imports_require_dynamic_capability() {
         let code = Module::new(
             vec![
-                Constant::String(EcmaString::from_utf8("main")),
-                Constant::String(EcmaString::from_utf8("./dep")),
+                Constant::String(EcmaString::encode("main")),
+                Constant::String(EcmaString::encode("./dep")),
             ],
             vec![Function::new(
                 None,
@@ -2482,7 +2733,7 @@ mod tests {
     #[test]
     fn runtime_dynamic_import_needs_no_linkage_edge() {
         let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("main"))],
+            vec![Constant::String(EcmaString::encode("main"))],
             vec![Function::new(
                 None,
                 0,
@@ -2550,9 +2801,9 @@ mod tests {
     fn static_and_dynamic_edge_satisfies_both_linkage_capabilities() {
         let code = Module::new(
             vec![
-                Constant::String(EcmaString::from_utf8("main")),
-                Constant::String(EcmaString::from_utf8("./dep")),
-                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::encode("main")),
+                Constant::String(EcmaString::encode("./dep")),
+                Constant::String(EcmaString::encode("value")),
             ],
             vec![Function::new(
                 None,
@@ -2599,7 +2850,7 @@ mod tests {
     #[test]
     fn executable_program_rejects_snapshot_exports() {
         let module = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("main"))],
+            vec![Constant::String(EcmaString::encode("main"))],
             vec![Function::new(
                 None,
                 0,
@@ -2644,9 +2895,9 @@ mod tests {
     fn post_import_mutation_keeps_external_binding_as_live_identity() {
         let code = Module::new(
             vec![
-                Constant::String(EcmaString::from_utf8("main")),
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("builtin:live")),
+                Constant::String(EcmaString::encode("main")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("builtin:live")),
             ],
             vec![Function::new(
                 None,
@@ -2708,7 +2959,7 @@ mod tests {
         };
         let program = Program::link(vec![module], ModuleId::new(0)).unwrap();
         assert_eq!(
-            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            program.resolve_export(ModuleId::new(0), &EcmaString::encode("x")),
             Some(ResolvedExport::External {
                 module: ModuleId::new(0),
                 edge: EdgeId::new(0),
@@ -2782,11 +3033,11 @@ mod tests {
             binding: BindingId::new(0),
         });
         assert_eq!(
-            program.resolve_export(ModuleId::new(0), &EcmaString::from_utf8("x")),
+            program.resolve_export(ModuleId::new(0), &EcmaString::encode("x")),
             leaf
         );
         assert_eq!(
-            program.resolve_export(ModuleId::new(1), &EcmaString::from_utf8("x")),
+            program.resolve_export(ModuleId::new(1), &EcmaString::encode("x")),
             leaf
         );
 
@@ -2807,5 +3058,160 @@ mod tests {
                 .kind,
             ProgramVerifyErrorKind::MissingImportedExport { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_export_bound_counts_exports_not_modules() {
+        // Only two modules are involved, but the re-export chain has five
+        // export entries. A bound based on the module count would stop after
+        // `self.modules.len() + 1` hops and return `None`, missing the leaf.
+        let m0 = {
+            let code = Module::new(
+                vec![
+                    Constant::String(EcmaString::encode("m0")),
+                    Constant::String(EcmaString::encode("a")),
+                    Constant::String(EcmaString::encode("b")),
+                    Constant::String(EcmaString::encode("c")),
+                    Constant::String(EcmaString::encode("d")),
+                    Constant::String(EcmaString::encode("e")),
+                    Constant::String(EcmaString::encode("m1")),
+                ],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    1,
+                    FunctionFlags::default(),
+                    vec![Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .unwrap();
+            ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: vec![Edge {
+                    specifier: ConstantId::new(6),
+                    target: EdgeTarget::Local(ModuleId::new(1)),
+                    kind: EdgeKind::Static,
+                }],
+                bindings: vec![Binding {
+                    name: ConstantId::new(5),
+                    kind: BindingKind::Hoisted,
+                }],
+                exports: vec![
+                    Export {
+                        name: ConstantId::new(1),
+                        source: ExportSource::Indirect {
+                            edge: EdgeId::new(0),
+                            name: ConstantId::new(2),
+                        },
+                    },
+                    Export {
+                        name: ConstantId::new(3),
+                        source: ExportSource::Indirect {
+                            edge: EdgeId::new(0),
+                            name: ConstantId::new(4),
+                        },
+                    },
+                    Export {
+                        name: ConstantId::new(5),
+                        source: ExportSource::Local(BindingId::new(0)),
+                    },
+                ],
+            }
+        };
+
+        let m1 = {
+            let code = Module::new(
+                vec![
+                    Constant::String(EcmaString::encode("m1")),
+                    Constant::String(EcmaString::encode("b")),
+                    Constant::String(EcmaString::encode("c")),
+                    Constant::String(EcmaString::encode("d")),
+                    Constant::String(EcmaString::encode("e")),
+                    Constant::String(EcmaString::encode("m0")),
+                ],
+                vec![Function::new(
+                    None,
+                    0,
+                    0,
+                    1,
+                    FunctionFlags::default(),
+                    vec![Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .unwrap();
+            ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: vec![Edge {
+                    specifier: ConstantId::new(5),
+                    target: EdgeTarget::Local(ModuleId::new(0)),
+                    kind: EdgeKind::Static,
+                }],
+                bindings: Vec::new(),
+                exports: vec![
+                    Export {
+                        name: ConstantId::new(1),
+                        source: ExportSource::Indirect {
+                            edge: EdgeId::new(0),
+                            name: ConstantId::new(2),
+                        },
+                    },
+                    Export {
+                        name: ConstantId::new(3),
+                        source: ExportSource::Indirect {
+                            edge: EdgeId::new(0),
+                            name: ConstantId::new(4),
+                        },
+                    },
+                ],
+            }
+        };
+
+        let program = Program::link(vec![m0, m1], ModuleId::new(0)).unwrap();
+        assert_eq!(
+            program.resolve_export(ModuleId::new(0), &EcmaString::encode("a")),
+            Some(ResolvedExport::Local {
+                module: ModuleId::new(0),
+                binding: BindingId::new(0),
+            })
+        );
+    }
+
+    #[test]
+    fn verify_error_display_is_human_readable_not_debug() {
+        // Pin the Display output: it must read as a sentence, never as
+        // Rust struct syntax like `DuplicateSpecifier { first: EdgeId(1), second: EdgeId(4) }`.
+        let error = ProgramVerifyError {
+            module: Some(ModuleId::new(3)),
+            kind: ProgramVerifyErrorKind::DuplicateSpecifier {
+                first: EdgeId::new(1),
+                second: EdgeId::new(4),
+            },
+        };
+        assert_eq!(
+            error.to_string(),
+            "module 3: edges 1 and 4 share one specifier"
+        );
+
+        // No module prefix variant.
+        let no_module = ProgramVerifyError {
+            module: None,
+            kind: ProgramVerifyErrorKind::EmptyProgram,
+        };
+        assert_eq!(no_module.to_string(), "program has no modules");
+
+        // Verify the output never contains debug-style braces or field names.
+        assert!(
+            !error.to_string().contains('{'),
+            "Display must not emit Debug struct syntax"
+        );
     }
 }

@@ -13,6 +13,7 @@ def formatVersion : Nat := 4
 abbrev EncodedField := List Nat
 abbrev EncodedInstr := List EncodedField
 abbrev EncodedHandler := List EncodedField
+abbrev EncodedConstant := List Nat
 
 inductive DecodeError where
   | badMagic
@@ -24,6 +25,7 @@ inductive DecodeError where
   | malformedInstruction
   | malformedHandler
   | malformedFunction
+  | malformedConstant
   | malformedModule
   deriving DecidableEq, Repr
 
@@ -90,13 +92,13 @@ structure Handler where
   handlerPc : Nat
   deriving DecidableEq, Repr
 
-/-- One production function body. `Program` remains an alias for execution proofs. -/
+/-- One production function body: a code list plus exception handlers. -/
 structure Function where
   code : List Instr
   handlers : List Handler
   deriving DecidableEq, Repr
 
-abbrev Program := Function
+abbrev FunctionBody := Function
 
 /-- Persistable v4 constant-pool values; runtime identities are intentionally absent. -/
 inductive Constant where
@@ -177,11 +179,16 @@ structure EncodedFunction where
 structure EncodedModule where
   magic : List Nat
   version : EncodedField
-  constants : List Constant
+  constants : List EncodedConstant
   functions : List EncodedFunction
   entry : EncodedField
   deriving DecidableEq, Repr
 
+/-- A bounded module header plus opaque linkage payloads.
+
+This model decodes `name` and `code`. The host must decode and validate `edges`,
+`bindings`, and `exports` before it constructs this value. The functions below
+preserve those three payloads but do not model their wire codec. -/
 structure EncodedProgramModule where
   name : EncodedField
   code : EncodedModule
@@ -341,8 +348,131 @@ def decodeFunctions : List EncodedFunction → Except DecodeError (List Function
       | .error error, _ => .error error
       | _, .error error => .error error
 
+/-- Encoded string payload: a length prefix followed by the exact UTF-16 code units. -/
+def encodeString (units : List Nat) : List Nat := units.length :: units
+
+def decodeString : List Nat → Except DecodeError (List Nat)
+  | len :: rest =>
+      if rest.length = len then .ok rest else .error .malformedConstant
+  | [] => .error .malformedConstant
+
+/-- BigInt text is encoded the same length-prefixed way as string units. -/
+def encodeBigint (text : List Nat) : List Nat := text.length :: text
+
+def decodeBigint : List Nat → Except DecodeError (List Nat)
+  | len :: rest =>
+      if rest.length = len then .ok rest else .error .malformedConstant
+  | [] => .error .malformedConstant
+
+/-- Int32 is encoded as sign and magnitude, preserving the two `Int` constructors. -/
+def encodeInt32 (value : Int) : List Nat :=
+  match value with
+  | .ofNat n => [0, n]
+  | .negSucc n => [1, n]
+
+def decodeInt32 : List Nat → Except DecodeError Int
+  | [0, n] => .ok (.ofNat n)
+  | [1, n] => .ok (.negSucc n)
+  | _ => .error .malformedConstant
+
+/-- v4 constant-pool wire encoding: each constructor carries a production tag. -/
+def encodeConstant : Constant → EncodedConstant
+  | .numberBits bits => [0, bits]
+  | .int32 value => 1 :: encodeInt32 value
+  | .string units => 2 :: encodeString units
+  | .boolean false => [3]
+  | .boolean true => [4]
+  | .null => [5]
+  | .undefined => [6]
+  | .bigint text => 7 :: encodeBigint text
+
+def decodeConstant : EncodedConstant → Except DecodeError Constant
+  | 0 :: bits :: [] => .ok (.numberBits bits)
+  | 1 :: intEncoded =>
+      match decodeInt32 intEncoded with
+      | .ok value => .ok (.int32 value)
+      | .error e => .error e
+  | 2 :: stringEncoded =>
+      match decodeString stringEncoded with
+      | .ok units => .ok (.string units)
+      | .error e => .error e
+  | 3 :: [] => .ok (.boolean false)
+  | 4 :: [] => .ok (.boolean true)
+  | 5 :: [] => .ok .null
+  | 6 :: [] => .ok .undefined
+  | 7 :: bigintEncoded =>
+      match decodeBigint bigintEncoded with
+      | .ok text => .ok (.bigint text)
+      | .error e => .error e
+  | _ => .error .malformedConstant
+
+def decodeConstants : List EncodedConstant → Except DecodeError (List Constant)
+  | [] => .ok []
+  | encoded :: rest =>
+      match decodeConstant encoded, decodeConstants rest with
+      | .ok constant, .ok constants => .ok (constant :: constants)
+      | .error error, _ => .error error
+      | _, .error error => .error error
+
+theorem decodeInt32_encodeInt32 (value : Int) :
+    decodeInt32 (encodeInt32 value) = .ok value := by
+  cases value with
+  | ofNat n => simp [encodeInt32, decodeInt32]
+  | negSucc n => simp [encodeInt32, decodeInt32]
+
+private theorem decodeString_cons (len : Nat) (rest : List Nat) (h : rest.length = len) :
+    decodeString (len :: rest) = .ok rest := by
+  simp only [decodeString]
+  split
+  · rfl
+  · contradiction
+
+private theorem decodeBigint_cons (len : Nat) (rest : List Nat) (h : rest.length = len) :
+    decodeBigint (len :: rest) = .ok rest := by
+  simp only [decodeBigint]
+  split
+  · rfl
+  · contradiction
+
+theorem decodeString_encodeString (units : List Nat) :
+    decodeString (encodeString units) = .ok units := by
+  simp only [encodeString]
+  exact decodeString_cons units.length units (by rfl)
+
+theorem decodeBigint_encodeBigint (text : List Nat) :
+    decodeBigint (encodeBigint text) = .ok text := by
+  simp only [encodeBigint]
+  exact decodeBigint_cons text.length text (by rfl)
+
+theorem decodeConstant_encodeConstant (constant : Constant) :
+    decodeConstant (encodeConstant constant) = .ok constant := by
+  cases constant with
+  | numberBits bits => simp [encodeConstant, decodeConstant]
+  | int32 value => simp [encodeConstant, decodeConstant, decodeInt32_encodeInt32 value]
+  | string units => simp [encodeConstant, decodeConstant, decodeString_encodeString units]
+  | boolean value =>
+      cases value <;> simp [encodeConstant, decodeConstant]
+  | null => simp [encodeConstant, decodeConstant]
+  | undefined => simp [encodeConstant, decodeConstant]
+  | bigint text => simp [encodeConstant, decodeConstant, decodeBigint_encodeBigint text]
+
+/-- Ordinary (0x0061), NUL (0x0000), and surrogate (0xD800, 0xDC00, 0xDFFF)
+code units round-trip through the constant codec exactly. -/
+theorem decodeConstant_string_roundTrip_sample :
+    decodeConstant (encodeConstant (Constant.string [97, 0, 55296, 56320, 57343])) =
+      .ok (Constant.string [97, 0, 55296, 56320, 57343]) := by
+  simp [encodeConstant, decodeConstant, decodeString_encodeString]
+
+theorem decodeConstants_encodeConstants (constants : List Constant) :
+    decodeConstants (constants.map encodeConstant) = .ok constants := by
+  induction constants with
+  | nil => rfl
+  | cons c cs ih =>
+      have hC := decodeConstant_encodeConstant c
+      simp [decodeConstants, hC, ih]
+
 def encodeModule (module : Module) : EncodedModule :=
-  ⟨moduleMagicBytes, encodeField formatVersion, module.constants,
+  ⟨moduleMagicBytes, encodeField formatVersion, module.constants.map encodeConstant,
     module.functions.map encodeFunction, encodeField module.entry⟩
 
 def decodeModule (encoded : EncodedModule) : Except DecodeError Module :=
@@ -353,10 +483,14 @@ def decodeModule (encoded : EncodedModule) : Except DecodeError Module :=
     | .ok version =>
         if version ≠ formatVersion then .error .unsupportedVersion
         else
-          match decodeFunctions encoded.functions, decodeField encoded.entry with
-          | .ok functions, .ok entry => .ok ⟨encoded.constants, functions, entry⟩
-          | .error error, _ => .error error
-          | _, .error error => .error error
+          match decodeConstants encoded.constants, decodeFunctions encoded.functions,
+                decodeField encoded.entry with
+          | .ok constants, .ok functions, .ok entry =>
+              if entry < functions.length then .ok ⟨constants, functions, entry⟩
+              else .error .malformedModule
+          | .error error, _, _ => .error error
+          | _, .error error, _ => .error error
+          | _, _, .error error => .error error
 
 def encodeProgramModule (module : ProgramModule) : EncodedProgramModule :=
   ⟨encodeField module.name, encodeModule module.code, module.edges, module.bindings, module.exports⟩
@@ -391,7 +525,9 @@ def decode (wire : Wire) : DecodeResult :=
         if version ≠ formatVersion then .rejected .unsupportedVersion
         else
           match decodeField wire.entry, decodeProgramModules wire.modules with
-          | .ok entry, .ok modules => .accepted ⟨modules, entry⟩
+          | .ok entry, .ok modules =>
+              if entry < modules.length then .accepted ⟨modules, entry⟩
+              else .rejected .malformedModule
           | .error error, _ => .rejected error
           | _, .error error => .rejected error
 theorem decode_rejects_bad_magic (wire : Wire) (badMagic : wire.magic ≠ programMagicBytes) :
@@ -414,24 +550,27 @@ def functionCanonical (function : Function) : Prop :=
   (∀ instruction ∈ function.code, instructionCanonical instruction) ∧
   ∀ handler ∈ function.handlers, handlerCanonical handler
 
-abbrev programCanonical := functionCanonical
+abbrev functionBodyCanonical := functionCanonical
 
 def moduleCanonical (module : Module) : Prop :=
-  module.entry < FieldLimit ∧ ∀ function ∈ module.functions, functionCanonical function
+  module.entry < FieldLimit ∧
+  module.entry < module.functions.length ∧
+  ∀ function ∈ module.functions, functionCanonical function
 
 def programModuleCanonical (module : ProgramModule) : Prop :=
   module.name < FieldLimit ∧ moduleCanonical module.code
 
 def envelopeCanonical (program : ProgramEnvelope) : Prop :=
+  program.entry < program.modules.length ∧
   program.entry < FieldLimit ∧
-    ∀ module ∈ program.modules, programModuleCanonical module
+  ∀ module ∈ program.modules, programModuleCanonical module
 
 def wireCanonical (wire : Wire) : Prop :=
   ∃ program, envelopeCanonical program ∧ wire = encode program
 
 /-- Instruction boundaries are decoded structure, never a caller-supplied target list. -/
-def instructionBoundaries (program : Program) : List Nat := List.range (program.code.length + 1)
-def boundary (program : Program) (pc : Nat) : Prop := pc ∈ instructionBoundaries program
+def instructionBoundaries (program : FunctionBody) : List Nat := List.range (program.code.length + 1)
+def boundary (program : FunctionBody) (pc : Nat) : Prop := pc ∈ instructionBoundaries program
 
 def controlTargets : List Instr → List Nat
   | [] => []
@@ -440,7 +579,7 @@ def controlTargets : List Instr → List Nat
       | some target => target :: controlTargets rest
       | none => controlTargets rest
 
-def targets (program : Program) : List Nat := controlTargets program.code
+def targets (program : FunctionBody) : List Nat := controlTargets program.code
 
 def backEdgeTargetsFrom (pc : Nat) : List Instr → List Nat
   | [] => []
@@ -449,18 +588,18 @@ def backEdgeTargetsFrom (pc : Nat) : List Instr → List Nat
       else backEdgeTargetsFrom (pc + 1) rest
   | _ :: rest => backEdgeTargetsFrom (pc + 1) rest
 
-def backEdgeTargets (program : Program) : List Nat := backEdgeTargetsFrom 0 program.code
+def backEdgeTargets (program : FunctionBody) : List Nat := backEdgeTargetsFrom 0 program.code
 
 def suspendResumePcs : List Instr → List Nat
   | [] => []
   | .suspend _ _ resumePc :: rest => resumePc :: suspendResumePcs rest
   | _ :: rest => suspendResumePcs rest
 
-def entryCandidates (program : Program) : List Nat :=
+def entryCandidates (program : FunctionBody) : List Nat :=
   0 :: (backEdgeTargets program ++ suspendResumePcs program.code)
 
 /-- Filtering the ordered instruction-boundary list gives sorted, duplicate-free entry ordinals. -/
-def entryPoints (program : Program) : List Nat :=
+def entryPoints (program : FunctionBody) : List Nat :=
   (List.range program.code.length).filter fun pc => decide (pc ∈ entryCandidates program)
 
 def nextPc (pc : Nat) : Instr → Option Nat
@@ -574,11 +713,13 @@ theorem decodeFunctions_encodeFunctions (functions : List Function)
 
 theorem decodeModule_encodeModule (module : Module) (h : moduleCanonical module) :
     decodeModule (encodeModule module) = .ok module := by
-  rcases h with ⟨entryCanonical, functionsCanonical⟩
+  rcases h with ⟨entryCanonical, entryInRange, functionsCanonical⟩
   have versionBound : formatVersion < FieldLimit := by decide
   simp [decodeModule, encodeModule, decodeField_encodeField formatVersion versionBound,
     decodeField_encodeField module.entry entryCanonical,
-    decodeFunctions_encodeFunctions module.functions functionsCanonical]
+    decodeConstants_encodeConstants module.constants,
+    decodeFunctions_encodeFunctions module.functions functionsCanonical,
+    if_pos entryInRange]
 
 theorem decodeProgramModule_encodeProgramModule
     (module : ProgramModule) (h : programModuleCanonical module) :
@@ -600,4 +741,82 @@ theorem decodeProgramModules_encodeProgramModules (modules : List ProgramModule)
         exact h remaining (by simp [hRemaining])
       simp [decodeProgramModules, decodeProgramModule_encodeProgramModule module hModule, ih hRest]
 
+/-- A minimal canonical function body with no instructions and no handlers. -/
+def emptyFunction : Function :=
+  ⟨[], []⟩
+
+private theorem functionCanonical_empty : functionCanonical emptyFunction := by
+  simp [functionCanonical, emptyFunction, instructionCanonical, handlerCanonical]
+
+/-- A minimal canonical module with one empty function and entry at zero. -/
+def emptyModule : Module :=
+  ⟨[], [emptyFunction], 0⟩
+
+private theorem moduleCanonical_emptyModule : moduleCanonical emptyModule := by
+  simp [moduleCanonical, emptyModule, functionCanonical_empty, FieldLimit]
+  <;> try { decide }
+
+/-- A one-function module whose entry index names no function (127 >= 1). -/
+def oneFunctionBadEntryModule : Module :=
+  ⟨[], [emptyFunction], 127⟩
+
+theorem oneFunctionBadEntryModule_not_canonical :
+    ¬ moduleCanonical oneFunctionBadEntryModule := by
+  simp [moduleCanonical, oneFunctionBadEntryModule, functionCanonical_empty, FieldLimit]
+  <;> try { decide }
+
+theorem oneFunctionBadEntryModule_decodes_malformed :
+    decodeModule (encodeModule oneFunctionBadEntryModule) = .error .malformedModule := by
+  rfl
+
+/-- A canonical program module carrying only a bounded name and the empty module. -/
+def exampleProgramModule (name : Nat) : ProgramModule :=
+  ⟨name, emptyModule, [], [], []⟩
+
+private theorem programModuleCanonical_example_zero :
+    programModuleCanonical (exampleProgramModule 0) := by
+  simp [programModuleCanonical, exampleProgramModule, moduleCanonical_emptyModule, FieldLimit]
+  <;> try { decide }
+
+private theorem programModuleCanonical_example_one :
+    programModuleCanonical (exampleProgramModule 1) := by
+  simp [programModuleCanonical, exampleProgramModule, moduleCanonical_emptyModule, FieldLimit]
+  <;> try { decide }
+
+private theorem programModulesCanonical_two :
+    ∀ module ∈ [exampleProgramModule 0, exampleProgramModule 1], programModuleCanonical module := by
+  intro module h
+  simp at h
+  rcases h with (rfl | rfl)
+  · exact programModuleCanonical_example_zero
+  · exact programModuleCanonical_example_one
+
+/-- A two-module envelope whose entry points to the first module. -/
+def twoModuleValidEnvelope : ProgramEnvelope :=
+  ⟨[exampleProgramModule 0, exampleProgramModule 1], 0⟩
+
+/-- A two-module envelope whose entry index names no module (127 >= 2). -/
+def twoModuleMissingEnvelope : ProgramEnvelope :=
+  ⟨[exampleProgramModule 0, exampleProgramModule 1], 127⟩
+
+theorem twoModuleValidEnvelope_canonical :
+    envelopeCanonical twoModuleValidEnvelope := by
+  simp [envelopeCanonical, twoModuleValidEnvelope, programModuleCanonical_example_zero,
+    programModuleCanonical_example_one, FieldLimit]
+  <;> try { decide }
+
+theorem twoModuleMissingEnvelope_not_canonical :
+    ¬ envelopeCanonical twoModuleMissingEnvelope := by
+  simp [envelopeCanonical, twoModuleMissingEnvelope, FieldLimit]
+  <;> try { decide }
+
+theorem twoModuleValidEnvelope_accepted :
+    decode (encode twoModuleValidEnvelope) = .accepted twoModuleValidEnvelope := by
+  simp [decode, encode, twoModuleValidEnvelope]
+  <;> try { rfl }
+
+theorem twoModuleMissingEnvelope_not_accepted :
+    decode (encode twoModuleMissingEnvelope) = .rejected .malformedModule := by
+  simp [decode, encode, twoModuleMissingEnvelope]
+  <;> try { rfl }
 end Bamti.Bytecode

@@ -2,8 +2,10 @@
 
 use std::error::Error;
 use std::fmt;
+use std::time::Instant;
 
 use bamts_bytecode::{Program as BytecodeProgram, Verified};
+use bamts_cancel::{CancellationToken, Cancelled};
 use bamts_native::{
     AbiError, Completion, CompletionTag, JitEntry, NativeEntryTable, NativeHelper, ShadowFrame,
     require_frame_module_id,
@@ -13,8 +15,10 @@ use cranelift_codegen::ir::{ExternalName, Function, UserExternalName};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError, default_libcall_names};
 
-use crate::jit_memory::{FinalizedMemory, WxMemoryHandle, WxMemoryProvider};
-use crate::{HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_program};
+use crate::jit_memory::{FinalizedMemory, WxByteTotals, WxMemoryHandle, WxMemoryProvider};
+use crate::{
+    HELPER_NAMESPACE, Helper, LoweredProgram, ProgramLowerError, lower_program_with_cancel,
+};
 
 /// A typed host-JIT compilation failure.
 #[derive(Debug)]
@@ -27,6 +31,8 @@ pub enum JitError {
     Module(Box<ModuleError>),
     /// Lowered IR named a runtime helper not present in the runtime helper table.
     UnknownHelper { index: u32 },
+    /// A caller-supplied cancellation token was triggered at a checkpoint.
+    Cancelled,
 }
 
 impl fmt::Display for JitError {
@@ -46,7 +52,14 @@ impl fmt::Display for JitError {
                     "lowered IR imports unknown runtime helper u1:{index}"
                 )
             }
+            JitError::Cancelled => formatter.write_str("operation cancelled"),
         }
+    }
+}
+
+impl From<Cancelled> for JitError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
     }
 }
 
@@ -54,7 +67,9 @@ impl Error for JitError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             JitError::Lower(error) => Some(error),
-            JitError::InvalidLoweredModule(_) | JitError::UnknownHelper { .. } => None,
+            JitError::InvalidLoweredModule(_)
+            | JitError::UnknownHelper { .. }
+            | JitError::Cancelled => None,
             JitError::Module(error) => Some(error.as_ref()),
         }
     }
@@ -134,13 +149,81 @@ impl NativeEntryTable for JitProgram {
     }
 }
 
+/// Wall time and W^X memory footprint observed while compiling a program.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct JitTelemetry {
+    /// Wall time spent lowering, compiling, and finalizing, in fractional
+    /// milliseconds.
+    pub jit_compile_wall_ms: f64,
+    /// Page-rounded bytes finalized as executable code.
+    pub code_bytes: u64,
+    /// Page-rounded bytes finalized as read-only data.
+    pub readonly_bytes: u64,
+    /// Page-rounded bytes kept writable.
+    pub readwrite_bytes: u64,
+    /// Total page-rounded bytes allocated across every mapping kind.
+    pub total_allocated_bytes: u64,
+}
+
 /// Lowers, compiles, and finalizes every module of a verified canonical program
 /// for the current host. Module-local ids remain local and native entries are
 /// keyed by `(module_id, function_id)`.
+///
+/// This is a convenience wrapper that uses a fresh, never-cancelled token; for
+/// cancellation support use [`compile_jit_with_cancel`].
 pub fn compile_jit(bytecode: &BytecodeProgram<Verified>) -> Result<JitProgram, JitError> {
-    let (module, memory, program_bytes) = build_module(bytecode)?;
-    let lowered = lower_program(bytecode, module.target_config())?;
-    compile_lowered(module, memory, lowered, program_bytes)
+    compile_jit_with_telemetry(bytecode).map(|(program, _telemetry)| program)
+}
+
+/// [`compile_jit`] plus compile-wall and page-rounded W^X memory telemetry.
+///
+/// The returned [`JitProgram`] is identical to what [`compile_jit`] produces;
+/// the [`JitTelemetry`] times the whole lower/compile/finalize path and reports
+/// the page-rounded bytes the W^X provider allocated for each mapping kind.
+///
+/// This is a convenience wrapper that uses a fresh, never-cancelled token; for
+/// cancellation support use [`compile_jit_with_telemetry_cancel`].
+pub fn compile_jit_with_telemetry(
+    bytecode: &BytecodeProgram<Verified>,
+) -> Result<(JitProgram, JitTelemetry), JitError> {
+    compile_jit_with_telemetry_cancel(bytecode, &CancellationToken::new())
+}
+
+/// [`compile_jit`] with cooperative cancellation.
+///
+/// Cancellation is checked at the entry, after lowering, before/after every
+/// Cranelift `declare_function`/`define_function`/`finalize_definitions` call,
+/// and per lowered function/data item.
+pub fn compile_jit_with_cancel(
+    bytecode: &BytecodeProgram<Verified>,
+    cancel: &CancellationToken,
+) -> Result<JitProgram, JitError> {
+    compile_jit_with_telemetry_cancel(bytecode, cancel).map(|(program, _telemetry)| program)
+}
+
+/// [`compile_jit_with_cancel`] plus compile-wall and page-rounded W^X memory
+/// telemetry.
+pub fn compile_jit_with_telemetry_cancel(
+    bytecode: &BytecodeProgram<Verified>,
+    cancel: &CancellationToken,
+) -> Result<(JitProgram, JitTelemetry), JitError> {
+    cancel.check()?;
+    let started = Instant::now();
+    let (module, memory, program_bytes) = build_module(bytecode, cancel)?;
+    let lowered = lower_program_with_cancel(bytecode, module.target_config(), cancel)?;
+    // Keep a handle clone so byte totals stay readable after `compile_lowered`
+    // consumes its own; both observe the same shared lifecycle counters.
+    let memory_view = memory.clone();
+    let program = compile_lowered(module, memory, lowered, program_bytes, cancel)?;
+    let bytes: WxByteTotals = memory_view.byte_totals();
+    let telemetry = JitTelemetry {
+        jit_compile_wall_ms: started.elapsed().as_secs_f64() * 1_000.0,
+        code_bytes: bytes.code,
+        readonly_bytes: bytes.readonly,
+        readwrite_bytes: bytes.readwrite,
+        total_allocated_bytes: bytes.total(),
+    };
+    Ok((program, telemetry))
 }
 
 /// Builds a `JITModule` with the W^X memory provider installed *before*
@@ -153,7 +236,9 @@ pub fn compile_jit(bytecode: &BytecodeProgram<Verified>) -> Result<JitProgram, J
 /// the handle.
 fn build_module(
     bytecode: &BytecodeProgram<Verified>,
+    cancel: &CancellationToken,
 ) -> Result<(JITModule, WxMemoryHandle, Vec<u8>), JitError> {
+    cancel.check()?;
     let program_bytes = bytecode.encode();
     let mut builder = JITBuilder::new(default_libcall_names())?;
     let (provider, memory) = WxMemoryProvider::new();
@@ -170,50 +255,33 @@ fn compile_lowered(
     memory: WxMemoryHandle,
     lowered: LoweredProgram,
     program_bytes: Vec<u8>,
+    cancel: &CancellationToken,
 ) -> Result<JitProgram, JitError> {
-    let function_count = lowered
-        .modules
-        .iter()
-        .map(|module| module.functions.len())
-        .sum();
-    let mut functions = Vec::with_capacity(function_count);
-    let mut declared_functions = std::collections::HashMap::with_capacity(function_count);
-    for (module_index, lowered_module) in lowered.modules.iter().enumerate() {
-        let module_id = lowered_module.id.get();
-        if module_id as usize != module_index {
-            return Err(JitError::InvalidLoweredModule(format!(
-                "module {module_id} appears at index {module_index}"
-            )));
-        }
-        for (function_index, function) in lowered_module.functions.iter().enumerate() {
-            let function_id = function.id.get();
-            if function_id as usize != function_index {
-                return Err(JitError::InvalidLoweredModule(format!(
-                    "module {module_id} function {function_id} appears at local index {function_index}"
-                )));
-            }
-            let declared =
-                module.declare_function(&function.symbol, Linkage::Local, &function.signature)?;
-            if declared_functions
-                .insert((module_id, function_id), declared)
-                .is_some()
-            {
-                return Err(JitError::InvalidLoweredModule(format!(
-                    "duplicate declaration for module {module_id} function {function_id}"
-                )));
-            }
-            functions.push(JitUnit {
-                module_id,
-                function_id,
-                function: declared,
-            });
-        }
+    cancel.check()?;
+    let units = crate::validate_lowered_program(&lowered)
+        .map_err(|error| JitError::InvalidLoweredModule(error.to_string()))?;
+    let mut functions = Vec::with_capacity(units.len());
+    let mut declared_functions = std::collections::HashMap::with_capacity(units.len());
+    for (module_id, function_id) in units {
+        cancel.check()?;
+        let function = &lowered.modules[module_id as usize].functions[function_id as usize];
+        let declared =
+            module.declare_function(&function.symbol, Linkage::Local, &function.signature)?;
+        cancel.check()?;
+        declared_functions.insert((module_id, function_id), declared);
+        functions.push(JitUnit {
+            module_id,
+            function_id,
+            function: declared,
+        });
     }
 
     let call_conv = module.target_config().default_call_conv;
     let mut helpers = Vec::with_capacity(bamts_native::HELPER_COUNT as usize);
     for index in 0..bamts_native::HELPER_COUNT {
+        cancel.check()?;
         let helper = Helper::from_external_index(index).ok_or(JitError::UnknownHelper { index })?;
+        cancel.check()?;
         helpers.push(module.declare_function(
             helper.symbol(),
             Linkage::Import,
@@ -222,7 +290,9 @@ fn compile_lowered(
     }
 
     for lowered_module in lowered.modules {
+        cancel.check()?;
         for function in lowered_module.functions {
+            cancel.check()?;
             let declared = declared_functions
                 .get(&(lowered_module.id.get(), function.id.get()))
                 .copied()
@@ -236,10 +306,14 @@ fn compile_lowered(
             let mut clif = function.clif;
             rebind_helper_imports(&mut clif, &helpers)?;
             let mut context = Context::for_function(clif);
+            cancel.check()?;
             module.define_function(declared, &mut context)?;
+            cancel.check()?;
         }
     }
+    cancel.check()?;
     module.finalize_definitions()?;
+    cancel.check()?;
 
     // Publication requires the receipt. `finalize_definitions` returned `Ok`, so
     // the provider reached `Executable` only after every owned mapping
@@ -341,6 +415,7 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::ToObject => bamts_native::bamts_to_object as *const u8,
         Helper::DisposeCapture => bamts_native::bamts_dispose_capture as *const u8,
         Helper::SuppressError => bamts_native::bamts_suppress_error as *const u8,
+        Helper::ResumeMode => bamts_native::bamts_resume_mode as *const u8,
     }
 }
 
@@ -371,10 +446,14 @@ mod tests {
     };
     use cranelift_module::Module as _;
 
-    use crate::{Helper, lower_program};
+    use crate::{Helper, JitError, lower_program};
 
-    use super::{JitProgram, build_module, compile_jit, compile_lowered};
+    use super::{
+        JitProgram, build_module, compile_jit, compile_jit_with_cancel, compile_jit_with_telemetry,
+        compile_jit_with_telemetry_cancel, compile_lowered,
+    };
     use crate::jit_memory::WxPhase;
+    use bamts_cancel::CancellationToken;
 
     struct SilentHost;
 
@@ -411,7 +490,7 @@ mod tests {
         ProgramModule {
             name: ConstantId::new(0),
             code: Module::new(
-                vec![Constant::String(EcmaString::from_utf8(name))],
+                vec![Constant::String(EcmaString::encode(name))],
                 vec![BytecodeFunction::new(
                     None,
                     0,
@@ -468,10 +547,10 @@ mod tests {
 
     fn callback_reentry_program() -> Program<bamts_bytecode::Verified> {
         let constants = vec![
-            Constant::String(EcmaString::from_utf8("entry")),
-            Constant::String(EcmaString::from_utf8("Array")),
-            Constant::String(EcmaString::from_utf8("prototype")),
-            Constant::String(EcmaString::from_utf8("map")),
+            Constant::String(EcmaString::encode("entry")),
+            Constant::String(EcmaString::encode("Array")),
+            Constant::String(EcmaString::encode("prototype")),
+            Constant::String(EcmaString::encode("map")),
             Constant::Int32(1),
         ];
         let entry = BytecodeFunction::new(
@@ -614,6 +693,36 @@ mod tests {
     }
 
     #[test]
+    fn compile_jit_with_telemetry_reports_wall_and_page_rounded_memory() {
+        let bytecode = two_module_program();
+        let (program, telemetry) =
+            compile_jit_with_telemetry(&bytecode).expect("host JIT compiles with telemetry");
+
+        // The program is exactly what `compile_jit` yields.
+        assert_eq!(program.entry_module(), 1);
+        assert_eq!(program.program_bytes(), bytecode.encode());
+
+        // The compile wall is a finite, non-negative measurement.
+        assert!(telemetry.jit_compile_wall_ms >= 0.0);
+        assert!(telemetry.jit_compile_wall_ms.is_finite());
+
+        // Finalized code exists, so at least one executable page was allocated,
+        // and the total is the exact sum of the per-kind, page-rounded bytes.
+        assert!(telemetry.code_bytes > 0, "generated code was allocated");
+        let page = region::page::size() as u64;
+        assert_eq!(
+            telemetry.code_bytes % page,
+            0,
+            "code bytes are page-rounded"
+        );
+        assert_eq!(
+            telemetry.total_allocated_bytes,
+            telemetry.code_bytes + telemetry.readonly_bytes + telemetry.readwrite_bytes,
+        );
+        assert!(telemetry.total_allocated_bytes >= telemetry.code_bytes);
+    }
+
+    #[test]
     fn matched_jit_program_runs_through_linked_runtime() {
         let bytecode = two_module_program();
         let program = compile_jit(&bytecode).expect("host JIT compiles every module");
@@ -630,7 +739,7 @@ mod tests {
     fn jit_charges_each_mixed_instruction_once_at_exact_boundaries() {
         let bytecode = one_function_program(
             vec![
-                Constant::String(EcmaString::from_utf8("entry")),
+                Constant::String(EcmaString::encode("entry")),
                 Constant::Int32(1),
             ],
             3,
@@ -690,7 +799,7 @@ mod tests {
     fn resumed_helper_failure_reports_suspend_pc() {
         let bytecode = one_function_program(
             vec![
-                Constant::String(EcmaString::from_utf8("entry")),
+                Constant::String(EcmaString::encode("entry")),
                 Constant::Null,
             ],
             1,
@@ -703,6 +812,7 @@ mod tests {
                     dst: Register::new(0),
                     src: Register::new(0),
                     resume: Pc::new(2),
+                    mode: Register::new(0),
                 },
                 Instruction::Halt,
             ],
@@ -722,11 +832,142 @@ mod tests {
         assert_eq!(tag, CompletionTag::FatalTrap);
         assert_eq!(frame.bytecode_pc, 1);
     }
+    /// A resume dispatcher that records the helper-call order and returns fixed
+    /// values for the resume prologue.
+    struct RecordingResume {
+        calls: std::cell::RefCell<Vec<HelperCall>>,
+        resumed_value: Value,
+        mode_value: Value,
+    }
+
+    impl RecordingResume {
+        fn new(resumed_value: Value, mode_value: Value) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                resumed_value,
+                mode_value,
+            }
+        }
+    }
+
+    impl NativeOps for RecordingResume {
+        fn truthy(&self, _frame: &mut NativeFrame<'_>, _value: Value) -> bool {
+            unreachable!("resume prologue fixture never tests truthiness")
+        }
+
+        fn dispatch(&self, _frame: &mut NativeFrame<'_>, call: HelperCall) -> HelperResult {
+            self.calls.borrow_mut().push(call);
+            match call {
+                HelperCall::LoadConstant { .. } => HelperResult::normal(Value::NULL),
+                HelperCall::ConsumeFuel { .. } => HelperResult::normal(Value::UNDEFINED),
+                HelperCall::ResumeValue => HelperResult::normal(self.resumed_value),
+                HelperCall::ResumeMode => HelperResult::normal(self.mode_value),
+                _ => panic!("unexpected helper call in resume prologue fixture: {call:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn jit_resume_prologue_calls_resume_value_then_resume_mode() {
+        let bytecode = one_function_program(
+            vec![
+                Constant::String(EcmaString::encode("entry")),
+                Constant::Null,
+            ],
+            2,
+            vec![
+                Instruction::LoadConst {
+                    dst: Register::new(0),
+                    constant: ConstantId::new(1),
+                },
+                Instruction::Suspend {
+                    dst: Register::new(0),
+                    src: Register::new(0),
+                    resume: Pc::new(2),
+                    mode: Register::new(1),
+                },
+                Instruction::Halt,
+            ],
+            Vec::new(),
+        );
+        let program = compile_jit(&bytecode).expect("suspend program compiles");
+        let mut registers = [Value::UNINITIALIZED; 2];
+        let mut frame = ShadowFrame::new(core::ptr::null_mut(), 0, 0, registers.as_mut_ptr(), 2);
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let mut ops = RecordingResume::new(Value::int32(42), Value::int32(2));
+
+        // Fresh call: token 0 yields the value and suspends.
+        let tag = with_native_ops(&mut ops, || {
+            program.invoke(0, 0, &mut frame, &mut completion)
+        })
+        .expect("compiled entry is registered");
+        assert_eq!(tag, CompletionTag::Suspend);
+
+        // Resume: token 2 enters the resume prologue.
+        frame.bytecode_pc = 2;
+        let mut completion = Completion::new(Value::UNDEFINED);
+        let tag = with_native_ops(&mut ops, || {
+            program.invoke(0, 0, &mut frame, &mut completion)
+        })
+        .expect("compiled resume entry is registered");
+        assert_eq!(tag, CompletionTag::Normal);
+
+        let calls = ops.calls.into_inner();
+        let value_pos = calls
+            .iter()
+            .position(|c| matches!(c, HelperCall::ResumeValue))
+            .expect("ResumeValue called");
+        let mode_pos = calls
+            .iter()
+            .position(|c| matches!(c, HelperCall::ResumeMode))
+            .expect("ResumeMode called");
+        assert!(
+            value_pos < mode_pos,
+            "ResumeValue must be called before ResumeMode:\n{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, HelperCall::ResumeValue))
+                .count(),
+            1,
+            "ResumeValue called exactly once"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, HelperCall::ResumeMode))
+                .count(),
+            1,
+            "ResumeMode called exactly once"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, HelperCall::LoadConstant { .. }))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, HelperCall::ConsumeFuel { .. }))
+        );
+        assert_eq!(
+            registers[0],
+            Value::int32(42),
+            "resumed value stored into dst"
+        );
+        assert_eq!(
+            registers[1],
+            Value::int32(2),
+            "resume mode stored into mode"
+        );
+        assert_eq!(frame.bytecode_pc, 2, "resume continues at the resume pc");
+    }
 
     #[test]
     fn jit_jump_to_self_exhausts_fuel() {
         let bytecode = one_function_program(
-            vec![Constant::String(EcmaString::from_utf8("entry"))],
+            vec![Constant::String(EcmaString::encode("entry"))],
             0,
             vec![Instruction::Jump { target: Pc::new(0) }],
             Vec::new(),
@@ -826,7 +1067,7 @@ mod tests {
     fn jit_fuel_exhaustion_bypasses_bytecode_handler() {
         let bytecode = one_function_program(
             vec![
-                Constant::String(EcmaString::from_utf8("entry")),
+                Constant::String(EcmaString::encode("entry")),
                 Constant::Undefined,
             ],
             1,
@@ -865,10 +1106,10 @@ mod tests {
     fn jit_zero_fuel_prevents_stdout_side_effects() {
         let bytecode = one_function_program(
             vec![
-                Constant::String(EcmaString::from_utf8("entry")),
-                Constant::String(EcmaString::from_utf8("console")),
-                Constant::String(EcmaString::from_utf8("log")),
-                Constant::String(EcmaString::from_utf8("hello")),
+                Constant::String(EcmaString::encode("entry")),
+                Constant::String(EcmaString::encode("console")),
+                Constant::String(EcmaString::encode("log")),
+                Constant::String(EcmaString::encode("hello")),
             ],
             6,
             vec![
@@ -953,9 +1194,11 @@ mod tests {
     #[test]
     fn compiled_jit_program_owns_executable_receipt_and_drops_to_freed() {
         let bytecode = two_module_program();
-        let (module, memory, program_bytes) = build_module(&bytecode).expect("module builds");
+        let cancel = CancellationToken::new();
+        let (module, memory, program_bytes) =
+            build_module(&bytecode, &cancel).expect("module builds");
         let lowered = lower_program(&bytecode, module.target_config()).expect("program lowers");
-        let program = compile_lowered(module, memory.clone(), lowered, program_bytes)
+        let program = compile_lowered(module, memory.clone(), lowered, program_bytes, &cancel)
             .expect("host JIT compiles");
 
         // The program was published, so it owns an executable receipt.
@@ -1005,12 +1248,14 @@ mod tests {
     #[test]
     fn compile_lowered_rejects_out_of_order_function_identity() {
         let bytecode = callback_reentry_program();
-        let (module, memory, program_bytes) = build_module(&bytecode).expect("module builds");
+        let cancel = CancellationToken::new();
+        let (module, memory, program_bytes) =
+            build_module(&bytecode, &cancel).expect("module builds");
         let mut lowered = lower_program(&bytecode, module.target_config()).expect("program lowers");
         lowered.modules[0].functions.swap(0, 1);
 
         assert!(matches!(
-            compile_lowered(module, memory, lowered, program_bytes),
+            compile_lowered(module, memory, lowered, program_bytes, &cancel),
             Err(super::JitError::InvalidLoweredModule(message))
                 if message.contains("function 1 appears at local index 0")
         ));
@@ -1022,13 +1267,13 @@ mod tests {
             name: ConstantId::new(0),
             code: Module::new(
                 vec![
-                    Constant::String(EcmaString::from_utf8("root")),
-                    Constant::String(EcmaString::from_utf8("./target")),
-                    Constant::String(EcmaString::from_utf8("then")),
-                    Constant::String(EcmaString::from_utf8("console")),
-                    Constant::String(EcmaString::from_utf8("log")),
+                    Constant::String(EcmaString::encode("root")),
+                    Constant::String(EcmaString::encode("./target")),
+                    Constant::String(EcmaString::encode("then")),
+                    Constant::String(EcmaString::encode("console")),
+                    Constant::String(EcmaString::encode("log")),
                     Constant::Int32(0),
-                    Constant::String(EcmaString::from_utf8("value")),
+                    Constant::String(EcmaString::encode("value")),
                 ],
                 vec![
                     BytecodeFunction::new(
@@ -1155,9 +1400,9 @@ mod tests {
             name: ConstantId::new(0),
             code: Module::new(
                 vec![
-                    Constant::String(EcmaString::from_utf8("target")),
+                    Constant::String(EcmaString::encode("target")),
                     Constant::Int32(7),
-                    Constant::String(EcmaString::from_utf8("value")),
+                    Constant::String(EcmaString::encode("value")),
                 ],
                 vec![BytecodeFunction::new(
                     None,
@@ -1208,5 +1453,23 @@ mod tests {
             .expect("JIT resolves local ImportDynamic");
         assert_eq!(outcome.exit_code, interpreter.outcome.exit_code);
         assert_eq!(jit_host.stdout, interpreter_host.stdout);
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_compile_jit() {
+        let bytecode = two_module_program();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = compile_jit_with_cancel(&bytecode, &cancel);
+        assert!(matches!(result, Err(JitError::Cancelled)));
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_compile_jit_with_telemetry() {
+        let bytecode = two_module_program();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = compile_jit_with_telemetry_cancel(&bytecode, &cancel);
+        assert!(matches!(result, Err(JitError::Cancelled)));
     }
 }

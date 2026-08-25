@@ -77,22 +77,24 @@
 //!
 //! ## Resume contract (async / generators)
 //!
-//! Two suspension primitives share one wire and CFG shape
-//! (`{ dst, src, resume }`): [`Instruction::Suspend`] is the `yield` form
-//! (including delegated `yield*`) and [`Instruction::Await`] is the `await`
-//! form, so an async-generator body can tell its two suspension kinds apart.
-//! [`FunctionFlags::is_async`] and [`FunctionFlags::is_generator`] select *how*
-//! a suspension is driven, but the contract is identical for both opcodes:
+//! [`Instruction::Suspend`] carries `{ dst, src, resume, mode }` for generator
+//! `yield`, while [`Instruction::Await`] retains `{ dst, src, resume }` for an
+//! awaited operand. Both suspension primitives have the same single-successor
+//! CFG shape, but only a generator suspension receives an engine-written resume
+//! completion mode. [`FunctionFlags::is_async`] and
+//! [`FunctionFlags::is_generator`] select *how* a suspension is driven:
 //!
 //! 1. The activation yields the value in `src` (a produced item for a
 //!    generator `yield`; an awaited operand for `await`) to its driver.
 //! 2. When the driver resumes the activation, control continues at `resume`
-//!    with the resumed value written to `dst` (the argument of `.next(v)` for a
-//!    generator; the settled result of the awaited value for `await`).
-//! 3. `resume` is a normal CFG successor and the only successor of either
-//!    suspension opcode, so the definite-initialization witness treats every
-//!    register live across a suspension as it would across any join: `dst` is
-//!    initialized on the resume edge, and registers not provably initialized
+//!    with the resumed value written to `dst`. A generator suspension also
+//!    receives [`RESUME_NEXT`], [`RESUME_THROW`], or [`RESUME_RETURN`] in
+//!    `mode`; the compiler dispatches that completion inside the suspended
+//!    body's protected ranges.
+//! 3. `resume` is the only CFG successor of either suspension opcode, so the
+//!    definite-initialization witness treats every register live across a
+//!    suspension as it would across any join: `dst` (and `mode` for `Suspend`)
+//!    is initialized on the resume edge, and registers not provably initialized
 //!    before the suspension are not assumed initialized after it.
 //!
 //! A generator's completion is an ordinary [`Instruction::Return`]; an uncaught
@@ -118,7 +120,7 @@ use std::marker::PhantomData;
 /// `BMTBC\0\0\1`, matching `Bamti.Bytecode.magicBytes`.
 pub const MAGIC: [u8; 8] = [66, 77, 84, 66, 67, 0, 0, 1];
 /// The sole supported wire version.
-pub const FORMAT_VERSION: u8 = 4;
+pub const FORMAT_VERSION: u8 = 5;
 
 /// Structural verify-time ceiling on a function's register count. Generous
 /// enough for real code yet bounds definite-initialization bitset allocation.
@@ -198,6 +200,74 @@ pub use program::{
     ProgramDecodeLimits, ProgramLoadError, ProgramModule, ProgramVerifyError,
     ProgramVerifyErrorKind, ResolvedExport, decode_program, decode_verified_program,
 };
+
+/// Formats one IEEE-754 number with ECMAScript `Number::toString` semantics.
+#[must_use]
+pub fn format_number(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_owned();
+    }
+    if number == f64::INFINITY {
+        return "Infinity".to_owned();
+    }
+    if number == f64::NEG_INFINITY {
+        return "-Infinity".to_owned();
+    }
+    if number == 0.0 {
+        return "0".to_owned();
+    }
+
+    let negative = number.is_sign_negative();
+    let raw = number.abs().to_string();
+    let (mantissa, explicit_exponent) = match raw.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i32>()
+                .expect("Rust formats finite f64 exponents as i32"),
+        ),
+        None => (raw.as_str(), 0),
+    };
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
+    let untrimmed: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let first = untrimmed
+        .find(|ch| ch != '0')
+        .expect("a nonzero number has a nonzero decimal digit");
+    let digits = untrimmed[first..].trim_end_matches('0');
+    let exponent = explicit_exponent + decimal as i32 - first as i32 - 1;
+
+    let mut result = String::new();
+    if negative {
+        result.push('-');
+    }
+    if !(-6..21).contains(&exponent) {
+        result.push(digits.as_bytes()[0] as char);
+        if digits.len() > 1 {
+            result.push('.');
+            result.push_str(&digits[1..]);
+        }
+        result.push('e');
+        if exponent >= 0 {
+            result.push('+');
+        }
+        result.push_str(&exponent.to_string());
+    } else if exponent >= 0 {
+        let integer_digits = exponent as usize + 1;
+        if digits.len() <= integer_digits {
+            result.push_str(digits);
+            result.extend(std::iter::repeat_n('0', integer_digits - digits.len()));
+        } else {
+            result.push_str(&digits[..integer_digits]);
+            result.push('.');
+            result.push_str(&digits[integer_digits..]);
+        }
+    } else {
+        result.push_str("0.");
+        result.extend(std::iter::repeat_n('0', (-exponent - 1) as usize));
+        result.push_str(digits);
+    }
+    result
+}
 
 /// Canonical IEEE-754 bits. Every positive or negative NaN payload collapses
 /// to the unique arithmetic NaN from `Bamti.canonical_nan`.
@@ -560,6 +630,13 @@ impl DescriptorSlot {
     }
 }
 
+/// Normal generator resumption (`Generator.prototype.next`).
+pub const RESUME_NEXT: i32 = 0;
+/// Abrupt throw resumption (`Generator.prototype.throw`).
+pub const RESUME_THROW: i32 = 1;
+/// Abrupt return resumption (`Generator.prototype.return`).
+pub const RESUME_RETURN: i32 = 2;
+
 /// The production instruction algebra. Existing opcodes 0..=50 retain stable
 /// wire tags; later instructions append new tags without reinterpreting them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -808,16 +885,17 @@ pub enum Instruction {
     /// Throw `value` (terminator; caught by an enclosing handler if any).
     Throw { value: Register },
     /// Yield `src` (the `yield` form, including delegated `yield*`) and resume
-    /// at `resume`, receiving the resumed value in `dst` (refines the formal
-    /// `Suspend`). See the module-level resume contract.
+    /// at `resume`, receiving the resumed value in `dst` and the engine-defined
+    /// completion mode in `mode`. See the module-level resume contract.
     Suspend {
         dst: Register,
         src: Register,
         resume: Pc,
+        mode: Register,
     },
     /// Await the operand in `src` and resume at `resume`, receiving the
-    /// settled value in `dst`. Identical register and CFG shape to
-    /// [`Instruction::Suspend`], which remains the `yield` form; keeping the
+    /// settled value in `dst`. It shares [`Instruction::Suspend`]'s CFG shape
+    /// but has no completion-mode destination; keeping the
     /// opcodes distinct lets an async-generator body tell `await` from
     /// `yield`. See the module-level resume contract.
     Await {
@@ -973,8 +1051,9 @@ impl Instruction {
     }
 
     /// Visits each register this instruction defines: zero, one, or two.
-    /// [`Instruction::IteratorNext`], [`Instruction::IteratorResult`], and
-    /// [`Instruction::IteratorClose`] are the two-write opcodes.
+    /// [`Instruction::IteratorNext`], [`Instruction::IteratorResult`],
+    /// [`Instruction::IteratorClose`], and [`Instruction::Suspend`] are the
+    /// two-write opcodes.
     fn visit_writes(self, mut visit: impl FnMut(Register)) {
         match self {
             Self::LoadConst { dst, .. }
@@ -1003,11 +1082,14 @@ impl Instruction {
             | Self::CreateRegExp { dst, .. }
             | Self::GetIterator { dst, .. }
             | Self::IteratorStep { dst, .. }
-            | Self::Suspend { dst, .. }
             | Self::Await { dst, .. }
             | Self::Import { dst, .. }
             | Self::ImportDynamic { dst, .. }
             | Self::SuppressError { dst, .. } => visit(dst),
+            Self::Suspend { dst, mode, .. } => {
+                visit(dst);
+                visit(mode);
+            }
             Self::IteratorNext { done, value, .. } | Self::IteratorResult { done, value, .. } => {
                 visit(done);
                 visit(value);
@@ -1478,6 +1560,12 @@ pub enum VerifyErrorKind {
     AliasedIteratorCloseOutputs {
         register: Register,
     },
+    AliasedIteratorNextOutputs {
+        register: Register,
+    },
+    AliasedIteratorResultOutputs {
+        register: Register,
+    },
     AliasedDisposeCaptureOutputs {
         register: Register,
     },
@@ -1600,6 +1688,16 @@ impl fmt::Display for VerifyError {
             VerifyErrorKind::AliasedIteratorCloseOutputs { register } => write!(
                 formatter,
                 "iterator close result and called outputs alias register {}",
+                register.get()
+            ),
+            VerifyErrorKind::AliasedIteratorNextOutputs { register } => write!(
+                formatter,
+                "iterator next done and value outputs alias register {}",
+                register.get()
+            ),
+            VerifyErrorKind::AliasedIteratorResultOutputs { register } => write!(
+                formatter,
+                "iterator result done and value outputs alias register {}",
                 register.get()
             ),
             VerifyErrorKind::AliasedDisposeCaptureOutputs { register } => write!(
@@ -2139,6 +2237,13 @@ fn verify_instruction(
             check_register(done)?;
             check_register(value)?;
             check_register(iterator)?;
+            if done == value {
+                return Err(instruction_error(
+                    function_index,
+                    pc,
+                    VerifyErrorKind::AliasedIteratorNextOutputs { register: done },
+                ));
+            }
         }
         Instruction::IteratorStep { dst, iterator } => {
             check_register(dst)?;
@@ -2152,6 +2257,13 @@ fn verify_instruction(
             check_register(done)?;
             check_register(value)?;
             check_register(result)?;
+            if done == value {
+                return Err(instruction_error(
+                    function_index,
+                    pc,
+                    VerifyErrorKind::AliasedIteratorResultOutputs { register: done },
+                ));
+            }
         }
         Instruction::IteratorClose {
             result,
@@ -2204,7 +2316,18 @@ fn verify_instruction(
             verify_target(function_index, pc, target, code_len)?;
         }
         Instruction::Return { value } | Instruction::Throw { value } => check_register(value)?,
-        Instruction::Suspend { dst, src, resume } | Instruction::Await { dst, src, resume } => {
+        Instruction::Suspend {
+            dst,
+            src,
+            resume,
+            mode,
+        } => {
+            check_register(dst)?;
+            check_register(src)?;
+            check_register(mode)?;
+            verify_target(function_index, pc, resume, code_len)?;
+        }
+        Instruction::Await { dst, src, resume } => {
             check_register(dst)?;
             check_register(src)?;
             verify_target(function_index, pc, resume, code_len)?;
@@ -2374,7 +2497,6 @@ pub enum DecodeErrorKind {
     UnsupportedVersion {
         version: u8,
     },
-    MalformedInteger,
     NonCanonicalInteger,
     IntegerOverflow,
     InvalidConstantTag {
@@ -2437,7 +2559,6 @@ impl fmt::Display for DecodeError {
             DecodeErrorKind::UnsupportedVersion { version } => {
                 write!(formatter, "unsupported format version {version}")
             }
-            DecodeErrorKind::MalformedInteger => formatter.write_str("malformed LEB128 integer"),
             DecodeErrorKind::NonCanonicalInteger => {
                 formatter.write_str("noncanonical (overlong) LEB128 integer")
             }
@@ -2848,6 +2969,7 @@ impl<'a> Decoder<'a> {
                 dst: Register::new(self.leb128()?),
                 src: Register::new(self.leb128()?),
                 resume: Pc::new(self.leb128()?),
+                mode: Register::new(self.leb128()?),
             }),
             33 => Ok(Instruction::Import {
                 dst: Register::new(self.leb128()?),
@@ -3008,31 +3130,24 @@ impl<'a> Decoder<'a> {
     /// overlong (trailing-zero) encodings, and values exceeding 32 bits.
     fn leb128(&mut self) -> Result<u32, DecodeError> {
         let start = self.offset;
-        let mut result: u32 = 0;
-        let mut shift: u32 = 0;
-        loop {
-            let byte = self.byte()?;
-            if shift == 28 {
-                // Fifth group: only the low four bits may be set, and the
-                // continuation bit must be clear (else overflow); a zero final
-                // group would be overlong.
-                if byte & 0x80 != 0 || byte > 0x0f {
-                    return Err(self.error(start, DecodeErrorKind::IntegerOverflow));
+        crate::program::read_leb128(self.bytes, &mut self.offset).map_err(|error| {
+            // EOF is reported where the missing byte belongs (current offset);
+            // overflow and noncanonical encoding are reported at the integer's
+            // start, matching the original decoder's diagnostics.
+            let offset = match error {
+                crate::program::Leb128Error::UnexpectedEof => self.offset,
+                crate::program::Leb128Error::IntegerOverflow
+                | crate::program::Leb128Error::NonCanonicalInteger => start,
+            };
+            let kind = match error {
+                crate::program::Leb128Error::UnexpectedEof => DecodeErrorKind::UnexpectedEof,
+                crate::program::Leb128Error::IntegerOverflow => DecodeErrorKind::IntegerOverflow,
+                crate::program::Leb128Error::NonCanonicalInteger => {
+                    DecodeErrorKind::NonCanonicalInteger
                 }
-                if byte == 0 {
-                    return Err(self.error(start, DecodeErrorKind::NonCanonicalInteger));
-                }
-                return Ok(result | (u32::from(byte) << 28));
-            }
-            result |= u32::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                if byte == 0 && self.offset - start > 1 {
-                    return Err(self.error(start, DecodeErrorKind::NonCanonicalInteger));
-                }
-                return Ok(result);
-            }
-            shift += 7;
-        }
+            };
+            self.error(offset, kind)
+        })
     }
 
     fn cap(&self, count: u32) -> usize {
@@ -3342,11 +3457,17 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             output.push(31);
             write_u32(value.get(), output);
         }
-        Instruction::Suspend { dst, src, resume } => {
+        Instruction::Suspend {
+            dst,
+            src,
+            resume,
+            mode,
+        } => {
             output.push(32);
             write_u32(dst.get(), output);
             write_u32(src.get(), output);
             write_u32(resume.get(), output);
+            write_u32(mode.get(), output);
         }
         Instruction::Import { dst, specifier } => {
             output.push(33);
@@ -3492,6 +3613,27 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn format_number_truth_table() {
+        let cases = [
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e21, "1e+21"),
+            (-0.0, "0"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (1e-6, "0.000001"),
+            (1e-7, "1e-7"),
+            (9_007_199_254_740_991.0, "9007199254740991"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (9_007_199_254_740_992.0, "9007199254740992"),
+            (1e20, "100000000000000000000"),
+        ];
+        for (number, expected) in cases {
+            assert_eq!(format_number(number), expected);
+        }
+    }
+
     fn flags() -> FunctionFlags {
         FunctionFlags::default()
     }
@@ -3519,19 +3661,19 @@ mod tests {
     /// * handler over [0,34) catches into r25
     fn rich_module() -> Module<Unverified> {
         let constants = vec![
-            Constant::String(EcmaString::from_utf8("main")), // 0: function name + key string
-            Constant::Int32(21),                             // 1
-            Constant::Number(NumberBits::from_f64(1.5)),     // 2
+            Constant::String(EcmaString::encode("main")), // 0: function name + key string
+            Constant::Int32(21),                          // 1
+            Constant::Number(NumberBits::from_f64(1.5)),  // 2
             Constant::BigInt(BigIntLiteral::new("-1234567890123".to_owned()).unwrap()), // 3
-            Constant::Boolean(true),                         // 4
-            Constant::Null,                                  // 5
-            Constant::Undefined,                             // 6
-            Constant::String(EcmaString::from_utf8("./dep")), // 7: import specifier
-            Constant::String(EcmaString::from_utf8("g")),    // 8: global name
-            Constant::String(EcmaString::from_utf8("#p")),   // 9: private description
-            Constant::String(EcmaString::from_utf8("ab")),   // 10: regexp pattern
-            Constant::String(EcmaString::from_utf8("gi")),   // 11: regexp flags
-            Constant::String(EcmaString::from_utf8("x")),    // 12: export name
+            Constant::Boolean(true),                      // 4
+            Constant::Null,                               // 5
+            Constant::Undefined,                          // 6
+            Constant::String(EcmaString::encode("./dep")), // 7: import specifier
+            Constant::String(EcmaString::encode("g")),    // 8: global name
+            Constant::String(EcmaString::encode("#p")),   // 9: private description
+            Constant::String(EcmaString::encode("ab")),   // 10: regexp pattern
+            Constant::String(EcmaString::encode("gi")),   // 11: regexp flags
+            Constant::String(EcmaString::encode("x")),    // 12: export name
         ];
         let code = vec![
             Instruction::LoadConst {
@@ -3666,6 +3808,7 @@ mod tests {
                 dst: Register::new(24),
                 src: Register::new(22),
                 resume: Pc::new(31),
+                mode: Register::new(25),
             },
             Instruction::JumpIfTrue {
                 condition: Register::new(21),
@@ -3862,6 +4005,7 @@ mod tests {
                 dst: Register::new(68),
                 src: Register::new(69),
                 resume: Pc::new(70),
+                mode: Register::new(71),
             },
             Instruction::Import {
                 dst: Register::new(71),
@@ -3970,6 +4114,28 @@ mod tests {
             assert_eq!(decoded, instruction, "{instruction:?} round-trips");
             assert_eq!(decoder.offset, bytes.len(), "consumes exactly its bytes");
         }
+    }
+
+    #[test]
+    fn suspend_wire_round_trip_preserves_mode() {
+        let instruction = Instruction::Suspend {
+            dst: Register::new(1),
+            src: Register::new(2),
+            resume: Pc::new(3),
+            mode: Register::new(4),
+        };
+        let mut bytes = Vec::new();
+        encode_instruction(instruction, &mut bytes);
+        assert_eq!(bytes, vec![32, 1, 2, 3, 4]);
+        let limits = DecodeLimits::default();
+        let mut decoder = Decoder {
+            bytes: &bytes,
+            offset: 0,
+            limits: &limits,
+            total_instructions: 0,
+        };
+        assert_eq!(decoder.instruction().expect("Suspend decodes"), instruction);
+        assert_eq!(decoder.offset, bytes.len());
     }
 
     #[test]
@@ -4198,6 +4364,16 @@ mod tests {
                 offset: 8,
                 kind: DecodeErrorKind::UnsupportedVersion { version: 3 },
             })
+        );
+        let mut version_four = rich_module().verify().expect("valid module").encode();
+        version_four[MAGIC.len()] = 4;
+        assert_eq!(
+            decode(&version_four, &DecodeLimits::default()),
+            Err(DecodeError {
+                offset: 8,
+                kind: DecodeErrorKind::UnsupportedVersion { version: 4 },
+            }),
+            "v4 artifacts are rejected after the Suspend wire grows"
         );
     }
 
@@ -5888,6 +6064,70 @@ mod tests {
     }
 
     #[test]
+    fn verifier_rejects_aliased_iterator_next_outputs() {
+        let register = Register::new(1);
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::IteratorNext {
+                        done: register,
+                        value: register,
+                        iterator: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::AliasedIteratorNextOutputs { register: found },
+                ..
+            }) if found == register
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_aliased_iterator_result_outputs() {
+        let register = Register::new(1);
+        let module = Module::new(
+            vec![],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::IteratorResult {
+                        done: register,
+                        value: register,
+                        result: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::AliasedIteratorResultOutputs { register: found },
+                ..
+            }) if found == register
+        ));
+    }
+
+    #[test]
     fn to_object_reads_source_before_writing_destination() {
         let valid = Module::new(
             vec![Constant::Int32(7)],
@@ -6604,6 +6844,87 @@ mod tests {
                 kind: VerifyErrorKind::ReadBeforeWrite { .. },
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn suspend_initializes_value_and_mode_on_resume() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                3,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::Suspend {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        resume: Pc::new(2),
+                        mode: Register::new(2),
+                    },
+                    Instruction::Return {
+                        value: Register::new(2),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        let verified = module.verify().expect("Suspend mode is engine-defined");
+        let certificate = verified.certificate(FunctionId::new(0)).unwrap();
+        assert_eq!(
+            certificate.initialized_before(Pc::new(2), Register::new(1)),
+            Some(true),
+            "resumed value is initialized on the resume edge"
+        );
+        assert_eq!(
+            certificate.initialized_before(Pc::new(2), Register::new(2)),
+            Some(true),
+            "resume mode is initialized on the resume edge"
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_out_of_bounds_suspend_mode() {
+        let module = Module::new(
+            vec![Constant::Int32(0)],
+            vec![Function::new(
+                None,
+                0,
+                0,
+                2,
+                flags(),
+                vec![
+                    Instruction::LoadConst {
+                        dst: Register::new(0),
+                        constant: ConstantId::new(0),
+                    },
+                    Instruction::Suspend {
+                        dst: Register::new(1),
+                        src: Register::new(0),
+                        resume: Pc::new(2),
+                        mode: Register::new(2),
+                    },
+                    Instruction::Return {
+                        value: Register::new(1),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            module.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::RegisterOutOfBounds { register, .. },
+                ..
+            }) if register == Register::new(2)
         ));
     }
 }

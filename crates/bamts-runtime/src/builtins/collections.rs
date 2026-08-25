@@ -9,8 +9,9 @@ use super::{
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     CollectionKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
-    PropertyMap,
+    PropertyMap, ResumeCompletion,
 };
+use bamts_bytecode::IteratorKind;
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -29,6 +30,7 @@ fn install_map<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    builtins.set_map_prototype(prototype);
     let constructor = install_function(heap, builtins, "Map", 0, map_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -49,9 +51,9 @@ fn install_map<H: Host>(
     define_getter(heap, prototype, "size", size);
     let entries = named_property(heap, prototype, "entries");
     define_symbol(heap, prototype, builtins.symbol_iterator(), entries);
-    let map_tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Map")));
+    let map_tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Map")));
     define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), map_tag);
-    globals.insert(EcmaString::from_utf8("Map"), constructor);
+    globals.insert(EcmaString::encode("Map"), constructor);
 }
 
 fn install_set<H: Host>(
@@ -60,6 +62,7 @@ fn install_set<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    builtins.set_set_prototype(prototype);
     let constructor = install_function(heap, builtins, "Set", 0, set_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -79,9 +82,9 @@ fn install_set<H: Host>(
     define_getter(heap, prototype, "size", size);
     let values = named_property(heap, prototype, "values");
     define_symbol(heap, prototype, builtins.symbol_iterator(), values);
-    let set_tag = super::super::push(heap, HeapEntry::String(EcmaString::from_utf8("Set")));
+    let set_tag = super::super::push(heap, HeapEntry::String(EcmaString::encode("Set")));
     define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), set_tag);
-    globals.insert(EcmaString::from_utf8("Set"), constructor);
+    globals.insert(EcmaString::encode("Set"), constructor);
 }
 
 fn install_weak_map<H: Host>(
@@ -90,6 +93,7 @@ fn install_weak_map<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    builtins.set_weak_map_prototype(prototype);
     let constructor = install_function(heap, builtins, "WeakMap", 0, weak_map_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -101,7 +105,7 @@ fn install_weak_map<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert(EcmaString::from_utf8("WeakMap"), constructor);
+    globals.insert(EcmaString::encode("WeakMap"), constructor);
 }
 
 fn install_weak_set<H: Host>(
@@ -110,6 +114,7 @@ fn install_weak_set<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
+    builtins.set_weak_set_prototype(prototype);
     let constructor = install_function(heap, builtins, "WeakSet", 0, weak_set_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -120,7 +125,7 @@ fn install_weak_set<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert(EcmaString::from_utf8("WeakSet"), constructor);
+    globals.insert(EcmaString::encode("WeakSet"), constructor);
 }
 
 pub(super) fn install_iterator_prototype<H: Host>(
@@ -162,8 +167,14 @@ pub(super) fn install_generator_prototype<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.iterator_prototype()));
-    let next = install_function(heap, builtins, "next", 1, generator_next::<H>);
-    define_data(heap, prototype, "next", next);
+    for (name, handler) in [
+        ("next", generator_next::<H> as BuiltinHandler<H>),
+        ("return", generator_return::<H> as BuiltinHandler<H>),
+        ("throw", generator_throw::<H> as BuiltinHandler<H>),
+    ] {
+        let function = install_function(heap, builtins, name, 1, handler);
+        define_data(heap, prototype, name, function);
+    }
     builtins.set_generator_prototype(prototype);
 }
 
@@ -172,9 +183,19 @@ pub(super) fn install_async_generator_prototype<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
-    let next = install_function(heap, builtins, "next", 1, async_generator_next::<H>);
-    define_data(heap, prototype, "next", next);
+    for (name, handler) in [
+        ("next", async_generator_next::<H> as BuiltinHandler<H>),
+        ("return", async_generator_return::<H> as BuiltinHandler<H>),
+        ("throw", async_generator_throw::<H> as BuiltinHandler<H>),
+    ] {
+        let function = install_function(heap, builtins, name, 1, handler);
+        define_data(heap, prototype, name, function);
+    }
     builtins.set_async_generator_prototype(prototype);
+}
+
+fn resume_value(args: &[Value]) -> Value {
+    args.first().copied().unwrap_or(Value::UNDEFINED)
 }
 
 fn async_generator_next<H: Host>(
@@ -183,9 +204,33 @@ fn async_generator_next<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    Ok(BuiltinOutcome::AsyncGeneratorNext {
+    Ok(BuiltinOutcome::AsyncGeneratorResume {
         generator: this,
-        resume_value: args.first().copied().unwrap_or(Value::UNDEFINED),
+        completion: ResumeCompletion::Next(resume_value(args)),
+    })
+}
+
+fn async_generator_return<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::AsyncGeneratorResume {
+        generator: this,
+        completion: ResumeCompletion::Return(resume_value(args)),
+    })
+}
+
+fn async_generator_throw<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::AsyncGeneratorResume {
+        generator: this,
+        completion: ResumeCompletion::Throw(resume_value(args)),
     })
 }
 
@@ -195,9 +240,33 @@ fn generator_next<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    Ok(BuiltinOutcome::GeneratorNext {
+    Ok(BuiltinOutcome::GeneratorResume {
         generator: this,
-        resume_value: args.first().copied().unwrap_or(Value::UNDEFINED),
+        completion: ResumeCompletion::Next(resume_value(args)),
+    })
+}
+
+fn generator_return<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::GeneratorResume {
+        generator: this,
+        completion: ResumeCompletion::Return(resume_value(args)),
+    })
+}
+
+fn generator_throw<H: Host>(
+    _machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    Ok(BuiltinOutcome::GeneratorResume {
+        generator: this,
+        completion: ResumeCompletion::Throw(resume_value(args)),
     })
 }
 
@@ -268,7 +337,25 @@ fn iterator_next<H: Host>(
                         })
                     })
                 }
+                HeapEntry::Uint8Array { bytes, .. } => {
+                    usize::try_from(cursor).ok().and_then(|index| {
+                        bytes.get(index).map(|byte| {
+                            let next = cursor
+                                .checked_add(1)
+                                .expect("typed-array bounds keep positions below u64::MAX");
+                            (
+                                next,
+                                crate::number_value(index as f64),
+                                Value::int32(u32::from(*byte)),
+                            )
+                        })
+                    })
+                }
                 HeapEntry::Collection { entries, .. } => {
+                    debug_assert!(
+                        entries.windows(2).all(|w| w[0].order <= w[1].order),
+                        "collection entries must stay sorted ascending by order"
+                    );
                     let index = entries.partition_point(|entry| entry.order < cursor);
                     entries[index..]
                         .iter()
@@ -359,20 +446,72 @@ fn map_like_constructor<H: Host>(
         .copied()
         .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)))
     {
-        let entries = machine.iterable_values(source)?;
-        for entry in entries {
-            if !machine.is_object(entry) {
-                return Err(type_error("Iterator value is not an entry object"));
+        let depth = machine.native_roots.len();
+        machine.push_native_roots(depth, &[object, source]);
+        let result: Result<(), EvalFailure> = (|| {
+            let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
+            loop {
+                machine.refresh_native_roots(depth, &[object, iterator]);
+                let (done, entry) = machine.iterator_next(iterator)?;
+                if done {
+                    break;
+                }
+                machine.refresh_native_roots(depth, &[object, iterator, entry]);
+                let inserted = (|| {
+                    if !machine.is_object(entry) {
+                        return Err(type_error("Iterator value is not an entry object"));
+                    }
+                    let key = machine.get_named_property(entry, "0")?;
+                    machine.refresh_native_roots(depth, &[object, iterator, entry, key]);
+                    let value = machine.get_named_property(entry, "1")?;
+                    machine.refresh_native_roots(depth, &[object, iterator, entry, key, value]);
+                    if kind == CollectionKind::WeakMap {
+                        require_weak_key(machine, key)?;
+                    }
+                    map_put(machine, object, key, value, kind)
+                })();
+                if let Err(failure) = inserted {
+                    return Err(close_rooted_collection_iterator(
+                        machine, depth, object, iterator, failure,
+                    ));
+                }
             }
-            let key = machine.get_named_property(entry, "0")?;
-            let value = machine.get_named_property(entry, "1")?;
-            if kind == CollectionKind::WeakMap {
-                require_weak_key(machine, key)?;
-            }
-            map_put(machine, object, key, value, kind)?;
-        }
+            Ok(())
+        })();
+        machine.pop_native_roots(depth);
+        result?;
     }
     Ok(BuiltinOutcome::Value(object))
+}
+
+pub(super) fn close_iterator_preserving_failure<H: Host>(
+    machine: &mut Machine<'_, H>,
+    iterator: Value,
+    failure: EvalFailure,
+) -> EvalFailure {
+    let (close, _) = machine.close_iterator_raw(iterator);
+    match close {
+        Err(EvalFailure::Runtime(kind)) => EvalFailure::Runtime(kind),
+        _ => failure,
+    }
+}
+
+fn close_rooted_collection_iterator<H: Host>(
+    machine: &mut Machine<'_, H>,
+    depth: usize,
+    object: Value,
+    iterator: Value,
+    failure: EvalFailure,
+) -> EvalFailure {
+    match &failure {
+        EvalFailure::ThrowValue(value) | EvalFailure::ThrowValueOrigin { value, .. } => {
+            machine.refresh_native_roots(depth, &[object, iterator, *value]);
+        }
+        EvalFailure::Throw(_) | EvalFailure::Runtime(_) => {
+            machine.refresh_native_roots(depth, &[object, iterator]);
+        }
+    }
+    close_iterator_preserving_failure(machine, iterator, failure)
 }
 
 fn set_like_constructor<H: Host>(
@@ -390,13 +529,33 @@ fn set_like_constructor<H: Host>(
         .copied()
         .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)))
     {
-        let values = machine.iterable_values(source)?;
-        for value in values {
-            if kind == CollectionKind::WeakSet {
-                require_weak_key(machine, value)?;
+        let depth = machine.native_roots.len();
+        machine.push_native_roots(depth, &[object, source]);
+        let result: Result<(), EvalFailure> = (|| {
+            let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
+            loop {
+                machine.refresh_native_roots(depth, &[object, iterator]);
+                let (done, value) = machine.iterator_next(iterator)?;
+                if done {
+                    break;
+                }
+                machine.refresh_native_roots(depth, &[object, iterator, value]);
+                let inserted = (|| {
+                    if kind == CollectionKind::WeakSet {
+                        require_weak_key(machine, value)?;
+                    }
+                    set_put(machine, object, value, kind)
+                })();
+                if let Err(failure) = inserted {
+                    return Err(close_rooted_collection_iterator(
+                        machine, depth, object, iterator, failure,
+                    ));
+                }
             }
-            set_put(machine, object, value, kind)?;
-        }
+            Ok(())
+        })();
+        machine.pop_native_roots(depth);
+        result?;
     }
     Ok(BuiltinOutcome::Value(object))
 }
@@ -540,22 +699,34 @@ fn map_delete_for<H: Host>(
     let Some(entry_index) = entry_index else {
         return Ok(BuiltinOutcome::Value(Value::FALSE));
     };
-    let HeapEntry::Collection { entries, size, .. } = &mut machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
-    entries.remove(entry_index);
-    *size -= 1;
-    let mut rebuilt = crate::CollectionIndex::default();
-    let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
-    for (index, entry) in entries.iter().enumerate() {
-        rebuilt.insert(crate::collection_key_hash(machine, entry.key), index);
+    // Extract the entry key and tombstone in one mutable pass, then compute
+    // the hash outside the mutable borrow to satisfy the borrow checker.
+    let entry_key;
+    {
+        let HeapEntry::Collection { entries, size, .. } = &mut machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        // Tombstone the entry rather than removing it: the `live` flag keeps
+        // index positions stable so live iterators keep valid order cursors,
+        // and only this one hash bucket needs pruning instead of a full rebuild.
+        entries[entry_index].live = false;
+        entry_key = entries[entry_index].key;
+        *size = size
+            .checked_sub(1)
+            .expect("delete found a live entry so size is at least one");
     }
-    let HeapEntry::Collection { index, .. } = &mut machine.heap[slot] else {
-        unreachable!("collection brand was checked")
-    };
-    *index = rebuilt;
+    let hash = crate::collection_key_hash(machine, entry_key);
+    {
+        let HeapEntry::Collection { index, .. } = &mut machine.heap[slot] else {
+            unreachable!("collection brand was checked")
+        };
+        if let Some(bucket) = index.buckets.get_mut(&hash) {
+            bucket.retain(|&idx| idx != entry_index);
+            if bucket.is_empty() {
+                index.buckets.remove(&hash);
+            }
+        }
+    }
     machine.refund_slot(
         slot,
         crate::CollectionEntry::BYTES + crate::CollectionIndex::ENTRY_BYTES,
@@ -563,13 +734,12 @@ fn map_delete_for<H: Host>(
     Ok(BuiltinOutcome::Value(Value::TRUE))
 }
 
-fn map_clear<H: Host>(
+fn collection_clear<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
-    _args: &[Value],
-    _constructing: bool,
+    expected: CollectionKind,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this, CollectionKind::Map)?;
+    let slot = collection_slot(machine, this, expected)?;
     let removed = {
         let HeapEntry::Collection {
             entries,
@@ -593,6 +763,15 @@ fn map_clear<H: Host>(
             .expect("collection entry charge fits heap limits"),
     );
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn map_clear<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    collection_clear(machine, this, CollectionKind::Map)
 }
 
 fn map_size<H: Host>(
@@ -730,30 +909,7 @@ fn set_clear<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let slot = collection_slot(machine, this, CollectionKind::Set)?;
-    let removed = {
-        let HeapEntry::Collection {
-            entries,
-            index,
-            size,
-            ..
-        } = &mut machine.heap[slot]
-        else {
-            unreachable!("collection brand was checked")
-        };
-        let removed = *size;
-        entries.clear();
-        index.clear();
-        *size = 0;
-        removed
-    };
-    machine.refund_slot(
-        slot,
-        removed
-            .checked_mul(crate::CollectionEntry::BYTES + crate::CollectionIndex::ENTRY_BYTES)
-            .expect("collection entry charge fits heap limits"),
-    );
-    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    collection_clear(machine, this, CollectionKind::Set)
 }
 
 fn set_size<H: Host>(
@@ -874,27 +1030,61 @@ pub(super) fn append_collection_entry<H: Host>(
             crate::CollectionEntry::BYTES + crate::CollectionIndex::ENTRY_BYTES,
         )
         .map_err(EvalFailure::Runtime)?;
-    let HeapEntry::Collection {
-        entries,
-        index,
-        size,
-        next_order: stored_next_order,
-        ..
-    } = &mut machine.heap[slot]
-    else {
+    // Push-only insertion keeps `entries` sorted ascending by `order`, which
+    // `collection_next`/`iterator_next` rely on for their binary-search cursor
+    // (`partition_point(|e| e.order < cursor)`). Reusing a tombstoned slot
+    // would write the largest order so far into an early position and break
+    // that, silently skipping live entries during iteration.
+    let needs_compact = {
+        let HeapEntry::Collection {
+            entries,
+            index,
+            size,
+            next_order: stored_next_order,
+            ..
+        } = &mut machine.heap[slot]
+        else {
+            unreachable!("collection slot owns collection storage")
+        };
+        entries.push(crate::CollectionEntry {
+            order,
+            key,
+            value,
+            live: true,
+        });
+        let entry_index = entries.len() - 1;
+        index.insert(hash, entry_index);
+        *size += 1;
+        *stored_next_order = next_order;
+        entries.len() > size.saturating_mul(2)
+    };
+    if needs_compact {
+        compact_collection(machine, slot);
+    }
+    Ok(())
+}
+
+/// Drop tombstoned entries and rebuild the hash index, bounding the entries
+/// vector under churn. Live entries retain their `order` values, preserving
+/// the sorted-by-order invariant and any outstanding iterator cursor. Mirrors
+/// the rebuild pattern used by GC weak-collection purging.
+fn compact_collection<H: Host>(machine: &mut Machine<'_, H>, slot: usize) {
+    let (retained, rebuilt) = {
+        let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+            unreachable!("collection slot owns collection storage")
+        };
+        let retained: Vec<_> = entries.iter().copied().filter(|e| e.live).collect();
+        let mut rebuilt = crate::CollectionIndex::default();
+        for (i, entry) in retained.iter().enumerate() {
+            rebuilt.insert(crate::collection_key_hash(machine, entry.key), i);
+        }
+        (retained, rebuilt)
+    };
+    let HeapEntry::Collection { entries, index, .. } = &mut machine.heap[slot] else {
         unreachable!("collection slot owns collection storage")
     };
-    let entry_index = entries.len();
-    entries.push(crate::CollectionEntry {
-        order,
-        key,
-        value,
-        live: true,
-    });
-    index.insert(hash, entry_index);
-    *size += 1;
-    *stored_next_order = next_order;
-    Ok(())
+    *entries = retained;
+    *index = rebuilt;
 }
 
 fn collection<H: Host>(
@@ -944,6 +1134,10 @@ fn collection_next<H: Host>(
     let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
         unreachable!("collection brand was checked")
     };
+    debug_assert!(
+        entries.windows(2).all(|w| w[0].order <= w[1].order),
+        "collection entries must stay sorted ascending by order"
+    );
     let index = entries.partition_point(|entry| entry.order < cursor);
     Ok(entries[index..]
         .iter()
@@ -974,12 +1168,18 @@ fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(),
     let Some(index) = machine.runtime_slot(key).map_err(EvalFailure::Runtime)? else {
         return Err(type_error("Invalid value used as weak collection key"));
     };
+    // Exhaustive match: every HeapEntry variant is listed so adding a new
+    // one forces a decision here instead of silently rejecting it via `_`.
     let valid = match &machine.heap[index] {
-        HeapEntry::Symbol { .. } => !machine
-            .intrinsics
-            .symbol_registry
-            .values()
-            .any(|registered| *registered == key),
+        HeapEntry::Symbol { description } => {
+            // O(log n) registry lookup by description instead of scanning
+            // every registered symbol value on each weak-key validation.
+            !machine
+                .intrinsics
+                .symbol_registry
+                .get(description)
+                .is_some_and(|registered| *registered == key)
+        }
         HeapEntry::Object { .. }
         | HeapEntry::Array { .. }
         | HeapEntry::Function { .. }
@@ -998,7 +1198,16 @@ fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(),
         | HeapEntry::Promise { .. }
         | HeapEntry::Timeout { .. }
         | HeapEntry::NativeFunction { .. } => true,
-        _ => false,
+        // Primitives and internal bookkeeping entries are not valid keys.
+        HeapEntry::Vacant
+        | HeapEntry::String(_)
+        | HeapEntry::BigInt(_)
+        | HeapEntry::PrivateName { .. }
+        | HeapEntry::Iterator { .. }
+        | HeapEntry::PromiseResolver { .. }
+        | HeapEntry::PromiseAll { .. }
+        | HeapEntry::PromiseAllElement { .. }
+        | HeapEntry::AsyncActivation { .. } => false,
     };
     if valid {
         Ok(())
@@ -1011,27 +1220,13 @@ fn constructor_prototype<H: Host>(
     machine: &Machine<'_, H>,
     kind: CollectionKind,
 ) -> Result<Value, EvalFailure> {
-    let name = match kind {
-        CollectionKind::Map => "Map",
-        CollectionKind::Set => "Set",
-        CollectionKind::WeakMap => "WeakMap",
-        CollectionKind::WeakSet => "WeakSet",
+    let prototype = match kind {
+        CollectionKind::Map => machine.intrinsics.builtins.map_prototype(),
+        CollectionKind::Set => machine.intrinsics.builtins.set_prototype(),
+        CollectionKind::WeakMap => machine.intrinsics.builtins.weak_map_prototype(),
+        CollectionKind::WeakSet => machine.intrinsics.builtins.weak_set_prototype(),
     };
-    let constructor = machine
-        .intrinsics
-        .global(name)
-        .ok_or_else(|| type_error("missing collection constructor"))?;
-    let index = machine
-        .runtime_slot(constructor)
-        .map_err(EvalFailure::Runtime)?
-        .ok_or_else(|| type_error("invalid collection constructor"))?;
-    let HeapEntry::NativeFunction { properties, .. } = &machine.heap[index] else {
-        return Err(type_error("invalid collection constructor"));
-    };
-    match properties.get(&PropertyKey::Named(EcmaString::from_utf8("prototype"))) {
-        Some(Property::Data { value, .. }) => Ok(*value),
-        _ => Err(type_error("missing collection prototype")),
-    }
+    Ok(prototype)
 }
 fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
     super::super::push(
@@ -1062,7 +1257,7 @@ fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Valu
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         Property::Accessor {
             getter: Some(getter),
             setter: None,
@@ -1098,7 +1293,7 @@ fn named_property(heap: &[HeapEntry], object: Value, name: &str) -> Value {
     let HeapEntry::Object { properties, .. } = &heap[heap_index(object)] else {
         unreachable!()
     };
-    match properties.get(&PropertyKey::Named(EcmaString::from_utf8(name))) {
+    match properties.get(&PropertyKey::Named(EcmaString::encode(name))) {
         Some(Property::Data { value, .. }) => *value,
         _ => unreachable!(),
     }
@@ -1167,6 +1362,7 @@ mod tests {
         };
         entries
             .iter()
+            .filter(|entry| entry.live)
             .map(|entry| (entry.key, entry.value))
             .collect()
     }
@@ -1534,154 +1730,249 @@ mod tests {
     }
 
     #[test]
-    fn generator_prototype_next_has_length_one() {
+    fn async_generator_prototype_chains_to_async_iterator_prototype() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let machine = Machine::new(&module, &mut host, Limits::default());
 
-        let gen_proto = machine.intrinsics.builtins.generator_prototype();
-        let next = machine.get_named_property(gen_proto, "next").unwrap();
-        let index = machine.runtime_slot(next).unwrap().unwrap();
-        let HeapEntry::NativeFunction {
-            callable: NativeCallable::Builtin(id),
-            ..
-        } = machine.heap[index]
-        else {
-            panic!("next must be a native function");
-        };
-        let def = machine.intrinsics.builtins.get(id);
-        assert_eq!(def.length, 1, "Generator.prototype.next length must be 1");
-        assert_eq!(def.name, "next");
-    }
-
-    #[test]
-    fn generator_prototype_inherits_symbol_iterator_identity() {
-        let module = blank_program("<test>");
-        let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
-
-        let gen_proto = machine.intrinsics.builtins.generator_prototype();
-        let iter_proto = machine.intrinsics.builtins.iterator_prototype();
-        let symbol = machine.intrinsics.builtins.symbol_iterator();
-        let key = machine.to_property_key(symbol).unwrap();
-
-        // %GeneratorPrototype% has no own Symbol.iterator — it inherits from
-        // %IteratorPrototype%, and the inherited function returns the same
-        // identity (the receiver itself).
-        let gen_identity = machine.get_property_key(gen_proto, &key).unwrap();
-        let iter_identity = machine.get_property_key(iter_proto, &key).unwrap();
-        assert_eq!(
-            gen_identity, iter_identity,
-            "Symbol.iterator on %GeneratorPrototype% must be the same \
-             function inherited from %IteratorPrototype%"
-        );
-    }
-
-    #[test]
-    fn async_generator_prototype_has_the_async_iterator_contract() {
-        let module = blank_program("<test>");
-        let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
-
-        let generator = machine.intrinsics.builtins.async_generator_prototype();
-        let iterator = machine.intrinsics.builtins.async_iterator_prototype();
+        let async_gen_proto = machine.intrinsics.builtins.async_generator_prototype();
+        let async_iter_proto = machine.intrinsics.builtins.async_iterator_prototype();
         assert!(
             machine
-                .inherits_from_prototype(generator, iterator)
+                .inherits_from_prototype(async_gen_proto, async_iter_proto)
                 .unwrap(),
             "%AsyncGeneratorPrototype% must inherit from %AsyncIteratorPrototype%"
         );
-        assert_eq!(
-            machine.get_named_property(iterator, "next").unwrap(),
-            Value::UNDEFINED,
-            "%AsyncIteratorPrototype% must not define next"
-        );
-
-        let symbol = machine.intrinsics.builtins.symbol_async_iterator();
-        let key = machine.to_property_key(symbol).unwrap();
-        assert!(
-            !machine.has_own_property_key(generator, &key).unwrap(),
-            "the async iterator identity must be inherited"
-        );
-        let identity = machine.get_property_key(generator, &key).unwrap();
-        assert_eq!(
-            machine.call_value(identity, generator, &[]).unwrap(),
-            generator
-        );
-
-        let next = machine.get_named_property(generator, "next").unwrap();
-        let index = machine.runtime_slot(next).unwrap().unwrap();
-        let HeapEntry::NativeFunction {
-            callable: NativeCallable::Builtin(id),
-            ..
-        } = machine.heap[index]
-        else {
-            panic!("next must be a native function");
-        };
-        let def = machine.intrinsics.builtins.get(id);
-        assert_eq!(def.name, "next");
-        assert_eq!(def.length, 1);
     }
 
     #[test]
-    fn generator_next_on_incompatible_receiver_typeerrors() {
+    fn generator_method_surface_has_expected_metadata_and_descriptors() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let machine = Machine::new(&module, &mut host, Limits::default());
 
-        // An ordinary object is not a generator — take_generator_state (the
-        // centralized driver validation) must reject it with a TypeError.
-        let non_generator = ordinary_object(&mut machine);
-        let result = machine.take_generator_state(non_generator);
-        assert!(
-            matches!(
-                result,
-                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        for (label, prototype) in [
+            (
+                "Generator",
+                machine.intrinsics.builtins.generator_prototype(),
             ),
-            "next on a non-generator must produce a TypeError"
-        );
+            (
+                "AsyncGenerator",
+                machine.intrinsics.builtins.async_generator_prototype(),
+            ),
+        ] {
+            for name in ["next", "return", "throw"] {
+                let key = PropertyKey::Named(EcmaString::encode(name));
+                let method_descriptor = machine
+                    .own_descriptor(prototype, &key)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{label}.prototype.{name} must be an own property"));
+                let Property::Data {
+                    value: method,
+                    writable,
+                    enumerable,
+                    configurable,
+                } = method_descriptor
+                else {
+                    panic!("{label}.prototype.{name} must be a data property");
+                };
+                assert!(writable, "{label}.prototype.{name} must be writable");
+                assert!(
+                    !enumerable,
+                    "{label}.prototype.{name} must not be enumerable"
+                );
+                assert!(
+                    configurable,
+                    "{label}.prototype.{name} must be configurable"
+                );
+
+                let index = machine.runtime_slot(method).unwrap().unwrap();
+                let HeapEntry::NativeFunction {
+                    callable: NativeCallable::Builtin(id),
+                    ..
+                } = machine.heap[index]
+                else {
+                    panic!("{label}.prototype.{name} must be a native function");
+                };
+                let definition = machine.intrinsics.builtins.get(id);
+                assert_eq!(definition.name, name, "{label}.prototype.{name} name");
+                assert_eq!(definition.length, 1, "{label}.prototype.{name} length");
+
+                for metadata in ["name", "length"] {
+                    let descriptor = machine
+                        .own_descriptor(method, &PropertyKey::Named(EcmaString::encode(metadata)))
+                        .unwrap()
+                        .unwrap_or_else(|| {
+                            panic!("{label}.prototype.{name}.{metadata} must exist")
+                        });
+                    assert!(
+                        matches!(
+                            descriptor,
+                            Property::Data {
+                                writable: false,
+                                enumerable: false,
+                                configurable: true,
+                                ..
+                            }
+                        ),
+                        "{label}.prototype.{name}.{metadata} has the wrong descriptor: {descriptor:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn generator_next_outcome_packages_this_and_resume_value() {
+    fn generator_methods_use_operation_specific_brand_errors() {
         let module = blank_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.builtins.generator_prototype();
+        let receiver = ordinary_object(&mut machine);
 
-        let gen_proto = machine.intrinsics.builtins.generator_prototype();
-        let next = machine.get_named_property(gen_proto, "next").unwrap();
-        let index = machine.runtime_slot(next).unwrap().unwrap();
-        let HeapEntry::NativeFunction {
-            callable: NativeCallable::Builtin(id),
-            ..
-        } = machine.heap[index]
-        else {
-            panic!("next must be a native function");
-        };
+        for name in ["next", "return", "throw"] {
+            let method = machine.get_named_property(prototype, name).unwrap();
+            let error = machine.call_value(method, receiver, &[]).unwrap_err();
+            assert!(matches!(
+                error,
+                EvalFailure::Throw(ThrowOrigin::TypeError { operation })
+                    if operation == match name {
+                        "next" => "Generator.prototype.next called on incompatible receiver",
+                        "return" => "Generator.prototype.return called on incompatible receiver",
+                        "throw" => "Generator.prototype.throw called on incompatible receiver",
+                        _ => unreachable!(),
+                    }
+            ));
+        }
+    }
 
+    #[test]
+    fn async_generator_methods_reject_bad_receivers_without_throwing() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let prototype = machine.intrinsics.builtins.async_generator_prototype();
+        let receiver = ordinary_object(&mut machine);
+
+        for name in ["next", "return", "throw"] {
+            let method = machine.get_named_property(prototype, name).unwrap();
+            let promise = machine
+                .call_value(method, receiver, &[])
+                .unwrap_or_else(|error| panic!("AsyncGenerator.prototype.{name} threw: {error:?}"));
+            let index = machine.runtime_slot(promise).unwrap().unwrap();
+            assert!(
+                matches!(
+                    &machine.heap[index],
+                    HeapEntry::Promise {
+                        state: crate::PromiseState::Rejected {
+                            origin: ThrowOrigin::TypeError { operation },
+                            ..
+                        },
+                        ..
+                    } if *operation == match name {
+                        "next" => "AsyncGenerator.prototype.next called on incompatible receiver",
+                        "return" => "AsyncGenerator.prototype.return called on incompatible receiver",
+                        "throw" => "AsyncGenerator.prototype.throw called on incompatible receiver",
+                        _ => unreachable!(),
+                    }
+                ),
+                "AsyncGenerator.prototype.{name} must return an operation-specific rejected promise"
+            );
+        }
+    }
+
+    #[test]
+    fn generator_resume_outcomes_package_receiver_completion_and_default_value() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
         let receiver = ordinary_object(&mut machine);
         let resume = Value::int32(42);
-        let outcome = machine
-            .call_builtin(id, receiver, &[resume], false)
-            .unwrap();
-        match outcome {
-            BuiltinOutcome::GeneratorNext {
-                generator,
-                resume_value,
-            } => {
-                assert_eq!(generator, receiver);
-                assert_eq!(resume_value, resume);
-            }
-            other => panic!("expected GeneratorNext, got {other:?}"),
-        }
 
-        // Without arguments, resume_value defaults to undefined.
-        let outcome = machine.call_builtin(id, receiver, &[], false).unwrap();
-        match outcome {
-            BuiltinOutcome::GeneratorNext { resume_value, .. } => {
-                assert_eq!(resume_value, Value::UNDEFINED);
+        for (name, expected) in [
+            ("next", ResumeCompletion::Next(resume)),
+            ("return", ResumeCompletion::Return(resume)),
+            ("throw", ResumeCompletion::Throw(resume)),
+        ] {
+            let method = machine
+                .get_named_property(machine.intrinsics.builtins.generator_prototype(), name)
+                .unwrap();
+            let index = machine.runtime_slot(method).unwrap().unwrap();
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } = machine.heap[index]
+            else {
+                panic!("{name} must be a native function");
+            };
+            let outcome = machine
+                .call_builtin(id, receiver, &[resume], false)
+                .unwrap();
+            match outcome {
+                BuiltinOutcome::GeneratorResume {
+                    generator,
+                    completion,
+                } => {
+                    assert_eq!(generator, receiver);
+                    assert_eq!(completion, expected);
+                }
+                other => panic!("expected GeneratorResume, got {other:?}"),
             }
-            other => panic!("expected GeneratorNext, got {other:?}"),
+
+            let outcome = machine.call_builtin(id, receiver, &[], false).unwrap();
+            let BuiltinOutcome::GeneratorResume { completion, .. } = outcome else {
+                panic!("expected GeneratorResume");
+            };
+            assert_eq!(completion.value(), Value::UNDEFINED);
+        }
+    }
+
+    #[test]
+    fn async_generator_resume_outcomes_package_receiver_completion_and_default_value() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let receiver = ordinary_object(&mut machine);
+        let resume = Value::int32(42);
+
+        for (name, expected) in [
+            ("next", ResumeCompletion::Next(resume)),
+            ("return", ResumeCompletion::Return(resume)),
+            ("throw", ResumeCompletion::Throw(resume)),
+        ] {
+            let method = machine
+                .get_named_property(
+                    machine.intrinsics.builtins.async_generator_prototype(),
+                    name,
+                )
+                .unwrap();
+            let index = machine.runtime_slot(method).unwrap().unwrap();
+            let HeapEntry::NativeFunction {
+                callable: NativeCallable::Builtin(id),
+                ..
+            } = machine.heap[index]
+            else {
+                panic!("{name} must be a native function");
+            };
+            let outcome = machine
+                .call_builtin(id, receiver, &[resume], false)
+                .unwrap();
+            match outcome {
+                BuiltinOutcome::AsyncGeneratorResume {
+                    generator,
+                    completion,
+                } => {
+                    assert_eq!(generator, receiver);
+                    assert_eq!(completion, expected);
+                }
+                other => panic!("expected AsyncGeneratorResume, got {other:?}"),
+            }
+
+            let outcome = machine.call_builtin(id, receiver, &[], false).unwrap();
+            let BuiltinOutcome::AsyncGeneratorResume { completion, .. } = outcome else {
+                panic!("expected AsyncGeneratorResume");
+            };
+            assert_eq!(completion.value(), Value::UNDEFINED);
         }
     }
 
@@ -1898,7 +2189,7 @@ mod tests {
     }
 
     fn root(machine: &mut Machine<'_, TestHost>, name: &str, value: Value) {
-        machine.globals.insert(EcmaString::from_utf8(name), value);
+        machine.test_set_global(name, value);
     }
 
     fn slot(machine: &Machine<'_, TestHost>, value: Value) -> usize {
@@ -1923,10 +2214,7 @@ mod tests {
 
         assert!(matches!(machine.heap[dead_slot], HeapEntry::Vacant));
         assert_eq!(slot(&machine, survivor), survivor_slot);
-        assert_eq!(
-            machine.globals[&EcmaString::from_utf8("survivor")],
-            survivor
-        );
+        assert_eq!(machine.test_global("survivor"), Some(survivor));
         assert!(matches!(
             machine.runtime_slot(dead),
             Err(RuntimeErrorKind::InvalidRuntimeHeapReference { .. })
@@ -2136,5 +2424,822 @@ mod tests {
         machine.collect_garbage();
 
         assert_eq!(slot(&machine, symbol), symbol_slot);
+    }
+
+    fn raw_entries_len(machine: &Machine<'_, TestHost>, obj: Value) -> usize {
+        let slot = machine
+            .runtime_slot(obj)
+            .unwrap()
+            .expect("runtime collection");
+        let HeapEntry::Collection { entries, .. } = &machine.heap[slot] else {
+            panic!("not a collection")
+        };
+        entries.len()
+    }
+
+    #[test]
+    fn delete_tombstones_entry_without_shrinking_vector() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(10),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(2),
+            Value::int32(20),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        assert_eq!(raw_entries_len(&machine, map), 2);
+
+        // Delete key 1 — the entry must be tombstoned, not removed.
+        assert!(matches!(
+            map_delete_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::TRUE))
+        ));
+        assert_eq!(
+            raw_entries_len(&machine, map),
+            2,
+            "tombstone must not shrink"
+        );
+        assert_eq!(
+            collection_entries(&machine, map),
+            vec![(Value::int32(2), Value::int32(20))],
+            "tombstoned entry must be invisible to collection_entries"
+        );
+
+        // has/get must not find the deleted key.
+        assert!(matches!(
+            map_has_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::FALSE))
+        ));
+        assert!(matches!(
+            map_get_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+        ));
+        // Re-inserting key 1 pushes a new entry (the tombstone stays until
+        // compaction); insertion order is now key 2, then the re-added key 1.
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(99),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        assert_eq!(
+            raw_entries_len(&machine, map),
+            3,
+            "push-only re-insert appends; the tombstone remains until compaction"
+        );
+        assert_eq!(
+            collection_entries(&machine, map),
+            vec![
+                (Value::int32(2), Value::int32(20)),
+                (Value::int32(1), Value::int32(99))
+            ],
+        );
+    }
+
+    #[test]
+    fn delete_during_iteration_skips_tombstoned_entries() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        for n in 1..=3 {
+            map_put(
+                &mut machine,
+                map,
+                Value::int32(n),
+                Value::int32(n * 10),
+                CollectionKind::Map,
+            )
+            .unwrap();
+        }
+        // Delete key 2 before iterating; the iterator must skip the tombstone.
+        assert!(matches!(
+            map_delete_for(&mut machine, map, &[Value::int32(2)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::TRUE))
+        ));
+        let mut visited = Vec::new();
+        let mut cursor = 0;
+        while let Some((next, key, value)) =
+            collection_next(&machine, map, CollectionKind::Map, cursor).unwrap()
+        {
+            cursor = next;
+            visited.push((key, value));
+        }
+        assert_eq!(
+            visited,
+            vec![
+                (Value::int32(1), Value::int32(10)),
+                (Value::int32(3), Value::int32(30)),
+            ],
+            "iteration must skip tombstoned entries"
+        );
+    }
+
+    #[test]
+    fn iteration_visits_all_live_entries_after_delete_then_reinsert() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        // The sortedness regression: set, set, delete, re-set left a large
+        // order in an early vector slot, breaking the binary-search cursor
+        // the real iterator protocol uses.
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(10),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(2),
+            Value::int32(20),
+            CollectionKind::Map,
+        )
+        .unwrap();
+        assert!(matches!(
+            map_delete_for(&mut machine, map, &[Value::int32(1)], CollectionKind::Map),
+            Ok(BuiltinOutcome::Value(Value::TRUE))
+        ));
+        map_put(
+            &mut machine,
+            map,
+            Value::int32(1),
+            Value::int32(99),
+            CollectionKind::Map,
+        )
+        .unwrap();
+
+        // Iterate via the REAL iterator protocol (collection_next), the path
+        // forEach/for..of use — NOT collection_entries, which scans by vector
+        // position and would miss the sortedness break.
+        let mut visited = Vec::new();
+        let mut cursor = 0;
+        while let Some((next, key, value)) =
+            collection_next(&machine, map, CollectionKind::Map, cursor).unwrap()
+        {
+            cursor = next;
+            visited.push((key, value));
+        }
+        assert_eq!(
+            visited,
+            vec![
+                (Value::int32(2), Value::int32(20)),
+                (Value::int32(1), Value::int32(99)),
+            ],
+            "every live entry must be visited exactly once in insertion order"
+        );
+    }
+
+    #[test]
+    fn repeated_insert_delete_does_not_grow_entries_unboundedly() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let map = construct_builtin(&mut machine, "Map", &[]);
+        const N: usize = 50;
+        const ROUNDS: usize = 20;
+        for _ in 0..ROUNDS {
+            for k in 1..=N {
+                map_put(
+                    &mut machine,
+                    map,
+                    Value::int32(k as u32),
+                    Value::int32((k as u32) * 10),
+                    CollectionKind::Map,
+                )
+                .unwrap();
+            }
+            for k in 1..=N {
+                assert!(matches!(
+                    map_delete_for(
+                        &mut machine,
+                        map,
+                        &[Value::int32(k as u32)],
+                        CollectionKind::Map
+                    ),
+                    Ok(BuiltinOutcome::Value(Value::TRUE))
+                ));
+            }
+        }
+        // Without compaction, 20 rounds of insert-all/delete-all would
+        // accumulate 1000 tombstoned slots. Compaction must keep the vector
+        // bounded near the live-set size.
+        let len = raw_entries_len(&machine, map);
+        assert!(
+            len <= 2 * N,
+            "entries grew to {len} after {ROUNDS} rounds; compaction should bound it near {N}"
+        );
+    }
+
+    #[test]
+    fn weak_key_rejects_internal_bookkeeping_entries() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let weak_map = construct_builtin(&mut machine, "WeakMap", &[]);
+
+        // An ordinary object is a valid weak key (object-like).
+        let obj = ordinary_object(&mut machine);
+        assert!(
+            call_prototype_method(
+                &mut machine,
+                "WeakMap",
+                "set",
+                weak_map,
+                &[obj, Value::int32(1)],
+            )
+            .is_ok(),
+            "ordinary object must be a valid weak key"
+        );
+
+        // A registered symbol must be rejected (the catch-all previously
+        // handled this, but the linear scan was the performance problem).
+        let registered = symbol_for(&mut machine, Value::int32(42));
+        assert_type_error(call_prototype_method(
+            &mut machine,
+            "WeakMap",
+            "set",
+            weak_map,
+            &[registered, Value::int32(2)],
+        ));
+
+        // A local symbol must be accepted.
+        let local = local_symbol(&mut machine);
+        assert!(
+            call_prototype_method(
+                &mut machine,
+                "WeakMap",
+                "set",
+                weak_map,
+                &[local, Value::int32(3)],
+            )
+            .is_ok(),
+            "local Symbol must be a valid weak key"
+        );
+    }
+
+    #[test]
+    fn collection_prototypes_are_cached_not_global_lookup() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let cases = [
+            (
+                "Map",
+                CollectionKind::Map,
+                machine.intrinsics.builtins.map_prototype(),
+            ),
+            (
+                "Set",
+                CollectionKind::Set,
+                machine.intrinsics.builtins.set_prototype(),
+            ),
+            (
+                "WeakMap",
+                CollectionKind::WeakMap,
+                machine.intrinsics.builtins.weak_map_prototype(),
+            ),
+            (
+                "WeakSet",
+                CollectionKind::WeakSet,
+                machine.intrinsics.builtins.weak_set_prototype(),
+            ),
+        ];
+
+        let saved: Vec<(
+            &str,
+            CollectionKind,
+            Value,
+            Value,
+            crate::intrinsics::BuiltinId,
+        )> = cases
+            .iter()
+            .map(|(name, kind, cached)| {
+                let ctor = machine.intrinsics.global(name).expect("global exists");
+                let id = machine
+                    .intrinsics
+                    .builtins
+                    .id_named(name)
+                    .expect("builtin id");
+                (*name, *kind, *cached, ctor, id)
+            })
+            .collect();
+
+        // Delete and overwrite every collection global. Construction through the
+        // saved builtin ids must still use the cached intrinsic prototypes.
+        for &(name, _, _, _, _) in &saved {
+            machine.intrinsics.globals.remove(&EcmaString::encode(name));
+            machine
+                .intrinsics
+                .globals
+                .insert(EcmaString::encode(name), Value::int32(99));
+        }
+
+        for (name, kind, cached, ctor_before, id) in saved {
+            let BuiltinOutcome::Value(instance) = machine
+                .call_builtin(id, Value::UNDEFINED, &[], true)
+                .expect("collection construct succeeds")
+            else {
+                panic!("{name} construct returns a value");
+            };
+
+            let slot = machine
+                .runtime_slot(instance)
+                .expect("valid instance")
+                .expect("slot");
+            let HeapEntry::Collection {
+                prototype,
+                kind: actual_kind,
+                ..
+            } = &machine.heap[slot]
+            else {
+                panic!("{name} instance");
+            };
+            assert_eq!(*prototype, Some(cached));
+            assert_eq!(*actual_kind, kind);
+
+            // The cached prototype's "constructor" is still the original constructor.
+            let ctor = machine
+                .get_named_property(cached, "constructor")
+                .expect("prototype has constructor");
+            assert_eq!(ctor, ctor_before);
+        }
+    }
+
+    use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
+
+    fn native_callback(
+        machine: &mut Machine<'_, TestHost>,
+        name: &'static str,
+        handler: BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 0,
+            handler,
+        });
+        native_function(&mut machine.heap, id, name, 0)
+    }
+
+    fn push_log(machine: &mut Machine<'_, TestHost>, event: u32) {
+        let log = machine.test_global("log").unwrap();
+        machine.array_push(log, Value::int32(event)).unwrap();
+    }
+
+    fn get_iter_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let iter = machine.test_global("testIterator").unwrap();
+        Ok(BuiltinOutcome::Value(iter))
+    }
+
+    fn make_custom_iterator_source(
+        machine: &mut Machine<'_, TestHost>,
+        next_fn: Value,
+        return_fn: Value,
+    ) -> Value {
+        let iter = ordinary_object(machine);
+        machine.set_data_property(iter, "next", next_fn).unwrap();
+        machine
+            .set_data_property(iter, "return", return_fn)
+            .unwrap();
+        machine.test_set_global("testIterator", iter);
+
+        let get_iter = native_callback(machine, "custom Symbol.iterator", get_iter_callback);
+        let iterable = ordinary_object(machine);
+        let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+        let iterator_key = machine
+            .to_property_key(iterator_symbol)
+            .expect("Symbol.iterator is a property key");
+        machine
+            .set_data_property_key(iterable, iterator_key, get_iter)
+            .expect("iterator install succeeds");
+        iterable
+    }
+
+    fn define_getter(
+        machine: &mut Machine<'_, TestHost>,
+        target: Value,
+        key_str: &str,
+        getter_fn: Value,
+    ) {
+        let descriptor = ordinary_object(machine);
+        machine
+            .set_data_property(descriptor, "get", getter_fn)
+            .unwrap();
+        machine
+            .set_data_property(descriptor, "configurable", Value::TRUE)
+            .unwrap();
+        machine
+            .set_data_property(descriptor, "enumerable", Value::TRUE)
+            .unwrap();
+        let object_ctor = machine.intrinsics.global("Object").unwrap();
+        let define_prop = machine
+            .get_named_property(object_ctor, "defineProperty")
+            .unwrap();
+        let key_val = machine
+            .allocate(HeapEntry::String(EcmaString::encode(key_str)))
+            .unwrap();
+        machine
+            .call_value(define_prop, object_ctor, &[target, key_val, descriptor])
+            .unwrap();
+    }
+
+    // ---- iteration order and abrupt close tests ---------------------------
+
+    fn order_next_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.collect_garbage();
+        let count = match machine.test_global("nextCount") {
+            Some(v) => match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            },
+            None => 0,
+        };
+        if count == 0 {
+            machine.test_set_global("nextCount", Value::int32(1));
+            push_log(machine, 10); // NEXT_0
+            let entry = machine.test_global("testEntry").unwrap();
+            let res = ordinary_object(machine);
+            machine.set_data_property(res, "done", Value::FALSE)?;
+            machine.set_data_property(res, "value", entry)?;
+            Ok(BuiltinOutcome::Value(res))
+        } else {
+            machine.test_set_global("nextCount", Value::int32(2));
+            push_log(machine, 40); // PUT (recorded before NEXT_1)
+            push_log(machine, 50); // NEXT_1
+            let res = ordinary_object(machine);
+            machine.set_data_property(res, "done", Value::TRUE)?;
+            machine.set_data_property(res, "value", Value::UNDEFINED)?;
+            Ok(BuiltinOutcome::Value(res))
+        }
+    }
+
+    fn order_get_0_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 20); // GET_0
+        Ok(BuiltinOutcome::Value(Value::int32(1)))
+    }
+
+    fn order_get_1_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 30); // GET_1
+        Ok(BuiltinOutcome::Value(Value::int32(100)))
+    }
+
+    fn order_return_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 60); // RETURN
+        let res = ordinary_object(machine);
+        machine.set_data_property(res, "done", Value::TRUE)?;
+        Ok(BuiltinOutcome::Value(res))
+    }
+
+    #[test]
+    fn map_constructor_iterator_and_entry_evaluation_order() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+
+        let entry = ordinary_object(&mut machine);
+        let get0 = native_callback(&mut machine, "get 0", order_get_0_callback);
+        let get1 = native_callback(&mut machine, "get 1", order_get_1_callback);
+        define_getter(&mut machine, entry, "0", get0);
+        define_getter(&mut machine, entry, "1", get1);
+        machine.test_set_global("testEntry", entry);
+
+        let next = native_callback(&mut machine, "next", order_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let map = construct_builtin(&mut machine, "Map", &[source]);
+        let entries = collection_entries(&machine, map);
+        assert_eq!(entries, vec![(Value::int32(1), Value::int32(100))]);
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|v| match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            })
+            .collect();
+
+        // Pin order: next0 (10), get0 (20), get1 (30), put (40), next1 (50)
+        assert_eq!(
+            event_nums,
+            vec![10, 20, 30, 40, 50],
+            "Map constructor must process entries lazily in order: next0, get0, get1, put, next1"
+        );
+    }
+
+    #[test]
+    fn set_constructor_roots_result_across_iterator_callbacks() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+        let entry = ordinary_object(&mut machine);
+        machine.test_set_global("testEntry", entry);
+
+        let next = native_callback(&mut machine, "next", order_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let set = construct_builtin(&mut machine, "Set", &[source]);
+        assert_eq!(collection_entries(&machine, set), vec![(entry, entry)]);
+    }
+
+    fn failing_entry_next_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let count = match machine.test_global("nextCount") {
+            Some(v) => match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            },
+            None => 0,
+        };
+        machine.test_set_global("nextCount", Value::int32(count + 1));
+        push_log(machine, 10); // NEXT_0
+        let entry = machine.test_global("testEntry").unwrap();
+        let res = ordinary_object(machine);
+        machine.set_data_property(res, "done", Value::FALSE)?;
+        machine.set_data_property(res, "value", entry)?;
+        Ok(BuiltinOutcome::Value(res))
+    }
+
+    fn failing_get_1_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 70); // GET_1_THROW
+        Err(type_error("entry value getter failed"))
+    }
+
+    #[test]
+    fn map_constructor_closes_iterator_on_entry_property_failure() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+
+        let entry = ordinary_object(&mut machine);
+        let get0 = native_callback(&mut machine, "get 0", order_get_0_callback);
+        let get1 = native_callback(&mut machine, "failing get 1", failing_get_1_callback);
+        define_getter(&mut machine, entry, "0", get0);
+        define_getter(&mut machine, entry, "1", get1);
+        machine.test_set_global("testEntry", entry);
+
+        let next = native_callback(&mut machine, "next", failing_entry_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let id = builtin_id(&machine, "Map");
+        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
+        assert!(
+            result.is_err(),
+            "Map constructor must fail when entry get throws"
+        );
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|v| match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            })
+            .collect();
+
+        // Pin abrupt close: next0 (10), get0 (20), get1_throw (70), return (60)
+        assert_eq!(
+            event_nums,
+            vec![10, 20, 70, 60],
+            "Entry property failure must trigger iterator return hook"
+        );
+
+        let next_count = match machine.test_global("nextCount").unwrap().decode() {
+            Some(Decoded::Int32(n)) => n,
+            _ => 0,
+        };
+        assert_eq!(
+            next_count, 1,
+            "No second next call must occur after entry failure"
+        );
+    }
+
+    fn throwing_next_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        push_log(machine, 80); // NEXT_THROW
+        Err(type_error("iterator next failed"))
+    }
+
+    #[test]
+    fn map_constructor_does_not_close_iterator_on_next_failure() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+
+        let next = native_callback(&mut machine, "throwing next", throwing_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let id = builtin_id(&machine, "Map");
+        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
+        assert!(
+            result.is_err(),
+            "Map constructor must fail when iterator next throws"
+        );
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|v| match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            })
+            .collect();
+
+        assert_eq!(
+            event_nums,
+            vec![80],
+            "Throwing next() must not call iterator return hook"
+        );
+    }
+
+    fn weak_set_invalid_next_callback(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let count = match machine.test_global("nextCount") {
+            Some(value) => match value.decode() {
+                Some(Decoded::Int32(count)) => count,
+                _ => 0,
+            },
+            None => 0,
+        };
+        machine.test_set_global("nextCount", Value::int32(count + 1));
+        push_log(machine, if count == 0 { 10 } else { 40 });
+
+        let result = ordinary_object(machine);
+        machine
+            .set_data_property(result, "done", Value::FALSE)
+            .unwrap();
+        machine
+            .set_data_property(result, "value", Value::int32(42))
+            .unwrap();
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    #[test]
+    fn weak_set_constructor_closes_before_requesting_next_invalid_value() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+
+        let next = native_callback(&mut machine, "next", weak_set_invalid_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let id = builtin_id(&machine, "WeakSet");
+        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
+        assert_type_error(result);
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|value| match value.decode() {
+                Some(Decoded::Int32(number)) => number,
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(event_nums, vec![10, 60]);
+
+        let next_count = match machine.test_global("nextCount") {
+            Some(value) => match value.decode() {
+                Some(Decoded::Int32(count)) => count,
+                _ => 0,
+            },
+            None => 0,
+        };
+        assert_eq!(next_count, 1);
+    }
+
+    #[test]
+    fn weak_map_constructor_closes_iterator_on_invalid_key() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let log = allocate_array(&mut machine, Vec::new()).unwrap();
+        machine.test_set_global("log", log);
+        machine.test_set_global("nextCount", Value::int32(0));
+
+        // Entry with primitive key for WeakMap
+        let entry = entry_pair(&mut machine, Value::int32(42), Value::int32(100));
+        machine.test_set_global("testEntry", entry);
+
+        let next = native_callback(&mut machine, "next", failing_entry_next_callback);
+        let ret = native_callback(&mut machine, "return", order_return_callback);
+        let source = make_custom_iterator_source(&mut machine, next, ret);
+
+        let id = builtin_id(&machine, "WeakMap");
+        let result = machine.call_builtin(id, Value::UNDEFINED, &[source], true);
+        assert!(
+            result.is_err(),
+            "WeakMap constructor must fail on primitive key"
+        );
+
+        let events = machine.array_elements(log).unwrap().unwrap();
+        let event_nums: Vec<u32> = events
+            .iter()
+            .map(|v| match v.decode() {
+                Some(Decoded::Int32(n)) => n,
+                _ => 0,
+            })
+            .collect();
+
+        // Pin abrupt close: next0 (10), return (60)
+        assert_eq!(
+            event_nums,
+            vec![10, 60],
+            "WeakMap invalid key failure must trigger iterator return hook"
+        );
+
+        let next_count = match machine.test_global("nextCount").unwrap().decode() {
+            Some(Decoded::Int32(n)) => n,
+            _ => 0,
+        };
+        assert_eq!(
+            next_count, 1,
+            "No second next call must occur after WeakMap key failure"
+        );
     }
 }

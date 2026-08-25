@@ -1,0 +1,69 @@
+{
+  "schema": 2,
+  "host": "BH1",
+  "slice": "s0",
+  "benchmark_id": "s0-conformance-foundation",
+  "fingerprint": {
+    "kernel_release": "7.0.0-30-generic",
+    "kernel_version": "#30-Ubuntu SMP PREEMPT_DYNAMIC",
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz",
+    "sockets": 2,
+    "cores_per_socket": 20,
+    "microcode": "0x2007006"
+  },
+  "conditions_expected": {
+    "governor": "powersave",
+    "swap_total_kib": 403979000,
+    "cpu_affinity": "0-19",
+    "memory_policy": "bind",
+    "memory_nodes": "0"
+  },
+  "conditions_observed": {
+    "governor": "powersave",
+    "swap_total_kib": 403979000,
+    "cpu_affinity": "0-19",
+    "memory_policy": "bind",
+    "memory_nodes": "0"
+  },
+  "conditions_match": true,
+  "repeats": 3,
+  "phases": {
+    "bind": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "check": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "emit": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "parse": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "scan": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "total": {
+      "p50": 4777.843019,
+      "p95": 5230.067638,
+      "p99": 5230.067638
+    }
+  },
+  "rss_bytes": {
+    "p50": 616927232.0,
+    "p95": 616927232.0,
+    "p99": 616927232.0
+  },
+  "selected": true
+}

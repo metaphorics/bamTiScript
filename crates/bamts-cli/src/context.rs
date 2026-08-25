@@ -1,0 +1,140 @@
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use bamts_compiler::program::ProgramLoadError;
+
+use crate::driver::DriverError;
+
+/// Immutable process inputs captured for one CLI invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionContext {
+    cwd: PathBuf,
+    env: BTreeMap<OsString, OsString>,
+    temp_dir: PathBuf,
+}
+
+impl ExecutionContext {
+    /// Captures the process working directory and environment for one invocation.
+    pub fn ambient() -> Result<Self, DriverError> {
+        let cwd = std::env::current_dir().map_err(|source| DriverError::ReadSource {
+            path: PathBuf::from("."),
+            source,
+        })?;
+        let env = std::env::vars_os().collect();
+        let temp_dir = std::env::temp_dir();
+        let cwd = canonicalize_cwd(&cwd)?;
+        let temp_dir = resolve_from(&cwd, temp_dir);
+        Ok(Self { cwd, env, temp_dir })
+    }
+
+    /// Creates a context from explicit process inputs.
+    pub fn new(
+        cwd: impl AsRef<Path>,
+        env: BTreeMap<OsString, OsString>,
+    ) -> Result<Self, DriverError> {
+        let cwd = canonicalize_cwd(cwd.as_ref())?;
+        let temp_dir = resolve_from(&cwd, temp_dir_from_env(&env));
+        Ok(Self { cwd, env, temp_dir })
+    }
+
+    /// Resolves an invocation-relative OS path without consulting process state.
+    #[must_use]
+    pub fn resolve_path(&self, path: impl AsRef<Path>) -> PathBuf {
+        resolve_from(&self.cwd, path.as_ref().to_path_buf())
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    #[must_use]
+    pub fn temp_dir(&self) -> &Path {
+        &self.temp_dir
+    }
+
+    #[must_use]
+    pub fn env(&self, key: impl AsRef<OsStr>) -> Option<&OsStr> {
+        self.env.get(key.as_ref()).map(OsString::as_os_str)
+    }
+
+    pub fn envs(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.env
+            .iter()
+            .map(|(key, value)| (key.as_os_str(), value.as_os_str()))
+    }
+}
+
+fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, DriverError> {
+    fs::canonicalize(cwd)
+        .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))
+}
+
+fn resolve_from(cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+#[cfg(unix)]
+fn temp_dir_from_env(env: &BTreeMap<OsString, OsString>) -> PathBuf {
+    env.get(OsStr::new("TMPDIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+#[cfg(windows)]
+fn temp_dir_from_env(env: &BTreeMap<OsString, OsString>) -> PathBuf {
+    fn value<'a>(env: &'a BTreeMap<OsString, OsString>, key: &str) -> Option<&'a OsStr> {
+        env.iter()
+            .find(|(candidate, _)| candidate.to_string_lossy().eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_os_str())
+    }
+
+    for key in ["TMP", "TEMP", "USERPROFILE"] {
+        if let Some(path) = value(env, key) {
+            return PathBuf::from(path);
+        }
+    }
+    value(env, "SystemRoot")
+        .or_else(|| value(env, "WINDIR"))
+        .map(|root| PathBuf::from(root).join("Temp"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\Temp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_context_resolves_relative_and_empty_temp_paths_from_cwd() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (value, expected) in [
+            (OsString::from("tmp"), directory.path().join("tmp")),
+            (OsString::new(), directory.path().to_path_buf()),
+        ] {
+            let context = ExecutionContext::new(
+                directory.path(),
+                BTreeMap::from([(OsString::from("TMPDIR"), value)]),
+            )
+            .expect("execution context");
+            assert_eq!(context.temp_dir(), expected);
+        }
+    }
+
+    #[test]
+    fn explicit_context_resolves_relative_paths_from_cwd() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let context =
+            ExecutionContext::new(directory.path(), BTreeMap::new()).expect("execution context");
+        assert_eq!(
+            context.resolve_path("cache"),
+            directory.path().join("cache")
+        );
+        assert_eq!(context.resolve_path(directory.path()), directory.path());
+    }
+}

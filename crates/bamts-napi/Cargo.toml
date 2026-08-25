@@ -1,0 +1,26 @@
+[package]
+name = "bamts-napi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+publish = false
+license.workspace = true
+repository.workspace = true
+description = "Private Node-API transport for BamTS"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bamts-cli.workspace = true
+bamts-cancel.workspace = true
+napi = { version = "=3.12.1", default-features = false, features = ["napi10"] }
+napi-derive = "=3.6.3"
+
+[build-dependencies]
+napi-build = "=2.4.1"
+[lints.rust]
+# napi-rs generates narrowly scoped FFI glue with `#[allow(unsafe_code)]`.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"

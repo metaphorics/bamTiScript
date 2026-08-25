@@ -29,7 +29,7 @@ use std::io;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use cranelift_jit::{BranchProtection, JITMemoryKind, JITMemoryProvider};
 use cranelift_module::{ModuleError, ModuleResult};
@@ -76,10 +76,36 @@ impl WxPhase {
 
 // -- Shared lifecycle (provider + handle) ------------------------------------
 
+/// Page-rounded W^X allocation totals by final mapping protection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WxByteTotals {
+    /// Bytes destined for `READ_EXECUTE` (generated code).
+    pub(crate) code: u64,
+    /// Bytes destined for `READ` (read-only data).
+    pub(crate) readonly: u64,
+    /// Bytes staying `READ_WRITE` (writable data).
+    pub(crate) readwrite: u64,
+}
+
+impl WxByteTotals {
+    /// The sum of all page-rounded allocations.
+    pub(crate) const fn total(&self) -> u64 {
+        self.code
+            .saturating_add(self.readonly)
+            .saturating_add(self.readwrite)
+    }
+}
+
 /// Lifecycle state shared between the provider (consumed by `JITModule`) and the
 /// handle that mints the publication receipt.
 struct Liveness {
     phase: AtomicU8,
+    /// Page-rounded bytes allocated for `READ_EXECUTE` mappings.
+    code_bytes: AtomicU64,
+    /// Page-rounded bytes allocated for `READ` mappings.
+    readonly_bytes: AtomicU64,
+    /// Page-rounded bytes allocated for `READ_WRITE` mappings.
+    readwrite_bytes: AtomicU64,
     #[cfg(test)]
     released_mappings: AtomicUsize,
 }
@@ -91,6 +117,23 @@ impl Liveness {
 
     fn mark(&self, phase: WxPhase) {
         self.phase.store(phase.into_raw(), Ordering::Release);
+    }
+
+    fn record_bytes(&self, kind: MappingKind, bytes: u64) {
+        let counter = match kind {
+            MappingKind::Code => &self.code_bytes,
+            MappingKind::ReadOnly => &self.readonly_bytes,
+            MappingKind::Writable => &self.readwrite_bytes,
+        };
+        counter.fetch_add(bytes, Ordering::Release);
+    }
+
+    fn byte_totals(&self) -> WxByteTotals {
+        WxByteTotals {
+            code: self.code_bytes.load(Ordering::Acquire),
+            readonly: self.readonly_bytes.load(Ordering::Acquire),
+            readwrite: self.readwrite_bytes.load(Ordering::Acquire),
+        }
     }
 
     #[cfg(test)]
@@ -173,6 +216,9 @@ impl WxMemoryProvider {
     pub(crate) fn new() -> (WxMemoryProvider, WxMemoryHandle) {
         let liveness = Arc::new(Liveness {
             phase: AtomicU8::new(PHASE_WRITABLE),
+            code_bytes: AtomicU64::new(0),
+            readonly_bytes: AtomicU64::new(0),
+            readwrite_bytes: AtomicU64::new(0),
             #[cfg(test)]
             released_mappings: AtomicUsize::new(0),
         });
@@ -341,9 +387,11 @@ impl JITMemoryProvider for WxMemoryProvider {
         let allocation =
             region::alloc(rounded, region::Protection::READ_WRITE).map_err(io::Error::other)?;
         let pointer = allocation.as_ptr::<u8>() as *mut u8;
+        let mapping_kind = MappingKind::from_request(kind);
+        self.liveness.record_bytes(mapping_kind, rounded as u64);
         self.mappings.push(OwnedMapping {
             allocation,
-            kind: MappingKind::from_request(kind),
+            kind: mapping_kind,
         });
         Ok(pointer)
     }
@@ -368,9 +416,15 @@ impl JITMemoryProvider for WxMemoryProvider {
                 Ok(())
             }
             Err(error) => {
-                // Any partial finalization failure poisons the module: release
-                // every mapping, leave the phase Freed, and never publish.
-                self.release();
+                // A partial finalization failure poisons the module:
+                // `finalization_started` is already true, so no further
+                // allocation or finalization can occur, and the publication
+                // receipt checks `phase() == Executable` and will refuse.
+                // Retain the mappings until `Drop` releases them —
+                // `JITModule` still holds `CompiledBlob` pointers that
+                // reference this memory, and unmapping here would leave
+                // dangling pointers that later `get_finalized_*` calls
+                // could dereference.
                 Err(*error)
             }
         }
@@ -397,6 +451,12 @@ impl WxMemoryHandle {
     /// The current lifecycle phase (shared with the provider).
     pub(crate) fn phase(&self) -> WxPhase {
         self.liveness.phase()
+    }
+
+    /// Page-rounded W^X allocation totals by mapping kind, observed through the
+    /// shared lifecycle. Stable once finalization completes.
+    pub(crate) fn byte_totals(&self) -> WxByteTotals {
+        self.liveness.byte_totals()
     }
 
     #[cfg(test)]
@@ -693,14 +753,20 @@ mod tests {
                 .finalize(BranchProtection::None)
                 .expect_err("injected fault prevents finalization");
 
-            // No receipt; the module is poisoned and Freed.
-            assert_eq!(memory.phase(), WxPhase::Freed);
-
-            assert_eq!(memory.released_mappings(), 3);
+            // No receipt; the module is poisoned. Mappings are retained
+            // until Drop to avoid dangling CompiledBlob pointers — see
+            // WxMemoryProvider::finalize.
+            assert_eq!(memory.phase(), WxPhase::Writable);
+            assert_eq!(memory.released_mappings(), 0);
 
             // A poisoned module is never retried.
             assert!(provider.finalize(BranchProtection::None).is_err());
             assert!(provider.allocate(16, 8, JITMemoryKind::Writable).is_err());
+
+            // Drop releases the retained mappings and moves to Freed.
+            drop(provider);
+            assert_eq!(memory.phase(), WxPhase::Freed);
+            assert_eq!(memory.released_mappings(), 3);
         }
     }
 

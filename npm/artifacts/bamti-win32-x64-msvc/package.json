@@ -1,0 +1,35 @@
+{
+  "name": "@bamti/bamti-win32-x64-msvc",
+  "version": "0.2.0",
+  "description": "BamTS native Node-API addon for Windows x64 MSVC",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/metaphorics/bamTiScript.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "commonjs",
+  "main": "bamti.win32-x64-msvc.node",
+  "files": ["bamti.win32-x64-msvc.node"],
+  "engines": {
+    "node": ">=24"
+  },
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "bamtiNative": {
+    "entry": "bamti.win32-x64-msvc.node",
+    "target": "x86_64-pc-windows-msvc",
+    "artifactKind": "native-addon",
+    "sha256": "__BAMTI_SHA256__",
+    "release": {
+      "packageVersion": "0.2.0",
+      "sourceCommit": "__BAMTI_SOURCE_COMMIT__",
+      "nativeAbi": 1,
+      "cliProtocol": 1,
+      "buildSetId": "__BAMTI_BUILD_SET_ID__",
+      "releaseId": "__BAMTI_RELEASE_ID__"
+    }
+  }
+}

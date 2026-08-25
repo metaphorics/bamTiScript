@@ -6,16 +6,16 @@ the native executable from that package. It does not use a postinstall script.
 
 ## Pre-release status
 
-These npm packages are prepared for a future release and are not published. The
-Rust workspace does not yet define the `bamts` binary, so there is no working
-platform artifact to install today. The shim deliberately fails with an actionable
-error when its artifact is absent; it does not pretend that a compiler is present.
+Version 0.1.0 is published on npm, but the platform artifact packages referenced
+by its optional dependencies are unavailable. Build the CLI from source to use it
+today. The JavaScript shim reports the missing package when an artifact is absent;
+it does not fall back to an unrelated executable.
 
-When artifacts exist, the package will support Linux x64 and arm64, macOS x64 and
-arm64, and Windows x64. An unsupported platform or a skipped optional dependency
-will report the package name needed to fix the installation.
+The package manifests reserve artifacts for Linux x64 and arm64, macOS x64 and
+arm64, and Windows x64. These targets describe the planned package layout, not a
+published support guarantee.
 
-The programmatic API is also available:
+The package also defines this programmatic API:
 
 ```js
 import { resolveBinary, run } from "bamti-cli";

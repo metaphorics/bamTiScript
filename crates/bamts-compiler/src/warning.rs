@@ -1,5 +1,5 @@
 use crate::{
-    diagnostic::{Diagnostic, Recovered},
+    diagnostic::Diagnostic,
     lint::{LintLevel, LintProfile, LintTable, RULES},
     rules,
     source::{ScriptKind, SourceId, SourceText},
@@ -9,21 +9,15 @@ use crate::{
 const MAX_RECOGNIZER_TOKENS: usize = 4_096;
 const MAX_PATTERN_TOKENS: usize = 128;
 
-/// Analyzes the recovered syntax product using the default lint profile.
-///
-/// Existing recovery diagnostics are intentionally neither read nor mutated.
+/// Analyzes one parsed source using the default lint profile.
 #[must_use]
-pub fn analyze_hard_warnings(source_file: &Recovered<SourceFile>) -> Vec<Diagnostic> {
+pub fn analyze_hard_warnings(source_file: &SourceFile) -> Vec<Diagnostic> {
     analyze_warnings(source_file, &LintTable::new(LintProfile::Default))
 }
 
-/// Analyzes the recovered syntax product using a resolved lint table.
+/// Analyzes one parsed source using a resolved lint table.
 #[must_use]
-pub fn analyze_warnings(
-    source_file: &Recovered<SourceFile>,
-    levels: &LintTable,
-) -> Vec<Diagnostic> {
-    let source_file = source_file.product();
+pub fn analyze_warnings(source_file: &SourceFile, levels: &LintTable) -> Vec<Diagnostic> {
     let mut diagnostics = if matches!(
         source_file.script_kind(),
         ScriptKind::TypeScript | ScriptKind::TypeScriptReact
@@ -784,7 +778,7 @@ mod tests {
     };
 
     fn codes(source: &str) -> Vec<&'static str> {
-        let source = SourceText::new(source);
+        let source = SourceText::new(source).expect("test source fits the per-file budget");
         analyze_source_text(SourceId::new(0), &source)
             .iter()
             .map(|diagnostic| diagnostic.code().as_str())
@@ -869,11 +863,12 @@ mod tests {
         let parsed = parser::parse(scanner::scan(
             SourceId::new(0),
             ScriptKind::JavaScript,
-            Arc::new(SourceText::new(
-                "try {} catch (error) { error.message; } value === NaN;",
-            )),
+            Arc::new(
+                SourceText::new("try {} catch (error) { error.message; } value === NaN;")
+                    .expect("test source fits the per-file budget"),
+            ),
         ));
-        let codes = analyze_hard_warnings(&parsed)
+        let codes = analyze_hard_warnings(parsed.product())
             .iter()
             .map(|diagnostic| diagnostic.code().as_str())
             .collect::<Vec<_>>();

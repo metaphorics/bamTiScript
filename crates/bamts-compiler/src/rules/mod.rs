@@ -13,9 +13,10 @@ use crate::{
     syntax::{
         ArrayElement, AssignmentArrayElement, AssignmentTarget, CallArgument, ClassDeclaration,
         ClassMember, ExportDeclaration, ExportDefaultValue, Expr, Expression, ForBinding,
-        ForInitializer, FunctionBody, FunctionLike, InterfaceDeclaration, MemberProperty,
-        ObjectMember, ParameterNode, PropertyName, SourceFile, Statement, Stmt, TokenKind,
-        TypeAnnotationNode, TypeMember, TypeNode, TypeParameterList,
+        ForInitializer, FunctionBody, FunctionLike, InterfaceDeclaration, JsxAttributeInitializer,
+        JsxAttributeItem, JsxChild, KeywordType, MemberProperty, ObjectMember, ParameterNode,
+        PropertyName, SourceFile, Statement, Stmt, TokenKind, TypeAnnotationNode, TypeMember,
+        TypeNode, TypeParameterList,
     },
 };
 
@@ -1006,6 +1007,9 @@ fn visit_statement(
                         visit_expression(expression, script_kind, findings)
                     }
                     ExportDefaultValue::Missing(_) => {}
+                    ExportDefaultValue::Interface(interface) => {
+                        visit_interface(statement.range(), interface, findings)
+                    }
                 }
             }
             ExportDeclaration::Named(crate::syntax::ExportNamedDeclaration::Declaration(inner)) => {
@@ -1218,12 +1222,21 @@ fn visit_class(
     for member in &class.members {
         match member.data() {
             ClassMember::Constructor(constructor) => {
-                flag_parameter_count(member.range(), constructor.parameters.len(), findings);
-                for parameter in &constructor.parameters {
-                    if let Some(initializer) = &parameter.data().initializer {
-                        visit_expression(initializer, script_kind, findings);
-                    }
-                }
+                // Constructors share the same signature surface as other callables
+                // (parameter count, mutable-array params, JS-only type syntax,
+                // decorators, initializers) and must not skip it. A constructor
+                // carries no return type or type parameters, so passing `None`
+                // for both keeps the JS-only function-type-syntax check (W085)
+                // from firing on it — that rule targets syntax a constructor
+                // cannot legally have.
+                visit_callable_signature(
+                    member.range(),
+                    &constructor.parameters,
+                    None,
+                    None,
+                    script_kind,
+                    findings,
+                );
                 visit_statement_list(&constructor.body.data().statements, script_kind, findings);
             }
             ClassMember::Method(method) => {
@@ -1260,12 +1273,67 @@ fn visit_property_name(
     }
 }
 
+fn visit_jsx_attributes(
+    attributes: &[JsxAttributeItem],
+    script_kind: ScriptKind,
+    findings: &mut Vec<(&'static str, TextRange, &'static str)>,
+) {
+    for attribute in attributes {
+        match attribute {
+            JsxAttributeItem::Attribute(attribute) => {
+                if let Some(JsxAttributeInitializer::Expression(container)) =
+                    &attribute.data().initializer
+                    && let Some(expression) = &container.data().expression
+                {
+                    visit_expression(expression, script_kind, findings);
+                }
+            }
+            JsxAttributeItem::Spread(spread) => {
+                visit_expression(&spread.data().expression, script_kind, findings);
+            }
+        }
+    }
+}
+
+fn visit_jsx_children(
+    children: &[JsxChild],
+    script_kind: ScriptKind,
+    findings: &mut Vec<(&'static str, TextRange, &'static str)>,
+) {
+    for child in children {
+        match child {
+            JsxChild::Text(_) => {}
+            JsxChild::ExpressionContainer(container) => {
+                if let Some(expression) = &container.data().expression {
+                    visit_expression(expression, script_kind, findings);
+                }
+            }
+            JsxChild::Spread(spread) => {
+                visit_expression(&spread.data().expression, script_kind, findings);
+            }
+            JsxChild::Element(expression) => {
+                visit_expression(expression, script_kind, findings);
+            }
+        }
+    }
+}
+
 fn visit_expression(
     expression: &Expr,
     script_kind: ScriptKind,
     findings: &mut Vec<(&'static str, TextRange, &'static str)>,
 ) {
     match expression.data() {
+        Expression::JsxElement(element) => {
+            visit_jsx_attributes(&element.opening.data().attributes, script_kind, findings);
+            visit_jsx_children(&element.children, script_kind, findings);
+        }
+        Expression::JsxFragment(fragment) => {
+            visit_jsx_children(&fragment.children, script_kind, findings);
+        }
+        Expression::JsxSelfClosingElement(element) => {
+            visit_jsx_attributes(&element.attributes, script_kind, findings);
+        }
         Expression::Template(template) => {
             for expression in &template.expressions {
                 visit_expression(expression, script_kind, findings);
@@ -1511,6 +1579,27 @@ fn visit_interface(
     }
 }
 
+/// Returns `true` when the declared return type can represent a missing
+/// return value: `undefined`, `void`, `any`, `unknown`, or any union that
+/// contains one of them. Parenthesized wrappers are unwrapped.
+fn return_type_admits_absence(return_type: Option<&TypeAnnotationNode>) -> bool {
+    fn admits_absence(ty: &TypeNode) -> bool {
+        match ty {
+            TypeNode::Keyword(keyword) => matches!(
+                keyword,
+                KeywordType::Undefined
+                    | KeywordType::Void
+                    | KeywordType::Any
+                    | KeywordType::Unknown
+            ),
+            TypeNode::Union(members) => members.iter().any(|member| admits_absence(member.data())),
+            TypeNode::Parenthesized(inner) => admits_absence(inner.data()),
+            _ => false,
+        }
+    }
+    return_type.is_some_and(|annotation| admits_absence(annotation.data().type_node.data()))
+}
+
 fn visit_function(
     range: TextRange,
     function: &FunctionLike,
@@ -1536,6 +1625,7 @@ fn visit_function(
                     .statements
                     .last()
                     .is_none_or(can_complete_normally)
+                && !return_type_admits_absence(function.return_type.as_ref())
             {
                 findings.push((
                     "BAMTS-W065",
@@ -1672,6 +1762,39 @@ fn can_complete_normally(statement: &Stmt) -> bool {
             });
             try_completes || catch_completes
         }
+        Statement::Switch(statement) => {
+            // Without a default the discriminant may match no case, so the
+            // switch always completes normally. With a default it completes
+            // normally only if some case can fall out the bottom: it ends in
+            // an unlabeled `break` (which exits the switch), or it is the last
+            // case and its final statement completes normally (control drops
+            // out the bottom). An empty consequent is fall-through to the next
+            // case and decides nothing on its own — except a trailing empty
+            // case, which has nothing to fall through to and so drops out.
+            let has_default = statement
+                .cases
+                .iter()
+                .any(|case| case.data().test.is_none());
+            if !has_default {
+                return true;
+            }
+            let last_index = statement.cases.len().saturating_sub(1);
+            statement.cases.iter().enumerate().any(|(index, case)| {
+                let Some(last) = case.data().consequent.last() else {
+                    // Empty consequent: falls through to the next case,
+                    // unless it is the final case (nothing to fall into).
+                    return index == last_index;
+                };
+                // An unlabeled break exits the switch normally. A labeled
+                // break targets an enclosing statement and does not.
+                if matches!(last.data(), Statement::Break(jump) if jump.label.is_none()) {
+                    return true;
+                }
+                // Only the final case can drop out the bottom; any other
+                // case that completes normally just falls through.
+                index == last_index && can_complete_normally(last)
+            })
+        }
         _ => true,
     }
 }
@@ -1691,7 +1814,7 @@ mod tests {
         let parsed = parser::parse(scanner::scan(
             SourceId::new(0),
             kind,
-            Arc::new(SourceText::new(source)),
+            Arc::new(SourceText::new(source).expect("test source fits the per-file budget")),
         ));
         let mut levels = LintTable::new(LintProfile::Pedantic);
         levels
@@ -1934,9 +2057,10 @@ mod tests {
         let parsed = parser::parse(scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
-            Arc::new(SourceText::new(
-                "enum Runtime { Value } const enum Inlined { Value }",
-            )),
+            Arc::new(
+                SourceText::new("enum Runtime { Value } const enum Inlined { Value }")
+                    .expect("test source fits the per-file budget"),
+            ),
         ));
         let diagnostics = analyze(parsed.product(), &LintTable::new(LintProfile::Strict));
         let runtime = diagnostics
@@ -1955,7 +2079,7 @@ mod tests {
         w059_mutable_array_function,
         "BAMTS-W059",
         "function f(xs: number[]) { return xs; }",
-        "function f(value: number) { return value; }"
+        "function f(xs: readonly number[]) { return xs; }"
     );
 
     rule_test!(
@@ -1965,12 +2089,213 @@ mod tests {
         "const f = (value: number) => value;"
     );
 
+    rule_test!(
+        w059_mutable_array_constructor,
+        "BAMTS-W059",
+        "class C { constructor(xs: number[]) {} }",
+        "class C { constructor(value: number) {} }"
+    );
+
     #[test]
     fn arrow_signature_rejects_javascript_type_syntax() {
         let diagnostics = codes("const f = (x: number) => x;", ScriptKind::JavaScript);
         assert!(
             diagnostics.contains(&"BAMTS-W085"),
             "BAMTS-W085 must flag TypeScript-only parameter syntax on arrow functions in JavaScript"
+        );
+    }
+
+    #[test]
+    fn w065_switch_returning_from_every_case_is_not_flagged() {
+        let source =
+            "function f(x: 1 | 2) { switch (x) { case 1: return 'a'; default: return 'b'; } }";
+        assert!(
+            !codes(source, ScriptKind::TypeScript).contains(&"BAMTS-W065"),
+            "a function that returns from every switch case must not be flagged as missing a return"
+        );
+    }
+
+    #[test]
+    fn w065_switch_grouped_empty_case_labels_are_not_flagged() {
+        // `case 1:` has an empty consequent and falls through to `case 2:`.
+        // Every reachable path returns, so W065 must not fire. The prior
+        // implementation treated the empty consequent as a path that completes
+        // normally, producing a false "missing return".
+        let source = "function f(x: 1 | 2 | 3): string {\n  switch (x) {\n    case 1:\n    case 2:\n      return 'a';\n    default:\n      return 'b';\n  }\n}";
+        assert!(
+            !codes(source, ScriptKind::TypeScript).contains(&"BAMTS-W065"),
+            "a function whose only empty case label falls through to a returning case must not be flagged as missing a return"
+        );
+    }
+
+    #[test]
+    fn w085_fires_in_jsx_attribute_value() {
+        assert!(
+            codes(
+                "<Foo onClick={(x: number) => x} />",
+                ScriptKind::JavaScriptReact,
+            )
+            .contains(&"BAMTS-W085"),
+            "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX attribute",
+        );
+    }
+
+    #[test]
+    fn w085_fires_in_jsx_child_expression() {
+        assert!(
+            codes(
+                "<Foo>{(x: number) => x}</Foo>;",
+                ScriptKind::JavaScriptReact,
+            )
+            .contains(&"BAMTS-W085"),
+            "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX child",
+        );
+    }
+
+    #[test]
+    fn w085_fires_in_jsx_fragment_child() {
+        assert!(
+            codes("<>{(x: number) => x}</>;", ScriptKind::JavaScriptReact,).contains(&"BAMTS-W085"),
+            "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX fragment",
+        );
+    }
+
+    #[test]
+    fn w085_fires_in_jsx_spread_attribute() {
+        assert!(
+            codes(
+                "<Foo {...((x: number) => x)} />",
+                ScriptKind::JavaScriptReact,
+            )
+            .contains(&"BAMTS-W085"),
+            "BAMTS-W085 must fire for TypeScript-only arrow parameter syntax in a JSX spread attribute",
+        );
+    }
+
+    #[test]
+    fn w085_does_not_fire_in_tsx() {
+        assert!(
+            !codes(
+                "<Foo onClick={(x: number) => x} />",
+                ScriptKind::TypeScriptReact,
+            )
+            .contains(&"BAMTS-W085"),
+            "BAMTS-W085 must not fire for TypeScript-only syntax in TSX",
+        );
+        assert!(
+            !codes("<>{x as number}</>;", ScriptKind::TypeScriptReact).contains(&"BAMTS-W085"),
+            "BAMTS-W085 must not fire for `as` assertions in TSX",
+        );
+    }
+
+    #[test]
+    fn w087_debugger_in_jsx_attribute() {
+        let diagnostics = codes(
+            "<Foo onClick={() => { debugger; }} />",
+            ScriptKind::TypeScriptReact,
+        );
+        assert!(
+            diagnostics.contains(&"BAMTS-W087"),
+            "BAMTS-W087 must fire for a debugger statement inside a JSX attribute arrow body",
+        );
+    }
+
+    #[test]
+    fn w064_six_parameter_arrow_in_jsx_attribute() {
+        let diagnostics = codes(
+            "<Foo onClick={(a,b,c,d,e,f) => a} />",
+            ScriptKind::TypeScriptReact,
+        );
+        assert!(
+            diagnostics.contains(&"BAMTS-W064"),
+            "BAMTS-W064 must fire for a six-parameter arrow inside a JSX attribute",
+        );
+    }
+
+    #[test]
+    fn jsx_names_and_text_are_not_traversed_as_expressions() {
+        let diagnostics = codes(
+            "const el = <My.Component ns:attr=\"value\">text</My.Component>;",
+            ScriptKind::TypeScriptReact,
+        );
+        assert!(
+            !diagnostics.contains(&"BAMTS-W085"),
+            "JSX names and text must not trigger TypeScript-only syntax rules",
+        );
+        assert!(
+            !diagnostics.contains(&"BAMTS-W064"),
+            "JSX names and text must not trigger the long-parameter-list rule",
+        );
+        assert!(
+            !diagnostics.contains(&"BAMTS-W087"),
+            "JSX names and text must not trigger the no-debugger rule",
+        );
+    }
+
+    #[test]
+    fn jsx_expressions_are_visited_exactly_once() {
+        let attribute = codes(
+            "<Foo onClick={(a,b,c,d,e,f) => a} />",
+            ScriptKind::TypeScriptReact,
+        );
+        assert_eq!(
+            attribute.iter().filter(|c| **c == "BAMTS-W064").count(),
+            1,
+            "a single arrow attribute must produce exactly one W064",
+        );
+
+        let nested = codes(
+            "<Foo>{<Bar onClick={(a,b,c,d,e,f) => a} />}</Foo>;",
+            ScriptKind::TypeScriptReact,
+        );
+        assert_eq!(
+            nested.iter().filter(|c| **c == "BAMTS-W064").count(),
+            1,
+            "a nested JSX element inside a child expression must produce exactly one W064",
+        );
+
+        let js = codes(
+            "<Foo {...((x: number) => x)} />",
+            ScriptKind::JavaScriptReact,
+        );
+        assert_eq!(
+            js.iter().filter(|c| **c == "BAMTS-W085").count(),
+            1,
+            "a single spread expression must produce exactly one W085",
+        );
+    }
+    #[test]
+    fn w065_suppressed_when_return_type_admits_absence() {
+        let no_warn = [
+            "function f(x: boolean): number | undefined { if (x) return 1; }",
+            "function f(x: boolean): undefined | number { if (x) return 1; }",
+            "function f(x: boolean): void { if (x) return 1; }",
+            "function f(x: boolean): any { if (x) return 1; }",
+            "function f(x: boolean): unknown { if (x) return 1; }",
+            "function f(x: boolean): (number | undefined) { if (x) return 1; }",
+            "function f(x: boolean): number | any { if (x) return 1; }",
+        ];
+        for source in no_warn {
+            assert!(
+                !codes(source, ScriptKind::TypeScript).contains(&"BAMTS-W065"),
+                "W065 must not fire when the return type admits absence: {source:?}"
+            );
+        }
+        assert!(
+            codes(
+                "function f(x: boolean): number { if (x) return 1; }",
+                ScriptKind::TypeScript,
+            )
+            .contains(&"BAMTS-W065"),
+            "W065 must fire for a non-optional return type"
+        );
+        assert!(
+            codes(
+                "function f(x: boolean) { if (x) return 1; }",
+                ScriptKind::TypeScript,
+            )
+            .contains(&"BAMTS-W065"),
+            "W065 must fire when no return type is declared"
         );
     }
 }

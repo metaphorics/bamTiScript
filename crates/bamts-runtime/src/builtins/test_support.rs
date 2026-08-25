@@ -14,7 +14,7 @@ impl Host for TestHost {}
 
 pub(super) fn blank_program(name: &str) -> Program<Verified> {
     let code = Module::new(
-        vec![Constant::String(EcmaString::from_utf8(name))],
+        vec![Constant::String(EcmaString::encode(name))],
         vec![Function::new(
             None,
             0,

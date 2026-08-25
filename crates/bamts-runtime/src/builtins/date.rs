@@ -15,6 +15,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
+    builtins.set_date_prototype(prototype);
     let constructor = install_function(heap, builtins, "Date", 7, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     let now = install_function(heap, builtins, "now", 0, now::<H>);
@@ -23,7 +24,7 @@ pub(super) fn install<H: Host>(
         unreachable!()
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("now")),
+        PropertyKey::Named(EcmaString::encode("now")),
         super::builtin_property(now),
     );
     for (name, handler) in [
@@ -34,7 +35,7 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, 0, handler);
         define_data(heap, prototype, name, function);
     }
-    globals.insert(EcmaString::from_utf8("Date"), constructor);
+    globals.insert(EcmaString::encode("Date"), constructor);
 }
 
 fn constructor<H: Host>(
@@ -44,11 +45,11 @@ fn constructor<H: Host>(
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     if !constructing {
-        let text = iso_string(time_clip(machine.host.now_ms() as f64))
+        let text = to_date_string(time_clip(machine.host.now_ms() as f64))
             .unwrap_or_else(|| "Invalid Date".to_owned());
         return Ok(BuiltinOutcome::Value(allocate_string(
             machine,
-            EcmaString::from_utf8(&text),
+            EcmaString::encode(&text),
         )?));
     }
 
@@ -65,21 +66,36 @@ fn constructor<H: Host>(
             });
         if let Some(time) = copied_time {
             time_clip(time)
-        } else if let Some(text) = machine.string_value(value) {
-            parse_iso_date(&text).unwrap_or(f64::NAN)
         } else {
-            time_clip(value_number(machine.coerce_number_observable(value)?))
+            let primitive = machine.coerce_primitive_default(value)?;
+            if let Some(text) = machine.string_value(primitive) {
+                parse_iso_date(&text).unwrap_or(f64::NAN)
+            } else {
+                time_clip(value_number(machine.coerce_number_observable(primitive)?))
+            }
         }
     } else {
         let mut components = [0.0; 7];
         components[2] = 1.0;
-        for (component, argument) in components.iter_mut().zip(args.iter().copied()) {
-            *component = value_number(machine.to_number(argument)?);
+        for (i, component) in components.iter_mut().enumerate() {
+            if let Some(&argument) = args.get(i) {
+                *component = value_number(machine.coerce_number_observable(argument)?);
+            }
         }
         date_from_components(components)
     };
-    let constructor = machine.intrinsics.global("Date").expect("Date installed");
-    let prototype = machine.get_named_property(constructor, "prototype")?;
+    let default_prototype = machine.intrinsics.builtins.date_prototype();
+    let new_target = machine.current_new_target();
+    let prototype = if new_target != Value::UNDEFINED {
+        let candidate = machine.get_named_property(new_target, "prototype")?;
+        if machine.is_object(candidate) {
+            candidate
+        } else {
+            default_prototype
+        }
+    } else {
+        default_prototype
+    };
     let object = machine
         .allocate(HeapEntry::Date {
             time: milliseconds,
@@ -123,7 +139,7 @@ fn to_iso_string<H: Host>(
     let text = iso_string(milliseconds).ok_or_else(|| range_error("Invalid time value"))?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        EcmaString::from_utf8(&text),
+        EcmaString::encode(&text),
     )?))
 }
 
@@ -159,6 +175,47 @@ fn iso_string(milliseconds: f64) -> Option<String> {
     };
     Some(format!(
         "{year_text}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millisecond:03}Z"
+    ))
+}
+
+/// `ToDateString`: the implementation-defined human-readable form used by both
+/// `Date()` (no `new`) and `Date.prototype.toString`. The runtime is UTC-only,
+/// so the offset is fixed at `GMT+0000` with the `(Coordinated Universal Time)`
+/// time-zone name, matching the host's `now_ms` UTC epoch.
+fn to_date_string(milliseconds: f64) -> Option<String> {
+    if !milliseconds.is_finite() || milliseconds.abs() > 8_640_000_000_000_000.0 {
+        return None;
+    }
+    let millis = milliseconds.trunc() as i64;
+    let seconds = millis.div_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = day_seconds / 3600;
+    let minute = day_seconds % 3600 / 60;
+    let second = day_seconds % 60;
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // 1970-01-01 was a Thursday (index 4); rem_euclid keeps negative days correct.
+    let weekday = ((days.rem_euclid(7) + 4) % 7) as usize;
+    let year_text = if (0..=9999).contains(&year) {
+        format!("{year:04}")
+    } else if year < 0 {
+        format!("-{abs:06}", abs = year.unsigned_abs())
+    } else {
+        format!("+{year:06}")
+    };
+    Some(format!(
+        "{} {} {:02} {} {:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+        WEEKDAYS[weekday],
+        MONTHS[(month - 1) as usize],
+        day,
+        year_text,
+        hour,
+        minute,
+        second
     ))
 }
 
@@ -423,14 +480,15 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use bamts_native::Value;
 
     use super::super::test_support::{blank_program, ordinary_object};
     use super::*;
-    use crate::Limits;
     use crate::intrinsics::{BuiltinDef, BuiltinHandler, native_function};
+    use crate::{Limits, Property};
+    use bamts_bytecode::{FunctionId, ModuleId};
 
     struct TestHost;
 
@@ -478,16 +536,125 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let garbage = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("not a date")))
+            .allocate(HeapEntry::String(EcmaString::encode("not a date")))
             .expect("string allocation succeeds");
 
+        // Date() without `new` returns ToDateString — the human-readable
+        // toString form — NOT the ISO-8601 string. ECMA-262 §21.4.2.1.
+        let expected = to_date_string(1_704_067_200_123.0).unwrap();
         for args in [&[][..], &[Value::int32(0)][..], &[garbage][..]] {
             let value = call_date(&mut machine, args, false);
             assert_eq!(
                 machine.string_value(value).unwrap().as_units(),
-                EcmaString::from_utf8("2024-01-01T00:00:00.123Z").as_units()
+                EcmaString::encode(&expected).as_units(),
+                "Date() must return the toString form, not ISO-8601"
+            );
+            // Guard against regression to the ISO form.
+            assert_ne!(
+                machine.string_value(value).unwrap().as_units(),
+                EcmaString::encode("2024-01-01T00:00:00.123Z").as_units()
             );
         }
+    }
+
+    #[test]
+    fn call_form_returns_to_date_string_not_iso() {
+        // Direct regression: the spec ToDateString form starts with a weekday
+        // and contains "GMT", never the ISO-8601 date/time separator.
+        let text = to_date_string(1_704_067_200_123.0).unwrap();
+        assert!(text.starts_with("Mon Jan 01 2024"));
+        assert!(text.contains("GMT+0000 (Coordinated Universal Time)"));
+        // ISO-8601 is `YYYY-MM-DDTHH:MM:SS.sssZ`; the ToDateString form is
+        // `Www Mmm DD YYYY HH:MM:SS GMT+0000 (...)`. The two are told apart
+        // by the `T` date/time separator at the fixed offset 10 — a `T` that
+        // appears inside "Time" or weekday "Tue"/"Thu" lives elsewhere, so a
+        // bare `contains('T')` cannot distinguish the forms.
+        let bytes = text.as_bytes();
+        let is_iso_prefix =
+            bytes.len() >= 11 && bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b'T';
+        assert!(!is_iso_prefix, "ToDateString must not be ISO-8601");
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let value = call_date(&mut machine, &[], false);
+        let result = machine.string_value(value).unwrap();
+        assert_eq!(result.as_units(), EcmaString::encode(&text).as_units());
+    }
+
+    #[test]
+    fn date_subclass_instance_has_subclass_prototype() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        // Build a stand-in for `class D extends Date {}`: a constructor
+        // function whose `prototype` is a fresh ordinary object that itself
+        // inherits from Date.prototype.
+        let date_constructor = machine.intrinsics.global("Date").expect("Date installed");
+        let date_prototype = machine
+            .get_named_property(date_constructor, "prototype")
+            .unwrap();
+
+        let sub_prototype = ordinary_object(&mut machine);
+        machine
+            .set_prototype(sub_prototype, date_prototype)
+            .unwrap();
+
+        let mut properties = PropertyMap::default();
+        properties.insert(
+            PropertyKey::Named(EcmaString::encode("prototype")),
+            Property::Data {
+                value: sub_prototype,
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        let sub_constructor = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                context: None,
+                properties,
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+
+        // Construct via Date with new.target = sub_constructor, simulating
+        // `super()` inside `class D extends Date`.
+        let date_index = machine.runtime_slot(date_constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: crate::NativeCallable::Builtin(date_id),
+            ..
+        } = machine.heap[date_index]
+        else {
+            panic!("Date is a builtin");
+        };
+        let BuiltinOutcome::Value(instance) = machine
+            .call_builtin_with_new_target(date_id, Value::UNDEFINED, &[], true, sub_constructor)
+            .expect("Date construct succeeds")
+        else {
+            panic!("Date construct returns a value");
+        };
+
+        // The instance must inherit from the subclass prototype, not directly
+        // from Date.prototype.
+        assert_eq!(
+            machine.prototype_value(instance).unwrap(),
+            Some(sub_prototype),
+            "subclass instance must carry the subclass prototype"
+        );
+        assert!(
+            machine.instance_of(instance, sub_constructor).unwrap(),
+            "instanceof SubClass must be true"
+        );
+        assert!(
+            machine.instance_of(instance, date_constructor).unwrap(),
+            "instanceof Date must still be true"
+        );
     }
 
     #[test]
@@ -532,7 +699,7 @@ mod tests {
             ("2024-01-01T24:00:00Z", 1_704_153_600_000.0),
         ] {
             assert_eq!(
-                parse_iso_date(&EcmaString::from_utf8(text)),
+                parse_iso_date(&EcmaString::encode(text)),
                 Some(milliseconds),
                 "{text}"
             );
@@ -544,7 +711,7 @@ mod tests {
             ("-000001-01-01T00:00:00.000Z", "-000001-01-01T00:00:00.000Z"),
         ] {
             let milliseconds =
-                parse_iso_date(&EcmaString::from_utf8(text)).expect("valid extended year");
+                parse_iso_date(&EcmaString::encode(text)).expect("valid extended year");
             assert_eq!(
                 iso_string(milliseconds).as_deref(),
                 Some(expected),
@@ -562,7 +729,7 @@ mod tests {
             "2024-01-01 00:00:00.000Z",
             "-000000-01-01T00:00:00.000Z",
         ] {
-            assert_eq!(parse_iso_date(&EcmaString::from_utf8(text)), None, "{text}");
+            assert_eq!(parse_iso_date(&EcmaString::encode(text)), None, "{text}");
         }
     }
     static VALUE_OF_CALLED: AtomicBool = AtomicBool::new(false);
@@ -599,6 +766,64 @@ mod tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         DATE_VALUE_OF_CALLED.store(true, Ordering::SeqCst);
         Ok(BuiltinOutcome::Value(Value::int32(99_999)))
+    }
+
+    static CALL_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static YEAR_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static MONTH_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static DAY_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static TO_STRING_CALLED: AtomicBool = AtomicBool::new(false);
+
+    fn year_value_of(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        YEAR_ORDER.store(
+            CALL_ORDER.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        Ok(BuiltinOutcome::Value(Value::int32(2024)))
+    }
+
+    fn month_value_of(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        MONTH_ORDER.store(
+            CALL_ORDER.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        Ok(BuiltinOutcome::Value(Value::int32(0)))
+    }
+
+    fn day_value_of(
+        _machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        DAY_ORDER.store(
+            CALL_ORDER.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        Ok(BuiltinOutcome::Value(Value::int32(1)))
+    }
+
+    fn to_string_date_string(
+        machine: &mut Machine<'_, TestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        TO_STRING_CALLED.store(true, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("2024-01-01T00:00:00.000Z"),
+        )?))
     }
 
     #[test]
@@ -657,5 +882,132 @@ mod tests {
             "Date valueOf must not be called when copying"
         );
         assert_eq!(date_time(&machine, copy).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn one_argument_parses_object_to_string_primitive() {
+        TO_STRING_CALLED.store(false, Ordering::SeqCst);
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let source = ordinary_object(&mut machine);
+        let to_string = native(&mut machine, "toString", to_string_date_string);
+        machine
+            .set_data_property(source, "toString", to_string)
+            .expect("toString install succeeds");
+
+        let value = call_date(&mut machine, &[source], true);
+        assert!(
+            TO_STRING_CALLED.load(Ordering::SeqCst),
+            "toString must be called"
+        );
+        assert_eq!(
+            date_time(&machine, value).unwrap(),
+            1_704_067_200_000.0,
+            "object toString must be parsed as an ISO date string"
+        );
+    }
+
+    #[test]
+    fn multi_argument_components_call_value_of_in_order() {
+        CALL_ORDER.store(0, Ordering::SeqCst);
+        YEAR_ORDER.store(0, Ordering::SeqCst);
+        MONTH_ORDER.store(0, Ordering::SeqCst);
+        DAY_ORDER.store(0, Ordering::SeqCst);
+
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let year = ordinary_object(&mut machine);
+        let month = ordinary_object(&mut machine);
+        let day = ordinary_object(&mut machine);
+
+        let year_fn = native(&mut machine, "yearValueOf", year_value_of);
+        let month_fn = native(&mut machine, "monthValueOf", month_value_of);
+        let day_fn = native(&mut machine, "dayValueOf", day_value_of);
+
+        machine
+            .set_data_property(year, "valueOf", year_fn)
+            .expect("year valueOf install succeeds");
+        machine
+            .set_data_property(month, "valueOf", month_fn)
+            .expect("month valueOf install succeeds");
+        machine
+            .set_data_property(day, "valueOf", day_fn)
+            .expect("day valueOf install succeeds");
+
+        let value = call_date(&mut machine, &[year, month, day], true);
+        assert_eq!(
+            date_time(&machine, value).unwrap(),
+            1_704_067_200_000.0,
+            "multi-argument components must coerce to 2024-01-01"
+        );
+        assert_eq!(
+            YEAR_ORDER.load(Ordering::SeqCst),
+            1,
+            "year must coerce first"
+        );
+        assert_eq!(
+            MONTH_ORDER.load(Ordering::SeqCst),
+            2,
+            "month must coerce second"
+        );
+        assert_eq!(DAY_ORDER.load(Ordering::SeqCst), 3, "day must coerce third");
+    }
+
+    #[test]
+    fn date_prototype_is_cached_not_global_lookup() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+
+        let ctor_before = machine
+            .intrinsics
+            .global("Date")
+            .expect("Date global exists");
+        let date_id = machine
+            .intrinsics
+            .builtins
+            .id_named("Date")
+            .expect("Date builtin id");
+
+        // Delete and overwrite the global name. Construction through the saved
+        // builtin id must still use the cached intrinsic prototype.
+        machine
+            .intrinsics
+            .globals
+            .remove(&EcmaString::encode("Date"));
+        machine
+            .intrinsics
+            .globals
+            .insert(EcmaString::encode("Date"), Value::int32(99));
+
+        let BuiltinOutcome::Value(instance) = machine
+            .call_builtin(date_id, Value::UNDEFINED, &[], true)
+            .expect("Date construct succeeds")
+        else {
+            panic!("Date construct returns a value");
+        };
+
+        let index = machine
+            .runtime_slot(instance)
+            .expect("valid instance")
+            .expect("slot");
+        let HeapEntry::Date { prototype, .. } = &machine.heap[index] else {
+            panic!("Date instance");
+        };
+        assert_eq!(
+            *prototype,
+            Some(machine.intrinsics.builtins.date_prototype())
+        );
+
+        // The cached prototype's "constructor" is still the original Date constructor.
+        let proto_val = machine.intrinsics.builtins.date_prototype();
+        let ctor = machine
+            .get_named_property(proto_val, "constructor")
+            .expect("prototype has constructor");
+        assert_eq!(ctor, ctor_before);
     }
 }

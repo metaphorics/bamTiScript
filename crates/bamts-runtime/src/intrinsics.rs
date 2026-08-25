@@ -4,7 +4,10 @@ use std::marker::PhantomData;
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
-use crate::{EvalFailure, HeapEntry, Host, Machine, NativeCallable, PropertyMap, ThrowOrigin};
+use crate::{
+    EvalFailure, HeapEntry, Host, Machine, NativeCallable, PropertyMap, ResumeCompletion,
+    ThrowOrigin,
+};
 
 #[path = "builtins/mod.rs"]
 pub(crate) mod builtins;
@@ -23,13 +26,13 @@ pub(crate) enum BuiltinOutcome {
         this_value: Value,
         arguments: Vec<Value>,
     },
-    GeneratorNext {
+    GeneratorResume {
         generator: Value,
-        resume_value: Value,
+        completion: ResumeCompletion,
     },
-    AsyncGeneratorNext {
+    AsyncGeneratorResume {
         generator: Value,
-        resume_value: Value,
+        completion: ResumeCompletion,
     },
 }
 
@@ -71,8 +74,21 @@ pub(crate) struct BuiltinTable<H: Host> {
     generator_prototype: Option<Value>,
     async_generator_prototype: Option<Value>,
     promise_resolver_targets: Option<(Value, Value)>,
-    promise_all_targets: Option<(Value, Value)>,
+    promise_all_target: Option<Value>,
     promise_prototype: Option<Value>,
+    uint8array_prototype: Option<Value>,
+    date_prototype: Option<Value>,
+    map_prototype: Option<Value>,
+    set_prototype: Option<Value>,
+    weak_map_prototype: Option<Value>,
+    weak_set_prototype: Option<Value>,
+    promise_capability_executor: Option<Value>,
+    promise_finally_value: Option<Value>,
+    promise_finally_throw: Option<Value>,
+    promise_finally_return: Option<Value>,
+    promise_finally_rethrow: Option<Value>,
+    promise_then_fulfill: Option<Value>,
+    promise_then_reject: Option<Value>,
     marker: PhantomData<fn() -> H>,
 }
 
@@ -109,8 +125,21 @@ impl<H: Host> BuiltinTable<H> {
             generator_prototype: None,
             async_generator_prototype: None,
             promise_resolver_targets: None,
-            promise_all_targets: None,
+            promise_all_target: None,
             promise_prototype: None,
+            uint8array_prototype: None,
+            date_prototype: None,
+            map_prototype: None,
+            set_prototype: None,
+            weak_map_prototype: None,
+            weak_set_prototype: None,
+            promise_capability_executor: None,
+            promise_finally_value: None,
+            promise_finally_throw: None,
+            promise_finally_return: None,
+            promise_finally_rethrow: None,
+            promise_then_fulfill: None,
+            promise_then_reject: None,
             marker: PhantomData,
         }
     }
@@ -282,6 +311,123 @@ impl<H: Host> BuiltinTable<H> {
             .expect("Promise builtins install their prototype")
     }
 
+    pub(crate) fn set_uint8array_prototype(&mut self, prototype: Value) {
+        self.uint8array_prototype = Some(prototype);
+    }
+
+    pub(crate) fn uint8array_prototype(&self) -> Value {
+        self.uint8array_prototype
+            .expect("Uint8Array builtins install their prototype")
+    }
+
+    pub(crate) fn set_date_prototype(&mut self, prototype: Value) {
+        self.date_prototype = Some(prototype);
+    }
+
+    pub(crate) fn date_prototype(&self) -> Value {
+        self.date_prototype
+            .expect("Date builtins install their prototype")
+    }
+
+    pub(crate) fn set_map_prototype(&mut self, prototype: Value) {
+        self.map_prototype = Some(prototype);
+    }
+
+    pub(crate) fn map_prototype(&self) -> Value {
+        self.map_prototype
+            .expect("Map builtins install their prototype")
+    }
+
+    pub(crate) fn set_set_prototype(&mut self, prototype: Value) {
+        self.set_prototype = Some(prototype);
+    }
+
+    pub(crate) fn set_prototype(&self) -> Value {
+        self.set_prototype
+            .expect("Set builtins install their prototype")
+    }
+
+    pub(crate) fn set_weak_map_prototype(&mut self, prototype: Value) {
+        self.weak_map_prototype = Some(prototype);
+    }
+
+    pub(crate) fn weak_map_prototype(&self) -> Value {
+        self.weak_map_prototype
+            .expect("WeakMap builtins install their prototype")
+    }
+
+    pub(crate) fn set_weak_set_prototype(&mut self, prototype: Value) {
+        self.weak_set_prototype = Some(prototype);
+    }
+
+    pub(crate) fn weak_set_prototype(&self) -> Value {
+        self.weak_set_prototype
+            .expect("WeakSet builtins install their prototype")
+    }
+
+    pub(crate) fn set_promise_capability_executor(&mut self, value: Value) {
+        self.promise_capability_executor = Some(value);
+    }
+
+    pub(crate) fn promise_capability_executor(&self) -> Value {
+        self.promise_capability_executor
+            .expect("Promise builtins install capability executor")
+    }
+
+    pub(crate) fn set_promise_finally_value(&mut self, value: Value) {
+        self.promise_finally_value = Some(value);
+    }
+
+    pub(crate) fn promise_finally_value(&self) -> Value {
+        self.promise_finally_value
+            .expect("Promise builtins install finally value")
+    }
+
+    pub(crate) fn set_promise_finally_throw(&mut self, value: Value) {
+        self.promise_finally_throw = Some(value);
+    }
+
+    pub(crate) fn promise_finally_throw(&self) -> Value {
+        self.promise_finally_throw
+            .expect("Promise builtins install finally throw")
+    }
+
+    pub(crate) fn set_promise_finally_return(&mut self, value: Value) {
+        self.promise_finally_return = Some(value);
+    }
+
+    pub(crate) fn promise_finally_return(&self) -> Value {
+        self.promise_finally_return
+            .expect("Promise builtins install finally return")
+    }
+
+    pub(crate) fn set_promise_finally_rethrow(&mut self, value: Value) {
+        self.promise_finally_rethrow = Some(value);
+    }
+
+    pub(crate) fn promise_finally_rethrow(&self) -> Value {
+        self.promise_finally_rethrow
+            .expect("Promise builtins install finally rethrow")
+    }
+
+    pub(crate) fn set_promise_then_fulfill(&mut self, value: Value) {
+        self.promise_then_fulfill = Some(value);
+    }
+
+    pub(crate) fn promise_then_fulfill(&self) -> Value {
+        self.promise_then_fulfill
+            .expect("Promise builtins install then fulfill")
+    }
+
+    pub(crate) fn set_promise_then_reject(&mut self, value: Value) {
+        self.promise_then_reject = Some(value);
+    }
+
+    pub(crate) fn promise_then_reject(&self) -> Value {
+        self.promise_then_reject
+            .expect("Promise builtins install then reject")
+    }
+
     pub(crate) fn set_promise_resolver_targets(&mut self, resolve: Value, reject: Value) {
         self.promise_resolver_targets = Some((resolve, reject));
     }
@@ -291,13 +437,13 @@ impl<H: Host> BuiltinTable<H> {
             .expect("Promise builtins install resolver targets")
     }
 
-    pub(crate) fn set_promise_all_targets(&mut self, fulfill: Value, reject: Value) {
-        self.promise_all_targets = Some((fulfill, reject));
+    pub(crate) fn set_promise_all_target(&mut self, fulfill: Value) {
+        self.promise_all_target = Some(fulfill);
     }
 
-    pub(crate) fn promise_all_targets(&self) -> (Value, Value) {
-        self.promise_all_targets
-            .expect("Promise builtins install all targets")
+    pub(crate) fn promise_all_target(&self) -> Value {
+        self.promise_all_target
+            .expect("Promise builtins install the all target")
     }
 
     pub(crate) fn set_constructor_prototype(
@@ -311,7 +457,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin constructor is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            crate::PropertyKey::Named(EcmaString::encode("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: false,
@@ -329,7 +475,7 @@ impl<H: Host> BuiltinTable<H> {
         match &mut heap[prototype_index] {
             HeapEntry::Object { properties, .. } | HeapEntry::Array { properties, .. } => {
                 properties.insert(
-                    crate::PropertyKey::Named(EcmaString::from_utf8("constructor")),
+                    crate::PropertyKey::Named(EcmaString::encode("constructor")),
                     constructor_property,
                 );
             }
@@ -348,7 +494,7 @@ impl<H: Host> BuiltinTable<H> {
             panic!("builtin function is a native function");
         };
         properties.insert(
-            crate::PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            crate::PropertyKey::Named(EcmaString::encode("prototype")),
             crate::Property::Data {
                 value: prototype,
                 writable: true,
@@ -382,43 +528,100 @@ impl<H: Host> BuiltinTable<H> {
             .map(BuiltinId)
     }
     fn for_each_value(&self, mut visit: impl FnMut(Value)) {
-        visit(self.object_prototype);
-        visit(self.function_prototype);
-        visit(self.array_prototype);
-        visit(self.string_prototype);
-        visit(self.number_prototype);
-        visit(self.boolean_prototype);
-        for (_, value) in &self.error_prototypes {
+        let Self {
+            defs: _,
+            object_prototype,
+            function_prototype,
+            array_prototype,
+            string_prototype,
+            number_prototype,
+            boolean_prototype,
+            error_prototypes,
+            symbol_iterator,
+            symbol_async_iterator,
+            symbol_to_string_tag,
+            symbol_species,
+            symbol_dispose,
+            symbol_async_dispose,
+            symbol_unscopables,
+            symbol_prototype,
+            object_to_string,
+            regexp_prototype,
+            iterator_prototype,
+            async_iterator_prototype,
+            generator_prototype,
+            async_generator_prototype,
+            promise_resolver_targets,
+            promise_all_target,
+            promise_prototype,
+            uint8array_prototype,
+            date_prototype,
+            map_prototype,
+            set_prototype,
+            weak_map_prototype,
+            weak_set_prototype,
+            promise_capability_executor,
+            promise_finally_value,
+            promise_finally_throw,
+            promise_finally_return,
+            promise_finally_rethrow,
+            promise_then_fulfill,
+            promise_then_reject,
+            marker: _,
+        } = self;
+
+        for value in [
+            *object_prototype,
+            *function_prototype,
+            *array_prototype,
+            *string_prototype,
+            *number_prototype,
+            *boolean_prototype,
+        ] {
+            visit(value);
+        }
+        for (_, value) in error_prototypes {
             visit(*value);
         }
         for value in [
-            self.symbol_iterator,
-            self.symbol_async_iterator,
-            self.symbol_to_string_tag,
-            self.symbol_species,
-            self.symbol_dispose,
-            self.symbol_async_dispose,
-            self.symbol_unscopables,
-            self.symbol_prototype,
-            self.object_to_string,
-            self.regexp_prototype,
-            self.iterator_prototype,
-            self.async_iterator_prototype,
-            self.generator_prototype,
-            self.async_generator_prototype,
-            self.promise_prototype,
+            *symbol_iterator,
+            *symbol_async_iterator,
+            *symbol_to_string_tag,
+            *symbol_species,
+            *symbol_dispose,
+            *symbol_async_dispose,
+            *symbol_unscopables,
+            *symbol_prototype,
+            *object_to_string,
+            *regexp_prototype,
+            *iterator_prototype,
+            *async_iterator_prototype,
+            *generator_prototype,
+            *async_generator_prototype,
+            *promise_all_target,
+            *promise_prototype,
+            *uint8array_prototype,
+            *date_prototype,
+            *map_prototype,
+            *set_prototype,
+            *weak_map_prototype,
+            *weak_set_prototype,
+            *promise_capability_executor,
+            *promise_finally_value,
+            *promise_finally_throw,
+            *promise_finally_return,
+            *promise_finally_rethrow,
+            *promise_then_fulfill,
+            *promise_then_reject,
         ]
         .into_iter()
         .flatten()
         {
             visit(value);
         }
-        for (first, second) in [self.promise_resolver_targets, self.promise_all_targets]
-            .into_iter()
-            .flatten()
-        {
-            visit(first);
-            visit(second);
+        if let Some((resolve, reject)) = *promise_resolver_targets {
+            visit(resolve);
+            visit(reject);
         }
     }
 }
@@ -487,9 +690,18 @@ impl<H: Host> Intrinsics<H> {
 
     pub(crate) fn global(&self, name: &str) -> Option<Value> {
         debug_assert!(name.is_ascii());
-        self.globals
-            .iter()
-            .find_map(|(candidate, value)| candidate.eq_ascii(name).then_some(*value))
+        // The previous scan used `eq_ascii`, which returns false for every
+        // candidate when `name` is non-ASCII, so a non-ASCII lookup always
+        // yielded `None`. Preserve that contract by bailing out before the
+        // keyed lookup, which would otherwise match a non-ASCII global.
+        if !name.is_ascii() {
+            return None;
+        }
+        // `EcmaString::encode` encodes ASCII as the identical u16 code
+        // units that `eq_ascii` compared against, and BTreeMap keys are
+        // unique, so `get` returns the same single match the scan did — in
+        // O(log n) instead of walking every global on each construction.
+        self.globals.get(&EcmaString::encode(name)).copied()
     }
 
     pub(crate) fn regexp_prototype(&self) -> Value {
@@ -508,16 +720,32 @@ impl<H: Host> Intrinsics<H> {
         self.builtins.object_to_string()
     }
     pub(crate) fn for_each_value(&self, mut visit: impl FnMut(Value)) {
-        for value in self.globals.values().chain(self.symbol_registry.values()) {
+        let Self {
+            globals,
+            symbol_registry,
+            object_prototype,
+            function_prototype,
+            array_prototype,
+            string_prototype,
+            number_prototype,
+            boolean_prototype,
+            builtins,
+        } = self;
+
+        for value in globals.values().chain(symbol_registry.values()) {
             visit(*value);
         }
-        visit(self.object_prototype);
-        visit(self.function_prototype);
-        visit(self.array_prototype);
-        visit(self.string_prototype);
-        visit(self.number_prototype);
-        visit(self.boolean_prototype);
-        self.builtins.for_each_value(visit);
+        for value in [
+            *object_prototype,
+            *function_prototype,
+            *array_prototype,
+            *string_prototype,
+            *number_prototype,
+            *boolean_prototype,
+        ] {
+            visit(value);
+        }
+        builtins.for_each_value(visit);
     }
 }
 
@@ -539,10 +767,10 @@ pub(crate) fn native_function(
     name: &'static str,
     length: u32,
 ) -> Value {
-    let name_value = push(heap, HeapEntry::String(EcmaString::from_utf8(name)));
+    let name_value = push(heap, HeapEntry::String(EcmaString::encode(name)));
     let mut properties = PropertyMap::default();
     properties.insert(
-        crate::PropertyKey::Named(EcmaString::from_utf8("length")),
+        crate::PropertyKey::Named(EcmaString::encode("length")),
         crate::Property::Data {
             value: crate::number_value(f64::from(length)),
             writable: false,
@@ -551,7 +779,7 @@ pub(crate) fn native_function(
         },
     );
     properties.insert(
-        crate::PropertyKey::Named(EcmaString::from_utf8("name")),
+        crate::PropertyKey::Named(EcmaString::encode("name")),
         crate::Property::Data {
             value: name_value,
             writable: false,
@@ -561,11 +789,7 @@ pub(crate) fn native_function(
     );
     push(
         heap,
-        HeapEntry::NativeFunction {
-            callable: NativeCallable::Builtin(id),
-            properties,
-            extensible: true,
-        },
+        HeapEntry::native_function(NativeCallable::Builtin(id), properties, None),
     )
 }
 
@@ -750,7 +974,7 @@ mod tests {
 
     fn module() -> Program<Verified> {
         let code = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Constant::String(EcmaString::encode("<test>"))],
             vec![Function::new(
                 None,
                 0,
@@ -796,6 +1020,56 @@ mod tests {
     }
 
     #[test]
+    fn builtin_table_root_walker_visits_every_cached_callback() {
+        let mut table = BuiltinTable::<TestHost>::new(
+            Value::int32(1),
+            Value::int32(2),
+            Value::int32(3),
+            Value::int32(4),
+            Value::int32(5),
+            Value::int32(6),
+        );
+        let roots = [
+            Value::int32(101),
+            Value::int32(102),
+            Value::int32(103),
+            Value::int32(104),
+            Value::int32(105),
+            Value::int32(106),
+            Value::int32(107),
+            Value::int32(108),
+            Value::int32(109),
+            Value::int32(110),
+            Value::int32(111),
+            Value::int32(112),
+            Value::int32(113),
+        ];
+        table.uint8array_prototype = Some(roots[0]);
+        table.promise_capability_executor = Some(roots[1]);
+        table.promise_finally_value = Some(roots[2]);
+        table.promise_finally_throw = Some(roots[3]);
+        table.promise_finally_return = Some(roots[4]);
+        table.promise_finally_rethrow = Some(roots[5]);
+        table.promise_then_fulfill = Some(roots[6]);
+        table.promise_then_reject = Some(roots[7]);
+        table.date_prototype = Some(roots[8]);
+        table.map_prototype = Some(roots[9]);
+        table.set_prototype = Some(roots[10]);
+        table.weak_map_prototype = Some(roots[11]);
+        table.weak_set_prototype = Some(roots[12]);
+
+        let mut visited = Vec::new();
+        table.for_each_value(|value| visited.push(value));
+
+        for root in roots {
+            assert!(
+                visited.contains(&root),
+                "cached root {root:?} was not traced"
+            );
+        }
+    }
+
+    #[test]
     fn corpus_value_builtin_oracles_match_node_24_bytes() {
         // Byte-exact outputs captured with Node v24.18.0. The labels name the
         // corpus programs whose observable operation each row exercises.
@@ -825,7 +1099,7 @@ mod tests {
         let json_text = machine.call_value(stringify, json, &[object]).unwrap();
 
         let test_key = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("test")))
+            .allocate(HeapEntry::String(EcmaString::encode("test")))
             .unwrap();
         let has_own = call_static(&mut machine, "Object", "hasOwn", &[object, test_key]);
 
@@ -843,7 +1117,7 @@ mod tests {
                 unreachable!()
             };
             properties.insert(
-                PropertyKey::Named(EcmaString::from_utf8(key)),
+                PropertyKey::Named(EcmaString::encode(key)),
                 Property::Data {
                     value: Value::int32(value),
                     writable: true,
@@ -915,7 +1189,7 @@ mod tests {
         let symbol = machine.intrinsics.global("Symbol").unwrap();
         let symbol_for = machine.get_named_property(symbol, "for").unwrap();
         let key_text = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("shared")))
+            .allocate(HeapEntry::String(EcmaString::encode("shared")))
             .unwrap();
         let first = machine.call_value(symbol_for, symbol, &[key_text]).unwrap();
         let second = machine.call_value(symbol_for, symbol, &[key_text]).unwrap();
@@ -944,12 +1218,12 @@ mod tests {
         );
 
         let pattern = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("^(a|b)\\.js$")))
+            .allocate(HeapEntry::String(EcmaString::encode("^(a|b)\\.js$")))
             .unwrap();
         let regexp = construct_builtin(&mut machine, "RegExp", &[pattern]);
         let test = machine.get_named_property(regexp, "test").unwrap();
         let input = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("b.js")))
+            .allocate(HeapEntry::String(EcmaString::encode("b.js")))
             .unwrap();
         assert_eq!(
             machine.call_value(test, regexp, &[input]).unwrap(),
@@ -957,7 +1231,7 @@ mod tests {
         );
 
         let message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("boom")))
+            .allocate(HeapEntry::String(EcmaString::encode("boom")))
             .unwrap();
         let error = construct_builtin(&mut machine, "TypeError", &[message]);
         let error_message = machine.get_named_property(error, "message").unwrap();
@@ -1268,6 +1542,102 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, Value::int32(2_048));
         assert_eq!(*next_order, 1_025);
+    }
+
+    #[test]
+    fn structured_clone_rejects_weak_collections() {
+        let module = module();
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let structured_clone = machine.intrinsics.global("structuredClone").unwrap();
+
+        for name in ["WeakMap", "WeakSet"] {
+            let weak_collection = construct_builtin(&mut machine, name, &[]);
+            let key = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    extensible: true,
+                    boxed_primitive: None,
+                })
+                .unwrap();
+            let method_name = if name == "WeakMap" { "set" } else { "add" };
+            let method = machine
+                .get_named_property(weak_collection, method_name)
+                .unwrap();
+            if name == "WeakMap" {
+                machine
+                    .call_value(method, weak_collection, &[key, Value::int32(1)])
+                    .unwrap();
+            } else {
+                machine.call_value(method, weak_collection, &[key]).unwrap();
+            }
+            assert!(matches!(
+                machine.call_value(structured_clone, Value::UNDEFINED, &[weak_collection]),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn checker_rejected_value_names_are_absent_from_runtime() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+        let names = [
+            "eval",
+            "decodeURI",
+            "encodeURI",
+            "escape",
+            "BigInt",
+            "Int8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "BigInt64Array",
+            "BigUint64Array",
+            "Float16Array",
+            "Float32Array",
+            "Float64Array",
+            "ArrayBuffer",
+            "SharedArrayBuffer",
+            "DataView",
+            "Proxy",
+            "Reflect",
+            "FinalizationRegistry",
+            "WeakRef",
+            "Intl",
+            "Iterator",
+            "AsyncIterator",
+            "URL",
+            "URLSearchParams",
+            "TextEncoder",
+            "TextDecoder",
+            "TextEncoderStream",
+            "TextDecoderStream",
+        ];
+
+        for name in names {
+            assert!(
+                machine.intrinsics.global(name).is_none(),
+                "{name} must not be checker-visible until the runtime installs it"
+            );
+        }
+        assert!(machine.intrinsics.global("global").is_some());
+    }
+
+    #[test]
+    fn function_global_remains_unimplemented() {
+        let module = module();
+        let mut host = TestHost;
+        let machine = Machine::new(&module, &mut host, Limits::default());
+
+        assert!(
+            machine.intrinsics.global("Function").is_none(),
+            "checker-only Function compatibility must not imply runtime support"
+        );
     }
 
     fn constructor_name(machine: &mut Machine<'_, TestHost>, constructor: Value) -> EcmaString {

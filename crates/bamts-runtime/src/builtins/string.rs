@@ -8,7 +8,7 @@ use super::{
     to_integer_or_infinity, type_error, uri_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey};
+use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey, PropertyMap};
 
 pub(super) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -18,7 +18,7 @@ pub(super) fn install<H: Host>(
     let prototype = builtins.string_prototype();
     let constructor = install_function(heap, builtins, "String", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8("String"), constructor);
+    globals.insert(EcmaString::encode("String"), constructor);
     for (name, length, handler) in [
         ("fromCharCode", 1, from_char_code::<H> as BuiltinHandler<H>),
         ("raw", 1, raw::<H>),
@@ -74,7 +74,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("String constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         super::builtin_property(value),
     );
 }
@@ -214,10 +214,17 @@ fn code_point_at<H: Host>(
         return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
     }
     let offset = index as usize;
-    let code_point = string
-        .code_points()
-        .find_map(|(candidate, code_point)| (candidate == offset).then_some(code_point))
-        .unwrap_or_else(|| u32::from(string.unit_at(offset).expect("offset is in bounds")));
+    // Read the code unit at the offset directly. If it is a high surrogate
+    // followed by a low surrogate, combine them into the supplementary code
+    // point (ECMA-262 §11.1.5). This touches at most two units instead of
+    // rescanning the whole string from index 0 on every call.
+    let first = string.unit_at(offset).expect("offset is in bounds");
+    let code_point = match (first, string.unit_at(offset + 1)) {
+        (0xD800..=0xDBFF, Some(second @ 0xDC00..=0xDFFF)) => {
+            0x1_0000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00)
+        }
+        _ => u32::from(first),
+    };
     Ok(BuiltinOutcome::Value(crate::number_value(
         code_point as f64,
     )))
@@ -708,7 +715,7 @@ fn pad<H: Host>(
         return Ok(BuiltinOutcome::Value(allocate_string(machine, string)?));
     }
     let filler = if args.len() < 2 || args[1] == Value::UNDEFINED {
-        EcmaString::from_utf8(" ")
+        EcmaString::encode(" ")
     } else {
         machine.to_string(args[1])?
     };
@@ -875,7 +882,7 @@ pub(super) fn encode_uri_component<H: Host>(
     }
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        EcmaString::from_utf8(&output),
+        EcmaString::encode(&output),
     )?))
 }
 fn hex_value(unit: u16) -> Option<u8> {
@@ -995,19 +1002,29 @@ fn string_iterator<H: Host>(
     _args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let pieces: Vec<EcmaString> = text(machine, this)?
-        .code_points()
-        .map(|(_, code_point)| {
-            let mut builder = EcmaStringBuilder::new();
-            builder
-                .push_code_point(code_point)
-                .expect("EcmaString code point is valid");
-            builder.finish()
-        })
-        .collect();
-    let mut values = Vec::with_capacity(pieces.len());
-    for piece in pieces {
-        values.push(allocate_string(machine, piece)?);
+    let string = text(machine, this)?;
+    let count = string.code_points().count();
+    // The iterator protocol is lazy, so materializing every code point up
+    // front charges the machine slot by slot. Preflight the full allocation
+    // (one heap string per code point plus the backing array) before building
+    // anything, matching the pad/repeat discipline that fails fast on an
+    // oversized source instead of allocating toward the heap limit.
+    let piece_bytes = string.len_units().saturating_mul(2);
+    let array_bytes = count
+        .saturating_mul(std::mem::size_of::<Value>())
+        .saturating_add(1);
+    let total_bytes = piece_bytes.saturating_add(array_bytes).saturating_add(1);
+    let total_slots = count.saturating_add(2);
+    machine
+        .ensure_allocation_capacity(total_slots, total_bytes)
+        .map_err(EvalFailure::Runtime)?;
+    let mut values = Vec::with_capacity(count);
+    for (_, code_point) in string.code_points() {
+        let mut builder = EcmaStringBuilder::new();
+        builder
+            .push_code_point(code_point)
+            .expect("EcmaString code point is valid");
+        values.push(allocate_string(machine, builder.finish())?);
     }
     let source = allocate_array(machine, values)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
@@ -1035,6 +1052,28 @@ fn regexp_for_argument<H: Host>(
     }
 }
 
+/// Run a compiled regex, mapping step-budget exhaustion to a runtime error
+/// instead of a silent non-match. Compile errors are impossible here (the
+/// regex was already compiled by `regexp_for_argument` or `compile`).
+fn exec_regex(
+    regex: &crate::intrinsics::regexp::Regex,
+    input: &EcmaString,
+    start: usize,
+) -> Result<Option<crate::intrinsics::regexp::Match>, EvalFailure> {
+    regex
+        .exec(input, start)
+        .map_err(|error| match error.kind() {
+            crate::intrinsics::regexp::RegexErrorKind::BudgetExhausted => {
+                EvalFailure::Runtime(crate::RuntimeErrorKind::RegexpStepBudgetExceeded {
+                    limit: crate::intrinsics::regexp::STEP_BUDGET,
+                })
+            }
+            crate::intrinsics::regexp::RegexErrorKind::Compile => {
+                unreachable!("regex already compiled successfully")
+            }
+        })
+}
+
 fn string_match<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -1047,7 +1086,7 @@ fn string_match<H: Host>(
     if !regex.flags().global {
         let matched = match object {
             Some(regexp) => super::regexp::execute(machine, regexp, &input)?,
-            None => regex.exec(&input, 0),
+            None => exec_regex(&regex, &input, 0)?,
         };
         return match matched {
             Some(matched) => Ok(BuiltinOutcome::Value(super::regexp::match_array(
@@ -1059,7 +1098,7 @@ fn string_match<H: Host>(
     if let Some(regexp) = object {
         machine.set_data_property(regexp, "lastIndex", Value::int32(0))?;
     }
-    let matches = collect_matches(&regex, &input);
+    let matches = collect_matches(&regex, &input)?;
     if matches.is_empty() {
         return Ok(BuiltinOutcome::Value(Value::NULL));
     }
@@ -1088,7 +1127,7 @@ fn match_all<H: Host>(
         ));
     }
     let mut values = Vec::new();
-    for matched in collect_matches(&regex, &input) {
+    for matched in collect_matches(&regex, &input)? {
         values.push(super::regexp::match_array(machine, &input, matched)?);
     }
     let source = allocate_array(machine, values)?;
@@ -1109,21 +1148,19 @@ fn search<H: Host>(
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, _) = regexp_for_argument(machine, argument)?;
     Ok(BuiltinOutcome::Value(crate::number_value(
-        regex
-            .exec(&input, 0)
-            .map_or(-1.0, |matched| matched.range.start as f64),
+        exec_regex(&regex, &input, 0)?.map_or(-1.0, |matched| matched.range.start as f64),
     )))
 }
 
 fn collect_matches(
     regex: &crate::intrinsics::regexp::Regex,
     input: &EcmaString,
-) -> Vec<crate::intrinsics::regexp::Match> {
+) -> Result<Vec<crate::intrinsics::regexp::Match>, EvalFailure> {
     let mut matches = Vec::new();
     let mut start = 0;
     let length = input.len_units();
     while start <= length {
-        let Some(matched) = regex.exec(input, start) else {
+        let Some(matched) = exec_regex(regex, input, start)? else {
             break;
         };
         let next = if matched.range.end == matched.range.start && matched.range.end < length {
@@ -1143,7 +1180,7 @@ fn collect_matches(
         }
         start = next;
     }
-    matches
+    Ok(matches)
 }
 
 fn split_regexp<H: Host>(
@@ -1172,15 +1209,34 @@ fn split_regexp<H: Host>(
         )?,
     ) as u32 as usize;
     let mut pieces = Vec::new();
+    // ECMA-262 §22.2.6.14 keeps two cursors: `p` (start of the pending
+    // piece) and `q` (search position). An empty match advances `q` only —
+    // it never pushes and never touches `p` — so the skipped text is not
+    // dropped. Collapsing both into one `cursor` made an empty match
+    // indistinguishable from a consumed one and silently deleted characters.
+    let mut piece_start = 0;
     let mut cursor = 0;
     let length = input.len_units();
-    while cursor <= length && pieces.len() < limit {
-        let Some(matched) = regex.exec(&input, cursor) else {
+    while cursor < length && pieces.len() < limit {
+        let Some(matched) = exec_regex(&regex, &input, cursor)? else {
             break;
         };
+        if matched.range.start == matched.range.end && matched.range.start == piece_start {
+            // Empty match at the pending piece start: advance the search
+            // cursor only, exactly as the spec moves `q` past `p`. Push
+            // nothing and leave `piece_start` untouched.
+            cursor = matched.range.end
+                + crate::intrinsics::regexp::next_code_point(
+                    input.as_units(),
+                    matched.range.end,
+                    regex.flags().unicode,
+                )
+                .1;
+            continue;
+        }
         pieces.push(super::regexp::slice_units(
             &input,
-            cursor..matched.range.start,
+            piece_start..matched.range.start,
         ));
         for capture in matched.captures.iter().skip(1) {
             if pieces.len() == limit {
@@ -1190,6 +1246,7 @@ fn split_regexp<H: Host>(
                 super::regexp::slice_units(&input, range)
             }));
         }
+        piece_start = matched.range.end;
         cursor = if matched.range.end == matched.range.start && matched.range.end < length {
             matched.range.end
                 + crate::intrinsics::regexp::next_code_point(
@@ -1205,7 +1262,7 @@ fn split_regexp<H: Host>(
     if pieces.len() < limit {
         pieces.push(super::regexp::slice_units(
             &input,
-            cursor.min(length)..length,
+            piece_start.min(length)..length,
         ));
     }
     let mut values = Vec::new();
@@ -1232,7 +1289,7 @@ fn replace_regexp<H: Host>(
         ));
     }
     let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    let matches = collect_matches(&regex, &input);
+    let matches = collect_matches(&regex, &input)?;
     let mut output = EcmaStringBuilder::new();
     let mut cursor = 0;
     for matched in matches {
@@ -1267,7 +1324,7 @@ fn regexp_replacement<H: Host>(
 ) -> Result<EcmaString, EvalFailure> {
     let matched_text = super::regexp::slice_units(input, matched.range.clone());
     if machine.is_callable(replacer)? {
-        let mut arguments = Vec::with_capacity(matched.captures.len() + 2);
+        let mut arguments = Vec::with_capacity(matched.captures.len() + 3);
         for capture in &matched.captures {
             arguments.push(match capture {
                 Some(range) => {
@@ -1278,6 +1335,29 @@ fn regexp_replacement<H: Host>(
         }
         arguments.push(crate::number_value(matched.range.start as f64));
         arguments.push(allocate_string(machine, input.clone())?);
+        // ECMA-262 §22.1.3.2.1 appends `groups` only when the pattern
+        // defines named capture metadata. The map retains unmatched groups
+        // as `None`, so metadata presence does not depend on participation.
+        if !matched.named.is_empty() {
+            let groups = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: None,
+                    extensible: true,
+                    boxed_primitive: None,
+                })
+                .map_err(EvalFailure::Runtime)?;
+            for (name, range) in &matched.named {
+                let value = match range {
+                    Some(range) => {
+                        allocate_string(machine, super::regexp::slice_units(input, range.clone()))?
+                    }
+                    None => Value::UNDEFINED,
+                };
+                machine.set_data_property(groups, name, value)?;
+            }
+            arguments.push(groups);
+        }
         return machine
             .call_value(replacer, Value::UNDEFINED, &arguments)
             .and_then(|value| machine.to_string(value));
@@ -1297,26 +1377,85 @@ fn regexp_replacement<H: Host>(
         let next = units[offset + 1];
         if next == u16::from(b'$') {
             output.push_unit(u16::from(b'$'));
+            offset += 2;
+            continue;
         } else if next == u16::from(b'&') {
             append(&mut output, &matched_text);
+            offset += 2;
+            continue;
         } else if next == u16::from(b'`') {
             append(&mut output, &before);
+            offset += 2;
+            continue;
         } else if next == u16::from(b'\'') {
             append(&mut output, &after);
-        } else if (u16::from(b'1')..=u16::from(b'9')).contains(&next) {
-            let capture = usize::from(next - u16::from(b'0'));
-            if let Some(Some(range)) = matched.captures.get(capture) {
-                append(
-                    &mut output,
-                    &super::regexp::slice_units(input, range.clone()),
-                );
+            offset += 2;
+            continue;
+        } else if next == u16::from(b'<') {
+            // ECMA-262 §22.1.3.19.1 GetSubstitution: $<Name> resolves a
+            // named capture group. If the name is absent or the group did
+            // not participate, the substitution is the empty string.
+            if !matched.named.is_empty()
+                && let Some(close) = units[offset + 2..]
+                    .iter()
+                    .position(|&unit| unit == u16::from(b'>'))
+            {
+                let name_units = &units[offset + 2..offset + 2 + close];
+                let name = String::from_utf16_lossy(name_units);
+                if let Some(Some(range)) = matched.named.get(&name) {
+                    append(
+                        &mut output,
+                        &super::regexp::slice_units(input, range.clone()),
+                    );
+                }
+                offset += 2 + close + 1;
+                continue;
             }
+            // Without named capture metadata, or without a closing `>`,
+            // `$<` starts a literal sequence.
+            output.push_unit(units[offset]);
+            offset += 1;
+            continue;
+        } else if (u16::from(b'1')..=u16::from(b'9')).contains(&next) {
+            // ECMA-262 §22.1.3.19.1: $nn (01–99). When two digits form a
+            // valid group number, prefer that reading. Otherwise use the
+            // single-digit group and leave the second digit as a literal.
+            let one_digit = usize::from(next - u16::from(b'0'));
+            if let Some(second) = units.get(offset + 2).copied()
+                && (u16::from(b'0')..=u16::from(b'9')).contains(&second)
+            {
+                let two_digit = one_digit * 10 + usize::from(second - u16::from(b'0'));
+                if two_digit < matched.captures.len() {
+                    if let Some(Some(range)) = matched.captures.get(two_digit) {
+                        append(
+                            &mut output,
+                            &super::regexp::slice_units(input, range.clone()),
+                        );
+                    }
+                    offset += 3;
+                    continue;
+                }
+            }
+            if one_digit < matched.captures.len() {
+                if let Some(Some(range)) = matched.captures.get(one_digit) {
+                    append(
+                        &mut output,
+                        &super::regexp::slice_units(input, range.clone()),
+                    );
+                }
+                offset += 2;
+                continue;
+            }
+            // No matching group — emit '$' literally and re-examine the
+            // digit on the next iteration.
+            output.push_unit(units[offset]);
+            offset += 1;
+            continue;
         } else {
             output.push_unit(units[offset]);
             offset += 1;
             continue;
         }
-        offset += 2;
     }
     Ok(output.finish())
 }
@@ -1336,7 +1475,7 @@ mod unescape_tests {
     ) -> Result<BuiltinOutcome, EvalFailure> {
         Ok(BuiltinOutcome::Value(
             machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("%u0041")))
+                .allocate(HeapEntry::String(EcmaString::encode("%u0041")))
                 .map_err(EvalFailure::Runtime)?,
         ))
     }
@@ -1377,16 +1516,16 @@ mod unescape_tests {
             )
             .expect("localeCompare is installed");
         let lower_a = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("alpha")))
+            .allocate(HeapEntry::String(EcmaString::encode("alpha")))
             .unwrap();
         let lower_b = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("beta")))
+            .allocate(HeapEntry::String(EcmaString::encode("beta")))
             .unwrap();
         let lower_a_again = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("alpha")))
+            .allocate(HeapEntry::String(EcmaString::encode("alpha")))
             .unwrap();
         let upper_a = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("Alpha")))
+            .allocate(HeapEntry::String(EcmaString::encode("Alpha")))
             .unwrap();
 
         assert_eq!(
@@ -1437,7 +1576,7 @@ mod unescape_tests {
             .global("Symbol")
             .expect("Symbol is installed");
         let description = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("event")))
+            .allocate(HeapEntry::String(EcmaString::encode("event")))
             .expect("description allocation succeeds");
         let symbol = machine
             .call_value(symbol_constructor, Value::UNDEFINED, &[description])
@@ -1470,7 +1609,7 @@ mod unescape_tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("message")))
+            .allocate(HeapEntry::String(EcmaString::encode("message")))
             .expect("message allocation succeeds");
         let error_constructor = machine
             .intrinsics
@@ -1532,7 +1671,7 @@ mod unescape_tests {
         );
 
         let malformed = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8(
+            .allocate(HeapEntry::String(EcmaString::encode(
                 "%uD800%u0041%uZZZZ%4G%u12",
             )))
             .unwrap();
@@ -1578,7 +1717,7 @@ mod unescape_tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .expect("source string allocation succeeds");
         let pad_start = machine
             .get_named_property(machine.intrinsics.builtins.string_prototype(), "padStart")
@@ -1610,5 +1749,447 @@ mod unescape_tests {
                 "failed string expansion must not allocate or charge the machine"
             );
         }
+    }
+
+    #[test]
+    fn string_iterator_preflights_oversized_sources() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
+            .expect("source string allocation succeeds");
+        let iterator_key = machine
+            .to_property_key(machine.intrinsics.builtins.symbol_iterator())
+            .expect("Symbol.iterator is a property key");
+        let iterator = machine
+            .get_property_key(
+                machine.intrinsics.builtins.string_prototype(),
+                &iterator_key,
+            )
+            .expect("string iterator is installed");
+        let before = (
+            machine.heap.len(),
+            machine.heap_bytes,
+            machine.machine_bytes,
+        );
+        // With no remaining heap budget, the iterator must fail fast instead
+        // of allocating one heap string per code point toward the limit.
+        machine.limits.max_heap_bytes = machine.heap_bytes;
+        assert!(matches!(
+            machine.call_value(iterator, source, &[]),
+            Err(EvalFailure::Runtime(
+                crate::RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(
+            (
+                machine.heap.len(),
+                machine.heap_bytes,
+                machine.machine_bytes
+            ),
+            before,
+            "a failed string iterator must not allocate or charge the machine"
+        );
+    }
+}
+
+/// Regression tests for codePointAt, split_regexp, and GetSubstitution.
+#[cfg(test)]
+mod split_replace_tests {
+    use super::super::test_support::{TestHost, blank_program};
+    use super::*;
+    use crate::Limits;
+    use crate::intrinsics::{BuiltinDef, native_function};
+
+    fn replacement_argument_count(
+        _: &mut Machine<'_, TestHost>,
+        _: Value,
+        args: &[Value],
+        _: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(
+            crate::number_value(args.len() as f64),
+        ))
+    }
+
+    fn native_replacer(
+        machine: &mut Machine<'_, TestHost>,
+        handler: BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "replacementArgumentCount",
+            length: 0,
+            handler,
+        });
+        native_function(&mut machine.heap, id, "replacementArgumentCount", 0)
+    }
+
+    /// Constructs a RegExp the same way the `RegExp` constructor does, so
+    /// `regexp_parts` recognises the result in split/replace dispatch.
+    fn construct_regexp(machine: &mut Machine<'_, TestHost>, pattern: &str, flags: &str) -> Value {
+        let constructor = machine.intrinsics.global("RegExp").expect("RegExp exists");
+        let pattern_val = machine
+            .allocate(HeapEntry::String(EcmaString::encode(pattern)))
+            .unwrap();
+        let flags_val = machine
+            .allocate(HeapEntry::String(EcmaString::encode(flags)))
+            .unwrap();
+        let index = machine.runtime_slot(constructor).unwrap().unwrap();
+        let HeapEntry::NativeFunction {
+            callable: crate::NativeCallable::Builtin(id),
+            ..
+        } = machine.heap[index]
+        else {
+            panic!("RegExp constructor is native");
+        };
+        let BuiltinOutcome::Value(value) = machine
+            .call_builtin(id, Value::UNDEFINED, &[pattern_val, flags_val], true)
+            .unwrap()
+        else {
+            panic!("RegExp constructor returns a value");
+        };
+        value
+    }
+
+    /// Calls a String.prototype method on `this_string` with `args`, returning
+    /// the raw result value.
+    fn call_string_method(
+        machine: &mut Machine<'_, TestHost>,
+        method: &str,
+        this_string: &str,
+        args: &[Value],
+    ) -> Value {
+        let method_fn = machine
+            .get_named_property(machine.intrinsics.builtins.string_prototype(), method)
+            .unwrap_or_else(|_| panic!("{method} is installed"));
+        let this_val = machine
+            .allocate(HeapEntry::String(EcmaString::encode(this_string)))
+            .unwrap();
+        machine
+            .call_value(method_fn, this_val, args)
+            .expect("string method call succeeds")
+    }
+
+    /// Extracts the string elements of an Array result.
+    fn array_strings(machine: &Machine<'_, TestHost>, array: Value) -> Vec<String> {
+        let elements = machine
+            .array_elements(array)
+            .unwrap()
+            .expect("result is an array");
+        elements
+            .into_iter()
+            .map(|value| {
+                machine
+                    .string_value(value)
+                    .map(|text| text.to_utf8_lossy())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    // ── Finding 1: codePointAt ──────────────────────────────────────────
+
+    #[test]
+    fn code_point_at_surrogate_pair_boundary() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        // "a😀b" — 😀 is U+1F600, a surrogate pair at UTF-16 indices 1..2.
+        let s = "a😀b";
+        let code_point_at = machine
+            .get_named_property(
+                machine.intrinsics.builtins.string_prototype(),
+                "codePointAt",
+            )
+            .unwrap();
+        let this_val = machine
+            .allocate(HeapEntry::String(EcmaString::encode(s)))
+            .unwrap();
+
+        // Index 0: 'a' = U+0061
+        let result = machine
+            .call_value(code_point_at, this_val, &[Value::int32(0)])
+            .unwrap();
+        assert_eq!(value_number(result), 97.0); // U+0061 = 97
+
+        // Index 1: high surrogate → full code point U+1F600
+        let result = machine
+            .call_value(code_point_at, this_val, &[Value::int32(1)])
+            .unwrap();
+        assert_eq!(value_number(result), 128512.0); // U+1F600 = 128512
+
+        // Index 2: low surrogate alone → 0xDC00 (the trailing surrogate unit)
+        let result = machine
+            .call_value(code_point_at, this_val, &[Value::int32(2)])
+            .unwrap();
+        assert_eq!(value_number(result), f64::from(0xDE00u16));
+
+        // Index 3: 'b' = U+0062
+        let result = machine
+            .call_value(code_point_at, this_val, &[Value::int32(3)])
+            .unwrap();
+        assert_eq!(value_number(result), 98.0); // U+0062 = 98
+
+        // Out of bounds → undefined
+        let result = machine
+            .call_value(code_point_at, this_val, &[Value::int32(4)])
+            .unwrap();
+        assert_eq!(result, Value::UNDEFINED);
+    }
+
+    // ── Finding 2: split_regexp empty-match data loss ───────────────────
+
+    #[test]
+    fn split_regexp_empty_pattern_preserves_every_character() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "(?:)", "");
+        let result = call_string_method(&mut machine, "split", "abc", &[regexp]);
+        assert_eq!(
+            array_strings(&machine, result),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "empty-pattern split must preserve every character"
+        );
+    }
+
+    #[test]
+    fn split_regexp_empty_pattern_on_two_chars() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "(?:)", "");
+        let result = call_string_method(&mut machine, "split", "ab", &[regexp]);
+        assert_eq!(
+            array_strings(&machine, result),
+            vec!["a".to_string(), "b".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_regexp_star_pattern_preserves_characters() {
+        // "abc".split(/b*/) — /b*/ matches "b" at index 1, so the separator
+        // consumes "b" and the result is ["a", "c"]. The data-loss bug would
+        // have dropped "a" (the empty match at position 0 advanced past it
+        // without pushing). Verify "a" and "c" survive.
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "b*", "");
+        let result = call_string_method(&mut machine, "split", "abc", &[regexp]);
+        assert_eq!(
+            array_strings(&machine, result),
+            vec!["a".to_string(), "c".to_string()],
+            "split(/b*/) must not drop 'a' via the empty match at position 0"
+        );
+    }
+
+    #[test]
+    fn split_regexp_empty_pattern_unicode_surrogate_pair() {
+        // "😀x".split(/(?:)/u) — the surrogate pair must be one piece under /u.
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "(?:)", "u");
+        let result = call_string_method(&mut machine, "split", "😀x", &[regexp]);
+        let pieces = array_strings(&machine, result);
+        assert_eq!(
+            pieces.len(),
+            2,
+            "😀x split on empty /u pattern yields 2 pieces"
+        );
+        assert_eq!(pieces[0], "😀");
+        assert_eq!(pieces[1], "x");
+    }
+
+    #[test]
+    fn split_regexp_non_empty_still_works() {
+        // The non-empty path was already correct; make sure the fix didn't
+        // break it.
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "\\d", "");
+        let result = call_string_method(&mut machine, "split", "a1b2c", &[regexp]);
+        assert_eq!(array_strings(&machine, result), vec!["a", "b", "c"],);
+    }
+
+    // ── Finding 3: GetSubstitution replacement patterns ─────────────────
+
+    #[test]
+    fn replace_dollar_dollar_escapes_to_literal_dollar() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("$$")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "axb", &[regexp, replacement]);
+        assert_eq!(machine.string_value(result).unwrap().to_utf8_lossy(), "a$b");
+    }
+
+    #[test]
+    fn replace_dollar_ampersand_inserts_matched_substring() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("[$&]")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "axb", &[regexp, replacement]);
+        assert_eq!(
+            machine.string_value(result).unwrap().to_utf8_lossy(),
+            "a[x]b"
+        );
+    }
+
+    #[test]
+    fn replace_dollar_backtick_inserts_before_match() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("[$`]")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "axb", &[regexp, replacement]);
+        assert_eq!(
+            machine.string_value(result).unwrap().to_utf8_lossy(),
+            "a[a]b"
+        );
+    }
+
+    #[test]
+    fn replace_dollar_quote_inserts_after_match() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("[$']")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "axb", &[regexp, replacement]);
+        assert_eq!(
+            machine.string_value(result).unwrap().to_utf8_lossy(),
+            "a[b]b"
+        );
+    }
+
+    #[test]
+    fn replace_two_digit_group_prefers_group_10_when_it_exists() {
+        // With 10+ capture groups, $10 must resolve to group 10, not group 1
+        // followed by a literal "0".
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        // (a)(b)(c)(d)(e)(f)(g)(h)(i)(j) — 10 groups; group 10 = "j"
+        let regexp = construct_regexp(&mut machine, "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("$10")))
+            .unwrap();
+        let result = call_string_method(
+            &mut machine,
+            "replace",
+            "abcdefghij",
+            &[regexp, replacement],
+        );
+        assert_eq!(
+            machine.string_value(result).unwrap().to_utf8_lossy(),
+            "j",
+            "$10 must prefer group 10 when it exists"
+        );
+    }
+
+    #[test]
+    fn replace_two_digit_group_falls_back_to_one_digit_when_group_absent() {
+        // With only 1 capture group, $10 resolves to group 1 + literal "0".
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "(a)", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("$10")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "aX", &[regexp, replacement]);
+        assert_eq!(
+            machine.string_value(result).unwrap().to_utf8_lossy(),
+            "a0X",
+            "$10 with only group 1 must yield group-1 + literal '0'"
+        );
+    }
+
+    #[test]
+    fn replace_named_group_reference() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "(?<id>\\d+)", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("id=$<id>")))
+            .unwrap();
+        let result =
+            call_string_method(&mut machine, "replace", "/users/7", &[regexp, replacement]);
+        assert_eq!(
+            machine.string_value(result).unwrap().to_utf8_lossy(),
+            "/users/id=7"
+        );
+    }
+
+    #[test]
+    fn replace_callback_omits_groups_argument_without_named_captures() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let replacer = native_replacer(&mut machine, replacement_argument_count);
+        let result = call_string_method(&mut machine, "replace", "x", &[regexp, replacer]);
+        assert_eq!(machine.string_value(result).unwrap().to_utf8_lossy(), "3");
+    }
+
+    #[test]
+    fn replace_named_reference_stays_literal_without_named_captures() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "x", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("$<foo>")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "x", &[regexp, replacement]);
+        assert_eq!(
+            machine.string_value(result).unwrap().to_utf8_lossy(),
+            "$<foo>"
+        );
+    }
+
+    #[test]
+    fn replace_absent_named_group_substitutes_empty() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "(?<name>x)", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("[$<missing>]")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "x", &[regexp, replacement]);
+        assert_eq!(machine.string_value(result).unwrap().to_utf8_lossy(), "[]");
+    }
+
+    #[test]
+    fn replace_named_group_undefined_substitutes_empty() {
+        // A named group that did not participate substitutes the empty string.
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        // (a)(?<name>b)? — the named group is optional and won't match "a".
+        let regexp = construct_regexp(&mut machine, "(a)(?<name>b)?", "");
+        let replacement = machine
+            .allocate(HeapEntry::String(EcmaString::encode("[$<name>]")))
+            .unwrap();
+        let result = call_string_method(&mut machine, "replace", "a", &[regexp, replacement]);
+        assert_eq!(machine.string_value(result).unwrap().to_utf8_lossy(), "[]");
     }
 }

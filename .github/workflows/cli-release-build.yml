@@ -1,0 +1,273 @@
+name: CLI release build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Derive CLI build set
+    runs-on: ubuntu-24.04
+    outputs:
+      build-set-id: ${{ steps.plan.outputs.build-set-id }}
+      source-commit: ${{ steps.plan.outputs.source-commit }}
+      source-version: ${{ steps.plan.outputs.source-version }}
+      cargo-lock-sha256: ${{ steps.plan.outputs.cargo-lock-sha256 }}
+      workflow-revision: ${{ steps.plan.outputs.workflow-revision }}
+      toolchain: ${{ steps.plan.outputs.toolchain }}
+      builder-revision: ${{ steps.plan.outputs.builder-revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Derive canonical build plan
+        id: plan
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content npm/bamti-cli/package.json -Raw | ConvertFrom-Json).version
+          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $cargoLockSha256 = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
+          $workflowRevision = (Get-FileHash .github/workflows/cli-release-build.yml -Algorithm SHA256).Hash.ToLowerInvariant()
+          $builderRevision = (Get-FileHash npm/scripts/package-platform.mjs -Algorithm SHA256).Hash.ToLowerInvariant()
+          $input = [ordered]@{
+            sourceCommit = $env:SOURCE_COMMIT
+            sourceVersion = $version
+            cargoLockSha256 = $cargoLockSha256
+            workflowRevision = $workflowRevision
+            toolchain = $toolchain
+            builderRevision = $builderRevision
+            targets = @(
+              'aarch64-apple-darwin'
+              'aarch64-unknown-linux-gnu'
+              'x86_64-apple-darwin'
+              'x86_64-pc-windows-msvc'
+              'x86_64-unknown-linux-gnu'
+            )
+          }
+          $input | ConvertTo-Json -Depth 3 | Set-Content cli-build-plan-input.json -Encoding utf8NoBOM
+          $buildSetId = (node npm/scripts/native-build-plan.mjs cli-build-plan-input.json cli-build-plan.json).Trim()
+          if ($buildSetId -cnotmatch '^[0-9a-f]{64}$') { throw "Invalid build-set identifier: $buildSetId" }
+          "build-set-id=$buildSetId" >> $env:GITHUB_OUTPUT
+          "source-commit=$env:SOURCE_COMMIT" >> $env:GITHUB_OUTPUT
+          "source-version=$version" >> $env:GITHUB_OUTPUT
+          "cargo-lock-sha256=$cargoLockSha256" >> $env:GITHUB_OUTPUT
+          "workflow-revision=$workflowRevision" >> $env:GITHUB_OUTPUT
+          "toolchain=$toolchain" >> $env:GITHUB_OUTPUT
+          "builder-revision=$builderRevision" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cli-build-plan-${{ github.run_attempt }}
+          path: cli-build-plan.json
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - label: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - label: darwin-x64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - label: darwin-arm64
+            target: aarch64-apple-darwin
+            runner: macos-15
+          - label: win32-x64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolchain = (Get-Content rust-toolchain.toml -Raw | Select-String 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain
+          rustup default $toolchain
+      - name: Install Rust target
+        shell: pwsh
+        run: rustup target add '${{ matrix.target }}'
+      - name: Test Windows cache guard
+        if: matrix.label == 'win32-x64'
+        shell: pwsh
+        run: |
+          cargo test -p bamts-native --features cache-guard
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p bamts-cli
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package CLI leaf
+        shell: pwsh
+        env:
+          BAMTI_BUILD_SET_ID: ${{ needs.plan.outputs.build-set-id }}
+          BAMTI_SOURCE_COMMIT: ${{ needs.plan.outputs.source-commit }}
+          BAMTI_RELEASE_PACKAGE_VERSION: ${{ needs.plan.outputs.source-version }}
+          BAMTI_CARGO_LOCK_SHA256: ${{ needs.plan.outputs.cargo-lock-sha256 }}
+          BAMTI_WORKFLOW_REVISION: ${{ needs.plan.outputs.workflow-revision }}
+          BAMTI_TOOLCHAIN: ${{ needs.plan.outputs.toolchain }}
+          BAMTI_BUILDER_REVISION: ${{ needs.plan.outputs.builder-revision }}
+          BAMTI_DIST_ROOT: ${{ github.workspace }}/npm/dist
+        run: node npm/scripts/package-platform.mjs --target '${{ matrix.target }}' --build-set-id $env:BAMTI_BUILD_SET_ID --source-commit $env:BAMTI_SOURCE_COMMIT
+      - name: Stage and smoke CLI leaf
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          BAMTI_EXPECTED_SOURCE_COMMIT: ${{ needs.plan.outputs.source-commit }}
+          BAMTI_EXPECTED_BUILD_SET_ID: ${{ needs.plan.outputs.build-set-id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $records = @(Get-ChildItem npm/dist -File -Filter '*.json')
+          $tarballs = @(Get-ChildItem npm/dist -File -Filter '*.tgz')
+          if ($records.Count -ne 1) { throw "Expected one build record, found $($records.Count)" }
+          if ($tarballs.Count -ne 1) { throw "Expected one leaf tarball, found $($tarballs.Count)" }
+          New-Item -ItemType Directory -Force cli-smoke | Out-Null
+          tar -xzf $tarballs[0].FullName -C cli-smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract CLI leaf tarball' }
+          if (-not (Test-Path cli-smoke/package/package.json -PathType Leaf)) { throw 'Missing leaf package.json' }
+          if ($IsWindows) {
+            if (-not (Test-Path cli-smoke/package/bin/bamts.exe -PathType Leaf)) { throw 'Missing leaf bin/bamts.exe' }
+          } else {
+            if (-not (Test-Path cli-smoke/package/bin/bamts -PathType Leaf)) { throw 'Missing leaf bin/bamts' }
+          }
+          $bamts = if ($IsWindows) { 'cli-smoke/package/bin/bamts.exe' } else { 'cli-smoke/package/bin/bamts' }
+          & $bamts --version
+          if ($LASTEXITCODE -ne 0) { throw 'CLI leaf --version smoke failed' }
+          $stage = 'cli-leaf-${{ matrix.label }}'
+          New-Item -ItemType Directory -Force "$stage/records", "$stage/tarballs", "$stage/leaf" | Out-Null
+          Copy-Item $records[0].FullName "$stage/records/"
+          Copy-Item $tarballs[0].FullName "$stage/tarballs/"
+          Copy-Item cli-smoke/package/* "$stage/leaf/" -Recurse
+      - name: Recreate canonical plan for artifact
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ needs.plan.outputs.source-commit }}
+          SOURCE_VERSION: ${{ needs.plan.outputs.source-version }}
+          CARGO_LOCK_SHA256: ${{ needs.plan.outputs.cargo-lock-sha256 }}
+          WORKFLOW_REVISION: ${{ needs.plan.outputs.workflow-revision }}
+          TOOLCHAIN: ${{ needs.plan.outputs.toolchain }}
+          BUILDER_REVISION: ${{ needs.plan.outputs.builder-revision }}
+          EXPECTED_BUILD_SET_ID: ${{ needs.plan.outputs.build-set-id }}
+        run: |
+          $input = [ordered]@{
+            sourceCommit = $env:SOURCE_COMMIT; sourceVersion = $env:SOURCE_VERSION
+            cargoLockSha256 = $env:CARGO_LOCK_SHA256; workflowRevision = $env:WORKFLOW_REVISION
+            toolchain = $env:TOOLCHAIN; builderRevision = $env:BUILDER_REVISION
+            targets = @('aarch64-apple-darwin','aarch64-unknown-linux-gnu','x86_64-apple-darwin','x86_64-pc-windows-msvc','x86_64-unknown-linux-gnu')
+          }
+          $input | ConvertTo-Json -Depth 3 | Set-Content cli-build-plan-input.json -Encoding utf8NoBOM
+          $actual = (node npm/scripts/native-build-plan.mjs cli-build-plan-input.json cli-build-plan.json).Trim()
+          if ($actual -cne $env:EXPECTED_BUILD_SET_ID) { throw 'Canonical build plan changed in matrix leg' }
+          if (-not (Test-Path 'cli-leaf-${{ matrix.label }}')) { throw 'cli-leaf directory missing' }
+          node npm/scripts/native-build-plan.mjs cli-build-plan-input.json 'cli-leaf-${{ matrix.label }}/cli-build-plan.json'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cli-leaf-${{ matrix.label }}
+          path: cli-leaf-${{ matrix.label }}
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble CLI facade
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: cli-leaf-*
+          path: downloaded-cli
+      - name: Validate complete build set
+        id: records
+        shell: pwsh
+        env:
+          EXPECTED_BUILD_SET_ID: ${{ needs.plan.outputs.build-set-id }}
+          EXPECTED_SOURCE_COMMIT: ${{ needs.plan.outputs.source-commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $roots = @(Get-ChildItem downloaded-cli -Directory)
+          $records = @(Get-ChildItem downloaded-cli -Recurse -File -Filter '*.json' | Where-Object { $_.Directory.Name -eq 'records' })
+          $tarballs = @(Get-ChildItem downloaded-cli -Recurse -File -Filter '*.tgz')
+          $leaves = @(Get-ChildItem downloaded-cli -Recurse -Directory | Where-Object { $_.Name -eq 'leaf' })
+          $plans = @(Get-ChildItem downloaded-cli -Recurse -File -Filter 'cli-build-plan.json')
+          if ($roots.Count -ne 5 -or $records.Count -ne 5 -or $tarballs.Count -ne 5 -or $leaves.Count -ne 5 -or $plans.Count -ne 5) {
+            throw 'Downloaded CLI artifacts are incomplete'
+          }
+          $expectedTargets = @('aarch64-apple-darwin','aarch64-unknown-linux-gnu','x86_64-apple-darwin','x86_64-pc-windows-msvc','x86_64-unknown-linux-gnu')
+          $actualTargets = @()
+          foreach ($recordFile in $records) {
+            $record = Get-Content $recordFile.FullName -Raw | ConvertFrom-Json
+            if ($record.release.buildSetId -cne $env:EXPECTED_BUILD_SET_ID -or $record.release.sourceCommit -cne $env:EXPECTED_SOURCE_COMMIT) { throw "Mismatched release tuple in $($recordFile.FullName)" }
+            $actualTargets += $record.target
+          }
+          if (@(Compare-Object $expectedTargets ($actualTargets | Sort-Object)).Count -ne 0) { throw 'Build records do not contain the exact target set' }
+          $planHash = (Get-FileHash $plans[0].FullName -Algorithm SHA256).Hash
+          foreach ($plan in $plans) { if ((Get-FileHash $plan.FullName -Algorithm SHA256).Hash -cne $planHash) { throw 'Matrix build plans differ' } }
+          $records | ForEach-Object { $_.FullName } | Set-Content record-paths.txt
+      - name: Assemble facade and release table
+        shell: pwsh
+        env:
+          BAMTI_DIST_ROOT: ${{ github.workspace }}/assembled-dist
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $records = @(Get-Content record-paths.txt)
+          if ($records.Count -ne 5) { throw 'Expected five record paths' }
+          node npm/scripts/package-platform.mjs --assemble @records
+          if ($LASTEXITCODE -ne 0) { throw 'Facade assembly failed' }
+          $facades = @(Get-ChildItem assembled-dist -File -Filter 'bamti-cli-*.tgz')
+          if ($facades.Count -ne 1) { throw "Expected one facade tarball, found $($facades.Count)" }
+          New-Item -ItemType Directory -Force assembled-release/facade | Out-Null
+          tar -xzf $facades[0].FullName -C assembled-release/facade
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract facade tarball' }
+          if (-not (Test-Path assembled-release/facade/package/cli-release-table.json -PathType Leaf)) { throw 'Facade is missing cli-release-table.json' }
+          Copy-Item downloaded-cli assembled-release/cli-leaves -Recurse
+          Copy-Item $facades[0].FullName assembled-release/
+          Copy-Item assembled-release/facade/package/cli-release-table.json assembled-release/cli-release-table.json
+          $planFile = (Get-ChildItem downloaded-cli -Recurse -File -Filter cli-build-plan.json | Select-Object -First 1).FullName
+          if (-not (Test-Path $planFile)) { throw 'Selected cli-build-plan.json is missing' }
+          Copy-Item $planFile assembled-release/cli-build-plan.json
+      - name: Verify CLI release preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force preflight-dist | Out-Null
+          Copy-Item assembled-dist/*.tgz preflight-dist/
+          Get-ChildItem downloaded-cli -Recurse -File -Filter '*.tgz' | ForEach-Object {
+            Copy-Item $_.FullName preflight-dist/
+          }
+          node -e "import('./npm/scripts/preflight.mjs').then(({ preflightCliRelease }) => preflightCliRelease('preflight-dist'))"
+          if ($LASTEXITCODE -ne 0) { throw 'CLI release preflight failed' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cli-release-${{ needs.plan.outputs.build-set-id }}-${{ github.run_attempt }}
+          path: assembled-release
+          if-no-files-found: error
+          retention-days: 14

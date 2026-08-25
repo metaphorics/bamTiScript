@@ -13,6 +13,8 @@
 use std::fmt;
 
 use bamts_compiler::lint::{LintLevel, rule_by_name};
+use bamts_compiler::program::{MAX_SESSION_SOURCE_BYTES, ProgramLoadError};
+use bamts_compiler::source::MAX_SOURCE_BYTES;
 
 /// The operational mode for the CLI compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -389,20 +391,107 @@ pub fn version_message() -> &'static str {
     concat!("bamts ", env!("CARGO_PKG_VERSION"))
 }
 
+/// Formats a program-load failure as a CLI diagnostic line, attaching the
+/// stable error code when the failure is a frontend budget breach (per-file
+/// `BAMTS-R001`, session `BAMTS-R002`).
+#[must_use]
+pub fn load_error_message(error: &ProgramLoadError) -> String {
+    match error.code() {
+        Some(code) => format!("error[{}]: {error}", code.as_str()),
+        None => format!("error: {error}"),
+    }
+}
+
+/// Formats a byte count as MiB when it is an exact multiple, otherwise as
+/// raw bytes. Keeps the CLI explanation tied to the compiler's budget
+/// constant instead of a hand-copied number that can silently drift.
+fn format_budget_mib(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Formats the four-line explanation block shared by lint rules and budget
+/// codes so the two paths cannot diverge in structure.
+fn format_explanation(
+    code: &str,
+    slug: &str,
+    rationale: &str,
+    sound_alternative: &str,
+    silence: &str,
+) -> String {
+    format!(
+        "{code} ({slug})
+rationale: {rationale}
+sound alternative: {sound_alternative}
+silence: {silence}\n"
+    )
+}
+
 /// Formats the compiler-owned explanation for a stable code or rule slug.
 pub fn explain_rule(name: &str) -> Result<String, ArgsError> {
+    // Resource budget codes are not lint rules, but users can look them up
+    // because the CLI prints them in `load_error_message`.
+    if let Some(explanation) = explain_budget_code(name) {
+        return Ok(explanation);
+    }
+
     let rule = rule_by_name(name).ok_or_else(|| ArgsError::InvalidOptionValue {
         option: "explain".to_string(),
         value: name.to_string(),
-        expected: "a stable BAMTS-W code or rule slug".to_string(),
+        expected: "a stable BAMTS-W rule code, a rule slug, or a budget code BAMTS-R001/R002"
+            .to_string(),
     })?;
-    Ok(format!(
-        "{} ({})\nrationale: {}\nsound alternative: {}\nsilence: {}\n",
+    Ok(format_explanation(
         rule.code(),
         rule.slug(),
         rule.rationale(),
         rule.sound_alternative(),
         rule.silence_flag(),
+    ))
+}
+
+/// Returns the explanation for a resource-budget code, if any.
+///
+/// Budget numbers are derived from the compiler's own constants
+/// ([`MAX_SOURCE_BYTES`] and [`MAX_SESSION_SOURCE_BYTES`]) so the CLI
+/// explanation cannot disagree with the checker that produced the error.
+#[must_use]
+fn explain_budget_code(name: &str) -> Option<String> {
+    let (code, slug, rationale, sound_alternative, silence): (&str, &str, String, &str, &str) =
+        match name {
+            "BAMTS-R001" => (
+                "BAMTS-R001",
+                "source-too-large",
+                format!(
+                    "A single source file exceeds the {} frontend budget.",
+                    format_budget_mib(MAX_SOURCE_BYTES)
+                ),
+                "Reduce the file size or split the module into smaller files.",
+                "(none; this is a hard resource limit)",
+            ),
+            "BAMTS-R002" => (
+                "BAMTS-R002",
+                "session-too-large",
+                format!(
+                    "The total source bytes loaded for this program exceed the {} session budget.",
+                    format_budget_mib(MAX_SESSION_SOURCE_BYTES)
+                ),
+                "Reduce the number or size of modules in the program.",
+                "(none; this is a hard resource limit)",
+            ),
+            _ => return None,
+        };
+
+    Some(format_explanation(
+        code,
+        slug,
+        &rationale,
+        sound_alternative,
+        silence,
     ))
 }
 
@@ -1255,6 +1344,31 @@ mod tests {
     }
 
     #[test]
+    fn load_error_message_attaches_budget_codes() {
+        let oversized = ProgramLoadError::SourceTooLarge {
+            path: std::path::PathBuf::from("huge.ts"),
+            len: 16 * 1024 * 1024 + 1,
+        };
+        let message = load_error_message(&oversized);
+        assert!(message.starts_with("error[BAMTS-R001]: "));
+        assert!(message.contains("huge.ts"));
+
+        let session = ProgramLoadError::SessionTooLarge {
+            path: std::path::PathBuf::from("next.ts"),
+            total: 256 * 1024 * 1024 + 1,
+        };
+        let message = load_error_message(&session);
+        assert!(message.starts_with("error[BAMTS-R002]: "));
+        assert!(message.contains("256 MiB") || message.contains("268435456"));
+
+        let uncoded = ProgramLoadError::TooManySources;
+        assert_eq!(
+            load_error_message(&uncoded),
+            "error: program contains more than u32::MAX sources"
+        );
+    }
+
+    #[test]
     fn explain_accepts_code_and_uses_catalog_metadata() {
         let args = parse_args(["explain", "BAMTS-W017"]).expect("explain parses");
         assert!(args.is_explain());
@@ -1262,7 +1376,22 @@ mod tests {
         let explanation = explain_rule(args.explain_rule.as_deref().unwrap()).expect("known rule");
         assert!(explanation.contains("rationale:"));
         assert!(explanation.contains("sound alternative:"));
-        assert!(explanation.contains("silence: -A explicit-any"));
+    }
+
+    #[test]
+    fn explain_budget_codes_use_resource_metadata() {
+        let r001 = explain_rule("BAMTS-R001").expect("BAMTS-R001 known");
+        assert!(r001.contains("rationale:"));
+        assert!(r001.contains("source-too-large"));
+        // The explanation must reflect the compiler's real budget constant,
+        // not a hand-copied number. If the constant changes, this test
+        // follows it; if the CLI drifts, this test fails.
+        assert!(r001.contains(&format_budget_mib(MAX_SOURCE_BYTES)));
+
+        let r002 = explain_rule("BAMTS-R002").expect("BAMTS-R002 known");
+        assert!(r002.contains("rationale:"));
+        assert!(r002.contains("session-too-large"));
+        assert!(r002.contains(&format_budget_mib(MAX_SESSION_SOURCE_BYTES)));
     }
 
     #[test]

@@ -1,0 +1,2 @@
+# Upstream performance fixtures are immutable byte artifacts.
+perf/fixtures/upstream/* -text

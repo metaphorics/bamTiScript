@@ -128,6 +128,12 @@ impl GcState {
             self.mark_value(&machine.heap, frame.this_value);
             self.mark_value(&machine.heap, frame.new_target);
             self.mark_values(&machine.heap, &frame.args);
+            if let Some(value) = frame.context {
+                self.mark_value(&machine.heap, value);
+            }
+            if let Some(value) = frame.outer_context {
+                self.mark_value(&machine.heap, value);
+            }
             if let Some(value) = frame.arguments_object {
                 self.mark_value(&machine.heap, value);
             }
@@ -135,9 +141,7 @@ impl GcState {
                 self.mark_value(&machine.heap, value);
             }
         }
-        for value in machine.globals.values().copied() {
-            self.mark_value(&machine.heap, value);
-        }
+        self.mark_value(&machine.heap, machine.global_object);
         if let Some(value) = machine.context_global {
             self.mark_value(&machine.heap, value);
         }
@@ -229,7 +233,6 @@ impl GcState {
 
     fn ephemeron_fixed_point(&mut self, heap: &[HeapEntry]) {
         loop {
-            let marked_before = self.marks.iter().filter(|marked| **marked).count();
             let weak_count = self.weak_collections.len();
             for list_index in 0..weak_count {
                 let slot = self.weak_collections[list_index];
@@ -247,10 +250,10 @@ impl GcState {
                     }
                 }
             }
-            self.drain(heap);
-            if self.marks.iter().filter(|marked| **marked).count() == marked_before {
+            if self.work.is_empty() {
                 break;
             }
+            self.drain(heap);
         }
     }
 
@@ -318,7 +321,13 @@ fn runtime_index(value: Value) -> Option<usize> {
     let Decoded::HeapRef(id) = value.decode()? else {
         return None;
     };
-    (id.segment() == RUNTIME_HEAP_SEGMENT).then(|| id.slot() as usize - 1)
+    if id.segment() != RUNTIME_HEAP_SEGMENT {
+        return None;
+    }
+    // SlotId stores a NonZeroU32 slot (from_parts rejects zero), so every
+    // decoded HeapRef has slot() >= 1; the subtraction cannot underflow.
+    debug_assert!(id.slot() > 0, "SlotId slot is NonZeroU32");
+    (id.slot() as usize).checked_sub(1)
 }
 
 fn is_marked_value(marks: &[bool], value: Value) -> bool {
@@ -399,6 +408,9 @@ fn trace_activation(
     if let Some(value) = activation.arguments_object {
         mark_value(heap, marks, work, value);
     }
+    if let Some(value) = activation.context {
+        mark_value(heap, marks, work, value);
+    }
 }
 
 fn trace_generator_start(
@@ -411,6 +423,9 @@ fn trace_generator_start(
     mark_value(heap, marks, work, start.this_value);
     mark_value(heap, marks, work, start.new_target);
     trace_values(heap, marks, work, &start.args);
+    if let Some(value) = start.context {
+        mark_value(heap, marks, work, value);
+    }
 }
 
 fn trace_generator_state(
@@ -438,7 +453,8 @@ fn trace_async_generator_state(
         }
         AsyncGeneratorState::SuspendedYield(activation)
         | AsyncGeneratorState::AwaitingOperand(activation)
-        | AsyncGeneratorState::AwaitingYield(activation) => {
+        | AsyncGeneratorState::AwaitingYield(activation)
+        | AsyncGeneratorState::AwaitingResumption(activation) => {
             trace_activation(activation, heap, marks, work);
         }
         AsyncGeneratorState::Executing
@@ -606,7 +622,9 @@ fn trace_runtime_error(
         | RuntimeErrorKind::DynamicImportEdgeMissing { .. }
         | RuntimeErrorKind::InvalidVerifiedProgram { .. }
         | RuntimeErrorKind::InvalidRuntimeHeapReference { .. }
-        | RuntimeErrorKind::ModuleEvaluationStalled { .. } => {}
+        | RuntimeErrorKind::ModuleEvaluationStalled { .. }
+        | RuntimeErrorKind::RegexpStepBudgetExceeded { .. }
+        | RuntimeErrorKind::Cancelled => {}
     }
 }
 
@@ -649,11 +667,15 @@ fn trace_entry(
         }
         HeapEntry::Function {
             captures,
+            context,
             properties,
             prototype,
             ..
         } => {
             trace_values(heap, marks, work, captures);
+            if let Some(value) = context {
+                mark_value(heap, marks, work, *value);
+            }
             trace_properties_and_prototype(properties, *prototype, heap, marks, work);
         }
         HeapEntry::Script {
@@ -744,7 +766,7 @@ fn trace_entry(
         } => {
             trace_async_generator_state(state, heap, marks, work);
             for request in queue {
-                mark_value(heap, marks, work, request.resume_value);
+                mark_value(heap, marks, work, request.completion.value());
                 mark_value(heap, marks, work, request.capability);
             }
             trace_properties_and_prototype(properties, *prototype, heap, marks, work);
@@ -767,9 +789,13 @@ fn trace_entry(
             mark_value(heap, marks, work, *promise);
         }
         HeapEntry::PromiseAll {
-            promise, values, ..
+            resolve,
+            reject,
+            values,
+            ..
         } => {
-            mark_value(heap, marks, work, *promise);
+            mark_value(heap, marks, work, *resolve);
+            mark_value(heap, marks, work, *reject);
             trace_values(heap, marks, work, values);
         }
         HeapEntry::PromiseAllElement { aggregate, .. } => {
@@ -795,6 +821,7 @@ fn trace_entry(
         HeapEntry::NativeFunction {
             callable,
             properties,
+            prototype,
             ..
         } => {
             match callable {
@@ -806,6 +833,9 @@ fn trace_entry(
                 }
             }
             trace_property_map(properties, heap, marks, work);
+            if let Some(prototype) = prototype {
+                mark_value(heap, marks, work, *prototype);
+            }
         }
     }
 }

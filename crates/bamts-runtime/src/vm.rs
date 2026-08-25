@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
 use bamts_bytecode::EcmaString;
-use bamts_native::Value;
+use bamts_native::{Decoded, Value};
 
 use crate::external_modules::InstalledModule;
 use crate::intrinsics::{self, BuiltinDef, BuiltinOutcome, BuiltinTable};
 use crate::{
-    EvalFailure, HeapEntry, Host, Machine, PropertyMap, ScriptCompileError, ScriptSource,
-    ThrowOrigin,
+    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ScriptCompileError,
+    ScriptSource, ThrowOrigin,
 };
 
 pub(crate) fn install<H: Host>(
@@ -15,7 +15,7 @@ pub(crate) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
     object_prototype: Value,
 ) -> InstalledModule {
-    let specifier = EcmaString::from_utf8("node:vm");
+    let specifier = EcmaString::encode("node:vm");
     let namespace = intrinsics::push(
         heap,
         HeapEntry::ExternalModuleNamespace {
@@ -99,12 +99,9 @@ pub(crate) fn install<H: Host>(
         specifier,
         namespace,
         exports: vec![
-            (EcmaString::from_utf8("Script"), script),
-            (EcmaString::from_utf8("runInNewContext"), run_in_new_context),
-            (
-                EcmaString::from_utf8("runInThisContext"),
-                run_in_this_context,
-            ),
+            (EcmaString::encode("Script"), script),
+            (EcmaString::encode("runInNewContext"), run_in_new_context),
+            (EcmaString::encode("runInThisContext"), run_in_this_context),
         ],
         internals: BTreeMap::from([("vm.script.prototype", script_prototype)]),
     }
@@ -160,7 +157,7 @@ fn script_constructor<H: Host>(
     let code = args.first().copied().unwrap_or(Value::UNDEFINED);
     let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     let (code, name) = source_arguments(machine, code, options)?;
-    let entry = compile_entry(machine, code, name, ScriptAllocation::Object)?;
+    let entry = compile_entry(machine, code, name, ScriptAllocation::Object, None)?;
     let script = machine
         .allocate(HeapEntry::Script {
             entry,
@@ -182,12 +179,8 @@ fn run_in_this_context<H: Host>(
         let function = machine
             .registry
             .external
-            .get(&EcmaString::from_utf8("node:vm"))
-            .and_then(|module| {
-                module
-                    .exports
-                    .get(&EcmaString::from_utf8("runInThisContext"))
-            })
+            .get(&EcmaString::encode("node:vm"))
+            .and_then(|module| module.exports.get(&EcmaString::encode("runInThisContext")))
             .expect("node:vm installs runInThisContext")
             .value;
         Some(
@@ -206,10 +199,23 @@ fn run_in_this_context<H: Host>(
     } else {
         ScriptAllocation::Call
     };
-    let entry = compile_entry(machine, code, name, allocation)?;
+    let entry = compile_entry(machine, code, name, allocation, None)?;
     call_entry(machine, entry, prototype, None)
 }
 
+/// `runInNewContext(code, contextObject?, options?)`
+///
+/// Compiles `code` as a classic script and executes it with a fresh
+/// `globalThis`. When `contextObject` is omitted, a fresh object is allocated
+/// and becomes `globalThis` for the duration of the call. The new context still
+/// shares this machine's intrinsic objects and prototype graph with the outer
+/// environment, so `Object`, `Array`, `Object.prototype`, and similar builtins
+/// are identical across contexts. Guest code can mutate shared objects such as
+/// `Object.prototype`; this is not a separate realm and is not a security
+/// boundary.
+///
+/// An unsupported `timeout` in `options` is rejected rather than silently
+/// ignored; see `reject_unsupported_timeout`.
 fn run_in_new_context<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
@@ -217,8 +223,8 @@ fn run_in_new_context<H: Host>(
     constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let prototype = if constructing {
-        let function = machine.registry.external[&EcmaString::from_utf8("node:vm")].exports
-            [&EcmaString::from_utf8("runInNewContext")]
+        let function = machine.registry.external[&EcmaString::encode("node:vm")].exports
+            [&EcmaString::encode("runInNewContext")]
             .value;
         Some(
             machine
@@ -252,7 +258,7 @@ fn run_in_new_context<H: Host>(
     } else {
         ScriptAllocation::Call
     };
-    let entry = compile_entry(machine, code, name, allocation)?;
+    let entry = compile_entry(machine, code, name, allocation, Some(context))?;
     call_entry(machine, entry, prototype, Some(context))
 }
 
@@ -267,13 +273,17 @@ fn script_run_in_this_context<H: Host>(
             "Script.prototype.runInThisContext is not a constructor",
         ));
     }
-    if let Some(options) = args
+    let options = args
         .first()
         .copied()
-        .filter(|value| *value != Value::UNDEFINED)
+        .filter(|value| *value != Value::UNDEFINED);
+    if let Some(options) = options
         && (!machine.is_object(options) || machine.is_callable(options)?)
     {
         return Err(type_error("The \"options\" argument must be an object"));
+    }
+    if let Some(options) = options {
+        reject_unsupported_timeout(machine, options)?;
     }
     let Some(index) = machine.runtime_slot(this).map_err(EvalFailure::Runtime)? else {
         return Err(type_error(
@@ -288,6 +298,23 @@ fn script_run_in_this_context<H: Host>(
     call_entry(machine, entry, None, None)
 }
 
+// The runtime has no execution-timeout enforcement point, so a caller-supplied
+// `timeout` cannot be honored. Reject it loudly instead of silently dropping a
+// safety-relevant option — accepting it would let callers believe guest
+// execution is bounded when it is not.
+fn reject_unsupported_timeout<H: Host>(
+    machine: &mut Machine<'_, H>,
+    options: Value,
+) -> Result<(), EvalFailure> {
+    let timeout = machine.get_named_property(options, "timeout")?;
+    if timeout != Value::UNDEFINED {
+        return Err(type_error(
+            "The \"timeout\" option is not supported by this runtime",
+        ));
+    }
+    Ok(())
+}
+
 fn source_arguments<H: Host>(
     machine: &mut Machine<'_, H>,
     code: Value,
@@ -295,7 +322,7 @@ fn source_arguments<H: Host>(
 ) -> Result<(EcmaString, EcmaString), EvalFailure> {
     let code = machine.to_string(code)?;
     if options == Value::UNDEFINED {
-        return Ok((code, EcmaString::from_utf8("evalmachine.<anonymous>")));
+        return Ok((code, EcmaString::encode("evalmachine.<anonymous>")));
     }
     if let Some(name) = machine.string_value(options) {
         return Ok((code, name));
@@ -303,9 +330,10 @@ fn source_arguments<H: Host>(
     if !machine.is_object(options) || machine.is_callable(options)? {
         return Err(type_error("The \"options\" argument must be an object"));
     }
+    reject_unsupported_timeout(machine, options)?;
     let filename = machine.get_named_property(options, "filename")?;
     if filename == Value::UNDEFINED {
-        return Ok((code, EcmaString::from_utf8("evalmachine.<anonymous>")));
+        return Ok((code, EcmaString::encode("evalmachine.<anonymous>")));
     }
     let Some(name) = machine.string_value(filename) else {
         return Err(type_error("The \"filename\" option must be of type string"));
@@ -318,6 +346,7 @@ fn compile_entry<H: Host>(
     code: EcmaString,
     name: EcmaString,
     allocation: ScriptAllocation,
+    context: Option<Value>,
 ) -> Result<Value, EvalFailure> {
     let compiled = {
         let provider = machine
@@ -339,6 +368,7 @@ fn compile_entry<H: Host>(
             module,
             function: machine.module_code(module).entry(),
             captures: Vec::new(),
+            context,
             properties: PropertyMap::default(),
             prototype: Some(machine.intrinsics.function_prototype),
             extensible: true,
@@ -356,6 +386,7 @@ fn compile_error<H: Host>(machine: &mut Machine<'_, H>, error: ScriptCompileErro
         ScriptCompileError::Syntax { message, .. }
         | ScriptCompileError::Unsupported { message, .. } => ("SyntaxError", message),
         ScriptCompileError::Capacity { message } => ("RangeError", message),
+        ScriptCompileError::Internal { message } => ("Error", message),
     };
     let id = machine
         .intrinsics
@@ -369,9 +400,82 @@ fn script_prototype<H: Host>(machine: &Machine<'_, H>) -> Value {
     *machine
         .registry
         .external
-        .get(&EcmaString::from_utf8("node:vm"))
+        .get(&EcmaString::encode("node:vm"))
         .and_then(|module| module.internals.get("vm.script.prototype"))
         .expect("node:vm installs Script.prototype")
+}
+
+fn contextify_global<H: Host>(
+    machine: &mut Machine<'_, H>,
+    context: Value,
+) -> Result<(), EvalFailure> {
+    let Some(Decoded::HeapRef(marker)) = machine.vm_context_marker.decode() else {
+        unreachable!("vm context marker is a private name");
+    };
+    let marker = PropertyKey::Private(marker.slot() - 1);
+    if machine.own_descriptor(context, &marker)?.is_some() {
+        return Ok(());
+    }
+
+    machine.define_descriptor_batch(
+        context,
+        [
+            (
+                PropertyKey::Named(EcmaString::encode("globalThis")),
+                Property::Data {
+                    value: context,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+            (
+                PropertyKey::Named(EcmaString::encode("global")),
+                Property::Data {
+                    value: context,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+            (
+                marker,
+                Property::Data {
+                    value: Value::TRUE,
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            ),
+        ],
+    )?;
+    // Populate the fresh context with the shared intrinsic globals so
+    // runInNewContext can resolve Object, Array, etc. without falling
+    // back to the outer global object. The intrinsic objects themselves
+    // remain shared (same Value); only the property bindings are copied.
+    // Host-only globals such as `process` and `console` are not copied
+    // unless they are already present on an explicitly supplied context object.
+    let intrinsic_names: Vec<EcmaString> = machine
+        .intrinsics
+        .globals
+        .keys()
+        .filter(|name| {
+            !name.eq_ascii("globalThis")
+                && !name.eq_ascii("global")
+                && !name.eq_ascii("process")
+                && !name.eq_ascii("console")
+        })
+        .cloned()
+        .collect();
+    for name in intrinsic_names {
+        let key = PropertyKey::Named(name);
+        if machine.own_descriptor(context, &key)?.is_none()
+            && let Some(descriptor) = machine.own_descriptor(machine.global_object, &key)?
+        {
+            machine.define_descriptor(context, key, descriptor)?;
+        }
+    }
+    Ok(())
 }
 
 fn call_entry<H: Host>(
@@ -380,12 +484,10 @@ fn call_entry<H: Host>(
     prototype: Option<Value>,
     context: Option<Value>,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let this_value = context.unwrap_or_else(|| {
-        machine
-            .intrinsics
-            .global("globalThis")
-            .expect("host objects install globalThis")
-    });
+    let this_value = context.unwrap_or(machine.global_object);
+    if let Some(context) = context {
+        contextify_global(machine, context)?;
+    }
     let previous = std::mem::replace(&mut machine.context_global, context);
     let result = machine.call_value(entry, this_value, &[]);
     machine.context_global = previous;
@@ -445,7 +547,7 @@ mod tests {
     fn program_returning(value: i32) -> Program<Verified> {
         let constants = vec![
             Constant::Int32(value),
-            Constant::String(EcmaString::from_utf8("test")),
+            Constant::String(EcmaString::encode("test")),
         ];
         let code = Module::new(
             constants,
@@ -483,6 +585,116 @@ mod tests {
         .expect("test program links")
     }
 
+    fn program_checking_intrinsics() -> Program<Verified> {
+        let constants = vec![
+            Constant::String(EcmaString::encode("Object")),
+            Constant::String(EcmaString::encode("Array")),
+            Constant::String(EcmaString::encode("prototype")),
+            Constant::String(EcmaString::encode("shared_marker")),
+            Constant::String(EcmaString::encode("<test>")),
+            Constant::Int32(1),
+        ];
+        let code = Module::new(
+            constants,
+            vec![Function::new(
+                None,
+                0,
+                0,
+                11,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::LoadThis {
+                        dst: Register::new(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: Register::new(8),
+                        constant: ConstantId::new(2),
+                    },
+                    Instruction::LoadConst {
+                        dst: Register::new(9),
+                        constant: ConstantId::new(3),
+                    },
+                    Instruction::LoadConst {
+                        dst: Register::new(10),
+                        constant: ConstantId::new(5),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: Register::new(1),
+                        name: ConstantId::new(0),
+                    },
+                    Instruction::GetProperty {
+                        dst: Register::new(2),
+                        object: Register::new(1),
+                        key: Register::new(8),
+                    },
+                    Instruction::DefineDataProperty {
+                        object: Register::new(2),
+                        key: Register::new(9),
+                        value: Register::new(10),
+                    },
+                    Instruction::CreateObject {
+                        dst: Register::new(5),
+                    },
+                    Instruction::GetProperty {
+                        dst: Register::new(6),
+                        object: Register::new(5),
+                        key: Register::new(9),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: Register::new(3),
+                        name: ConstantId::new(1),
+                    },
+                    Instruction::GetProperty {
+                        dst: Register::new(4),
+                        object: Register::new(3),
+                        key: Register::new(8),
+                    },
+                    Instruction::CreateArray {
+                        dst: Register::new(7),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(1),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(2),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(4),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(7),
+                        value: Register::new(6),
+                    },
+                    Instruction::Return {
+                        value: Register::new(7),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test bytecode is verified");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(4),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("test program links")
+    }
+
     fn compiler_host() -> ScriptHost {
         ScriptHost {
             compiler: Some(FakeCompiler {
@@ -496,15 +708,15 @@ mod tests {
         let vm = machine
             .registry
             .external
-            .get(&EcmaString::from_utf8("node:vm"))
+            .get(&EcmaString::encode("node:vm"))
             .expect("node:vm is installed");
         (
             vm.exports
-                .get(&EcmaString::from_utf8("Script"))
+                .get(&EcmaString::encode("Script"))
                 .expect("Script is exported")
                 .value,
             vm.exports
-                .get(&EcmaString::from_utf8("runInThisContext"))
+                .get(&EcmaString::encode("runInThisContext"))
                 .expect("runInThisContext is exported")
                 .value,
         )
@@ -534,7 +746,7 @@ mod tests {
             !machine
                 .registry
                 .external
-                .contains_key(&EcmaString::from_utf8("node:vm"))
+                .contains_key(&EcmaString::encode("node:vm"))
         );
     }
 
@@ -547,31 +759,31 @@ mod tests {
             let vm = machine
                 .registry
                 .external
-                .get(&EcmaString::from_utf8("node:vm"))
+                .get(&EcmaString::encode("node:vm"))
                 .expect("node:vm is installed");
             let names: Vec<_> = vm.exports.keys().cloned().collect();
             assert_eq!(
                 names,
                 vec![
-                    EcmaString::from_utf8("Script"),
-                    EcmaString::from_utf8("default"),
-                    EcmaString::from_utf8("runInNewContext"),
-                    EcmaString::from_utf8("runInThisContext"),
+                    EcmaString::encode("Script"),
+                    EcmaString::encode("default"),
+                    EcmaString::encode("runInNewContext"),
+                    EcmaString::encode("runInThisContext"),
                 ]
             );
             let script = vm
                 .exports
-                .get(&EcmaString::from_utf8("Script"))
+                .get(&EcmaString::encode("Script"))
                 .expect("Script is exported")
                 .value;
             let run = vm
                 .exports
-                .get(&EcmaString::from_utf8("runInThisContext"))
+                .get(&EcmaString::encode("runInThisContext"))
                 .expect("runInThisContext is exported")
                 .value;
             let run_new = vm
                 .exports
-                .get(&EcmaString::from_utf8("runInNewContext"))
+                .get(&EcmaString::encode("runInNewContext"))
                 .expect("runInNewContext is exported")
                 .value;
             (script, run, run_new)
@@ -668,11 +880,11 @@ mod tests {
         let mut host = compiler_host();
         let mut machine = Machine::new(&program, &mut host, Limits::default());
         machine.instantiate_modules().unwrap();
-        let run = machine.registry.external[&EcmaString::from_utf8("node:vm")].exports
-            [&EcmaString::from_utf8("runInNewContext")]
+        let run = machine.registry.external[&EcmaString::encode("node:vm")].exports
+            [&EcmaString::encode("runInNewContext")]
             .value;
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("({})")))
+            .allocate(HeapEntry::String(EcmaString::encode("({})")))
             .unwrap();
 
         assert_eq!(
@@ -730,6 +942,538 @@ mod tests {
     }
 
     #[test]
+    fn contextification_runs_once_and_preserves_alias_mutations() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+
+        contextify_global(&mut machine, context).unwrap();
+        machine
+            .set_data_property(context, "globalThis", Value::int32(7))
+            .unwrap();
+        assert!(
+            machine
+                .delete_property(context, &PropertyKey::Named(EcmaString::encode("global")))
+                .unwrap()
+        );
+        contextify_global(&mut machine, context).unwrap();
+
+        assert_eq!(
+            machine.get_named_property(context, "globalThis").unwrap(),
+            Value::int32(7)
+        );
+        assert!(matches!(
+            machine
+                .own_descriptor(
+                    context,
+                    &PropertyKey::Named(EcmaString::encode("globalThis")),
+                )
+                .unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            }) if value == Value::int32(7)
+        ));
+        assert!(
+            machine
+                .own_descriptor(context, &PropertyKey::Named(EcmaString::encode("global")),)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_contextification_restores_every_descriptor() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let global_this = PropertyKey::Named(EcmaString::encode("globalThis"));
+        let global = PropertyKey::Named(EcmaString::encode("global"));
+        machine
+            .define_descriptor(
+                context,
+                global_this.clone(),
+                Property::Data {
+                    value: Value::int32(7),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        machine
+            .define_descriptor(
+                context,
+                global.clone(),
+                Property::Data {
+                    value: Value::int32(8),
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            contextify_global(&mut machine, context),
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert!(matches!(
+            machine.own_descriptor(context, &global_this).unwrap(),
+            Some(Property::Data {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            }) if value == Value::int32(7)
+        ));
+        assert!(matches!(
+            machine.own_descriptor(context, &global).unwrap(),
+            Some(Property::Data {
+                value,
+                writable: false,
+                enumerable: true,
+                configurable: false,
+            }) if value == Value::int32(8)
+        ));
+        let Some(Decoded::HeapRef(marker)) = machine.vm_context_marker.decode() else {
+            unreachable!();
+        };
+        assert!(
+            machine
+                .own_descriptor(context, &PropertyKey::Private(marker.slot() - 1))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn heap_limit_failure_does_not_partially_contextify() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let bytes = machine.heap_bytes;
+        machine.limits.max_heap_bytes = bytes;
+
+        assert!(matches!(
+            contextify_global(&mut machine, context),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::HeapByteLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(machine.heap_bytes, bytes);
+        for key in [
+            PropertyKey::Named(EcmaString::encode("globalThis")),
+            PropertyKey::Named(EcmaString::encode("global")),
+        ] {
+            assert!(machine.own_descriptor(context, &key).unwrap().is_none());
+        }
+        let Some(Decoded::HeapRef(marker)) = machine.vm_context_marker.decode() else {
+            unreachable!();
+        };
+        assert!(
+            machine
+                .own_descriptor(context, &PropertyKey::Private(marker.slot() - 1))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn run_in_new_context_shares_intrinsics_and_prototypes() {
+        let program = program_returning(0);
+        let mut host = ScriptHost {
+            compiler: Some(FakeCompiler {
+                program: Arc::new(program_checking_intrinsics()),
+                sources: Vec::new(),
+            }),
+        };
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+        let run = machine
+            .registry
+            .external
+            .get(&EcmaString::encode("node:vm"))
+            .expect("node:vm is installed")
+            .exports
+            .get(&EcmaString::encode("runInNewContext"))
+            .expect("runInNewContext is exported")
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::encode("intrinsics check")))
+            .unwrap();
+
+        let first = machine
+            .call_value(run, Value::UNDEFINED, &[source])
+            .expect("first runInNewContext call succeeds");
+        let outer_global_this = machine
+            .intrinsics
+            .global("globalThis")
+            .expect("outer globalThis exists");
+        let outer_object = machine.intrinsics.global("Object").expect("Object exists");
+        let outer_object_prototype = machine.intrinsics.object_prototype;
+        let outer_array_prototype = machine.intrinsics.array_prototype;
+
+        assert_ne!(
+            machine.get_named_property(first, "0").unwrap(),
+            outer_global_this,
+            "runInNewContext provides a fresh globalThis"
+        );
+        assert_eq!(
+            machine.get_named_property(first, "1").unwrap(),
+            outer_object,
+            "Object is shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(first, "2").unwrap(),
+            outer_object_prototype,
+            "Object.prototype is shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(first, "3").unwrap(),
+            outer_array_prototype,
+            "Array.prototype is shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(first, "4").unwrap(),
+            Value::int32(1),
+            "mutations to the shared Object.prototype are visible to new objects"
+        );
+
+        let second = machine
+            .call_value(run, Value::UNDEFINED, &[source])
+            .expect("second runInNewContext call succeeds");
+        assert_ne!(
+            machine.get_named_property(second, "0").unwrap(),
+            outer_global_this,
+            "each new context has a fresh globalThis"
+        );
+        assert_ne!(
+            machine.get_named_property(second, "0").unwrap(),
+            machine.get_named_property(first, "0").unwrap(),
+            "each new context has a distinct globalThis"
+        );
+        assert_eq!(
+            machine.get_named_property(second, "1").unwrap(),
+            outer_object,
+            "Object is still shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(second, "2").unwrap(),
+            outer_object_prototype,
+            "Object.prototype is still shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(second, "3").unwrap(),
+            outer_array_prototype,
+            "Array.prototype is still shared across contexts"
+        );
+        assert_eq!(
+            machine.get_named_property(second, "4").unwrap(),
+            Value::int32(1),
+            "mutations to the shared prototype survive into a new context"
+        );
+    }
+
+    /// Program that checks global isolation: TypeOfGlobal on host-only
+    /// names (should be "undefined") and on a standard intrinsic (should be
+    /// "function"), returning [typeof hostOnly, typeof process, typeof console, typeof Object].
+    fn program_checking_global_isolation() -> Program<Verified> {
+        let constants = vec![
+            Constant::String(EcmaString::encode("hostOnly")),
+            Constant::String(EcmaString::encode("process")),
+            Constant::String(EcmaString::encode("console")),
+            Constant::String(EcmaString::encode("Object")),
+            Constant::String(EcmaString::encode("<isolation>")),
+        ];
+        let code = Module::new(
+            constants,
+            vec![Function::new(
+                None,
+                0,
+                0,
+                5,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(0),
+                        name: ConstantId::new(0),
+                    },
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(1),
+                        name: ConstantId::new(1),
+                    },
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(2),
+                        name: ConstantId::new(2),
+                    },
+                    Instruction::TypeOfGlobal {
+                        dst: Register::new(3),
+                        name: ConstantId::new(3),
+                    },
+                    Instruction::CreateArray {
+                        dst: Register::new(4),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(4),
+                        value: Register::new(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(4),
+                        value: Register::new(1),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(4),
+                        value: Register::new(2),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(4),
+                        value: Register::new(3),
+                    },
+                    Instruction::Return {
+                        value: Register::new(4),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test bytecode is verified");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(4),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("test program links")
+    }
+
+    /// Program that returns the values of explicitly-supplied `process`
+    /// and `console` globals: [process, console].
+    fn program_returning_supplied_globals() -> Program<Verified> {
+        let constants = vec![
+            Constant::String(EcmaString::encode("process")),
+            Constant::String(EcmaString::encode("console")),
+            Constant::String(EcmaString::encode("<explicit>")),
+        ];
+        let code = Module::new(
+            constants,
+            vec![Function::new(
+                None,
+                0,
+                0,
+                3,
+                FunctionFlags::default(),
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: Register::new(0),
+                        name: ConstantId::new(0),
+                    },
+                    Instruction::LoadGlobal {
+                        dst: Register::new(1),
+                        name: ConstantId::new(1),
+                    },
+                    Instruction::CreateArray {
+                        dst: Register::new(2),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(2),
+                        value: Register::new(0),
+                    },
+                    Instruction::ArrayPush {
+                        array: Register::new(2),
+                        value: Register::new(1),
+                    },
+                    Instruction::Return {
+                        value: Register::new(2),
+                    },
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        )
+        .verify()
+        .expect("test bytecode is verified");
+        Program::link(
+            vec![ProgramModule {
+                name: ConstantId::new(2),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("test program links")
+    }
+
+    #[test]
+    fn run_in_new_context_does_not_leak_host_only_globals() {
+        let program = program_returning(0);
+        let mut host = ScriptHost {
+            compiler: Some(FakeCompiler {
+                program: Arc::new(program_checking_global_isolation()),
+                sources: Vec::new(),
+            }),
+        };
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+
+        // Install a host-only global on the outer global object.
+        machine.test_set_global("hostOnly", Value::int32(42));
+        assert_eq!(
+            machine.test_global("hostOnly"),
+            Some(Value::int32(42)),
+            "host-only global is visible in the main context"
+        );
+
+        let run = machine
+            .registry
+            .external
+            .get(&EcmaString::encode("node:vm"))
+            .expect("node:vm is installed")
+            .exports
+            .get(&EcmaString::encode("runInNewContext"))
+            .expect("runInNewContext is exported")
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::encode("isolation check")))
+            .unwrap();
+
+        let result = machine
+            .call_value(run, Value::UNDEFINED, &[source])
+            .expect("runInNewContext call succeeds");
+
+        // The host-only globals must NOT leak into the new context.
+        let typeof_host_only = machine.get_named_property(result, "0").unwrap();
+        assert!(
+            machine
+                .string_value(typeof_host_only)
+                .is_some_and(|text| text.eq_ascii("undefined")),
+            "host-only global is absent inside runInNewContext"
+        );
+        let typeof_process = machine.get_named_property(result, "1").unwrap();
+        assert!(
+            machine
+                .string_value(typeof_process)
+                .is_some_and(|text| text.eq_ascii("undefined")),
+            "process is absent inside runInNewContext"
+        );
+        let typeof_console = machine.get_named_property(result, "2").unwrap();
+        assert!(
+            machine
+                .string_value(typeof_console)
+                .is_some_and(|text| text.eq_ascii("undefined")),
+            "console is absent inside runInNewContext"
+        );
+        // Standard intrinsics must remain usable in the new context.
+        let typeof_object = machine.get_named_property(result, "3").unwrap();
+        assert!(
+            machine
+                .string_value(typeof_object)
+                .is_some_and(|text| text.eq_ascii("function")),
+            "standard intrinsics work inside runInNewContext"
+        );
+
+        // The main-context lookup is unchanged after the call.
+        assert_eq!(
+            machine.test_global("hostOnly"),
+            Some(Value::int32(42)),
+            "main-context lookup is unchanged"
+        );
+    }
+
+    #[test]
+    fn run_in_new_context_keeps_explicit_context_properties() {
+        let program = program_returning(0);
+        let mut host = ScriptHost {
+            compiler: Some(FakeCompiler {
+                program: Arc::new(program_returning_supplied_globals()),
+                sources: Vec::new(),
+            }),
+        };
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+
+        let run = machine
+            .registry
+            .external
+            .get(&EcmaString::encode("node:vm"))
+            .expect("node:vm is installed")
+            .exports
+            .get(&EcmaString::encode("runInNewContext"))
+            .expect("runInNewContext is exported")
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::encode(
+                "explicit context check",
+            )))
+            .unwrap();
+
+        // Allocate a context object and explicitly provide `process` and `console`.
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(context, "process", Value::int32(123))
+            .unwrap();
+        machine
+            .set_data_property(context, "console", Value::int32(456))
+            .unwrap();
+
+        let result = machine
+            .call_value(run, Value::UNDEFINED, &[source, context])
+            .expect("runInNewContext call succeeds");
+
+        assert_eq!(
+            machine.get_named_property(result, "0").unwrap(),
+            Value::int32(123),
+            "explicit process property is visible inside runInNewContext"
+        );
+        assert_eq!(
+            machine.get_named_property(result, "1").unwrap(),
+            Value::int32(456),
+            "explicit console property is visible inside runInNewContext"
+        );
+    }
+
+    #[test]
     fn script_constructs_without_execution_and_runs_via_continuation() {
         let program = program_returning(0);
         let mut host = compiler_host();
@@ -737,7 +1481,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (script_constructor, _) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .expect("source allocation succeeds");
         let script_constructor_id = builtin_id(&machine, script_constructor);
         let script = match machine
@@ -746,8 +1490,8 @@ mod tests {
         {
             BuiltinOutcome::Value(script) => script,
             BuiltinOutcome::Call { .. }
-            | BuiltinOutcome::GeneratorNext { .. }
-            | BuiltinOutcome::AsyncGeneratorNext { .. } => {
+            | BuiltinOutcome::GeneratorResume { .. }
+            | BuiltinOutcome::AsyncGeneratorResume { .. } => {
                 panic!("Script construction must not execute")
             }
         };
@@ -822,7 +1566,7 @@ mod tests {
             "1".encode_utf16().collect::<Vec<_>>()
         );
         let filename = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("custom.js")))
+            .allocate(HeapEntry::String(EcmaString::encode("custom.js")))
             .unwrap();
         assert_eq!(
             machine
@@ -876,7 +1620,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (_, run) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .unwrap();
         let used_slots = machine.heap.len() - machine.intrinsic_slots;
         machine.limits.max_heap_slots = used_slots + 1;
@@ -914,7 +1658,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (script_constructor, _) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .unwrap();
         let used_slots = machine.heap.len() - machine.intrinsic_slots;
         machine.limits.max_heap_slots = used_slots + 1;
@@ -957,7 +1701,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (script_constructor, _) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .unwrap();
         let script_bytes = Machine::<ScriptHost>::script_heap_cost(
             &machine.host.compiler.as_ref().unwrap().program,
@@ -1002,7 +1746,7 @@ mod tests {
         machine.instantiate_modules().unwrap();
         let (script_constructor, _) = vm_exports(&machine);
         let source = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("ignored")))
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
             .expect("source allocation succeeds");
         let script_constructor_id = builtin_id(&machine, script_constructor);
         let script = match machine
@@ -1011,8 +1755,8 @@ mod tests {
         {
             BuiltinOutcome::Value(script) => script,
             BuiltinOutcome::Call { .. }
-            | BuiltinOutcome::GeneratorNext { .. }
-            | BuiltinOutcome::AsyncGeneratorNext { .. } => unreachable!(),
+            | BuiltinOutcome::GeneratorResume { .. }
+            | BuiltinOutcome::AsyncGeneratorResume { .. } => unreachable!(),
         };
         let run = machine
             .get_named_property(script, "runInThisContext")
@@ -1029,5 +1773,113 @@ mod tests {
             unreachable!();
         };
         assert_eq!(properties.iter().count(), 0);
+    }
+
+    fn options_with_timeout<H: Host>(machine: &mut Machine<'_, H>, timeout: Value) -> Value {
+        let options = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .expect("options allocation succeeds");
+        machine
+            .set_data_property(options, "timeout", timeout)
+            .expect("timeout property is writable");
+        options
+    }
+
+    #[test]
+    fn timeout_option_is_rejected_not_silently_dropped() {
+        let program = program_returning(0);
+        let mut host = compiler_host();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.instantiate_modules().unwrap();
+        let (script_constructor, run) = vm_exports(&machine);
+        let run_new = machine.registry.external[&EcmaString::encode("node:vm")].exports
+            [&EcmaString::encode("runInNewContext")]
+            .value;
+        let source = machine
+            .allocate(HeapEntry::String(EcmaString::encode("ignored")))
+            .unwrap();
+
+        // Script.prototype.runInThisContext rejects a timeout it cannot honor.
+        let script = match machine
+            .call_builtin(
+                builtin_id(&machine, script_constructor),
+                Value::UNDEFINED,
+                &[source],
+                true,
+            )
+            .unwrap()
+        {
+            BuiltinOutcome::Value(script) => script,
+            _ => unreachable!(),
+        };
+        let script_run = machine
+            .get_named_property(script, "runInThisContext")
+            .unwrap();
+        let timeout_opts = options_with_timeout(&mut machine, Value::int32(50));
+        let error = machine
+            .call_value(script_run, script, &[timeout_opts])
+            .expect_err("timeout must be rejected, not silently dropped");
+        assert!(matches!(
+            error,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+
+        // runInThisContext(code, { timeout }) rejects.
+        let timeout_opts = options_with_timeout(&mut machine, Value::int32(50));
+        let error = machine
+            .call_value(run, Value::UNDEFINED, &[source, timeout_opts])
+            .expect_err("timeout must be rejected, not silently dropped");
+        assert!(matches!(
+            error,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+
+        // runInNewContext(code, ctx, { timeout }) rejects.
+        let context = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let timeout_opts = options_with_timeout(&mut machine, Value::int32(50));
+        let error = machine
+            .call_value(run_new, Value::UNDEFINED, &[source, context, timeout_opts])
+            .expect_err("timeout must be rejected, not silently dropped");
+        assert!(matches!(
+            error,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+
+        // An options object without timeout still runs (happy path intact).
+        let plain_options = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        assert_eq!(
+            machine
+                .call_value(run, Value::UNDEFINED, &[source, plain_options])
+                .unwrap(),
+            Value::int32(42)
+        );
+
+        // `timeout: undefined` is accepted — absence is not a request to bound.
+        let absent_timeout_opts = options_with_timeout(&mut machine, Value::UNDEFINED);
+        assert_eq!(
+            machine
+                .call_value(run, Value::UNDEFINED, &[source, absent_timeout_opts])
+                .unwrap(),
+            Value::int32(42)
+        );
     }
 }

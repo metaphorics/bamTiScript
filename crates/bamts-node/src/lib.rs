@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
 #[cfg(feature = "script-compiler")]
-use bamts_bytecode::{Program, Verified};
+use bamts_bytecode::{EcmaString, Program, Verified};
 use bamts_runtime::Host;
 
 /// Parent-to-AOT-child transport for the logical source entrypoint.
@@ -38,12 +38,18 @@ impl bamts_runtime::CompileProvider for ScriptCompiler {
         &mut self,
         source: bamts_runtime::ScriptSource<'_>,
     ) -> std::result::Result<Arc<Program<Verified>>, bamts_runtime::ScriptCompileError> {
-        bamts_compiler::compile_classic_script(
-            source.source,
-            &String::from_utf16_lossy(source.name),
-        )
-        .map(Arc::new)
-        .map_err(map_script_compile_error)
+        // Strict conversion preserves the exact name the caller supplied.
+        // Lossy conversion would replace unpaired surrogates with U+FFFD,
+        // causing diagnostics and module resolution to disagree with the
+        // caller's intent.
+        let resource_name = EcmaString::from_units(source.name)
+            .to_utf8_strict()
+            .map_err(|error| bamts_runtime::ScriptCompileError::IllFormedSource {
+                unit_offset: error.unit_offset,
+            })?;
+        bamts_compiler::compile_classic_script(source.source, &resource_name)
+            .map(Arc::new)
+            .map_err(map_script_compile_error)
     }
 }
 
@@ -76,6 +82,9 @@ fn map_script_compile_error(
         bamts_compiler::ScriptCompileError::Capacity { message } => {
             bamts_runtime::ScriptCompileError::Capacity { message }
         }
+        bamts_compiler::ScriptCompileError::Internal { message } => {
+            bamts_runtime::ScriptCompileError::Internal { message }
+        }
     }
 }
 
@@ -86,7 +95,7 @@ fn map_script_compile_error(
 pub struct NodeHost {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    exit_code: i32,
+    exit_code: Option<i32>,
     argv: Vec<String>,
     env: BTreeMap<String, String>,
     started: Instant,
@@ -107,7 +116,7 @@ impl NodeHost {
         Self {
             stdout: Vec::new(),
             stderr: Vec::new(),
-            exit_code: 0,
+            exit_code: None,
             argv: Vec::new(),
             env: BTreeMap::new(),
             started: Instant::now(),
@@ -128,8 +137,16 @@ impl NodeHost {
     }
 
     #[must_use]
-    pub const fn exit_code(&self) -> i32 {
+    pub const fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    #[must_use]
+    pub const fn completion_exit_code(&self, runtime_exit_code: i32) -> i32 {
+        match self.exit_code {
+            Some(exit_code) => exit_code,
+            None => runtime_exit_code,
+        }
     }
 
     pub fn set_argv(&mut self, argv: impl IntoIterator<Item = String>) {
@@ -168,12 +185,12 @@ impl Host for NodeHost {
         self.stderr.extend_from_slice(bytes);
     }
 
-    fn exit_code(&self) -> i32 {
+    fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }
 
     fn set_exit_code(&mut self, exit_code: i32) {
-        self.exit_code = exit_code;
+        self.exit_code = Some(exit_code);
     }
 
     fn argv(&self) -> &[String] {
@@ -542,14 +559,7 @@ fn write_aot_completion(
     let (exit_code, failure) = match completion {
         AotCompletion::Success(outcome) => {
             stdout.write_all(&outcome.stdout)?;
-            (
-                if host.exit_code() == 0 {
-                    outcome.exit_code
-                } else {
-                    host.exit_code()
-                },
-                None,
-            )
+            (host.completion_exit_code(outcome.exit_code), None)
         }
         AotCompletion::Failure(error) => (1, Some(error)),
     };
@@ -687,7 +697,7 @@ mod tests {
         let module = |name: &str| ProgramModule {
             name: ConstantId::new(0),
             code: Module::new(
-                vec![Constant::String(EcmaString::from_utf8(name))],
+                vec![Constant::String(EcmaString::encode(name))],
                 vec![Function::new(
                     None,
                     0,
@@ -743,7 +753,7 @@ mod tests {
         Host::set_env(&mut host, "NODE_ENV", "test");
         assert_eq!(host.stdout(), b"out");
         assert_eq!(host.stderr(), b"err");
-        assert_eq!(host.exit_code(), 23);
+        assert_eq!(host.exit_code(), Some(23));
         assert_eq!(host.argv(), ["bamts", "file.ts"]);
         assert_eq!(host.env("NODE_ENV"), Some("test"));
         assert!(Host::delete_env(&mut host, "NODE_ENV"));
@@ -923,7 +933,29 @@ mod tests {
     }
 
     #[test]
-    fn aot_success_preserves_host_and_runtime_output_and_exit_precedence() {
+    fn aot_exit_code_prefers_host_zero() {
+        let mut host = NodeHost::new();
+        Host::set_exit_code(&mut host, 0);
+        let outcome = bamts_runtime::ExecutionOutcome {
+            stdout: Vec::new(),
+            exit_code: 7,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = write_aot_completion(
+            &host,
+            AotCompletion::Success(&outcome),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("completion writes");
+
+        assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn aot_success_writes_host_and_runtime_output() {
         let mut host = NodeHost::new();
         Host::write_stdout(&mut host, b"host stdout");
         Host::write_stderr(&mut host, b"host stderr");
@@ -1068,6 +1100,62 @@ mod tests {
         assert!(host.argv().is_empty());
         assert_eq!(host.env("SAFE"), None);
     }
+
+    #[cfg(feature = "script-compiler")]
+    #[test]
+    fn compile_script_passes_exact_resource_name_to_compiler() {
+        use bamts_bytecode::Constant;
+        use bamts_runtime::{CompileProvider, ScriptSource};
+
+        // A non-ASCII name proves the UTF-16 → UTF-8 path preserves every
+        // code point the caller supplied, rather than substituting or
+        // dropping characters.
+        let name: Vec<u16> = "café-σ-script.js".encode_utf16().collect();
+        let source: Vec<u16> = "1 + 1".encode_utf16().collect();
+
+        let program = ScriptCompiler
+            .compile_script(ScriptSource {
+                source: &source,
+                name: &name,
+            })
+            .expect("script compiles");
+
+        let module = &program.modules()[program.entry().get() as usize];
+        match &module.code().constants()[module.name().get() as usize] {
+            Constant::String(stored) => {
+                assert_eq!(
+                    stored
+                        .to_utf8_strict()
+                        .expect("module name is valid UTF-16"),
+                    "café-σ-script.js",
+                );
+            }
+            other => panic!("module name is a string constant, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "script-compiler")]
+    #[test]
+    fn compile_script_rejects_ill_formed_resource_name() {
+        use bamts_runtime::{CompileProvider, ScriptCompileError, ScriptSource};
+
+        // An unpaired high surrogate must not be silently replaced with
+        // U+FFFD; the caller should learn the name was ill-formed.
+        let name = [0xD800_u16];
+        let source: Vec<u16> = "1 + 1".encode_utf16().collect();
+
+        let error = ScriptCompiler
+            .compile_script(ScriptSource {
+                source: &source,
+                name: &name,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ScriptCompileError::IllFormedSource { unit_offset: 0 }
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1087,8 +1175,14 @@ mod timer_tests {
         assert!(early <= late, "smaller delay yields an earlier deadline");
         assert!(timers.has_pending());
 
-        let first = timers.wait_expired().expect("wait").expect("a wakeup");
-        let second = timers.wait_expired().expect("wait").expect("a wakeup");
+        let first = timers
+            .wait_expired(&bamts_runtime::CancellationToken::new())
+            .expect("wait")
+            .expect("a wakeup");
+        let second = timers
+            .wait_expired(&bamts_runtime::CancellationToken::new())
+            .expect("wait")
+            .expect("a wakeup");
         assert_eq!(first.id, 2, "the earlier deadline fires first");
         assert_eq!(second.id, 1);
         assert_eq!(first.deadline_ms, early);
@@ -1096,7 +1190,10 @@ mod timer_tests {
 
         assert!(!timers.has_pending());
         assert!(
-            timers.wait_expired().expect("wait").is_none(),
+            timers
+                .wait_expired(&bamts_runtime::CancellationToken::new())
+                .expect("wait")
+                .is_none(),
             "an empty pending set never blocks"
         );
     }
@@ -1119,10 +1216,18 @@ mod timer_tests {
             "an unknown id cancels to false"
         );
 
-        let wakeup = timers.wait_expired().expect("wait").expect("a wakeup");
+        let wakeup = timers
+            .wait_expired(&bamts_runtime::CancellationToken::new())
+            .expect("wait")
+            .expect("a wakeup");
         assert_eq!(wakeup.id, 11, "only the surviving timer fires");
         assert!(!timers.has_pending());
-        assert!(timers.wait_expired().expect("wait").is_none());
+        assert!(
+            timers
+                .wait_expired(&bamts_runtime::CancellationToken::new())
+                .expect("wait")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1143,7 +1248,37 @@ mod timer_tests {
         timers.poll_expired(&mut output).expect("poll");
         assert!(output.is_empty(), "a cancelled id is never delivered");
         assert!(!timers.has_pending());
-        assert!(timers.wait_expired().expect("wait").is_none());
+        assert!(
+            timers
+                .wait_expired(&bamts_runtime::CancellationToken::new())
+                .expect("wait")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rearmed_timer_drops_stale_wakeup_from_previous_arming() {
+        let mut host = NodeHost::new();
+        let timers = Host::timers(&mut host).unwrap();
+
+        let _first_deadline = timers.schedule(7, 1).expect("schedule id 7 (first)");
+        // Let the worker fire and queue the wakeup while the caller has not yet
+        // polled it.
+        std::thread::sleep(Duration::from_millis(40));
+
+        // Re-arm id 7 with a much longer delay before polling the expired wakeup.
+        let _second_deadline = timers.schedule(7, 1000).expect("schedule id 7 (re-arm)");
+
+        let mut output = Vec::new();
+        timers.poll_expired(&mut output).expect("poll");
+        assert!(
+            output.is_empty(),
+            "stale wakeup from previous arming must be dropped on re-arm"
+        );
+        assert!(
+            timers.has_pending(),
+            "re-armed timer 7 must remain pending for its new deadline"
+        );
     }
 
     #[test]
@@ -1193,7 +1328,10 @@ mod timer_tests {
             .schedule(1, 2)
             .expect("schedule under ambient runtime");
         assert!(deadline >= 2);
-        let wakeup = timers.wait_expired().expect("wait").expect("a wakeup");
+        let wakeup = timers
+            .wait_expired(&bamts_runtime::CancellationToken::new())
+            .expect("wait")
+            .expect("a wakeup");
         assert_eq!(wakeup.id, 1);
         assert!(!timers.has_pending());
     }

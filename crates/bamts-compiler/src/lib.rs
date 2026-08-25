@@ -15,6 +15,8 @@ pub mod scanner;
 pub mod script;
 pub mod source;
 pub mod syntax;
+pub mod telemetry;
 pub mod warning;
 
+pub use bamts_cancel::{CancellationToken, Cancelled};
 pub use script::{ScriptCompileError, compile_classic_script};

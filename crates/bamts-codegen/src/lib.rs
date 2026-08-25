@@ -137,8 +137,8 @@
 //! | `Return`            | `handles[value]` → `out.value`, return `Normal`           |
 //! | `Throw`             | route to covering handler (bind `catch_register`) or       |
 //! |                     | `out.value` + return `Throw`                              |
-//! | `Suspend`           | yield path + resume path via [`Helper::ResumeValue`]      |
-//! | `Await`             | same suspension ABI as `Suspend` (await operand)         |
+//! | `Suspend`           | yield path + resume path via [`Helper::ResumeValue`]/[`Helper::ResumeMode`] |
+//! | `Await`             | same value resume as `Suspend`; no mode helper            |
 //! | `Halt`              | `undefined` → `out.value`, return `Normal`               |
 //!
 //! No opcode is silently dropped and none is lowered to a placeholder no-op.
@@ -154,27 +154,30 @@
 //!
 //! # Suspend/Await and the resume helper
 //!
-//! `Suspend { dst, src, resume }` (the `yield` form) and
+//! `Suspend { dst, src, resume, mode }` (the `yield` form) and
 //! `Await { dst, src, resume }` (the `await` form) share one suspension ABI:
-//! yield `src` and, when resumed, deliver the resumed value into `dst` before
-//! continuing at `resume`. The native entry ABI
-//! carries no resume input (`out.value` is the *yielded* value, not an input),
-//! so the resumed value is obtained through an explicit runtime contract rather
-//! than invented:
+//! yield `src` and, when resumed, deliver the resumed value into `dst` and the
+//! completion mode into `mode` before continuing at `resume`. The native entry
+//! ABI carries no resume input (`out.value` is the *yielded* value, not an
+//! input), so the resumed value and mode are obtained through an explicit
+//! runtime contract rather than invented:
 //!
 //! * **Yield path** — store this suspension's resume token into `frame.bytecode_pc`
 //!   (`0` is a fresh call; the `Suspend`/`Await` at bytecode pc `P` uses token
 //!   `P + 1`, so tokens never collide with a fresh entry or with each other),
 //!   write `src` into `out.value`, and return `Suspend`.
 //! * **Resume path** — the dispatch prologue for token `P + 1` calls
-//!   [`Helper::ResumeValue`], which the runtime resolves to write the verified
-//!   resumed value for this frame into `out.value` (it may return `Throw` for
+//!   [`Helper::ResumeValue`], which the runtime resolves to write the resumed
+//!   completion value for this frame into `out.value` (it may return `Throw` for
 //!   `generator.throw`, routed to a covering handler, or `FatalTrap`); the
-//!   resumed value is then stored into `dst` and control continues at `resume`.
+//!   resumed value is then stored into `dst`. For [`Instruction::Suspend`] only,
+//!   the prologue then calls [`Helper::ResumeMode`], which writes the mode
+//!   (`0` = Next, `1` = Throw, `2` = Return) into `out.value` and stores it
+//!   into `mode` before continuing at `resume`.
 //!
 //! `bamts_bytecode` currently exposes no ABI for the resume input, so
-//! [`Helper::ResumeValue`] is a **new required contract** the runtime must
-//! provide for any module that suspends.
+//! [`Helper::ResumeValue`] and [`Helper::ResumeMode`] are **new required
+//! contracts** the runtime must provide for any module that suspends.
 
 #![deny(unsafe_code)]
 
@@ -184,12 +187,17 @@ mod jit;
 #[allow(unsafe_code)]
 mod jit_memory;
 #[cfg(feature = "host-jit")]
-pub use jit::{JitError, JitProgram, compile_jit};
+pub use jit::{
+    JitError, JitProgram, JitTelemetry, compile_jit, compile_jit_with_cancel,
+    compile_jit_with_telemetry, compile_jit_with_telemetry_cancel,
+};
 
 #[cfg(feature = "aot")]
 mod aot;
 #[cfg(feature = "aot")]
-pub use aot::{AotError, AotObject, PROGRAM_DESCRIPTOR_SYMBOL, compile_aot};
+pub use aot::{
+    AotError, AotObject, PROGRAM_DESCRIPTOR_SYMBOL, compile_aot, compile_aot_with_cancel,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -199,6 +207,8 @@ use bamts_bytecode::{
     AccessorKind, BinaryOp, DescriptorSlot, DisposeHint, ExceptionHandler, FunctionId, Instruction,
     IteratorCloseMode, IteratorKind, Module, ModuleId, Pc, Program, Register, UnaryOp, Verified,
 };
+use bamts_cancel::{CancellationToken, Cancelled};
+
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     AbiParam, Block, ExtFuncData, ExternalName, Function, InstBuilder, MemFlagsData, Signature,
@@ -322,7 +332,8 @@ const _: () = {
 /// | 42 | `DefineDataProperty` | `object: i64, key: i64, value: i64`         |
 /// | 43 | `LoadOwnDescriptorSlot` | `object: i64, key: i64, slot: i32`      |
 /// | 44 | `DefineOwnDescriptorSlot` | `object: i64, key: i64, src: i64, slot: i32` |
-/// | 45 | `WithHasBinding`     | `object: i64, key: i64`                     |
+/// | 45 | `WithHasBinding`    | `object: i64, key: i64`                     |
+/// | 46 | `ResumeMode`        | —                                            |
 ///
 /// Every helper except [`Helper::Truthy`] returns a
 /// `bamts_native::CompletionTag`. [`Helper::Truthy`] returns `0`/`1`.
@@ -370,9 +381,8 @@ pub enum Helper {
     /// never writes `out`.
     Truthy,
     /// `bamts_resume_value(frame, out)`: write the verified resumed value for
-    /// `frame` into `out.value`. Resolves the resume-input gap in the native
-    /// entry ABI (see the crate docs); may return `Throw` (`generator.throw`)
-    /// or `FatalTrap`.
+    /// `frame` into `out.value`. The helper only reports the value;
+    /// [`Helper::ResumeMode`] supplies and consumes the resume completion.
     ResumeValue,
     /// `bamts_define_accessor(frame, object, key, accessor, kind, out)`: install
     /// a getter or setter (`kind`, see `accessor_kind_selector`) under `key`.
@@ -483,6 +493,10 @@ pub enum Helper {
     /// Record `HasBinding` for a `with` binding object. Uses the realm-owned
     /// `%Symbol.unscopables%` intrinsic and writes a Boolean into `out.value`.
     WithHasBinding,
+    /// `bamts_resume_mode(frame, out)`: write the resumed completion mode for
+    /// `frame` into `out.value`, consuming the pending completion after
+    /// [`Helper::ResumeValue`] observed it.
+    ResumeMode,
 }
 
 impl Helper {
@@ -536,6 +550,7 @@ impl Helper {
             Helper::Export => "bamts_export",
             Helper::ConsumeFuel => "bamts_consume_fuel",
             Helper::CreateCell => "bamts_create_cell",
+            Helper::ResumeMode => "bamts_resume_mode",
         }
     }
 
@@ -590,6 +605,7 @@ impl Helper {
             Helper::LoadOwnDescriptorSlot => 43,
             Helper::DefineOwnDescriptorSlot => 44,
             Helper::WithHasBinding => 45,
+            Helper::ResumeMode => 46,
         }
     }
 
@@ -644,6 +660,7 @@ impl Helper {
             43 => Some(Helper::LoadOwnDescriptorSlot),
             44 => Some(Helper::DefineOwnDescriptorSlot),
             45 => Some(Helper::WithHasBinding),
+            46 => Some(Helper::ResumeMode),
             _ => None,
         }
     }
@@ -664,6 +681,7 @@ impl Helper {
             | Helper::CreateArray
             | Helper::CreateCell
             | Helper::ResumeValue
+            | Helper::ResumeMode
             | Helper::LoadThis
             | Helper::LoadArguments
             | Helper::LoadNewTarget
@@ -877,6 +895,14 @@ pub enum LowerError {
         /// The verifier's diagnostics.
         message: String,
     },
+    /// A caller-supplied cancellation token was triggered at a checkpoint.
+    Cancelled,
+}
+
+impl From<Cancelled> for LowerError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
+    }
 }
 
 impl fmt::Display for LowerError {
@@ -908,6 +934,7 @@ impl fmt::Display for LowerError {
                     function.get()
                 )
             }
+            LowerError::Cancelled => f.write_str("operation cancelled"),
         }
     }
 }
@@ -1012,6 +1039,88 @@ pub struct LoweredProgram {
     pub entry_function: FunctionId,
 }
 
+/// A deterministic failure from validating the structure of a lowered program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LoweredProgramError {
+    /// A module's canonical id does not match its position in the program.
+    ModuleIndexMismatch {
+        /// The expected id (the vector index).
+        expected: u32,
+        /// The id stored on the module.
+        found: u32,
+    },
+    /// A function's canonical id does not match its position in its module.
+    FunctionIndexMismatch {
+        /// The id of the containing module.
+        module: u32,
+        /// The expected id (the vector index).
+        expected: u32,
+        /// The id stored on the function.
+        found: u32,
+    },
+}
+
+impl fmt::Display for LoweredProgramError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ModuleIndexMismatch { expected, found } => {
+                write!(f, "module {found} appears at index {expected}")
+            }
+            Self::FunctionIndexMismatch {
+                module,
+                expected,
+                found,
+            } => write!(
+                f,
+                "module {module} function {found} appears at local index {expected}"
+            ),
+        }
+    }
+}
+
+impl Error for LoweredProgramError {}
+
+/// Validates that `lowered` has dense, identity-ordered modules and functions.
+///
+/// The returned vector lists every `(module_id, function_id)` in the canonical
+/// tuple order that the JIT binary search and the AOT unit descriptor table rely
+/// on. A mismatch between an id and its vector index is reported as a typed
+/// error so each backend can map it to its own public error variant.
+pub(crate) fn validate_lowered_program(
+    lowered: &LoweredProgram,
+) -> Result<Vec<(u32, u32)>, LoweredProgramError> {
+    let mut units = Vec::with_capacity(
+        lowered
+            .modules
+            .iter()
+            .map(|module| module.functions.len())
+            .sum(),
+    );
+    for (module_index, module) in lowered.modules.iter().enumerate() {
+        let module_id = module.id.get();
+        let expected_module_id = module_index as u32;
+        if module_id != expected_module_id {
+            return Err(LoweredProgramError::ModuleIndexMismatch {
+                expected: expected_module_id,
+                found: module_id,
+            });
+        }
+        for (function_index, function) in module.functions.iter().enumerate() {
+            let function_id = function.id.get();
+            let expected_function_id = function_index as u32;
+            if function_id != expected_function_id {
+                return Err(LoweredProgramError::FunctionIndexMismatch {
+                    module: module_id,
+                    expected: expected_function_id,
+                    found: function_id,
+                });
+            }
+            units.push((module_id, function_id));
+        }
+    }
+    Ok(units)
+}
+
 /// The collision-free linker symbol for a module-qualified lowered function.
 #[must_use]
 pub fn function_symbol(module_id: u32, function_id: u32) -> String {
@@ -1023,21 +1132,39 @@ pub fn function_symbol(module_id: u32, function_id: u32) -> String {
 /// Lowers every function of every module in a verified canonical program.
 ///
 /// Modules remain separate: function and constant ids are never flattened or
-/// renumbered. Each error carries the module id whose lowering failed.
+/// renumbered. Each error carries the module id whose lowering failed. This is
+/// a convenience wrapper that uses a fresh, never-cancelled token; for
+/// cancellation support use [`lower_program_with_cancel`].
 pub fn lower_program(
     program: &Program<Verified>,
     config: TargetFrontendConfig,
 ) -> Result<LoweredProgram, ProgramLowerError> {
+    lower_program_with_cancel(program, config, &CancellationToken::new())
+}
+
+/// Lowers every function of every module with cooperative cancellation checks.
+///
+/// Cancellation is checked at the entry, before each module, before each
+/// function, and immediately before/after Cranelift's IR verifier.
+pub fn lower_program_with_cancel(
+    program: &Program<Verified>,
+    config: TargetFrontendConfig,
+    cancel: &CancellationToken,
+) -> Result<LoweredProgram, ProgramLowerError> {
+    cancel.check().map_err(|_| ProgramLowerError {
+        module: program.entry(),
+        kind: LowerError::Cancelled,
+    })?;
     let mut modules = Vec::with_capacity(program.modules().len());
     for (index, module) in program.modules().iter().enumerate() {
         let module_id = ModuleId::new(index as u32);
         modules.push(
-            lower_code_module(module_id, module.code(), config).map_err(|kind| {
-                ProgramLowerError {
+            lower_code_module_with_cancel(module_id, module.code(), config, cancel).map_err(
+                |kind| ProgramLowerError {
                     module: module_id,
                     kind,
-                }
-            })?,
+                },
+            )?,
         );
     }
     let entry_module = program.entry();
@@ -1053,11 +1180,22 @@ pub fn lower_program(
     })
 }
 
+#[cfg(test)]
 fn lower_code_module(
     module_id: ModuleId,
     module: &Module<Verified>,
     config: TargetFrontendConfig,
 ) -> Result<LoweredModule, LowerError> {
+    lower_code_module_with_cancel(module_id, module, config, &CancellationToken::new())
+}
+
+fn lower_code_module_with_cancel(
+    module_id: ModuleId,
+    module: &Module<Verified>,
+    config: TargetFrontendConfig,
+    cancel: &CancellationToken,
+) -> Result<LoweredModule, LowerError> {
+    cancel.check()?;
     if config.pointer_bits() != 64 {
         return Err(LowerError::UnsupportedPointerWidth {
             bits: config.pointer_bits(),
@@ -1074,21 +1212,21 @@ fn lower_code_module(
     let entry_signature = entry_signature(call_conv);
     let flags = Flags::new(settings::builder());
     let mut builder_context = FunctionBuilderContext::new();
+    let mut context = LowerFunctionContext {
+        module_id,
+        entry_signature: &entry_signature,
+        config,
+        flags: &flags,
+        builder_context: &mut builder_context,
+        cancel,
+    };
 
     let mut functions = Vec::with_capacity(function_count);
     for (index, function) in module.functions().iter().enumerate() {
         // Bounds checked above.
         let id = FunctionId::new(index as u32);
-        let lowered = lower_function(
-            module_id,
-            id,
-            function,
-            &entry_signature,
-            config,
-            &flags,
-            &mut builder_context,
-        )?;
-        functions.push(lowered);
+        cancel.check()?;
+        functions.push(lower_function(id, function, &mut context)?);
     }
 
     Ok(LoweredModule {
@@ -1126,15 +1264,19 @@ fn validate_slots(id: FunctionId, function: &bamts_bytecode::Function) -> Result
         })
     }
 }
+struct LowerFunctionContext<'a> {
+    module_id: ModuleId,
+    entry_signature: &'a Signature,
+    config: TargetFrontendConfig,
+    flags: &'a Flags,
+    builder_context: &'a mut FunctionBuilderContext,
+    cancel: &'a CancellationToken,
+}
 
 fn lower_function(
-    module_id: ModuleId,
     id: FunctionId,
     function: &bamts_bytecode::Function,
-    entry_signature: &Signature,
-    config: TargetFrontendConfig,
-    flags: &Flags,
-    builder_context: &mut FunctionBuilderContext,
+    context: &mut LowerFunctionContext<'_>,
 ) -> Result<LoweredFunction, LowerError> {
     validate_slots(id, function)?;
 
@@ -1144,31 +1286,38 @@ fn lower_function(
     let entry_points = resume_tokens(code, &reachable);
 
     let name = UserFuncName::user(FUNCTION_NAMESPACE, id.get());
-    let mut clif = Function::with_name_signature(name, entry_signature.clone());
+    let mut clif = Function::with_name_signature(name, context.entry_signature.clone());
 
     let helpers = {
-        let builder = FunctionBuilder::new(&mut clif, builder_context);
-        let mut lowering = Lowering::new(builder, code.len(), handlers, config.default_call_conv);
+        let builder = FunctionBuilder::new(&mut clif, context.builder_context);
+        let mut lowering = Lowering::new(
+            builder,
+            code.len(),
+            handlers,
+            context.config.default_call_conv,
+        );
         lowering.build(code, &reachable);
-        lowering.finish(config)
+        lowering.finish(context.config)
     };
 
     // Signature validation: the produced entry ABI must be identical to the
     // shared native-entry signature (params and returns), independent of the
     // structural IR checks Cranelift performs below.
-    if clif.signature != *entry_signature {
+    if clif.signature != *context.entry_signature {
         return Err(LowerError::EntrySignatureMismatch { function: id });
     }
 
-    verify_function(&clif, flags).map_err(|errors| LowerError::IrVerification {
+    context.cancel.check()?;
+    verify_function(&clif, context.flags).map_err(|errors| LowerError::IrVerification {
         function: id,
         message: errors.to_string(),
     })?;
+    context.cancel.check()?;
 
     Ok(LoweredFunction {
         id,
-        symbol: function_symbol(module_id.get(), id.get()),
-        signature: entry_signature.clone(),
+        symbol: function_symbol(context.module_id.get(), id.get()),
+        signature: context.entry_signature.clone(),
         clif,
         entry_points,
         helpers,
@@ -1236,9 +1385,13 @@ impl<'a> Lowering<'a> {
         }
         for &pc in reachable {
             match code[pc] {
-                Instruction::Suspend { dst, resume, .. }
-                | Instruction::Await { dst, resume, .. } => {
-                    self.emit_resume_prologue(pc, dst, resume);
+                Instruction::Suspend {
+                    dst, resume, mode, ..
+                } => {
+                    self.emit_resume_prologue(pc, dst, resume, Some(mode));
+                }
+                Instruction::Await { dst, resume, .. } => {
+                    self.emit_resume_prologue(pc, dst, resume, None);
                 }
                 _ => {}
             }
@@ -1913,11 +2066,19 @@ impl<'a> Lowering<'a> {
         self.builder.ins().return_(&[tag]);
     }
 
-    /// Emits a `Suspend`/`Await` resume prologue: obtain the resumed value
-    /// from the runtime via [`Helper::ResumeValue`], store it into `dst`, and
-    /// continue at `resume`. A `Throw` from the resume (e.g. `generator.throw`)
-    /// routes to a covering handler; `FatalTrap` propagates.
-    fn emit_resume_prologue(&mut self, pc: usize, dst: Register, resume: Pc) {
+    /// Emits a `Suspend`/`Await` resume prologue: obtain the resumed value from
+    /// the runtime via [`Helper::ResumeValue`], store it into `dst`, and continue
+    /// at `resume`. For [`Instruction::Suspend`] only, also obtain the resume
+    /// mode via [`Helper::ResumeMode`] and store it into `mode`. Each helper is
+    /// called at most once, and `ResumeMode` is only reached after `ResumeValue`
+    /// succeeds.
+    fn emit_resume_prologue(
+        &mut self,
+        pc: usize,
+        dst: Register,
+        resume: Pc,
+        mode: Option<Register>,
+    ) {
         let block = self.resume_blocks[&pc];
         self.builder.switch_to_block(block);
         let current_pc = self.iconst32(i64::from(pc as u32));
@@ -1927,21 +2088,43 @@ impl<'a> Lowering<'a> {
             self.frame,
             SHADOW_FRAME_PC_OFFSET,
         );
-        let tag = self.call_helper(Helper::ResumeValue, &[self.frame, self.out]);
+        let value_tag = self.call_helper(Helper::ResumeValue, &[self.frame, self.out]);
 
-        let normal = self.builder.create_block();
-        let abnormal = self.builder.create_block();
-        self.builder.ins().brif(tag, abnormal, &[], normal, &[]);
+        let value_normal = self.builder.create_block();
+        let value_abnormal = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(value_tag, value_abnormal, &[], value_normal, &[]);
 
-        self.builder.switch_to_block(normal);
+        self.builder.switch_to_block(value_normal);
         let handles = self.load_handles();
         let resumed = self.load_completion_value();
         self.store_register(handles, dst, resumed);
-        let target = self.pc_block(resume);
-        self.builder.ins().jump(target, &[]);
 
-        self.builder.switch_to_block(abnormal);
-        self.emit_abnormal_completion(pc, tag);
+        if let Some(mode) = mode {
+            let mode_tag = self.call_helper(Helper::ResumeMode, &[self.frame, self.out]);
+            let mode_normal = self.builder.create_block();
+            let mode_abnormal = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(mode_tag, mode_abnormal, &[], mode_normal, &[]);
+
+            self.builder.switch_to_block(mode_normal);
+            let handles = self.load_handles();
+            let mode_value = self.load_completion_value();
+            self.store_register(handles, mode, mode_value);
+            let target = self.pc_block(resume);
+            self.builder.ins().jump(target, &[]);
+
+            self.builder.switch_to_block(mode_abnormal);
+            self.emit_abnormal_completion(pc, mode_tag);
+        } else {
+            let target = self.pc_block(resume);
+            self.builder.ins().jump(target, &[]);
+        }
+
+        self.builder.switch_to_block(value_abnormal);
+        self.emit_abnormal_completion(pc, value_tag);
     }
 
     fn emit_halt(&mut self) {
@@ -2527,6 +2710,7 @@ mod tests {
             Helper::LoadOwnDescriptorSlot,
             Helper::DefineOwnDescriptorSlot,
             Helper::WithHasBinding,
+            Helper::ResumeMode,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2539,8 +2723,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 46);
-        assert_eq!(Helper::from_external_index(46), None);
+        assert_eq!(symbols.len(), 47);
+        assert_eq!(Helper::from_external_index(47), None);
     }
     #[test]
     fn iterator_close_helpers_use_the_pinned_abis() {
@@ -3169,7 +3353,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String(EcmaString::from_utf8("g"))],
+            vec![Constant::String(EcmaString::encode("g"))],
             vec![func(2, code, Vec::new())],
         );
         let (helpers, clif) = lower_one(&module);
@@ -3240,7 +3424,7 @@ mod tests {
             catch_register: reg(0),
         }];
         let module = verified(
-            vec![Constant::String(EcmaString::from_utf8("g"))],
+            vec![Constant::String(EcmaString::encode("g"))],
             vec![func(1, code, handlers)],
         );
         // Must lower without panicking on a missing handler block.
@@ -3306,8 +3490,8 @@ mod tests {
         ];
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("p")),
-                Constant::String(EcmaString::from_utf8("g")),
+                Constant::String(EcmaString::encode("p")),
+                Constant::String(EcmaString::encode("g")),
             ],
             vec![func(4, code, Vec::new())],
         );
@@ -3492,7 +3676,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String(EcmaString::from_utf8("x"))],
+            vec![Constant::String(EcmaString::encode("x"))],
             vec![func(1, code, Vec::new())],
         );
         let (helpers, clif) = lower_one(&module);
@@ -3514,16 +3698,19 @@ mod tests {
                 dst: reg(0),
                 src: reg(0),
                 resume: Pc::new(2),
+                mode: reg(1),
             },
             Instruction::Halt,
         ];
-        let module = single(func(1, code, Vec::new()));
+        let module = single(func(2, code, Vec::new()));
         let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         // Fresh token 0 plus the suspend at pc 1 -> token 2.
         assert_eq!(function.entry_points, vec![0, 2]);
         assert!(function.helpers.contains(&Helper::ResumeValue));
         assert_eq!(Helper::ResumeValue.external_index(), 13);
+        assert!(function.helpers.contains(&Helper::ResumeMode));
+        assert_eq!(Helper::ResumeMode.external_index(), 46);
         let clif = function.clif.display().to_string();
         // Multi-token dispatch loads and compares the resume token.
         assert!(
@@ -3540,6 +3727,10 @@ mod tests {
             clif.contains("u1:13"),
             "resume helper import missing:\n{clif}"
         );
+        assert!(
+            clif.contains("u1:46"),
+            "resume mode helper import missing:\n{clif}"
+        );
     }
 
     #[test]
@@ -3553,6 +3744,7 @@ mod tests {
                 dst: reg(0),
                 src: reg(0),
                 resume: Pc::new(2),
+                mode: reg(1),
             },
             Instruction::Await {
                 dst: reg(0),
@@ -3561,13 +3753,15 @@ mod tests {
             },
             Instruction::Halt,
         ];
-        let module = single(func(1, code, Vec::new()));
+        let module = single(func(2, code, Vec::new()));
         let lowered = lower_code_module(ModuleId::new(0), &module, host_config()).expect("lowers");
         let function = &lowered.functions[0];
         // Fresh token 0, the suspend at pc 1 -> token 2, the await at pc 2 ->
         // token 3: distinct tokens across both suspension opcodes.
         assert_eq!(function.entry_points, vec![0, 2, 3]);
         assert!(function.helpers.contains(&Helper::ResumeValue));
+        assert!(function.helpers.contains(&Helper::ResumeMode));
+        assert_eq!(Helper::ResumeMode.external_index(), 46);
         let clif = function.clif.display().to_string();
         // Multi-token dispatch loads and compares the resume token.
         assert!(
@@ -3578,6 +3772,61 @@ mod tests {
         assert!(
             clif.contains("u1:13"),
             "resume helper import missing:\n{clif}"
+        );
+        assert!(
+            clif.contains("u1:46"),
+            "resume mode helper import missing:\n{clif}"
+        );
+    }
+    #[test]
+    fn suspend_resume_prologue_calls_resume_value_then_resume_mode() {
+        // Load undefined into r0, then yield it via Suspend. r1 receives the
+        // resume mode. The resume prologue must call ResumeValue before
+        // ResumeMode and store both results into the destination registers.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Suspend {
+                dst: reg(0),
+                src: reg(0),
+                resume: Pc::new(2),
+                mode: reg(1),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(2, code, Vec::new()));
+        let clif = lower_one(&module).1;
+        let value_call = clif.find("u1:13").expect("ResumeValue call missing");
+        let mode_call = clif.find("u1:46").expect("ResumeMode call missing");
+        assert!(
+            value_call < mode_call,
+            "ResumeValue must be called before ResumeMode:\n{clif}"
+        );
+        assert!(clif.contains("store"), "resume stores missing:\n{clif}");
+    }
+
+    #[test]
+    fn await_resume_prologue_uses_only_resume_value() {
+        // Load undefined into r0, then await it. Await uses ResumeValue only.
+        let code = vec![
+            load_undef(reg(0)),
+            Instruction::Await {
+                dst: reg(0),
+                src: reg(0),
+                resume: Pc::new(2),
+            },
+            Instruction::Halt,
+        ];
+        let module = single(func(1, code, Vec::new()));
+        let (helpers, clif) = lower_one(&module);
+        assert!(helpers.contains(&Helper::ResumeValue));
+        assert!(!helpers.contains(&Helper::ResumeMode));
+        assert!(
+            clif.contains("u1:13"),
+            "ResumeValue import missing:\n{clif}"
+        );
+        assert!(
+            !clif.contains("u1:46"),
+            "Await must not import ResumeMode:\n{clif}"
         );
     }
 
@@ -3683,7 +3932,7 @@ mod tests {
             Instruction::Halt,
         ];
         let module = verified(
-            vec![Constant::String(EcmaString::from_utf8("mod"))],
+            vec![Constant::String(EcmaString::encode("mod"))],
             vec![func(3, code, Vec::new())],
         );
         let (helpers, _) = lower_one(&module);
@@ -3837,7 +4086,7 @@ mod tests {
             Vec::new(),
         )];
         let module = Module::new(
-            vec![Constant::String(EcmaString::from_utf8("main"))],
+            vec![Constant::String(EcmaString::encode("main"))],
             functions,
             FunctionId::new(0),
         )
@@ -3851,7 +4100,7 @@ mod tests {
         let make_module = |name: &str| bamts_bytecode::ProgramModule {
             name: ConstantId::new(0),
             code: Module::new(
-                vec![Constant::String(EcmaString::from_utf8(name))],
+                vec![Constant::String(EcmaString::encode(name))],
                 vec![func(0, vec![Instruction::Halt], Vec::new())],
                 FunctionId::new(0),
             )
@@ -3877,6 +4126,60 @@ mod tests {
         assert_eq!(lowered.modules[1].functions[0].symbol, "bamts_m1_fn_0");
         assert_eq!(lowered.entry_module, ModuleId::new(1));
         assert_eq!(lowered.entry_function, FunctionId::new(0));
+    }
+
+    fn two_module_lowered() -> LoweredProgram {
+        let make_module = |name: &str| bamts_bytecode::ProgramModule {
+            name: ConstantId::new(0),
+            code: Module::new(
+                vec![Constant::String(EcmaString::encode(name))],
+                vec![func(0, vec![Instruction::Halt], Vec::new())],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("module verifies"),
+            edges: Vec::new(),
+            bindings: Vec::new(),
+            exports: Vec::new(),
+        };
+        let program = Program::link(
+            vec![make_module("dependency"), make_module("entry")],
+            ModuleId::new(1),
+        )
+        .expect("program verifies");
+        lower_program(&program, host_config()).expect("program lowers")
+    }
+
+    #[test]
+    fn validate_lowered_program_accepts_canonical_order() {
+        assert_eq!(
+            validate_lowered_program(&two_module_lowered()).unwrap(),
+            vec![(0, 0), (1, 0)]
+        );
+    }
+
+    #[test]
+    fn validate_lowered_program_rejects_module_identity_mismatch() {
+        let mut lowered = two_module_lowered();
+        lowered.modules[0].id = ModuleId::new(7);
+
+        assert!(matches!(
+            validate_lowered_program(&lowered),
+            Err(LoweredProgramError::ModuleIndexMismatch { expected, found })
+                if expected == 0 && found == 7
+        ));
+    }
+
+    #[test]
+    fn validate_lowered_program_rejects_function_identity_mismatch() {
+        let mut lowered = two_module_lowered();
+        lowered.modules[0].functions[0].id = FunctionId::new(3);
+
+        assert!(matches!(
+            validate_lowered_program(&lowered),
+            Err(LoweredProgramError::FunctionIndexMismatch { module, expected, found })
+                if module == 0 && expected == 0 && found == 3
+        ));
     }
 
     #[test]
@@ -3919,5 +4222,34 @@ mod tests {
             clif.contains("(i64, i64, i64) -> i32"),
             "ToObject helper ABI wrong:\n{clif}"
         );
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_lower_program() {
+        let module = verified(
+            vec![Constant::String(EcmaString::encode("<test>"))],
+            vec![func(1, vec![Instruction::Halt], Vec::new())],
+        );
+        let program = Program::link(
+            vec![bamts_bytecode::ProgramModule {
+                name: ConstantId::new(0),
+                code: module,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            ModuleId::new(0),
+        )
+        .expect("program verifies");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = lower_program_with_cancel(&program, host_config(), &cancel);
+        assert!(matches!(
+            result,
+            Err(ProgramLowerError {
+                kind: LowerError::Cancelled,
+                ..
+            })
+        ));
     }
 }

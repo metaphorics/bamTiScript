@@ -1,60 +1,128 @@
 # Contributing to bamTiScript
 
-bamTiScript targets the behavior of stable TypeScript 7.0.2. Keep changes narrow, reproducible, and tied to an observable compiler or runtime contract.
+This guide describes how to set up your environment, navigate the repository, validate changes locally, and submit contributions to bamTiScript.
 
-## Before you change code
+## Project status
 
-1. Search existing issues for the same diagnostic, syntax form, runtime behavior, or API surface.
-2. Reduce the case to the smallest TypeScript program that still fails.
-3. Record the exact command, output, and TypeScript 7.0.2 result.
-4. Keep `.references/` read-only. It is study material, not implementation source.
+bamTiScript is in pre-release state (`0.2.0`).
 
-Open an issue before work that changes a public API, diagnostic contract, bytecode format, runtime semantics, evidence schema, or release gate.
+- `bamti` and `bamti-cli` 0.1.0 are published, but their referenced platform binary packages are unavailable.
+- TypeScript 7.0.2 serves as the primary compatibility oracle, not a completed compatibility claim.
+- No repository-local GitHub Actions workflow is present. Run the verification gates locally before committing or pushing.
 
-## Build and test
+---
 
-The workspace requires Rust 1.97.1 and uses Rust 2024.
+## Prerequisites and Rust setup
 
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
+### Pinned toolchain
+
+bamTiScript requires the toolchain pinned in `rust-toolchain.toml` and declared in `Cargo.toml`:
+
+- Rust version: `1.97.1`
+- Edition: `2024`
+- Components: `rustfmt`, `clippy`, `rust-src`
+- Profile: `minimal`
+
+Ensure your local toolchain matches `rust-toolchain.toml` before building.
+
+### Safety policy
+
+The workspace root `Cargo.toml` enforces a strict lint policy:
+
+```toml
+[workspace.lints.rust]
+unsafe_code = "forbid"
 ```
 
-Run the narrow test that covers your change while developing. Run the full commands above once before you submit it. Do not pipe verification commands through output filters because that can hide a failing exit status.
+The root policy defaults to `unsafe_code = "forbid"`. Most crates inherit it. `bamts-codegen`, `bamts-node`, and `bamts-verification` use `deny` with narrowly scoped exceptions. `bamts-native` contains documented unsafe FFI and native-bridge code. This policy and encapsulation are not an end-to-end memory-safety proof.
 
-Changes to generated catalogs, evidence, formal bindings, targets, or completion records must also pass the commands in the corresponding GitHub workflow. The workflow files are the command authority:
+### Host C toolchain
 
-- [Pull request checks](.github/workflows/pr.yml)
-- [Nightly checks](.github/workflows/nightly.yml)
-- [Weekly audit](.github/workflows/weekly-audit.yml)
-- [Release checks](.github/workflows/release.yml)
+AOT steps require a working C compiler driver selected by `$CC`, defaulting to `cc`. For example, use `CC=gcc` or `CC=clang` when that compiler is not installed as `cc`. AOT targets the host architecture and does not cross-compile.
 
-## Tests
+---
 
-Add a test only when it protects observable behavior or a boundary that static checks cannot prove. A regression test must fail when the defect returns. Prefer the nearest existing test module or suite. Do not add source-text assertions, duplicate constructor-shape tests, or mocks that replace the behavior under test.
+## Repository architecture and components
 
-For compatibility defects, include:
+The project is structured as a Cargo workspace under `crates/`. Architectural concepts and rules are documented in:
 
-- the minimal TypeScript or JavaScript input;
-- the bamTiScript command and output;
-- the TypeScript 7.0.2 command and output;
-- the execution mode when runtime behavior differs between interpreter, JIT, or AOT;
-- the host and target when native behavior is target-specific.
+- [`docs/explanation/architecture.md`](docs/explanation/architecture.md) — System architecture, pipeline design, and runtime execution model.
+- [`crates/bamts-compiler/RULES.md`](crates/bamts-compiler/RULES.md) — Diagnostic lint and strictness rules catalog.
+- [`docs/solutions/architecture-patterns/exact-ecmascript-utf16-strings.md`](docs/solutions/architecture-patterns/exact-ecmascript-utf16-strings.md) — Exact UTF-16 code-unit string representation (`EcmaString`).
 
-## Code standards
+### Workspace crates
 
-- Keep one concern per commit.
-- Use the existing module boundary instead of adding a second convention.
-- Remove obsolete callers and paths in the same change. Do not add compatibility aliases.
-- Keep control flow shallow and comments focused on why a constraint exists.
-- Use typed errors at recoverable boundaries. Fail fast on impossible internal states.
-- Do not add an unsafe block. The workspace forbids unsafe Rust.
+- `crates/bamts-compiler`: Scanner, lexer, AST definitions, parser, binder, type checker, and strictness rules engine.
+- `crates/bamts-bytecode`: Bytecode instruction set, program structures, and string storage model.
+- `crates/bamts-runtime`: Memory layout, garbage collector, JS VM interpreter, and standard builtins (`Object`, `Array`, `Promise`, `Uint8Array`, `JSON`, `Date`, etc.).
+- `crates/bamts-codegen`: Execution backends including JIT compiler and host C AOT emission.
+- `crates/bamts-cli`: Main executable binary (`bamts`), command line argument parsing, and diagnostic formatters.
+- `crates/bamts-native`: Host interop bridge and C runtime linkage.
+- `crates/bamts-node`: Subset implementation of Node.js host APIs (e.g. `process.stdout.write`, timers).
+- `crates/bamts-verification`: Conformance test runner, differential testing harnesses, and formal gates.
+- `crates/bamts`: Root workspace library facade.
 
-Use conventional commit subjects such as `fix(runtime): preserve signed zero in typed array sort`.
+---
 
-## Pull requests
+## Development and validation workflow
 
-Describe the defect or requirement, the concrete change, and the verification you ran. Call out known limits. Do not claim complete parity, performance, or target support beyond the evidence included in the repository.
+### Narrow-first validation
 
-By contributing, you agree that your contribution is licensed under the repository's [MIT License](LICENSE).
+During active development, run focused checks against the specific crate or subsystem you are modifying to maintain fast feedback loops.
+
+Examples of narrow validation commands:
+
+```bash
+# Check compiler crate only
+cargo check -p bamts-compiler
+
+# Run targeted unit tests matching a filter
+cargo test -p bamts-compiler --lib filter_name
+
+# Check CLI binary package
+cargo check -p bamts-cli
+
+# Build release CLI binary
+cargo build --release -p bamts-cli
+```
+
+### Conventions for tests and examples
+
+- Use `process.stdout.write` for program output in TypeScript examples and fixtures. Do not use `console.log`, `console.debug`, `console.trace`, `console.table`, or `debugger` statements.
+- Single entrypoint source files are supported for compilation. Generation of declaration files (`.d.ts`) and source maps is rejected in version `0.2.0`.
+
+---
+
+## Mandatory unpiped verification gates
+
+All changes must pass the full workspace verification suite before publication or merging.
+
+### Gate sequence
+
+Run the following commands in sequence from the workspace root:
+
+```bash
+cargo fmt --all --check
+cargo check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+### Execution rules
+
+Commands MUST run without pipes. Do not pipe a gate into `tail`, `head`, `grep`,
+or a log command. A pipeline can hide the Cargo command's exit status.
+
+---
+
+## Commit and documentation discipline
+
+### Commit discipline
+
+- One mechanism per commit: Each commit contains one logical change. Do not combine unrelated fixes or cleanups.
+- Every commit builds: Each commit must compile and pass its applicable checks so `git bisect` remains useful.
+
+### Documentation discipline
+
+- Separate current behavior from targets.
+- Link claims about evidence to [`docs/explanation/verification.md`](docs/explanation/verification.md).

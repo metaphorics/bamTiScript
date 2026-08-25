@@ -17,7 +17,7 @@ pub(super) fn install<H: Host>(
     let prototype = builtins.number_prototype();
     let constructor = install_function(heap, builtins, "Number", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
-    globals.insert(EcmaString::from_utf8("Number"), constructor);
+    globals.insert(EcmaString::encode("Number"), constructor);
     for (name, length, handler) in [
         ("isInteger", 1, is_integer::<H> as BuiltinHandler<H>),
         ("isSafeInteger", 1, is_safe_integer::<H>),
@@ -56,7 +56,7 @@ fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: 
         panic!("Number constructor must be native")
     };
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8(name)),
+        PropertyKey::Named(EcmaString::encode(name)),
         super::builtin_property(value),
     );
 }
@@ -231,6 +231,17 @@ pub(super) fn parse_float<H: Host>(
         parse_float_units(text.as_units()),
     )))
 }
+/// ECMAScript ToInt32 applied to the parseInt radix argument: wraps the
+/// number modulo 2^32 into the signed 32-bit range. `value_number(...) as
+/// i32` saturates in Rust, so radices like 2^32 and 2^32 + 10 must be
+/// converted here instead of cast.
+fn to_int32_radix(number: f64) -> i32 {
+    if !number.is_finite() || number == 0.0 {
+        0
+    } else {
+        number.trunc().rem_euclid(4_294_967_296.0) as i32
+    }
+}
 pub(super) fn parse_int<H: Host>(
     machine: &mut Machine<'_, H>,
     _: Value,
@@ -249,8 +260,9 @@ pub(super) fn parse_int<H: Host>(
         Some(unit) if *unit == u16::from(b'+') => cursor = 1,
         _ => {}
     }
-    let requested =
-        value_number(machine.to_number(args.get(1).copied().unwrap_or(Value::int32(0)))?) as i32;
+    let requested = to_int32_radix(value_number(
+        machine.to_number(args.get(1).copied().unwrap_or(Value::int32(0)))?,
+    ));
     let mut radix = if requested == 0 { 10 } else { requested };
     if !(2..=36).contains(&radix) {
         return Ok(BuiltinOutcome::Value(crate::number_value(f64::NAN)));
@@ -281,6 +293,12 @@ pub(super) fn parse_int<H: Host>(
         }
         found = true;
         value = value * f64::from(radix) + f64::from(digit);
+        // Once the accumulator overflows to infinity, further digits cannot
+        // change the result; stop scanning to avoid charging the machine for
+        // arbitrarily long trailing input.
+        if !value.is_finite() {
+            break;
+        }
     }
     Ok(BuiltinOutcome::Value(crate::number_value(if found {
         sign * value
@@ -331,7 +349,7 @@ fn to_string<H: Host>(
     };
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        EcmaString::from_utf8(&text),
+        EcmaString::encode(&text),
     )?))
 }
 fn radix_string(n: f64, radix: u32) -> String {
@@ -374,7 +392,7 @@ fn to_fixed<H: Host>(
     };
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        EcmaString::from_utf8(&text),
+        EcmaString::encode(&text),
     )?))
 }
 fn value_of<H: Host>(
@@ -427,5 +445,73 @@ mod tests {
 
         assert_eq!(float, Value::int32(1));
         assert_eq!(integer, Value::int32(1));
+    }
+
+    fn parse_int_radix(machine: &mut Machine<'_, TestHost>, input: &str, radix: Value) -> Value {
+        let text = machine
+            .allocate(HeapEntry::String(EcmaString::encode(input)))
+            .expect("input string allocation succeeds");
+        let BuiltinOutcome::Value(result) =
+            parse_int(&mut *machine, Value::UNDEFINED, &[text, radix], false)
+                .expect("parseInt returns a value")
+        else {
+            panic!("parseInt returns a value");
+        };
+        result
+    }
+
+    #[test]
+    fn parse_int_wraps_radix_through_to_int32() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        // ToInt32 wraps modulo 2^32: 2^32 -> 0 (defaults to 10), 2^32 + 10 -> 10.
+        assert_eq!(
+            parse_int_radix(&mut machine, "10", Value::number(4_294_967_296.0)),
+            Value::int32(10),
+            "radix 2^32 must wrap to 0 and default to base 10"
+        );
+        assert_eq!(
+            parse_int_radix(&mut machine, "10", Value::number(4_294_967_306.0)),
+            Value::int32(10),
+            "radix 2^32 + 10 must wrap to 10"
+        );
+        // 2^32 + 2 wraps to 2, so "10" parses as binary.
+        assert_eq!(
+            parse_int_radix(&mut machine, "10", Value::number(4_294_967_298.0)),
+            Value::int32(2),
+            "radix 2^32 + 2 must wrap to 2"
+        );
+        // A non-integer radix is truncated by ToInt32: 10.5 -> 10.
+        assert_eq!(
+            parse_int_radix(&mut machine, "10", Value::number(10.5)),
+            Value::int32(10),
+            "non-integer radix 10.5 must truncate to 10"
+        );
+        // 2^32 - 1 wraps to -1, which is outside [2, 36], so NaN results.
+        assert!(
+            value_number(parse_int_radix(
+                &mut machine,
+                "10",
+                Value::number(4_294_967_295.0)
+            ))
+            .is_nan(),
+            "radix 2^32 - 1 must wrap to -1 and yield NaN"
+        );
+    }
+
+    #[test]
+    fn parse_int_stops_accumulating_once_the_value_overflows() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let input = "9".repeat(500);
+        let result = parse_int_radix(&mut machine, &input, Value::int32(10));
+        assert_eq!(
+            value_number(result),
+            f64::INFINITY,
+            "an overflowing integer literal must saturate to Infinity"
+        );
     }
 }

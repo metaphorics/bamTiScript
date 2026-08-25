@@ -1,6 +1,9 @@
 #![allow(clippy::too_many_lines)]
 use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar, EnumValue};
-use crate::literal::{cook_escapes, number_value, string_value};
+use crate::literal::{
+    BigIntTextError, MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, cook_escapes,
+    number_value, string_value,
+};
 use crate::namespace_plan::{ContainerAcquisition, NamespaceFacts};
 pub use crate::program::{
     ExecutableModuleProvenance, ExecutableProgram, ProgramLowerError, ProgramLowerErrorKind,
@@ -18,8 +21,8 @@ use crate::syntax::{
     FunctionLike, IdentifierNode, IfStatement, ImportBinding, ImportDeclaration,
     ImportSpecifierMode, LabeledStatement, Literal, LogicalExpression, LogicalOperator,
     MemberExpression, MemberProperty, MetaProperty, ModuleExportName, NamespaceDeclaration,
-    NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral, ObjectMember,
-    ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
+    NamespaceName, NewExpression, NodeId, NodeKind, NumericLiteralNode, ObjectLiteral,
+    ObjectMember, ParameterNode, Pattern, PrivateIdentifierNode, PropertyModifier, PropertyName,
     RegexLiteralNode, SourceFile, Statement, Stmt, StringLiteralNode, SwitchStatement,
     TemplateElementNode, TemplateLiteral, TokenKind, UnaryOperator, UpdateExpression,
     UpdateOperator, VariableDeclaration, VariableKind, WhileStatement, WithStatement,
@@ -29,8 +32,8 @@ use bamts_bytecode::{
     AccessorKind, BigIntLiteral, BinaryOp, Constant, ConstantId, DescriptorSlot, DisposeHint,
     EcmaString, ExceptionHandler, Function, FunctionFlags, FunctionId, Instruction,
     IteratorCloseMode, IteratorKind, MAX_BIGINT_BYTES, MAX_CONSTANTS, MAX_FUNCTIONS,
-    MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, Register, UnaryOp, Verified,
-    VerifyError,
+    MAX_INSTRUCTIONS, MAX_REGISTERS, Module, NumberBits, Pc, RESUME_RETURN, RESUME_THROW, Register,
+    UnaryOp, Verified, VerifyError,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -120,8 +123,6 @@ pub enum UnsupportedConstruct {
     ParameterDecorator,
     /// A constructor decorator (legacy-only; not part of the TC39 decorator model).
     ConstructorDecorator,
-    /// A `super` expression appears outside a valid derived-constructor call.
-    InvalidSuper,
 }
 /// The exhausted structural capacity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,7 +209,6 @@ impl fmt::Display for UnsupportedConstruct {
             Self::RuntimeExportAll => "runtime `export *` declaration",
             Self::ParameterDecorator => "parameter decorator",
             Self::ConstructorDecorator => "constructor decorator",
-            Self::InvalidSuper => "`super` outside a derived constructor call",
         };
         f.write_str(text)
     }
@@ -330,7 +330,7 @@ fn assemble_with_linkage_strings(
         functions: Vec::new(),
     };
     for value in linkage_strings {
-        builder.intern(Constant::String(EcmaString::from_utf8(value)), file.range())?;
+        builder.intern(Constant::String(EcmaString::encode(value)), file.range())?;
     }
     let entry = builder.reserve_function(file.range())?;
     let mut context = FunctionContext::new_top_level(
@@ -1030,7 +1030,7 @@ impl<'a> FunctionContext<'a> {
         declaration_scope: DeclarationScope,
     ) -> Result<(), LowerError> {
         if self.top_level && !matches!(declaration_scope, DeclarationScope::Iteration) {
-            let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+            let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
             self.emit(range, Instruction::StoreGlobal { name: id, value })?;
             return Ok(());
         }
@@ -1350,7 +1350,7 @@ impl<'a> FunctionContext<'a> {
         if objects.is_empty() {
             return Ok(None);
         }
-        let key = self.string_reg(builder, EcmaString::from_utf8(name), range)?;
+        let key = self.string_reg(builder, EcmaString::encode(name), range)?;
         let undef = self.undefined(builder, range)?;
         let fals = self.load_constant(builder, Constant::Boolean(false), range)?;
         let tru = self.load_constant(builder, Constant::Boolean(true), range)?;
@@ -1474,7 +1474,7 @@ impl<'a> FunctionContext<'a> {
         if name == "undefined" {
             return self.undefined(builder, range);
         }
-        let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+        let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(range, Instruction::LoadGlobal { dst, name: id })?;
         Ok(dst)
@@ -1501,7 +1501,7 @@ impl<'a> FunctionContext<'a> {
                 )),
             };
         }
-        let id = builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+        let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
         self.emit(range, Instruction::StoreGlobal { name: id, value })?;
         Ok(())
     }
@@ -3349,7 +3349,13 @@ impl<'a> FunctionContext<'a> {
                     UnsupportedConstruct::NamespaceDeclaration,
                 )
             })?;
-        let name = self.identifier_text(&declaration.name)?;
+        let NamespaceName::Identifier {
+            name: name_node, ..
+        } = &declaration.name
+        else {
+            return Ok(());
+        };
+        let name = self.identifier_text(name_node)?;
         // Reuse one register across the `existing || (existing = {})` diamond so
         // the jump-if-present path still has a definite object value (same shape
         // as runtime enum container init).
@@ -3381,8 +3387,7 @@ impl<'a> FunctionContext<'a> {
                             UnsupportedConstruct::NamespaceDeclaration,
                         )
                     })?;
-                let key =
-                    self.string_reg(builder, EcmaString::from_utf8(&name), statement.range())?;
+                let key = self.string_reg(builder, EcmaString::encode(&name), statement.range())?;
                 let object = self.alloc_register(statement.range())?;
                 self.emit(
                     statement.range(),
@@ -3598,6 +3603,11 @@ impl<'a> FunctionContext<'a> {
             return self.lower_enum_scalar(builder, &scalar, range);
         }
         match expression.data() {
+            Expression::JsxElement(_)
+            | Expression::JsxFragment(_)
+            | Expression::JsxSelfClosingElement(_) => {
+                Err(self.missing(range, NodeKind::JsxElement))
+            }
             Expression::Identifier(identifier) => {
                 if let Some((object, name)) = self.namespace_member_site(expression.id()) {
                     let key = self.string_reg(builder, name, range)?;
@@ -3625,9 +3635,11 @@ impl<'a> FunctionContext<'a> {
                 self.read_name(builder, &name, range)
             }
             Expression::This => self.this_value(builder, range),
-            // Calls intercept `super(...)`; a bare `super` expression has no
-            // runtime meaning and cannot initialize the derived `this` cell.
-            Expression::Super => Err(self.unsupported(range, UnsupportedConstruct::InvalidSuper)),
+            // A bare `super` expression is rejected by the checker
+            // (BAMTS-C024). Calls intercept `super(...)` before reaching here,
+            // so only diagnosed sources lower a bare `super`; give it the
+            // inert `undefined` value.
+            Expression::Super => self.undefined(builder, range),
             Expression::Literal(literal) => self.lower_literal(builder, range, literal),
             Expression::Template(template) => self.lower_template(builder, range, template),
             Expression::TaggedTemplate(tagged) => {
@@ -3793,8 +3805,7 @@ impl<'a> FunctionContext<'a> {
                     )?;
                     self.move_to(range, result, typed)?;
                 } else {
-                    let id =
-                        builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?;
+                    let id = builder.intern(Constant::String(EcmaString::encode(&name)), range)?;
                     let typed = self.alloc_register(range)?;
                     self.emit(
                         range,
@@ -3812,7 +3823,7 @@ impl<'a> FunctionContext<'a> {
                 || (name == "arguments" && !matches!(self.arguments_source, ArgumentsSource::None))
                 || name == "undefined";
             if !resolved {
-                let id = builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?;
+                let id = builder.intern(Constant::String(EcmaString::encode(&name)), range)?;
                 let dst = self.alloc_register(range)?;
                 self.emit(range, Instruction::TypeOfGlobal { dst, name: id })?;
                 return Ok(dst);
@@ -4288,7 +4299,7 @@ impl<'a> FunctionContext<'a> {
             Some(expression) => self.lower_expression(builder, expression)?,
             None => self.undefined(builder, range)?,
         };
-        self.emit_suspend(range, src)
+        self.emit_suspend(builder, range, src)
     }
     fn lower_yield_delegate(
         &mut self,
@@ -4330,7 +4341,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        let resumed = self.emit_suspend(range, value)?;
+        let resumed = self.emit_suspend(builder, range, value)?;
         self.move_to(range, result, resumed)?;
         self.emit(range, Instruction::Jump { target: head })?;
         let exit = self.next_pc();
@@ -4338,10 +4349,36 @@ impl<'a> FunctionContext<'a> {
         self.move_to(range, result, value)?;
         Ok(result)
     }
-    fn emit_suspend(&mut self, range: TextRange, src: Register) -> Result<Register, LowerError> {
+    fn emit_suspend(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        src: Register,
+    ) -> Result<Register, LowerError> {
         let dst = self.alloc_register(range)?;
+        let mode = self.alloc_register(range)?;
         let resume = Pc::new(self.code.len() as u32 + 1);
-        self.emit(range, Instruction::Suspend { dst, src, resume })?;
+        self.emit(
+            range,
+            Instruction::Suspend {
+                dst,
+                src,
+                resume,
+                mode,
+            },
+        )?;
+
+        let skip_throw = self.emit_int32_guard(builder, range, mode, RESUME_THROW)?;
+        self.emit(range, Instruction::Throw { value: dst })?;
+        let after_throw = self.next_pc();
+        self.patch_jump(skip_throw, after_throw);
+
+        let skip_return = self.emit_int32_guard(builder, range, mode, RESUME_RETURN)?;
+        if !self.route_through_finally(builder, range, COMPLETION_RETURN, Some(dst), None)? {
+            self.emit_function_return(builder, range, dst)?;
+        }
+        let after_return = self.next_pc();
+        self.patch_jump(skip_return, after_return);
         Ok(dst)
     }
     fn emit_await(&mut self, range: TextRange, src: Register) -> Result<Register, LowerError> {
@@ -4902,7 +4939,7 @@ impl<'a> FunctionContext<'a> {
         name: &str,
         value: Register,
     ) -> Result<(), LowerError> {
-        let key = self.string_reg(builder, EcmaString::from_utf8(name), range)?;
+        let key = self.string_reg(builder, EcmaString::encode(name), range)?;
         self.emit(range, Instruction::SetProperty { object, key, value })?;
         Ok(())
     }
@@ -4966,7 +5003,7 @@ impl<'a> FunctionContext<'a> {
                 operand: returned,
             },
         )?;
-        let function_type = self.string_reg(builder, EcmaString::from_utf8("function"), range)?;
+        let function_type = self.string_reg(builder, EcmaString::encode("function"), range)?;
         let is_function = self.alloc_register(range)?;
         self.emit(
             range,
@@ -5033,7 +5070,7 @@ impl<'a> FunctionContext<'a> {
                 operand: returned,
             },
         )?;
-        let function_type = self.string_reg(builder, EcmaString::from_utf8("function"), range)?;
+        let function_type = self.string_reg(builder, EcmaString::encode("function"), range)?;
         let is_function = self.alloc_register(range)?;
         self.emit(
             range,
@@ -5177,7 +5214,7 @@ impl<'a> FunctionContext<'a> {
                     },
                 )?;
                 let function_type =
-                    inner.string_reg(builder, EcmaString::from_utf8("function"), range)?;
+                    inner.string_reg(builder, EcmaString::encode("function"), range)?;
                 let is_function = inner.alloc_register(range)?;
                 inner.emit(
                     range,
@@ -5222,7 +5259,7 @@ impl<'a> FunctionContext<'a> {
         match name {
             PropertyName::Identifier(identifier) => {
                 let text = self.identifier_text(identifier)?;
-                self.string_reg(builder, EcmaString::from_utf8(&text), identifier.range())
+                self.string_reg(builder, EcmaString::encode(&text), identifier.range())
             }
             PropertyName::String(string) => {
                 let value = self.string_literal_value(string)?;
@@ -5230,11 +5267,11 @@ impl<'a> FunctionContext<'a> {
             }
             PropertyName::Number(number) => {
                 let key = numeric_key_text(self, number)?;
-                self.string_reg(builder, EcmaString::from_utf8(&key), number.range())
+                self.string_reg(builder, EcmaString::encode(&key), number.range())
             }
             PropertyName::Private(private) => {
                 let text = self.private_text(private)?;
-                self.string_reg(builder, EcmaString::from_utf8(&text), private.range())
+                self.string_reg(builder, EcmaString::encode(&text), private.range())
             }
             PropertyName::Computed(_) => Ok(evaluated_key),
             PropertyName::Missing(missing) => Err(self.error(
@@ -5263,7 +5300,7 @@ impl<'a> FunctionContext<'a> {
         let context = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateObject { dst: context })?;
         let kind_value =
-            self.string_reg(builder, EcmaString::from_utf8(kind.context_name()), range)?;
+            self.string_reg(builder, EcmaString::encode(kind.context_name()), range)?;
         self.set_named_entry(builder, range, context, "kind", kind_value)?;
         let name_value = self.member_context_name(builder, range, name, evaluated_key)?;
         self.set_named_entry(builder, range, context, "name", name_value)?;
@@ -5368,7 +5405,7 @@ impl<'a> FunctionContext<'a> {
                 },
             )?;
         }
-        let raw_key = self.string_reg(builder, EcmaString::from_utf8("raw"), range)?;
+        let raw_key = self.string_reg(builder, EcmaString::encode("raw"), range)?;
         self.emit(
             range,
             Instruction::SetProperty {
@@ -5444,7 +5481,7 @@ impl<'a> FunctionContext<'a> {
         if cook {
             Ok(cook_escapes(interior))
         } else {
-            Ok(EcmaString::from_utf8(interior))
+            Ok(EcmaString::encode(interior))
         }
     }
     fn lower_regex_literal(
@@ -5463,9 +5500,8 @@ impl<'a> FunctionContext<'a> {
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidRegexLiteral))?;
         let (pattern, flags) = split_regex(lexeme)
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidRegexLiteral))?;
-        let pattern_id =
-            builder.intern(Constant::String(EcmaString::from_utf8(&pattern)), range)?;
-        let flags_id = builder.intern(Constant::String(EcmaString::from_utf8(&flags)), range)?;
+        let pattern_id = builder.intern(Constant::String(EcmaString::encode(&pattern)), range)?;
+        let flags_id = builder.intern(Constant::String(EcmaString::encode(&flags)), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(
             range,
@@ -5558,7 +5594,7 @@ impl<'a> FunctionContext<'a> {
         match property {
             MemberProperty::Named(identifier) => {
                 let name = self.identifier_text(identifier)?;
-                self.string_reg(builder, EcmaString::from_utf8(&name), identifier.range())
+                self.string_reg(builder, EcmaString::encode(&name), identifier.range())
             }
             MemberProperty::Computed(expression) => self.lower_expression(builder, expression),
             MemberProperty::Private(private) => {
@@ -5575,7 +5611,7 @@ impl<'a> FunctionContext<'a> {
         match name {
             PropertyName::Identifier(identifier) => {
                 let text = self.identifier_text(identifier)?;
-                self.string_reg(builder, EcmaString::from_utf8(&text), identifier.range())
+                self.string_reg(builder, EcmaString::encode(&text), identifier.range())
             }
             PropertyName::String(string) => {
                 let value = self.string_literal_value(string)?;
@@ -5583,7 +5619,7 @@ impl<'a> FunctionContext<'a> {
             }
             PropertyName::Number(number) => {
                 let key = numeric_key_text(self, number)?;
-                self.string_reg(builder, EcmaString::from_utf8(&key), number.range())
+                self.string_reg(builder, EcmaString::encode(&key), number.range())
             }
             PropertyName::Computed(expression) => self.lower_expression(builder, expression),
             PropertyName::Private(private) => {
@@ -5758,7 +5794,7 @@ impl<'a> FunctionContext<'a> {
         object: Register,
         name: &str,
     ) -> Result<Register, LowerError> {
-        let key = self.string_reg(builder, EcmaString::from_utf8(name), range)?;
+        let key = self.string_reg(builder, EcmaString::encode(name), range)?;
         let dst = self.alloc_register(range)?;
         self.emit(range, Instruction::GetProperty { dst, object, key })?;
         Ok(dst)
@@ -5780,7 +5816,13 @@ impl<'a> FunctionContext<'a> {
         {
             return Ok(());
         }
-        let name = self.identifier_text(&declaration.name)?;
+        let NamespaceName::Identifier {
+            name: name_node, ..
+        } = &declaration.name
+        else {
+            return Ok(());
+        };
+        let name = self.identifier_text(name_node)?;
         let object = self.read_name(builder, &name, statement.range())?;
         let reuse = self.emit(
             statement.range(),
@@ -5805,7 +5847,7 @@ impl<'a> FunctionContext<'a> {
             return Ok(());
         }
         let src = self.read_name(builder, local, range)?;
-        let name = builder.intern(Constant::String(EcmaString::from_utf8(exported)), range)?;
+        let name = builder.intern(Constant::String(EcmaString::encode(exported)), range)?;
         self.emit(range, Instruction::Export { name, src })?;
         Ok(())
     }
@@ -5827,7 +5869,7 @@ impl<'a> FunctionContext<'a> {
                 DeclarationScope::Lexical,
             );
         }
-        let name = builder.intern(Constant::String(EcmaString::from_utf8(exported)), range)?;
+        let name = builder.intern(Constant::String(EcmaString::encode(exported)), range)?;
         self.emit(range, Instruction::Export { name, src })?;
         Ok(())
     }
@@ -5936,6 +5978,7 @@ impl<'a> FunctionContext<'a> {
                 ExportDefaultValue::Missing(missing) => {
                     Err(self.missing(range, missing.expected()))
                 }
+                ExportDefaultValue::Interface(_) => Ok(()),
             },
             ExportDeclaration::Assignment(expression) => {
                 let value = self.lower_expression(builder, expression)?;
@@ -6335,7 +6378,7 @@ impl<'a> FunctionContext<'a> {
             let prototype = self.alloc_register(range)?;
             self.emit(range, Instruction::CreateObject { dst: prototype })?;
             let constructor_key =
-                self.string_reg(builder, EcmaString::from_utf8("constructor"), range)?;
+                self.string_reg(builder, EcmaString::encode("constructor"), range)?;
             self.emit(
                 range,
                 Instruction::SetProperty {
@@ -6344,8 +6387,7 @@ impl<'a> FunctionContext<'a> {
                     value: closure,
                 },
             )?;
-            let prototype_key =
-                self.string_reg(builder, EcmaString::from_utf8("prototype"), range)?;
+            let prototype_key = self.string_reg(builder, EcmaString::encode("prototype"), range)?;
             self.emit(
                 range,
                 Instruction::SetProperty {
@@ -6507,9 +6549,7 @@ impl<'a> FunctionContext<'a> {
             }
         }
         let name_constant = match name {
-            Some(name) => {
-                Some(builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?)
-            }
+            Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(&name)), range)?),
             None => None,
         };
         let assembled = inner.into_function(name_constant, flags);
@@ -6616,9 +6656,7 @@ impl<'a> FunctionContext<'a> {
         let value = emit_body(&mut inner, builder, &parameters)?;
         inner.emit(range, Instruction::Return { value })?;
         let name_constant = match name {
-            Some(name) => {
-                Some(builder.intern(Constant::String(EcmaString::from_utf8(&name)), range)?)
-            }
+            Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(&name)), range)?),
             None => None,
         };
         let assembled = inner.into_function(name_constant, FunctionFlags::default());
@@ -6772,7 +6810,7 @@ impl<'a> FunctionContext<'a> {
                 operand: value,
             },
         )?;
-        let object_kind = self.string_reg(builder, EcmaString::from_utf8("object"), range)?;
+        let object_kind = self.string_reg(builder, EcmaString::encode("object"), range)?;
         let is_object = self.alloc_register(range)?;
         self.emit(
             range,
@@ -6810,7 +6848,7 @@ impl<'a> FunctionContext<'a> {
         )?;
         let object_selected = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
         self.patch_jump(to_function, self.next_pc());
-        let function_kind = self.string_reg(builder, EcmaString::from_utf8("function"), range)?;
+        let function_kind = self.string_reg(builder, EcmaString::encode("function"), range)?;
         let is_function = self.alloc_register(range)?;
         self.emit(
             range,
@@ -6828,7 +6866,7 @@ impl<'a> FunctionContext<'a> {
                 target: Pc::new(0),
             },
         )?;
-        let undefined_kind = self.string_reg(builder, EcmaString::from_utf8("undefined"), range)?;
+        let undefined_kind = self.string_reg(builder, EcmaString::encode("undefined"), range)?;
         let is_undefined = self.alloc_register(range)?;
         self.emit(
             range,
@@ -6924,9 +6962,13 @@ impl<'a> FunctionContext<'a> {
                 )),
             },
             CaptureKey::This => self.this_value(builder, range),
-            CaptureKey::ThisCell => self
-                .this_cell
-                .ok_or_else(|| self.unsupported(range, UnsupportedConstruct::InvalidSuper)),
+            CaptureKey::ThisCell => match self.this_cell {
+                Some(cell) => Ok(cell),
+                // `compute_captures` requests `ThisCell` only when this
+                // context owns a derived `this` cell, so this arm is
+                // defensive against a broken capture-plan invariant.
+                None => self.this_value(builder, range),
+            },
             CaptureKey::Arguments => match self.arguments_value(builder, range)? {
                 Some(register) => Ok(register),
                 None => self.undefined(builder, range),
@@ -7431,7 +7473,7 @@ impl<'a> FunctionContext<'a> {
                 },
             )?;
         }
-        let prototype_key = self.string_reg(builder, EcmaString::from_utf8("prototype"), range)?;
+        let prototype_key = self.string_reg(builder, EcmaString::encode("prototype"), range)?;
         self.emit(
             range,
             Instruction::SetProperty {
@@ -7440,8 +7482,7 @@ impl<'a> FunctionContext<'a> {
                 value: prototype,
             },
         )?;
-        let constructor_key =
-            self.string_reg(builder, EcmaString::from_utf8("constructor"), range)?;
+        let constructor_key = self.string_reg(builder, EcmaString::encode("constructor"), range)?;
         self.emit(
             range,
             Instruction::DefineDataProperty {
@@ -7532,8 +7573,7 @@ impl<'a> FunctionContext<'a> {
                 }
                 None => {
                     debug_assert!(self.top_level);
-                    let id =
-                        builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?;
+                    let id = builder.intern(Constant::String(EcmaString::encode(name)), range)?;
                     self.emit(
                         range,
                         Instruction::StoreGlobal {
@@ -7585,10 +7625,10 @@ impl<'a> FunctionContext<'a> {
     ) -> Result<Register, LowerError> {
         let context = self.alloc_register(range)?;
         self.emit(range, Instruction::CreateObject { dst: context })?;
-        let class_kind = self.string_reg(builder, EcmaString::from_utf8("class"), range)?;
+        let class_kind = self.string_reg(builder, EcmaString::encode("class"), range)?;
         self.set_named_entry(builder, range, context, "kind", class_kind)?;
         let name_value = match name {
-            Some(name) => self.string_reg(builder, EcmaString::from_utf8(name), range)?,
+            Some(name) => self.string_reg(builder, EcmaString::encode(name), range)?,
             None => self.undefined(builder, range)?,
         };
         self.set_named_entry(builder, range, context, "name", name_value)?;
@@ -7626,7 +7666,7 @@ impl<'a> FunctionContext<'a> {
                     continue;
                 }
                 let description =
-                    builder.intern(Constant::String(EcmaString::from_utf8(&text)), range)?;
+                    builder.intern(Constant::String(EcmaString::encode(&text)), range)?;
                 let value = self.alloc_register(range)?;
                 self.emit(
                     range,
@@ -7657,7 +7697,7 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
     ) -> Result<Register, LowerError> {
         let description =
-            builder.intern(Constant::String(EcmaString::from_utf8("#accessor")), range)?;
+            builder.intern(Constant::String(EcmaString::encode("#accessor")), range)?;
         let value = self.alloc_register(range)?;
         self.emit(
             range,
@@ -7924,12 +7964,14 @@ impl<'a> FunctionContext<'a> {
         call: &CallExpression,
     ) -> Result<Register, LowerError> {
         self.guard_derived_super(builder, range)?;
-        let parent = self
-            .parent_constructor_capture
-            .ok_or_else(|| self.unsupported(range, UnsupportedConstruct::InvalidSuper))?;
-        let this_cell = self
-            .this_cell
-            .ok_or_else(|| self.unsupported(range, UnsupportedConstruct::InvalidSuper))?;
+        let (Some(parent), Some(this_cell)) = (self.parent_constructor_capture, self.this_cell)
+        else {
+            // `super(...)` outside a derived constructor body is rejected by
+            // the checker (BAMTS-C025/C026/C027). Keep argument side effects
+            // and yield the inert `undefined` value for diagnosed sources.
+            self.build_arguments(builder, range, &call.arguments)?;
+            return self.undefined(builder, range);
+        };
         let arguments = self.build_arguments(builder, range, &call.arguments)?;
         let new_target = self.new_target_value(range)?;
         let result = self.alloc_register(range)?;
@@ -7953,15 +7995,21 @@ impl<'a> FunctionContext<'a> {
         range: TextRange,
     ) -> Result<(), LowerError> {
         self.guard_derived_super(builder, range)?;
-        let parent = self
-            .parent_constructor_capture
-            .ok_or_else(|| self.unsupported(range, UnsupportedConstruct::InvalidSuper))?;
-        let this_cell = self
-            .this_cell
-            .ok_or_else(|| self.unsupported(range, UnsupportedConstruct::InvalidSuper))?;
-        let arguments = self
-            .arguments_value(builder, range)?
-            .ok_or_else(|| self.unsupported(range, UnsupportedConstruct::InvalidSuper))?;
+        // `compute_constructor_captures` always captures the parent for a
+        // derived constructor, and `build_constructor_into` always installs
+        // the derived `this` cell and the constructor's own `arguments`
+        // before this call; all three bindings are structural invariants.
+        let (Some(parent), Some(this_cell), Some(arguments)) = (
+            self.parent_constructor_capture,
+            self.this_cell,
+            self.arguments_value(builder, range)?,
+        ) else {
+            debug_assert!(
+                false,
+                "derived constructor lost its parent, this cell, or arguments"
+            );
+            return Ok(());
+        };
         let call_arguments = self.alloc_register(range)?;
         self.emit(
             range,
@@ -8108,9 +8156,7 @@ impl<'a> FunctionContext<'a> {
             inner.emit_return_undefined(builder, range)?;
         }
         let name_constant = match source_name {
-            Some(name) => {
-                Some(builder.intern(Constant::String(EcmaString::from_utf8(name)), range)?)
-            }
+            Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(name)), range)?),
             None => None,
         };
         let assembled = inner.into_function(name_constant, FunctionFlags::default());
@@ -8268,7 +8314,7 @@ impl<'a> FunctionContext<'a> {
         let current_set = self.alloc_register(range)?;
         self.move_to(range, current_set, initial_set)?;
         let undefined = self.undefined(builder, range)?;
-        let object_type = self.string_reg(builder, EcmaString::from_utf8("object"), range)?;
+        let object_type = self.string_reg(builder, EcmaString::encode("object"), range)?;
         let mut collected_inits = Vec::new();
         for &decorator in decorators.iter().rev() {
             let collected = self.alloc_register(range)?;
@@ -9262,6 +9308,7 @@ impl<'a> FreeVarScanner<'a> {
                     self.scan_class(class);
                 }
                 ExportDefaultValue::Missing(_) => {}
+                ExportDefaultValue::Interface(_) => {}
             },
             Statement::Enum(declaration) if !declaration.is_const => {
                 for member in &declaration.members {
@@ -9271,8 +9318,12 @@ impl<'a> FreeVarScanner<'a> {
                 }
             }
             Statement::Namespace(declaration) => {
-                if let Some(name) = identifier_name(self.file, &declaration.name) {
-                    self.bind_function(name.clone());
+                let name = declaration
+                    .name
+                    .as_identifier()
+                    .and_then(|n| identifier_name(self.file, n));
+                if let Some(name) = name.clone() {
+                    self.bind_function(name);
                 }
                 self.fn_boundary += 1;
                 self.function_depth += 1;
@@ -9280,8 +9331,8 @@ impl<'a> FreeVarScanner<'a> {
                 self.function_roots.push(self.bound.len() - 1);
                 self.preseed_vars(&declaration.body.data().statements);
                 self.predeclare_immediate(&declaration.body.data().statements, false);
-                if let Some(name) = identifier_name(self.file, &declaration.name) {
-                    self.use_name(&name);
+                if let Some(name) = &name {
+                    self.use_name(name);
                 }
                 for statement in &declaration.body.data().statements {
                     self.scan_statement(statement);
@@ -9476,6 +9527,9 @@ impl<'a> FreeVarScanner<'a> {
     }
     fn scan_expression(&mut self, expression: &Expr) {
         match expression.data() {
+            Expression::JsxElement(_)
+            | Expression::JsxFragment(_)
+            | Expression::JsxSelfClosingElement(_) => {}
             Expression::Identifier(identifier) => {
                 if let Some(name) = identifier_name(self.file, identifier) {
                     self.use_name(&name);
@@ -9719,16 +9773,6 @@ fn collect_immediate_declaration<'a>(
                 });
             }
         }
-        Statement::Namespace(declaration) => {
-            if let Some(name) = identifier_name(file, &declaration.name) {
-                declarations.push(ImmediateDeclaration {
-                    name,
-                    site: binding_site(declaration.name.range()),
-                    range: declaration.name.range(),
-                    kind: ImmediateDeclarationKind::Lexical,
-                });
-            }
-        }
         Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
             declaration,
         ))) => collect_immediate_declaration(file, declaration, declarations),
@@ -9834,7 +9878,11 @@ pub(crate) fn declared_names(file: &SourceFile, statement: &Stmt) -> Vec<String>
             }
         }
         Statement::Namespace(declaration) => {
-            if let Some(name) = identifier_name(file, &declaration.name) {
+            if let Some(name) = declaration
+                .name
+                .as_identifier()
+                .and_then(|n| identifier_name(file, n))
+            {
                 names.push(name);
             }
         }
@@ -9916,7 +9964,11 @@ fn collect_var_names_stmt(file: &SourceFile, statement: &Stmt, names: &mut Vec<S
             }
         }
         Statement::Namespace(declaration) => {
-            if let Some(name) = identifier_name(file, &declaration.name) {
+            if let Some(name) = declaration
+                .name
+                .as_identifier()
+                .and_then(|n| identifier_name(file, n))
+            {
                 names.push(name);
             }
         }
@@ -10089,145 +10141,6 @@ fn split_regex(lexeme: &str) -> Option<(String, String)> {
     let flags = &lexeme[last_slash + 1..];
     Some((pattern.to_owned(), flags.to_owned()))
 }
-const MAX_BIGINT_CONVERSION_LIMB_OPS: usize = 1 << 24;
-/// Failure while canonicalizing BigInt source text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BigIntTextError {
-    Invalid,
-    Bytes,
-    Work,
-}
-/// Canonicalizes a BigInt lexeme to bounded decimal text.
-fn canonical_bigint_text(
-    lexeme: &str,
-    max_bytes: usize,
-    max_limb_ops: usize,
-) -> Result<String, BigIntTextError> {
-    const LIMB_BASE: u64 = 1_000_000_000;
-    const DECIMAL_LIMB_DIGITS: usize = 9;
-    const LOG10_2_UPPER_NUMERATOR: usize = 30_103;
-    const LOG10_2_UPPER_DENOMINATOR: usize = 100_000;
-    let literal = lexeme.strip_suffix('n').ok_or(BigIntTextError::Invalid)?;
-    let (digits, radix) = literal
-        .strip_prefix("0x")
-        .or_else(|| literal.strip_prefix("0X"))
-        .map(|digits| (digits, 16))
-        .or_else(|| {
-            literal
-                .strip_prefix("0o")
-                .or_else(|| literal.strip_prefix("0O"))
-                .map(|digits| (digits, 8))
-        })
-        .or_else(|| {
-            literal
-                .strip_prefix("0b")
-                .or_else(|| literal.strip_prefix("0B"))
-                .map(|digits| (digits, 2))
-        })
-        .unwrap_or((literal, 10));
-    if digits.is_empty() {
-        return Err(BigIntTextError::Invalid);
-    }
-    let mut previous_was_digit = false;
-    let mut significant_digits = 0_usize;
-    let mut first_significant_bits = 0_usize;
-    for character in digits.chars() {
-        if character == '_' {
-            if !previous_was_digit {
-                return Err(BigIntTextError::Invalid);
-            }
-            previous_was_digit = false;
-            continue;
-        }
-        let digit = character.to_digit(radix).ok_or(BigIntTextError::Invalid)?;
-        previous_was_digit = true;
-        if first_significant_bits == 0 {
-            if digit == 0 {
-                continue;
-            }
-            first_significant_bits = (u32::BITS - digit.leading_zeros()) as usize;
-        }
-        significant_digits = significant_digits
-            .checked_add(1)
-            .ok_or(BigIntTextError::Work)?;
-    }
-    if !previous_was_digit {
-        return Err(BigIntTextError::Invalid);
-    }
-    if radix == 10 {
-        let output_bytes = significant_digits.max(1);
-        if output_bytes > max_bytes {
-            return Err(BigIntTextError::Bytes);
-        }
-        let mut output = String::with_capacity(output_bytes);
-        let mut significant = false;
-        for character in digits.chars().filter(|character| *character != '_') {
-            if character != '0' || significant {
-                significant = true;
-                output.push(character);
-            }
-        }
-        if output.is_empty() {
-            output.push('0');
-        }
-        return Ok(output);
-    }
-    let bit_length = significant_digits
-        .saturating_sub(1)
-        .checked_mul(radix.trailing_zeros() as usize)
-        .and_then(|remaining| remaining.checked_add(first_significant_bits))
-        .ok_or(BigIntTextError::Work)?;
-    let max_decimal_bytes = if bit_length == 0 {
-        1
-    } else {
-        bit_length
-            .checked_mul(LOG10_2_UPPER_NUMERATOR)
-            .and_then(|value| value.checked_add(LOG10_2_UPPER_DENOMINATOR - 1))
-            .map(|value| value / LOG10_2_UPPER_DENOMINATOR)
-            .ok_or(BigIntTextError::Work)?
-    };
-    if max_decimal_bytes > max_bytes {
-        return Err(BigIntTextError::Bytes);
-    }
-    let max_limb_count = max_decimal_bytes.div_ceil(DECIMAL_LIMB_DIGITS);
-    let worst_case_limb_ops = significant_digits
-        .checked_mul(max_limb_count)
-        .ok_or(BigIntTextError::Work)?;
-    if worst_case_limb_ops > max_limb_ops {
-        return Err(BigIntTextError::Work);
-    }
-    let mut limbs = vec![0_u32];
-    let mut significant = false;
-    for character in digits.chars().filter(|character| *character != '_') {
-        let digit = u64::from(
-            character
-                .to_digit(radix)
-                .expect("validated BigInt digit remains valid"),
-        );
-        if digit == 0 && !significant {
-            continue;
-        }
-        significant = true;
-        let mut carry = digit;
-        for limb in &mut limbs {
-            let value = u64::from(*limb) * u64::from(radix) + carry;
-            *limb = (value % LIMB_BASE) as u32;
-            carry = value / LIMB_BASE;
-        }
-        if carry != 0 {
-            limbs.push(carry as u32);
-        }
-    }
-    let mut output = limbs.pop().ok_or(BigIntTextError::Invalid)?.to_string();
-    for limb in limbs.iter().rev() {
-        use std::fmt::Write as _;
-        write!(output, "{limb:09}").expect("writing to String cannot fail");
-    }
-    if output.len() > max_bytes {
-        return Err(BigIntTextError::Bytes);
-    }
-    Ok(output)
-}
 fn number_constant(value: f64) -> Constant {
     if value.fract() == 0.0
         && value.is_finite()
@@ -10354,7 +10267,8 @@ mod tests {
             let path = root.join(relative);
             let text = fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display()));
-            let source = Arc::new(SourceText::new(text));
+            let source =
+                Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
             let scanned = scan(SourceId::new(index as u32), script_kind(relative), source);
             let parsed = parse(scanned);
             match lower(
@@ -10381,11 +10295,13 @@ mod tests {
         );
     }
     use bamts_bytecode::{
-        BinaryOp, Constant, DecodeLimits, Function, Instruction, Module, Pc, Register, UnaryOp,
-        Verified, decode_verified,
+        BinaryOp, Constant, DecodeLimits, Function, Instruction, Module, Pc, RESUME_RETURN,
+        RESUME_THROW, Register, UnaryOp, Verified, decode_verified,
     };
     fn lower_js_result(src: &str) -> Result<Module<Verified>, LowerError> {
-        let source = Arc::new(SourceText::new(src.to_owned()));
+        let source = Arc::new(
+            SourceText::new(src.to_owned()).expect("test source fits the per-file budget"),
+        );
         let scanned = scan(SourceId::new(0), ScriptKind::TypeScript, source);
         let parsed = parse(scanned);
         lower(
@@ -10449,6 +10365,22 @@ mod tests {
             )),
             "the class keeps its TDZ cell"
         );
+    }
+    #[test]
+    fn checker_diagnosed_super_misuse_lowers_to_inert_values() {
+        // The checker rejects every one of these (BAMTS-C024..C027); lowering
+        // must still produce a verified module for diagnosed sources instead
+        // of failing.
+        for src in [
+            "function f() { super(); }",
+            "super;",
+            "let x = super;",
+            "class A { constructor() { super(); } }",
+            "class A extends Object { constructor() { super(); const g = () => super(); } }",
+            "class A extends Object { m() { super(); } }",
+        ] {
+            lower_js(src);
+        }
     }
     #[test]
     fn parameter_decorators_are_rejected() {
@@ -12243,7 +12175,10 @@ mod tests {
     }
     #[test]
     fn malformed_non_decimal_bigint_separator_fails_lowering() {
-        let source = Arc::new(SourceText::new("const value = 0x1_n;".to_owned()));
+        let source = Arc::new(
+            SourceText::new("const value = 0x1_n;".to_owned())
+                .expect("test source fits the per-file budget"),
+        );
         let scanned = scan(SourceId::new(0), ScriptKind::TypeScript, source);
         let parsed = parse(scanned);
         let error = lower(
@@ -12306,9 +12241,10 @@ mod tests {
     }
     #[test]
     fn checked_lowering_inlines_a_local_const_enum_member() {
-        let source = Arc::new(SourceText::new(
-            "const enum K { X = 2, Y = X + 3 } K.Y;".to_owned(),
-        ));
+        let source = Arc::new(
+            SourceText::new("const enum K { X = 2, Y = X + 3 } K.Y;".to_owned())
+                .expect("test source fits the per-file budget"),
+        );
         let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source));
         let checked = check(&parsed);
         let module = lower_checked(
@@ -12337,9 +12273,10 @@ mod tests {
             ("call argument", "((value: number) => value)(K.Y);"),
             ("parenthesized member", "((K.Y));"),
         ] {
-            let source = Arc::new(SourceText::new(format!(
-                "const enum K {{ X = 2, Y = X + 3 }} {expression}"
-            )));
+            let source = Arc::new(
+                SourceText::new(format!("const enum K {{ X = 2, Y = X + 3 }} {expression}"))
+                    .expect("test source fits the per-file budget"),
+            );
             let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source));
             let checked = check(&parsed);
             let module = lower_checked(
@@ -12363,9 +12300,10 @@ mod tests {
                 Constant::Number(value) if value.to_f64() == 5.0
             )));
         }
-        let source = Arc::new(SourceText::new(
-            "enum E { Literal = `literal`, Interpolated = `${1}` }".to_owned(),
-        ));
+        let source = Arc::new(
+            SourceText::new("enum E { Literal = `literal`, Interpolated = `${1}` }".to_owned())
+                .expect("test source fits the per-file budget"),
+        );
         let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source));
         let checked = check(&parsed);
         let module = lower_checked(
@@ -12394,9 +12332,10 @@ mod tests {
     }
     #[test]
     fn checked_lowering_inlines_const_enum_reads_but_rejects_member_callees() {
-        let source = Arc::new(SourceText::new(
-            "const enum K { X = 2 } K.X; (K.X as number);".to_owned(),
-        ));
+        let source = Arc::new(
+            SourceText::new("const enum K { X = 2 } K.X; (K.X as number);".to_owned())
+                .expect("test source fits the per-file budget"),
+        );
         let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source));
         let checked = check(&parsed);
         let module = lower_checked(
@@ -12446,9 +12385,10 @@ mod tests {
                 ConstEnumOperation::Read,
             ),
         ] {
-            let source = Arc::new(SourceText::new(format!(
-                "const enum K {{ X = 2 }} {expression}"
-            )));
+            let source = Arc::new(
+                SourceText::new(format!("const enum K {{ X = 2 }} {expression}"))
+                    .expect("test source fits the per-file budget"),
+            );
             let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source));
             let checked = check(&parsed);
             let error = lower_checked(
@@ -12480,7 +12420,9 @@ mod tests {
                 ConstEnumOperation::OptionalAccess,
             ),
         ] {
-            let source_text = Arc::new(SourceText::new(source.to_owned()));
+            let source_text = Arc::new(
+                SourceText::new(source.to_owned()).expect("test source fits the per-file budget"),
+            );
             let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source_text));
             let checked = check(&parsed);
             let error = lower_checked(
@@ -12500,7 +12442,9 @@ mod tests {
         }
     }
     fn lower_local_const_enum_mutation(source: &str) -> LowerError {
-        let source = Arc::new(SourceText::new(source.to_owned()));
+        let source = Arc::new(
+            SourceText::new(source.to_owned()).expect("test source fits the per-file budget"),
+        );
         let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source));
         let checked = check(&parsed);
         lower_checked(
@@ -12517,12 +12461,17 @@ mod tests {
         let enum_file = parse(scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
-            Arc::new(SourceText::new("export const enum K { X = 2 }".to_owned())),
+            Arc::new(
+                SourceText::new("export const enum K { X = 2 }".to_owned())
+                    .expect("test source fits the per-file budget"),
+            ),
         ));
         let importer_file = parse(scan(
             SourceId::new(1),
             ScriptKind::TypeScript,
-            Arc::new(SourceText::new(importer.to_owned())),
+            Arc::new(
+                SourceText::new(importer.to_owned()).expect("test source fits the per-file budget"),
+            ),
         ));
         let files = [enum_file, importer_file];
         let import = files[1].product().statements()[import_statement].data();
@@ -12648,7 +12597,10 @@ mod tests {
     }
     #[test]
     fn checked_lowering_materializes_empty_exported_namespace_object() {
-        let source = Arc::new(SourceText::new("export namespace N {}".to_owned()));
+        let source = Arc::new(
+            SourceText::new("export namespace N {}".to_owned())
+                .expect("test source fits the per-file budget"),
+        );
         let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source));
         let checked = check(&parsed);
         let module = lower_checked(
@@ -12687,12 +12639,18 @@ mod tests {
         let enum_file = parse(scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
-            Arc::new(SourceText::new(enum_source.to_owned())),
+            Arc::new(
+                SourceText::new(enum_source.to_owned())
+                    .expect("test source fits the per-file budget"),
+            ),
         ));
         let importer_file = parse(scan(
             SourceId::new(1),
             ScriptKind::TypeScript,
-            Arc::new(SourceText::new(importer_source.to_owned())),
+            Arc::new(
+                SourceText::new(importer_source.to_owned())
+                    .expect("test source fits the per-file budget"),
+            ),
         ));
         let files = [enum_file, importer_file];
         let import = files[1].product().statements()[0].data();
@@ -14200,6 +14158,241 @@ mod tests {
         );
     }
     #[test]
+    fn generator_suspend_emits_inline_throw_and_return_dispatch() {
+        let module = lower_js("function* g() { yield 1; }");
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("generator function");
+        let code = function.code();
+        let suspend_pc = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Suspend { .. }))
+            .expect("generator suspends");
+        let Instruction::Suspend {
+            dst, resume, mode, ..
+        } = code[suspend_pc]
+        else {
+            unreachable!()
+        };
+        assert_ne!(
+            dst, mode,
+            "resume value and completion mode use distinct registers"
+        );
+        let resume_pc = resume.get() as usize;
+        assert_eq!(
+            resume_pc,
+            suspend_pc + 1,
+            "resume enters the inline dispatch"
+        );
+
+        let Instruction::LoadConst {
+            dst: throw_marker,
+            constant: throw_constant,
+        } = code[resume_pc]
+        else {
+            panic!("throw mode marker is loaded first")
+        };
+        assert_eq!(
+            module.constants()[throw_constant.get() as usize],
+            Constant::Int32(RESUME_THROW)
+        );
+        let Instruction::Binary {
+            dst: throw_matches,
+            op: BinaryOp::StrictEqual,
+            left: throw_left,
+            right: throw_right,
+        } = code[resume_pc + 1]
+        else {
+            panic!("throw mode is tested inline")
+        };
+        assert_eq!((throw_left, throw_right), (mode, throw_marker));
+        let Instruction::JumpIfFalse {
+            condition: throw_condition,
+            target: after_throw,
+        } = code[resume_pc + 2]
+        else {
+            panic!("throw guard skips the abrupt arm")
+        };
+        assert_eq!(throw_condition, throw_matches);
+        assert_eq!(after_throw.get() as usize, resume_pc + 4);
+        assert_eq!(code[resume_pc + 3], Instruction::Throw { value: dst });
+
+        let Instruction::LoadConst {
+            dst: return_marker,
+            constant: return_constant,
+        } = code[resume_pc + 4]
+        else {
+            panic!("return mode marker follows throw dispatch")
+        };
+        assert_eq!(
+            module.constants()[return_constant.get() as usize],
+            Constant::Int32(RESUME_RETURN)
+        );
+        let Instruction::Binary {
+            dst: return_matches,
+            op: BinaryOp::StrictEqual,
+            left: return_left,
+            right: return_right,
+        } = code[resume_pc + 5]
+        else {
+            panic!("return mode is tested inline")
+        };
+        assert_eq!((return_left, return_right), (mode, return_marker));
+        let Instruction::JumpIfFalse {
+            condition: return_condition,
+            target: after_return,
+        } = code[resume_pc + 6]
+        else {
+            panic!("return guard skips the abrupt arm")
+        };
+        assert_eq!(return_condition, return_matches);
+        assert_eq!(after_return.get() as usize, resume_pc + 8);
+        assert_eq!(code[resume_pc + 7], Instruction::Return { value: dst });
+        assert_round_trips(&module);
+    }
+
+    #[test]
+    fn generator_throw_resume_dispatch_stays_inside_try_handler() {
+        let module = lower_js("function* g() { try { yield 1; } catch (e) { yield e; } }");
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("generator function");
+        let code = function.code();
+        let suspend_pc = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Suspend { .. }))
+            .expect("try body suspends");
+        let Instruction::Suspend { dst, resume, .. } = code[suspend_pc] else {
+            unreachable!()
+        };
+        let throw_pc = code
+            .iter()
+            .enumerate()
+            .skip(resume.get() as usize)
+            .find_map(|(pc, instruction)| match instruction {
+                Instruction::Throw { value } if *value == dst => Some(pc),
+                _ => None,
+            })
+            .expect("resume throw arm");
+        let handler = function
+            .handlers()
+            .iter()
+            .find(|handler| {
+                handler.start.get() as usize <= suspend_pc
+                    && handler.end.get() as usize > suspend_pc
+            })
+            .expect("try handler covers the suspension");
+        assert!(
+            handler.start.get() as usize <= resume.get() as usize
+                && handler.end.get() as usize > throw_pc,
+            "resume entry and Throw remain inside the protected range"
+        );
+    }
+
+    #[test]
+    fn generator_return_bypasses_catch_and_routes_to_finally() {
+        let module = lower_js(
+            "function* g() { try { yield 1; } catch (e) { sink(e); } finally { sink(2); } }",
+        );
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("generator function");
+        let code = function.code();
+        let suspend_pc = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Suspend { .. }))
+            .expect("try body suspends");
+        let Instruction::Suspend { resume, .. } = code[suspend_pc] else {
+            unreachable!()
+        };
+        let handler = function
+            .handlers()
+            .iter()
+            .find(|handler| {
+                handler.start.get() as usize <= suspend_pc
+                    && handler.end.get() as usize > suspend_pc
+            })
+            .expect("try handler");
+        let return_route = code[resume.get() as usize + 7..handler.end.get() as usize]
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::Jump { target } => Some(*target),
+                _ => None,
+            })
+            .expect("return routes out of the protected body");
+        assert_ne!(
+            return_route, handler.handler,
+            "return completion must not enter the catch clause"
+        );
+        assert!(
+            return_route.get() >= handler.end.get(),
+            "return completion targets the finalizer after the protected range"
+        );
+    }
+
+    #[test]
+    fn nested_generator_return_routes_through_each_finally() {
+        let module = lower_js(
+            "function* g() { try { try { yield 1; } finally { sink(1); } } finally { sink(2); } }",
+        );
+        let function = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("generator function");
+        let code = function.code();
+        let suspend_pc = code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::Suspend { .. }))
+            .expect("nested try body suspends");
+        let Instruction::Suspend { dst, resume, .. } = code[suspend_pc] else {
+            unreachable!()
+        };
+        let mut enclosing: Vec<_> = function
+            .handlers()
+            .iter()
+            .filter(|handler| {
+                handler.start.get() as usize <= suspend_pc
+                    && handler.end.get() as usize > suspend_pc
+            })
+            .collect();
+        enclosing.sort_by_key(|handler| handler.end.get() - handler.start.get());
+        let [inner, outer] = enclosing.as_slice() else {
+            panic!("the suspension is protected by two nested handlers")
+        };
+        let return_body = resume.get() as usize + 7;
+        assert!(
+            code[return_body..inner.end.get() as usize].iter().any(
+                |instruction| matches!(instruction, Instruction::Move { src, .. } if *src == dst)
+            ),
+            "return value is recorded in the innermost finally frame"
+        );
+        let inner_route = code[return_body..inner.end.get() as usize]
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::Jump { target } => Some(*target),
+                _ => None,
+            })
+            .expect("return routes to inner finalizer");
+        assert!(
+            inner_route.get() >= inner.end.get() && inner_route.get() < outer.end.get(),
+            "inner finalizer runs while still inside the outer protected range"
+        );
+        assert!(
+            code[inner_route.get() as usize..outer.end.get() as usize]
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Jump { target } if target.get() >= outer.end.get())),
+            "inner finalizer dispatch preserves return and routes to the outer finalizer"
+        );
+    }
+
+    #[test]
     fn async_await_uses_the_await_opcode() {
         let module = lower_js("async function f(p: any) { return await p; }");
         assert!(
@@ -14549,7 +14742,8 @@ mod tests {
         use super::{Binding, DeclarationScope, FunctionContext, ModuleBuilder};
         use crate::enum_plan::EnumFacts;
         use crate::namespace_plan::NamespaceFacts;
-        let source = Arc::new(SourceText::new("".to_owned()));
+        let source =
+            Arc::new(SourceText::new("".to_owned()).expect("test source fits the per-file budget"));
         let scanned = scan(SourceId::new(0), ScriptKind::TypeScript, source);
         let parsed = parse(scanned);
         let file = parsed.product();
@@ -15083,5 +15277,50 @@ mod tests {
     fn with_body_error_still_pops_region() {
         let error = lower_js_result("with (o) { return; }").expect_err("top-level return");
         assert!(matches!(error.kind, LowerErrorKind::ReturnOutsideFunction));
+    }
+
+    #[test]
+    fn ambient_string_module_lowers_to_empty_module() {
+        let module = lower_js("declare module \"pkg\" { export const x: number; }");
+        let entry = &module.functions()[module.entry().get() as usize];
+        let has_runtime = entry.code().iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::CreateObject { .. }
+                    | Instruction::StoreGlobal { .. }
+                    | Instruction::Call { .. }
+            )
+        });
+        assert!(
+            !has_runtime,
+            "ambient string modules must erase to no runtime container work: {:?}",
+            entry.code()
+        );
+    }
+
+    #[test]
+    fn identifier_namespace_still_lowers_iife_container() {
+        let source = Arc::new(
+            SourceText::new("namespace N { export const x = 1 }".to_owned())
+                .expect("test source fits the per-file budget"),
+        );
+        let parsed = parse(scan(SourceId::new(0), ScriptKind::TypeScript, source));
+        let checked = check(&parsed);
+        let module = lower_checked(
+            parsed.product(),
+            LowerOptions {
+                javascript_compatibility: true,
+            },
+            checked.product().enum_facts(),
+            checked.product().namespace_facts(),
+        )
+        .expect("identifier namespace lowers with namespace facts");
+        assert!(
+            any_instruction(&module, |instruction| matches!(
+                instruction,
+                Instruction::CreateObject { .. }
+            )),
+            "identifier namespaces must keep runtime lowering"
+        );
     }
 }

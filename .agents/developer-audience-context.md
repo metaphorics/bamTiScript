@@ -1,72 +1,116 @@
-# Developer audience context
+# Developer Audience Context
 
-Last updated: 2026-08-25
+Last updated: 2026-08-11
 
-## Product overview
+## Product Overview
 
-| Field | Current position |
-| --- | --- |
-| Product | bamTiScript |
-| One-line description | A pre-release, clean-room Rust implementation of TypeScript 7.0.2 with a `tsc`-compatible command line, type checking, JavaScript execution, native code generation, and formal models. |
-| Category | Open-source compiler, command-line tool, runtime, and developer infrastructure |
-| Core technology | Rust 2024, TypeScript 7.0.2, Node.js 24 host integration, interpreter, JIT, AOT, Racket models, Lean 4 proofs, and Quint specifications |
-| Pricing | MIT-licensed open source |
+| Field | Repository Evidence & State |
+|-------|-----------------------------|
+| **Product Name** | `bamTiScript` (Rust workspace); CLI binary `bamts`; Node/npm shims `bamti` and `bamti-cli`. Repository: `metaphorics/bamTiScript`. |
+| **One-liner** | A pre-release TypeScript compiler and runtime implemented primarily in Rust, with AOT/JIT execution paths and Lean 4 models for selected invariants. |
+| **Category** | Open-source compiler toolchain, CLI utility, native runtime, and planned Node.js package surface. |
+| **Core Technology** | Rust 2024 (`rust-version = 1.97.1`), TypeScript 7.0.2 compatibility oracle (`package.json`), Node.js-hosted execution surfaces, Lean 4 specifications (`formal/lean`), and vendored libuv (`vendor/libuv-1.52.1`). |
+| **Pricing / Licensing** | Open source under the MIT License (`Cargo.toml`). |
+| **Operational Status** | Pre-release. The `bamti` and `bamti-cli` 0.1.0 wrapper packages are published, but their referenced platform binary packages are unavailable. Source 0.2.0 native artifacts are not published. |
 
-## Developer persona
+## Developer Persona
 
-The primary reader works on TypeScript tooling, compilers, language runtimes, static analysis, or build infrastructure. They are likely a senior individual contributor, staff engineer, researcher, or tool maintainer. They can read Rust and TypeScript, evaluate compatibility evidence, and build the project from source. The repository does not yet establish a commercial buyer or a specific company-size segment.
+| Field | Maintainer Grounding & Scope |
+|-------|------------------------------|
+| **Primary Role** | Systems engineers, compiler developers, language runtime authors, and TypeScript/Rust platform engineers. |
+| **Seniority** | *Hypothesis*: Senior, Staff, and Principal Engineers or Infrastructure Architects evaluating alternative TypeScript runtimes and fast native compilation pipelines. |
+| **Company Size** | *Unknown*: No production customer telemetry or user database exists in the repository. |
+| **Industry Verticals** | *Unknown*: Repository evidence provides no vertical segmentation data. |
+| **Tech Stack** | Rust 1.97.1+, TypeScript 7.0.2 as the compatibility oracle, Node.js, Lean 4, and native C toolchains used by AOT linking. |
+| **Decision Authority** | Toolchain maintainers, platform engineers, open-source contributors, and compiler researchers. |
 
-## Where they spend time
+*Explicit Unknowns*: Actual developer demographics, developer team sizes, enterprise adoption percentages, and user geographic distribution are entirely unknown from repository evidence.
 
-Likely technical channels include GitHub repositories and issues, Rust compiler communities, TypeScript compiler discussions, programming-language research forums, and systems-programming conferences. The project has not collected channel or community data yet, so no specific forum, newsletter, or event is treated as proven.
+## Where They Hang Out
 
-## Problems and pain points
+| Channel Category | Known Repository Anchors & Ecosystem Hypotheses |
+|------------------|-------------------------------------------------|
+| **Code & Issue Tracking** | Primary channel: GitHub repository `https://github.com/metaphorics/bamTiScript` (`Cargo.toml`). |
+| **Communities** | *Hypothesis*: `r/rust`, `r/typescript`, compiler design Discord/Slack communities, Rust user groups. |
+| **Aggregators & Content** | *Hypothesis*: Hacker News (`news.ycombinator.com`), Lobsters (`lobste.rs`), Rust Weekly, TypeScript release tracking blogs. |
+| **Events** | *Hypothesis*: Systems programming conferences (RustConf, EuroRust, TSConf). |
 
-- TypeScript users depend on a mature JavaScript implementation whose compiler, runtime, and host behavior are difficult to study or replace as one system.
-- Compiler engineers need exact diagnostics, compatibility evidence, and reproducible native execution rather than broad compatibility claims.
-- Runtime work spans parsing, checking, JavaScript semantics, module resolution, native lowering, and target behavior. Failures often hide at the boundaries between those parts.
+*Explicit Unknowns*: The repository contains no links or records for official Discord servers, Slack channels, subreddit moderation, or social media accounts (X/Twitter, LinkedIn). All non-GitHub channels remain unverified hypotheses.
 
-The repository has not collected user interviews or verbatim problem statements yet.
+## Problems & Pain Points
 
-## Current alternatives
+| Level | Evidence-Grounded Description |
+|-------|-------------------------------|
+| **Functional** | *Hypothesis*: Developers evaluating this project want TypeScript checking and native execution in one toolchain. The repository does not contain user research that establishes their current latency, memory, or CI pain. |
+| **Emotional** | *Unknown*: The repository contains no interviews, surveys, or support records from which to infer emotional pain. |
+| **Situational** | *Hypothesis*: Evaluation occurs when a team is comparing TypeScript compiler or runtime architectures, native execution, stricter diagnostics, or machine-checked models. |
 
-- The official TypeScript compiler and language services.
-- JavaScript and TypeScript toolchains written in Rust, Go, or JavaScript.
-- Separate type checkers, transpilers, bundlers, and JavaScript runtimes.
-- Internal compiler or static-analysis infrastructure.
+*Explicit Unknowns*: External problem statements and verbatim complaint logs do not exist in the repository. Resource diagnostics such as `BAMTS-R001` and `BAMTS-R002` describe bamTiScript's own operating limits, not user pain.
 
-No competitive ranking is established. The official TypeScript 7.0.2 behavior is the compatibility authority for this project.
+## Current Alternatives
 
-## Key differentiators
+| Alternative | Role & Distinction Relative to bamTiScript |
+|-------------|--------------------------------------------|
+| **`tsc` (Official TypeScript Compiler)** | Compatibility oracle (`typescript: 7.0.2` in the root `package.json`). bamTiScript is a separate pre-release implementation and does not yet claim complete compatibility. |
+| **Node.js / V8** | Current execution oracle and host surface for corpus comparisons. bamTiScript implements separate bytecode, runtime, and code-generation crates. |
+| **Bun / Deno** | Alternative JavaScript and TypeScript runtimes. No repository evidence supports a performance or compatibility comparison yet. |
+| **swc / oxc / other native toolchains** | Native parser and compiler alternatives. No repository evidence supports a feature-completeness or performance comparison yet. |
 
-- One Rust workspace owns parsing, checking, emitting, runtime execution, JIT, AOT, and verification.
-- Compatibility work binds to a fixed TypeScript release and records machine-readable evidence.
-- The project includes formal models and target-cell evidence alongside executable tests.
-- The implementation is clean-room work. The `.references/` tree is study material, not source material.
+*Explicit Unknowns*: User switching behavior, comparative market share, and external developer sentiment toward alternatives are unknown from repository data.
 
-These are architectural facts, not performance or completeness claims. The project remains pre-release.
+## Key Differentiators
 
-## Verbatim developer language
+| Dimension | Grounded Technical Feature |
+|-----------|----------------------------|
+| **Technical Safety** | The workspace forbids unsafe Rust by default. Native code generation, host export, verification, FFI, and Node-API modules contain documented scoped exceptions. This policy is not an end-to-end memory-safety guarantee. |
+| **Formal Verification** | Lean 4 formal proofs validating bytecode execution semantics, ABI correctness, and JIT lifecycle invariants (`formal/lean/`). |
+| **Execution Targets** | Multi-target architecture supporting AOT binary compilation, JIT compilation, and interpreter execution (`--target aot|jit` in CLI). |
+| **Exact Semantics** | Exact ECMAScript UTF-16 string compliance model (`docs/solutions/architecture-patterns/exact-ecmascript-utf16-strings.md`). |
+| **Developer Experience (DX)** | Integrated rule explainer (`bamts explain <rule>`); postinstall-free npm platform shims (`npm/bamti-cli/README.md`). |
 
-No issue, interview, support, or community corpus has been collected. Do not invent quotations. Add exact language here only when a public issue, discussion, or user conversation provides it.
+*Explicit Unknowns*: Verified production benchmark multipliers (e.g., "10x faster than tsc") cannot be claimed because performance benchmarks (`perf/benchmarks.toml`) represent internal testing fixtures rather than published production measurements.
 
-## Technical trust signals
+## Verbatim Developer Language
 
-- Public MIT license.
-- Rust workspace with compiler, bytecode, runtime, native code generation, CLI, Node host, and verification crates.
-- GitHub Actions for pull requests, nightly checks, weekly audits, and releases.
-- Test262, TypeScript suite, corpus, target, performance, and formal-evidence machinery in the repository.
+Because the repository has no external issue tracker export, user survey, or community chat logs, external developer quotes **must not be fabricated**. The following terms represent verified internal CLI and diagnostic vocabulary:
 
-Only passing published checks should appear as badges or release claims.
+- **CLI Operations**: `check`, `compile`, `run`, `explain`.
+- **Execution Targets**: `aot`, `jit`.
+- **Compatibility Options**: `--js-compat`, `--compat <standard|esnext|es2022|node|strict|loose>`, `--allow-js`, `--check-js`, `--jsx-preserve`.
+- **Diagnostic Formats**: `text`, `pretty`, `json`, `github`, `compact`.
+- **Budget Breach Identifiers**: `BAMTS-R001` (file source byte limit exceeded), `BAMTS-R002` (session total source byte limit exceeded).
+- **Frontend Diagnostic Codes**: `BAMTS-C004` (and related semantic checking error codes).
 
-## Conversion actions
+*Explicit Unknowns*: Outside developer quotes, praise, tweets, or verbatim feature requests are completely absent from repository evidence.
 
-1. Read the README and inspect the compatibility scope.
-2. Clone the repository and run the two-minute source quick start.
-3. Try `bamts` on a real TypeScript file.
-4. Read the architecture and verification material before relying on pre-release behavior.
-5. Open a focused issue with a reproducible TypeScript case.
+## Technical Trust Signals
 
-## Voice and tone
+| Signal Type | Repository Grounding & Status |
+|-------------|-------------------------------|
+| **Code Quality & Safety** | Workspace lint rule `[workspace.lints.rust] unsafe_code = "forbid"` (`Cargo.toml`). |
+| **Formal Correctness** | Lean 4 proof specifications in `formal/lean/Bytecode/Verify.lean` and `JitLifecycle.lean`. |
+| **Transparency** | The npm package README states that packages are prepared for a future release and are not published. |
+| **Test Coverage** | Conformance and differential verification suites in `crates/bamts-verification`. |
 
-Write for technical readers. Be direct, specific, and evidence-led. State release status and limits early. Prefer commands, file paths, observed outputs, and exact compatibility targets over promotional language. Do not claim parity, speed, safety, or production readiness without a published receipt.
+*Explicit Unknowns*: GitHub star count (UNKNOWN), npm download numbers (0 / UNPUBLISHED), third-party security audit reports (NONE), and corporate sponsors (UNKNOWN).
+
+## Conversion Actions
+
+| Funnel Stage | Maintainer & Contributor Action |
+|--------------|---------------------------------|
+| **Awareness / Discovery** | Review repository architecture, `Cargo.toml`, and compiler rules (`RULES.md`). |
+| **Consideration / Evaluation** | Clone workspace; inspect Lean formal verification proofs (`formal/lean/`); examine CLI argument contracts (`crates/bamts-cli/src/args.rs`). |
+| **Local Verification** | Execute Rust workspace checks (`cargo check --workspace`) and test suites (`cargo test --workspace`). |
+| **Future Trial (Post-Release)** | Install the planned `bamti-cli` npm package, then run `bamts check <file.ts>` or `bamts run <file.ts>`. |
+| **Future Integration** | Use the planned `bamti` Node package after its native artifact and API contracts are implemented and published. |
+
+## Voice & Tone
+
+| Dimension | Setting & Maintainer Rule |
+|-----------|---------------------------|
+| **Formality** | **Professional / Academic**: Precise technical language without informal slang. |
+| **Technicality** | **Deep Technical**: Direct reference to AST nodes, bytecode verification, Lean semantics, UTF-16 representation, and Rust workspace layout. |
+| **Personality** | **Rigorous and Transparent**: Separate behavior verified in the current tree from compatibility targets and release plans. |
+| **Humor** | **Serious**: Zero marketing hyperbole or playful detours. |
+
+*Maintainer Rule*: Maintain documentation as evidence-backed internal records. State facts verified in code, label all unproven items as hypotheses, and explicitly identify unknown parameters where repository evidence is silent.

@@ -1,0 +1,36 @@
+{
+  "name": "@bamti/bamti-linux-arm64-gnu",
+  "version": "0.2.0",
+  "description": "BamTS native Node-API addon for Linux arm64 glibc",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/metaphorics/bamTiScript.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "commonjs",
+  "main": "bamti.linux-arm64-gnu.node",
+  "files": ["bamti.linux-arm64-gnu.node"],
+  "engines": {
+    "node": ">=24"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "libc": ["glibc"],
+  "bamtiNative": {
+    "entry": "bamti.linux-arm64-gnu.node",
+    "target": "aarch64-unknown-linux-gnu",
+    "artifactKind": "native-addon",
+    "sha256": "__BAMTI_SHA256__",
+    "release": {
+      "packageVersion": "0.2.0",
+      "sourceCommit": "__BAMTI_SOURCE_COMMIT__",
+      "nativeAbi": 1,
+      "cliProtocol": 1,
+      "buildSetId": "__BAMTI_BUILD_SET_ID__",
+      "releaseId": "__BAMTI_RELEASE_ID__"
+    }
+  }
+}

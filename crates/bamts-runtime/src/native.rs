@@ -67,8 +67,9 @@ use crate::intrinsics::BuiltinOutcome;
 use crate::{
     CalleeKind, EvalFailure, Execution, ExecutionOutcome, GeneratorResume, GeneratorStart,
     GeneratorState, GetOutcome, HeapEntry, Host, IteratorNextPrepared, Limits, Machine, Property,
-    PropertyMap, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation, ThrowOrigin,
-    accessor_from_selector, binary_from_selector, iterator_kind_from_selector, unary_from_selector,
+    PropertyMap, ResumeCompletion, RuntimeError, RuntimeErrorKind, SetOutcome, SuspendedActivation,
+    ThrowOrigin, accessor_from_selector, binary_from_selector, iterator_kind_from_selector,
+    unary_from_selector,
 };
 
 // -- ABI selector encoders (inverse of the shared `*_from_selector` decoders) --
@@ -183,6 +184,8 @@ pub enum NativeError {
     ProgramMismatch,
     /// A native entry returned `FatalTrap`; `value` is the raw trap id word.
     FatalTrap { value: Value },
+    /// A caller-supplied [`bamts_cancel::CancellationToken`] was triggered.
+    Cancelled,
 }
 
 impl fmt::Display for NativeError {
@@ -203,6 +206,7 @@ impl fmt::Display for NativeError {
                     value.to_bits()
                 )
             }
+            NativeError::Cancelled => formatter.write_str("operation cancelled"),
         }
     }
 }
@@ -254,14 +258,14 @@ impl CodeRef<'_> {
 
 /// A native activation record. It holds only per-call *metadata*; the register
 /// file lives as a driver-stack-local `Vec<Value>` so a [`NativeFrame`] can
-/// borrow it disjointly from the engine.
 struct Activation {
     this_value: Value,
     new_target: Value,
     args: Vec<Value>,
     arguments_object: Option<Value>,
-    /// The resumed value delivered to a pending `ResumeValue` (linked backend).
-    pending_resume: Option<Value>,
+    /// The pending [`ResumeCompletion`] delivered to [`HelperCall::ResumeValue`] /
+    /// [`HelperCall::ResumeMode`] (linked backend).
+    pending_resume: Option<ResumeCompletion>,
     /// The executing function; [`ShadowFrame`] carries only module and pc, so
     /// the activation supplies the function id for sourced errors and handler
     /// lookup at the helper boundary.
@@ -292,12 +296,14 @@ enum FrameCompletion {
     Unwind(Value, ThrowOrigin, usize),
     Suspend(Value, u32),
 }
-
 #[derive(Clone, Copy)]
 enum FrameDrive {
     Ordinary,
     GeneratorStart,
-    GeneratorResume { token: u32, sent: Value },
+    GeneratorResume {
+        token: u32,
+        completion: ResumeCompletion,
+    },
 }
 
 /// The result of invoking a callee (runtime function, host entity, or foreign
@@ -346,6 +352,8 @@ pub struct NativeEngine<'m, 'h, H: Host> {
     pending_error: Cell<Option<RuntimeError>>,
     /// A nested entry-table linkage failure, propagated through `FatalTrap`.
     pending_abi_error: Cell<Option<AbiError>>,
+    /// Cooperative cancellation signal shared with the embedded [`Machine`].
+    cancel: bamts_cancel::CancellationToken,
 }
 
 impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
@@ -355,11 +363,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         host: &'h mut H,
         limits: Limits,
         backend: Backend,
+        cancel: bamts_cancel::CancellationToken,
     ) -> Self
     where
         'm: 'h,
     {
-        let mut machine = Machine::new(program, host, limits);
+        let mut machine = Machine::new_with_cancel(program, host, limits, cancel.clone());
         machine.frames.clear();
         machine.live_registers = 0;
         NativeEngine {
@@ -375,6 +384,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             pending_fatal_kind: Cell::new(None),
             pending_error: Cell::new(None),
             pending_abi_error: Cell::new(None),
+            cancel,
         }
     }
 
@@ -391,7 +401,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     where
         'm: 'h,
     {
-        Self::build(program, entries, host, limits, Backend::Reference)
+        Self::build(
+            program,
+            entries,
+            host,
+            limits,
+            Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
+        )
     }
 
     /// Buffered process stdout produced during execution.
@@ -496,7 +513,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         roots.push(activation.new_target);
         roots.extend_from_slice(&activation.args);
         roots.extend(activation.arguments_object);
-        roots.extend(activation.pending_resume);
+        roots.extend(
+            activation
+                .pending_resume
+                .map(|completion| completion.value()),
+        );
         roots.extend(self.pending_throw.get().map(|pending| pending.value));
         roots
     }
@@ -750,7 +771,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         };
         let mut pc = match drive {
             FrameDrive::Ordinary | FrameDrive::GeneratorStart => 0,
-            FrameDrive::GeneratorResume { token, sent } => {
+            FrameDrive::GeneratorResume { token, completion } => {
                 let suspend_pc = token.checked_sub(1).map(|pc| pc as usize).ok_or_else(|| {
                     self.error_at(
                         module,
@@ -761,8 +782,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         0,
                     )
                 })?;
-                let Instruction::Suspend { dst, resume, .. } =
-                    code.functions()[function].code()[suspend_pc]
+                let Instruction::Suspend {
+                    dst, resume, mode, ..
+                } = code.functions()[function].code()[suspend_pc]
                 else {
                     return Err(self.error_at(
                         module,
@@ -773,7 +795,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         suspend_pc,
                     ));
                 };
-                frame.set_register(dst.get(), sent);
+                frame.set_register(dst.get(), completion.value());
+                frame.set_register(mode.get(), Value::int32(completion.mode()));
                 resume.get() as usize
             }
         };
@@ -1412,8 +1435,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         loop {
             let kind = self.machine.borrow().callee_kind(callee);
             match kind {
-                Ok(CalleeKind::Runtime { target, captures }) => {
-                    return self.invoke_runtime(target, &captures, this, new_target, args.as_ref());
+                Ok(CalleeKind::Runtime {
+                    target,
+                    captures,
+                    context,
+                }) => {
+                    return self.invoke_runtime(
+                        target,
+                        &captures,
+                        context,
+                        this,
+                        new_target,
+                        args.as_ref(),
+                    );
                 }
                 Ok(CalleeKind::Builtin { id }) => {
                     let result = {
@@ -1435,20 +1469,20 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                             args = Cow::Owned(next_arguments);
                             new_target = Value::UNDEFINED;
                         }
-                        Ok(BuiltinOutcome::GeneratorNext {
+                        Ok(BuiltinOutcome::GeneratorResume {
                             generator,
-                            resume_value,
+                            completion,
                         }) => {
-                            return self.resume_generator(generator, resume_value);
+                            return self.resume_generator(generator, completion);
                         }
-                        Ok(BuiltinOutcome::AsyncGeneratorNext {
+                        Ok(BuiltinOutcome::AsyncGeneratorResume {
                             generator,
-                            resume_value,
+                            completion,
                         }) => {
                             let outcome = self
                                 .machine
                                 .borrow_mut()
-                                .enqueue_async_generator_next(generator, resume_value);
+                                .enqueue_async_generator_next(generator, completion);
                             return match outcome {
                                 Ok(promise) => InvokeOutcome::Value(promise),
                                 Err(failure) => self.failure_outcome(failure),
@@ -1510,6 +1544,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         &self,
         target: crate::RuntimeFunction,
         captures: &[Value],
+        context: Option<Value>,
         this: Value,
         new_target: Value,
         args: &[Value],
@@ -1524,6 +1559,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 .create_async_generator(GeneratorStart {
                     target,
                     captures: captures.to_vec(),
+                    context,
                     this_value: this,
                     new_target,
                     args: args.to_vec(),
@@ -1540,6 +1576,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             let created = self.machine.borrow_mut().create_generator(GeneratorStart {
                 target,
                 captures: captures.to_vec(),
+                context,
                 this_value: this,
                 new_target,
                 args: args.to_vec(),
@@ -1560,14 +1597,19 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             let outcome = self
                 .machine
                 .borrow_mut()
-                .start_async_call(target, captures, this, new_target, args);
+                .start_async_call(target, captures, context, this, new_target, args);
             return match outcome {
                 Ok(promise) => InvokeOutcome::Value(promise),
                 Err(failure) => self.failure_outcome(failure),
             };
         }
-        if self.backend == Backend::Reference || self.is_dynamic_module(target.module) {
-            return match self.execute(
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, context)
+        };
+        let outcome = if self.backend == Backend::Reference || self.is_dynamic_module(target.module)
+        {
+            match self.execute(
                 target.module,
                 index,
                 this,
@@ -1589,32 +1631,64 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     self.pending_error.set(Some(error));
                     InvokeOutcome::Fatal
                 }
-            };
-        }
-        self.invoke_linked(target, captures, this, new_target, args)
+            }
+        } else {
+            self.invoke_linked(target, captures, this, new_target, args)
+        };
+        self.machine.borrow_mut().context_global = previous;
+        outcome
     }
 
-    fn resume_generator(&self, generator: Value, resume_value: Value) -> InvokeOutcome {
+    fn resume_generator(&self, generator: Value, completion: ResumeCompletion) -> InvokeOutcome {
         let state = self.machine.borrow_mut().take_generator_state(generator);
         let resumed = match state {
             Ok(GeneratorState::Completed) => {
-                return self.generator_result(Value::UNDEFINED, true);
+                return match completion {
+                    ResumeCompletion::Next(_) => self.generator_result(Value::UNDEFINED, true),
+                    ResumeCompletion::Return(value) => self.generator_result(value, true),
+                    ResumeCompletion::Throw(value) => {
+                        InvokeOutcome::Threw(value, ThrowOrigin::Bytecode)
+                    }
+                };
             }
-            Ok(GeneratorState::SuspendedStart(start)) => {
-                if self.backend == Backend::Reference || self.is_dynamic_module(start.target.module)
-                {
-                    self.start_reference_generator(start)
-                } else {
-                    self.start_linked_generator(start)
+            Ok(GeneratorState::SuspendedStart(start)) => match completion {
+                ResumeCompletion::Next(_) => {
+                    if self.backend == Backend::Reference
+                        || self.is_dynamic_module(start.target.module)
+                    {
+                        self.start_reference_generator(start)
+                    } else {
+                        self.start_linked_generator(start)
+                    }
                 }
-            }
+                ResumeCompletion::Return(value) => {
+                    if let Err(failure) = self
+                        .machine
+                        .borrow_mut()
+                        .settle_generator_completed(generator)
+                    {
+                        return self.failure_outcome(failure);
+                    }
+                    return self.generator_result(value, true);
+                }
+                ResumeCompletion::Throw(value) => {
+                    if let Err(failure) = self
+                        .machine
+                        .borrow_mut()
+                        .settle_generator_completed(generator)
+                    {
+                        return self.failure_outcome(failure);
+                    }
+                    return InvokeOutcome::Threw(value, ThrowOrigin::Bytecode);
+                }
+            },
             Ok(GeneratorState::Suspended(activation)) => {
                 if self.backend == Backend::Reference
                     || self.is_dynamic_module(activation.target.module)
                 {
-                    self.resume_reference_generator(activation, resume_value)
+                    self.resume_reference_generator(activation, completion)
                 } else {
-                    self.resume_linked_generator(activation, resume_value)
+                    self.resume_linked_generator(activation, completion)
                 }
             }
             Ok(GeneratorState::Executing) => {
@@ -1641,7 +1715,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 }
                 self.generator_result(value, true)
             }
-            Some(GeneratorResume::Throw { value, origin, .. }) => {
+            Some(GeneratorResume::Throw { value, origin }) => {
                 let settled = self
                     .machine
                     .borrow_mut()
@@ -2023,6 +2097,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
 
     fn start_reference_generator(&self, start: GeneratorStart) -> Option<GeneratorResume> {
         let target = start.target;
+        let context = start.context;
         let index = target.function.get() as usize;
         let handle = self.code_ref(target.module);
         let code = handle.code(target.module);
@@ -2052,6 +2127,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             target,
         });
         self.push_native_roots(&registers);
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, context)
+        };
         let completion = self.run_frame(
             target.module,
             index,
@@ -2059,6 +2138,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             &mut registers,
             FrameDrive::GeneratorStart,
         );
+        self.machine.borrow_mut().context_global = previous;
         self.pop_native_roots();
         let activation = self
             .activations
@@ -2066,15 +2146,16 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             .pop()
             .expect("generator activation exists");
         self.machine.borrow_mut().leave_native_generator();
-        self.finish_reference_generator(target, registers, activation, completion)
+        self.finish_reference_generator(target, registers, activation, context, completion)
     }
 
     fn resume_reference_generator(
         &self,
         mut suspended: SuspendedActivation,
-        sent: Value,
+        completion: ResumeCompletion,
     ) -> Option<GeneratorResume> {
         let target = suspended.target;
+        let context = suspended.context;
         let index = target.function.get() as usize;
         let handle = self.code_ref(target.module);
         let code = handle.code(target.module);
@@ -2095,6 +2176,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             target,
         });
         self.push_native_roots(&suspended.registers);
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, context)
+        };
         let completion = self.run_frame(
             target.module,
             index,
@@ -2102,9 +2187,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             &mut suspended.registers,
             FrameDrive::GeneratorResume {
                 token: suspended.resume_token,
-                sent,
+                completion,
             },
         );
+        self.machine.borrow_mut().context_global = previous;
         self.pop_native_roots();
         let activation = self
             .activations
@@ -2112,7 +2198,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             .pop()
             .expect("generator activation exists");
         self.machine.borrow_mut().leave_native_generator();
-        self.finish_reference_generator(target, suspended.registers, activation, completion)
+        self.finish_reference_generator(
+            target,
+            suspended.registers,
+            activation,
+            context,
+            completion,
+        )
     }
 
     fn finish_reference_generator(
@@ -2120,6 +2212,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         target: crate::RuntimeFunction,
         registers: Vec<Value>,
         activation: Activation,
+        context: Option<Value>,
         completion: Result<FrameCompletion, RuntimeError>,
     ) -> Option<GeneratorResume> {
         let register_count = registers.len();
@@ -2133,6 +2226,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     new_target: activation.new_target,
                     args: activation.args,
                     arguments_object: activation.arguments_object,
+                    context,
                     resume_token,
                 },
             }),
@@ -2179,6 +2273,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 new_target: start.new_target,
                 args: start.args,
                 arguments_object: None,
+                context: start.context,
                 resume_token: 0,
             },
             None,
@@ -2188,15 +2283,15 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     fn resume_linked_generator(
         &self,
         activation: SuspendedActivation,
-        sent: Value,
+        completion: ResumeCompletion,
     ) -> Option<GeneratorResume> {
-        self.drive_linked_generator(activation, Some(sent))
+        self.drive_linked_generator(activation, Some(completion))
     }
 
     fn drive_linked_generator(
         &self,
         mut suspended: SuspendedActivation,
-        pending_resume: Option<Value>,
+        pending_resume: Option<ResumeCompletion>,
     ) -> Option<GeneratorResume> {
         let register_count = suspended.registers.len();
         if let Err(kind) = self.machine.borrow_mut().enter_native_generator() {
@@ -2230,6 +2325,10 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         });
         self.push_native_roots(&suspended.registers);
         let handles = suspended.registers.as_mut_ptr();
+        let previous = {
+            let mut machine = self.machine.borrow_mut();
+            std::mem::replace(&mut machine.context_global, suspended.context)
+        };
         let (invoked, next_token, out) = {
             let mut shadow = ShadowFrame::new(
                 std::ptr::null_mut(),
@@ -2247,6 +2346,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             );
             (invoked, shadow.bytecode_pc, out)
         };
+        self.machine.borrow_mut().context_global = previous;
         self.pop_native_roots();
         let activation = self
             .activations
@@ -2421,6 +2521,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         let outcome = self.invoke_runtime(
             crate::RuntimeFunction { module, function },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -2631,8 +2732,8 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Ok(BuiltinOutcome::Value(value)) => HelperResult::normal(value),
                     Ok(
                         BuiltinOutcome::Call { .. }
-                        | BuiltinOutcome::GeneratorNext { .. }
-                        | BuiltinOutcome::AsyncGeneratorNext { .. },
+                        | BuiltinOutcome::GeneratorResume { .. }
+                        | BuiltinOutcome::AsyncGeneratorResume { .. },
                     ) => {
                         self.pending_throw.set(Some(PendingThrow {
                             value: Value::UNDEFINED,
@@ -2645,7 +2746,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Err(failure) => self.fail(failure),
                 }
             }
-            Ok(CalleeKind::Runtime { target, captures }) => {
+            Ok(CalleeKind::Runtime {
+                target,
+                captures,
+                context,
+            }) => {
                 let flags = {
                     let handle = self.code_ref(target.module);
                     handle.code(target.module).functions()[target.function.get() as usize].flags()
@@ -2672,6 +2777,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 let outcome = self.invoke_runtime(
                     target,
                     &captures,
+                    context,
                     instance,
                     new_target,
                     arguments.as_ref(),
@@ -2701,6 +2807,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     // -- Linked backend ------------------------------------------------------
 
     fn run_linked(&mut self) -> Result<ExecutionOutcome, NativeError> {
+        if self.cancel.is_cancelled() {
+            return Err(NativeError::Cancelled);
+        }
         self.machine.borrow_mut().instantiate_modules()?;
         let module = self.program.entry();
         let execution = if self.machine.borrow().module_graph_suspends(module) {
@@ -2845,6 +2954,14 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             },
         });
         self.push_native_roots(&registers);
+        if self.cancel.is_cancelled() {
+            self.pop_native_roots();
+            self.activations.borrow_mut().pop();
+            self.machine
+                .borrow_mut()
+                .release_native_activation(register_count);
+            return Err(NativeError::Cancelled);
+        }
         let handles = registers.as_mut_ptr();
         let entries = self.entries;
         let (tag, out, fault_pc) = {
@@ -2861,6 +2978,9 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         self.machine
             .borrow_mut()
             .release_native_activation(register_count);
+        if self.cancel.is_cancelled() {
+            return Err(NativeError::Cancelled);
+        }
         match tag {
             Ok(CompletionTag::Normal) => {
                 self.pending_throw.take();
@@ -2910,7 +3030,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
         self.prepare_native_helper(frame);
         let module = ModuleId::new(frame.module_id());
         let amount = match call {
-            HelperCall::ResumeValue => None,
+            HelperCall::ResumeValue | HelperCall::ResumeMode => None,
             HelperCall::ConsumeFuel { amount } => Some(u64::from(amount)),
             _ => Some(1),
         };
@@ -2991,6 +3111,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         .machine
                         .borrow()
                         .captures_from_array(module, captures, function);
+                    let context = self.machine.borrow().context_global;
                     match materialized {
                         Ok(captures) => {
                             let prototype = self.machine.borrow().intrinsics.function_prototype;
@@ -2998,6 +3119,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                                 module,
                                 function,
                                 captures,
+                                context,
                                 properties: PropertyMap::default(),
                                 prototype: Some(prototype),
                                 extensible: true,
@@ -3225,13 +3347,33 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     HelperResult::normal(Value::boolean(self.machine.borrow().truthy(value)))
                 }
                 HelperCall::ResumeValue => {
-                    let resumed = self
+                    match self
+                        .activations
+                        .borrow()
+                        .last()
+                        .and_then(|a| a.pending_resume)
+                    {
+                        Some(ResumeCompletion::Throw(value)) => {
+                            self.pending_throw.set(Some(PendingThrow {
+                                value,
+                                origin: ThrowOrigin::Bytecode,
+                            }));
+                            HelperResult::throw(value)
+                        }
+                        Some(completion) => self.validated(completion.value()),
+                        None => self.fatal(RuntimeErrorKind::InvalidValue {
+                            value: Value::UNDEFINED,
+                        }),
+                    }
+                }
+                HelperCall::ResumeMode => {
+                    match self
                         .activations
                         .borrow_mut()
                         .last_mut()
-                        .and_then(|activation| activation.pending_resume.take());
-                    match resumed {
-                        Some(value) => self.validated(value),
+                        .and_then(|a| a.pending_resume.take())
+                    {
+                        Some(completion) => self.validated(Value::int32(completion.mode())),
                         None => self.fatal(RuntimeErrorKind::InvalidValue {
                             value: Value::UNDEFINED,
                         }),
@@ -3273,10 +3415,8 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                         .borrow_mut()
                         .load_global(module, ConstantId::new(name));
                     let text = match resolved {
-                        Ok(Some(value)) => {
-                            EcmaString::from_utf8(self.machine.borrow().type_of(value))
-                        }
-                        Ok(None) => EcmaString::from_utf8("undefined"),
+                        Ok(Some(value)) => EcmaString::encode(self.machine.borrow().type_of(value)),
+                        Ok(None) => EcmaString::encode("undefined"),
                         Err(failure) => break 'result self.fail(failure),
                     };
                     self.allocated(HeapEntry::String(text))
@@ -3327,10 +3467,11 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                     let pattern = self.constant_text(module, pattern);
                     let flags = self.constant_text(module, flags);
                     let prototype = self.machine.borrow().intrinsics.regexp_prototype();
+                    let properties = crate::intrinsics::builtins::initial_regexp_properties();
                     self.allocated(HeapEntry::RegExp {
                         pattern,
                         flags,
-                        properties: PropertyMap::default(),
+                        properties,
                         prototype: Some(prototype),
                         extensible: true,
                     })
@@ -3507,11 +3648,47 @@ pub fn run_linked_program<H: Host>(
     host: &mut H,
     limits: &Limits,
 ) -> Result<ExecutionOutcome, NativeError> {
+    run_linked_program_with_cancel(
+        program,
+        entries,
+        host,
+        limits,
+        bamts_cancel::CancellationToken::new(),
+    )
+}
+
+/// Runs a linked program's entry through the native engine with a
+/// caller-supplied [`bamts_cancel::CancellationToken`].
+///
+/// The token is checked before engine construction, immediately before and
+/// after the linked entry invocation, and at every fuel, microtask, timer, and
+/// quiescence checkpoint inside the shared [`Machine`]. Triggering it aborts
+/// execution with [`NativeError::Cancelled`].
+///
+/// Returns [`NativeError::ProgramMismatch`] before constructing the engine when
+/// `entries` was not compiled from this program's exact canonical encoding.
+pub fn run_linked_program_with_cancel<H: Host>(
+    program: &Program<Verified>,
+    entries: &dyn NativeEntryTable,
+    host: &mut H,
+    limits: &Limits,
+    cancel: bamts_cancel::CancellationToken,
+) -> Result<ExecutionOutcome, NativeError> {
+    if cancel.is_cancelled() {
+        return Err(NativeError::Cancelled);
+    }
     let program_bytes = program.encode();
     if program_bytes != entries.program_bytes() {
         return Err(NativeError::ProgramMismatch);
     }
-    let mut engine = NativeEngine::build(program, entries, host, limits.clone(), Backend::Linked);
+    let mut engine = NativeEngine::build(
+        program,
+        entries,
+        host,
+        limits.clone(),
+        Backend::Linked,
+        cancel,
+    );
     engine.run_linked()
 }
 
@@ -3527,13 +3704,13 @@ mod tests {
         ModuleId, Pc, Program, ProgramModule, Register, Verified,
     };
     use bamts_native::{
-        AbiError, Completion, CompletionTag, HelperCall, HelperResult, NativeEntryTable,
-        NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value,
+        AbiError, Completion, CompletionTag, HELPER_COUNT, HelperCall, HelperResult,
+        NativeEntryTable, NativeFrame, NativeHelper, NativeOps, ShadowFrame, Value,
     };
 
     use crate::{
         GeneratorState, HeapEntry, Host, Limits, Machine, Property, PropertyKey, PropertyMap,
-        RuntimeError, RuntimeErrorKind, ThrowOrigin,
+        ResumeCompletion, RuntimeError, RuntimeErrorKind, ThrowOrigin,
     };
 
     use super::EcmaString;
@@ -3650,7 +3827,7 @@ mod tests {
         bindings: Vec<Binding>,
         exports: Vec<Export>,
     ) -> ProgramModule<Verified> {
-        constants.insert(0, Constant::String(EcmaString::from_utf8(name)));
+        constants.insert(0, Constant::String(EcmaString::encode(name)));
         ProgramModule {
             name: cid(0),
             code: Module::new(constants, functions, FunctionId::new(0))
@@ -3669,7 +3846,7 @@ mod tests {
     fn dynamic_cycle_program() -> Program<Verified> {
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![entry_function(
                 3,
                 vec![
@@ -3700,7 +3877,7 @@ mod tests {
         );
         let target = program_module(
             "target",
-            vec![Constant::String(EcmaString::from_utf8("./root"))],
+            vec![Constant::String(EcmaString::encode("./root"))],
             vec![entry_function(1, vec![Instruction::Halt])],
             vec![Edge {
                 specifier: cid(1),
@@ -3772,8 +3949,8 @@ mod tests {
                 vec![
                     Constant::Int32(11),
                     Constant::Int32(22),
-                    Constant::String(EcmaString::from_utf8("error")),
-                    Constant::String(EcmaString::from_utf8("suppressed")),
+                    Constant::String(EcmaString::encode("error")),
+                    Constant::String(EcmaString::encode("suppressed")),
                 ],
                 vec![entry_function(
                     7,
@@ -3840,9 +4017,9 @@ mod tests {
                 vec![program_module(
                     "root",
                     vec![
-                        Constant::String(EcmaString::from_utf8("Symbol")),
-                        Constant::String(EcmaString::from_utf8(property)),
-                        Constant::String(EcmaString::from_utf8("Array")),
+                        Constant::String(EcmaString::encode("Symbol")),
+                        Constant::String(EcmaString::encode(property)),
+                        Constant::String(EcmaString::encode("Array")),
                     ],
                     vec![entry_function(
                         7,
@@ -3997,8 +4174,8 @@ mod tests {
             vec![program_module(
                 "root",
                 vec![
-                    Constant::String(EcmaString::from_utf8("queueMicrotask")),
-                    Constant::String(EcmaString::from_utf8("observed")),
+                    Constant::String(EcmaString::encode("queueMicrotask")),
+                    Constant::String(EcmaString::encode("observed")),
                     Constant::Int32(7),
                     Constant::Undefined,
                 ],
@@ -4056,14 +4233,13 @@ mod tests {
             )],
             0,
         );
-        let observed = EcmaString::from_utf8("observed");
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
         interpreter.evaluate().unwrap();
-        assert!(!interpreter.globals.contains_key(&observed));
+        assert!(interpreter.test_global("observed").is_none());
         let interpreter_drain = interpreter.drain_microtasks().unwrap();
-        let interpreter_value = interpreter.globals.get(&observed).copied();
+        let interpreter_value = interpreter.test_global("observed");
 
         let mut native_host = SilentHost;
         let engine = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default());
@@ -4072,9 +4248,9 @@ mod tests {
             .evaluate_reference_module(program.entry())
             .unwrap()
             .expect("native entry completes");
-        assert!(!engine.machine.borrow().globals.contains_key(&observed));
+        assert!(engine.machine.borrow().test_global("observed").is_none());
         let native_drain = engine.machine.borrow_mut().drain_microtasks().unwrap();
-        let native_value = engine.machine.borrow().globals.get(&observed).copied();
+        let native_value = engine.machine.borrow().test_global("observed");
 
         assert_eq!(interpreter_drain, native_drain);
         assert_eq!(interpreter_value, Some(Value::int32(7)));
@@ -4101,11 +4277,11 @@ mod tests {
             vec![program_module(
                 "root",
                 vec![
-                    Constant::String(EcmaString::from_utf8("console")),
-                    Constant::String(EcmaString::from_utf8("log")),
-                    Constant::String(EcmaString::from_utf8("sync")),
-                    Constant::String(EcmaString::from_utf8("async")),
-                    Constant::String(EcmaString::from_utf8("queueMicrotask")),
+                    Constant::String(EcmaString::encode("console")),
+                    Constant::String(EcmaString::encode("log")),
+                    Constant::String(EcmaString::encode("sync")),
+                    Constant::String(EcmaString::encode("async")),
+                    Constant::String(EcmaString::encode("queueMicrotask")),
                     Constant::Int32(42),
                     Constant::Undefined,
                 ],
@@ -4198,6 +4374,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function,
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(prototype),
                 extensible: true,
@@ -4288,6 +4465,7 @@ mod tests {
                 &mut linked_host,
                 Limits::default(),
                 Backend::Linked,
+                bamts_cancel::CancellationToken::new(),
             );
             queue_callback_microtask(&mut linked, FunctionId::new(1));
             linked
@@ -4345,6 +4523,7 @@ mod tests {
                 &mut linked_host,
                 Limits::default(),
                 Backend::Linked,
+                bamts_cancel::CancellationToken::new(),
             );
             queue_callback_microtask(&mut linked, FunctionId::new(1));
             linked
@@ -4383,7 +4562,7 @@ mod tests {
             vec![program_module(
                 "root",
                 vec![
-                    Constant::String(EcmaString::from_utf8("observed")),
+                    Constant::String(EcmaString::encode("observed")),
                     Constant::Int32(7),
                     Constant::Undefined,
                 ],
@@ -4437,14 +4616,13 @@ mod tests {
             )],
             0,
         );
-        let observed = EcmaString::from_utf8("observed");
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
         interpreter.evaluate().unwrap();
-        assert!(!interpreter.globals.contains_key(&observed));
+        assert!(interpreter.test_global("observed").is_none());
         let interpreter_drain = interpreter.drain_microtasks().unwrap();
-        let interpreter_value = interpreter.globals.get(&observed).copied();
+        let interpreter_value = interpreter.test_global("observed");
 
         let mut native_host = SilentHost;
         let engine = NativeEngine::new(&program, &NoEntries, &mut native_host, Limits::default());
@@ -4453,9 +4631,9 @@ mod tests {
             .evaluate_reference_module(program.entry())
             .unwrap()
             .expect("native entry completes");
-        assert!(!engine.machine.borrow().globals.contains_key(&observed));
+        assert!(engine.machine.borrow().test_global("observed").is_none());
         let native_drain = engine.machine.borrow_mut().drain_microtasks().unwrap();
-        let native_value = engine.machine.borrow().globals.get(&observed).copied();
+        let native_value = engine.machine.borrow().test_global("observed");
 
         let mut linked_host = SilentHost;
         let linked = NativeEngine::build(
@@ -4464,6 +4642,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         linked.machine.borrow_mut().instantiate_modules().unwrap();
         assert!(matches!(
@@ -4473,15 +4652,16 @@ mod tests {
                     function: FunctionId::new(1),
                 },
                 &[],
+                None,
                 Value::UNDEFINED,
                 Value::UNDEFINED,
                 &[],
             ),
             InvokeOutcome::Value(_)
         ));
-        assert!(!linked.machine.borrow().globals.contains_key(&observed));
+        assert!(linked.machine.borrow().test_global("observed").is_none());
         let linked_drain = linked.machine.borrow_mut().drain_microtasks().unwrap();
-        let linked_value = linked.machine.borrow().globals.get(&observed).copied();
+        let linked_value = linked.machine.borrow().test_global("observed");
 
         assert_eq!(interpreter_drain, native_drain);
         assert_eq!(interpreter_value, Some(Value::int32(7)));
@@ -4721,7 +4901,7 @@ mod tests {
             program_module(
                 name,
                 vec![
-                    Constant::String(EcmaString::from_utf8("x")),
+                    Constant::String(EcmaString::encode("x")),
                     Constant::Int32(value),
                 ],
                 vec![module_function(
@@ -4753,11 +4933,11 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("left")),
-                Constant::String(EcmaString::from_utf8("right")),
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("one")),
-                Constant::String(EcmaString::from_utf8("two")),
+                Constant::String(EcmaString::encode("left")),
+                Constant::String(EcmaString::encode("right")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("one")),
+                Constant::String(EcmaString::encode("two")),
             ],
             vec![module_function(
                 0,
@@ -4823,10 +5003,10 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(1),
                 Constant::Int32(2),
-                Constant::String(EcmaString::from_utf8("set")),
+                Constant::String(EcmaString::encode("set")),
             ],
             vec![
                 module_function(
@@ -4895,9 +5075,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("set")),
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("dependency")),
+                Constant::String(EcmaString::encode("set")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("dependency")),
             ],
             vec![module_function(
                 0,
@@ -4957,9 +5137,9 @@ mod tests {
         let first = program_module(
             "first",
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::encode("a")),
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("second")),
+                Constant::String(EcmaString::encode("second")),
             ],
             vec![module_function(
                 0,
@@ -4993,8 +5173,8 @@ mod tests {
         let second = program_module(
             "second",
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
-                Constant::String(EcmaString::from_utf8("first")),
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("first")),
             ],
             vec![module_function(
                 0,
@@ -5034,7 +5214,7 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(7),
             ],
             vec![module_function(
@@ -5065,9 +5245,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("ns")),
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("dependency")),
+                Constant::String(EcmaString::encode("ns")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("dependency")),
             ],
             vec![module_function(
                 0,
@@ -5115,7 +5295,7 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("count")),
+                Constant::String(EcmaString::encode("count")),
                 Constant::Int32(0),
                 Constant::Int32(1),
             ],
@@ -5170,9 +5350,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("count")),
-                Constant::String(EcmaString::from_utf8("dependency")),
-                Constant::String(EcmaString::from_utf8("dependency-again")),
+                Constant::String(EcmaString::encode("count")),
+                Constant::String(EcmaString::encode("dependency")),
+                Constant::String(EcmaString::encode("dependency-again")),
             ],
             vec![module_function(
                 0,
@@ -5426,7 +5606,7 @@ mod tests {
     fn native_matches_interpreter_on_object_property_roundtrip() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(5),
             ],
             vec![entry_function(
@@ -5541,7 +5721,7 @@ mod tests {
     fn one_module_program(module: &Module<Verified>) -> Program<Verified> {
         let mut constants = module.constants().to_vec();
         let name = ConstantId::new(constants.len() as u32);
-        constants.push(Constant::String(EcmaString::from_utf8("test-module")));
+        constants.push(Constant::String(EcmaString::encode("test-module")));
         let code = Module::new(constants, module.functions().to_vec(), module.entry())
             .verify()
             .expect("test module remains verified");
@@ -5592,7 +5772,7 @@ mod tests {
 
     fn trivial_program() -> Program<Verified> {
         let code = verified(
-            vec![Constant::String(EcmaString::from_utf8("<test>"))],
+            vec![Constant::String(EcmaString::encode("<test>"))],
             vec![entry_function(1, vec![Instruction::Halt])],
         );
         Program::link(
@@ -5689,7 +5869,7 @@ mod tests {
         let first = single.modules()[0].clone();
         let second = program_module(
             "entry",
-            vec![Constant::String(EcmaString::from_utf8("dependency"))],
+            vec![Constant::String(EcmaString::encode("dependency"))],
             vec![entry_function(1, vec![Instruction::Halt])],
             vec![Edge {
                 specifier: cid(1),
@@ -5714,7 +5894,7 @@ mod tests {
         let module = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("after")),
+                Constant::String(EcmaString::encode("after")),
                 Constant::Int32(7),
             ],
             vec![entry_function(
@@ -5752,18 +5932,15 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
 
         engine.run_linked().expect("top-level await completes");
 
         assert!(!entries.invoked.get(), "linked entry must not run");
         assert_eq!(
-            engine
-                .machine
-                .borrow()
-                .globals
-                .get(&EcmaString::from_utf8("after")),
-            Some(&Value::int32(7)),
+            engine.machine.borrow().test_global("after"),
+            Some(Value::int32(7)),
         );
     }
 
@@ -5772,7 +5949,7 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("after")),
+                Constant::String(EcmaString::encode("after")),
                 Constant::Undefined,
                 Constant::Int32(7),
             ],
@@ -5806,8 +5983,8 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("after")),
-                Constant::String(EcmaString::from_utf8("dependency")),
+                Constant::String(EcmaString::encode("after")),
+                Constant::String(EcmaString::encode("dependency")),
             ],
             vec![entry_function(
                 1,
@@ -5847,6 +6024,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine
             .run_linked()
@@ -5856,12 +6034,8 @@ mod tests {
             "the linked graph must not mix native and interpreter entries"
         );
         assert_eq!(
-            engine
-                .machine
-                .borrow()
-                .globals
-                .get(&EcmaString::from_utf8("after")),
-            Some(&Value::int32(7)),
+            engine.machine.borrow().test_global("after"),
+            Some(Value::int32(7)),
         );
     }
 
@@ -5923,9 +6097,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("rejecting")),
-                Constant::String(EcmaString::from_utf8("pending")),
-                Constant::String(EcmaString::from_utf8("root-ran")),
+                Constant::String(EcmaString::encode("rejecting")),
+                Constant::String(EcmaString::encode("pending")),
+                Constant::String(EcmaString::encode("root-ran")),
                 Constant::Int32(1),
             ],
             vec![entry_function(
@@ -5972,9 +6146,7 @@ mod tests {
             } if value == Value::int32(9)
         ));
         assert!(
-            !machine
-                .globals
-                .contains_key(&EcmaString::from_utf8("root-ran")),
+            machine.test_global("root-ran").is_none(),
             "the root body must not run after a dependency rejects"
         );
 
@@ -6001,6 +6173,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let error = engine
             .run_linked()
@@ -6020,11 +6193,7 @@ mod tests {
             "the rejected async graph must not run a linked entry"
         );
         assert!(
-            !engine
-                .machine
-                .borrow()
-                .globals
-                .contains_key(&EcmaString::from_utf8("root-ran")),
+            engine.machine.borrow().test_global("root-ran").is_none(),
             "the linked root body must not run after a dependency rejects"
         );
     }
@@ -6040,7 +6209,7 @@ mod tests {
     fn dynamic_import_throw_is_caught_at_the_requester_in_both_backends() {
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![Function::new(
                 None,
                 0,
@@ -6110,6 +6279,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.machine.borrow_mut().instantiate_modules().unwrap();
         assert!(matches!(
@@ -6150,11 +6320,11 @@ mod tests {
     fn native_functions_call_and_construct_with_engine_parity() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("Object")),
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("toString")),
-                Constant::String(EcmaString::from_utf8("call")),
-                Constant::String(EcmaString::from_utf8("[object Object]")),
+                Constant::String(EcmaString::encode("Object")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("toString")),
+                Constant::String(EcmaString::encode("call")),
+                Constant::String(EcmaString::encode("[object Object]")),
                 Constant::Undefined,
             ],
             vec![entry_function(
@@ -6263,10 +6433,10 @@ mod tests {
     fn bound_calls_match_between_engines() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
-                Constant::String(EcmaString::from_utf8("marker")),
-                Constant::String(EcmaString::from_utf8("0")),
-                Constant::String(EcmaString::from_utf8("1")),
+                Constant::String(EcmaString::encode("bind")),
+                Constant::String(EcmaString::encode("marker")),
+                Constant::String(EcmaString::encode("0")),
+                Constant::String(EcmaString::encode("1")),
                 Constant::Int32(7),
                 Constant::Int32(1),
                 Constant::Int32(2),
@@ -6355,14 +6525,14 @@ mod tests {
     fn applied_calls_match_between_engines() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("apply")),
-                Constant::String(EcmaString::from_utf8("marker")),
-                Constant::String(EcmaString::from_utf8("0")),
-                Constant::String(EcmaString::from_utf8("1")),
+                Constant::String(EcmaString::encode("apply")),
+                Constant::String(EcmaString::encode("marker")),
+                Constant::String(EcmaString::encode("0")),
+                Constant::String(EcmaString::encode("1")),
                 Constant::Int32(7),
                 Constant::Int32(1),
                 Constant::Int32(2),
-                Constant::String(EcmaString::from_utf8("length")),
+                Constant::String(EcmaString::encode("length")),
                 Constant::Undefined,
             ],
             vec![
@@ -6500,11 +6670,11 @@ mod tests {
     fn bound_construction_matches_between_engines() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("sum")),
-                Constant::String(EcmaString::from_utf8("0")),
-                Constant::String(EcmaString::from_utf8("1")),
+                Constant::String(EcmaString::encode("bind")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("sum")),
+                Constant::String(EcmaString::encode("0")),
+                Constant::String(EcmaString::encode("1")),
                 Constant::Int32(4),
                 Constant::Int32(5),
                 Constant::Int32(9),
@@ -6780,7 +6950,7 @@ mod tests {
     fn construct_with_new_target_preserves_explicit_target_through_bound_callee() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::String(EcmaString::encode("bind")),
                 Constant::Undefined,
             ],
             vec![
@@ -6873,7 +7043,7 @@ mod tests {
         //   Construct(B2)                   -> Base
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::String(EcmaString::encode("bind")),
                 Constant::Undefined,
             ],
             vec![
@@ -7060,12 +7230,12 @@ mod tests {
         // and allocates under customNewTarget.prototype in both engines.
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("Object")),
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::String(EcmaString::encode("Object")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("marker")),
                 Constant::Int32(42),
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("own")),
+                Constant::String(EcmaString::encode("own")),
             ],
             vec![
                 entry_function(
@@ -7256,6 +7426,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.pending_throw.set(Some(PendingThrow {
             value: Value::UNDEFINED,
@@ -7296,6 +7467,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let (callee, arguments) = {
             let mut machine = engine.machine.borrow_mut();
@@ -7305,6 +7477,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(1),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(function_prototype),
                     extensible: true,
@@ -7397,6 +7570,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.pending_fault.set(Some((
             crate::RuntimeFunction {
@@ -7437,6 +7611,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.pending_throw.set(Some(PendingThrow {
             value: Value::int32(1),
@@ -7460,6 +7635,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine
             .pending_fatal_kind
@@ -7492,6 +7668,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let outcome = engine.invoke_runtime(
             crate::RuntimeFunction {
@@ -7499,6 +7676,7 @@ mod tests {
                 function: FunctionId::new(1),
             },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -7524,6 +7702,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.machine.borrow_mut().instantiate_modules().unwrap();
         for _ in 0..2 {
@@ -7564,6 +7743,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         engine.machine.borrow_mut().instantiate_modules().unwrap();
         let module = engine
@@ -7578,6 +7758,7 @@ mod tests {
                 function: FunctionId::new(0),
             },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -7615,6 +7796,7 @@ mod tests {
                     dst: reg(1),
                     src: reg(0),
                     resume: pc(2),
+                    mode: reg(2),
                 },
                 Instruction::LoadConst {
                     dst: reg(0),
@@ -7624,6 +7806,7 @@ mod tests {
                     dst: reg(1),
                     src: reg(0),
                     resume: pc(4),
+                    mode: reg(2),
                 },
                 Instruction::Return { value: reg(1) },
             ],
@@ -7638,6 +7821,7 @@ mod tests {
                 function: FunctionId::new(1),
             },
             &[],
+            None,
             Value::UNDEFINED,
             Value::UNDEFINED,
             &[],
@@ -7690,7 +7874,7 @@ mod tests {
 
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(999)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(999))),
             Value::int32(4),
             false,
         );
@@ -7710,19 +7894,19 @@ mod tests {
 
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(99)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(99))),
             Value::int32(5),
             false,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(7)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(7))),
             Value::int32(7),
             true,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(8)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(8))),
             Value::UNDEFINED,
             true,
         );
@@ -7748,12 +7932,12 @@ mod tests {
         let engine = NativeEngine::new(&program, &entries, &mut host, Limits::default());
         let generator = invoke_test_generator(&engine);
         assert!(matches!(
-            engine.resume_generator(generator, Value::UNDEFINED),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED)),
             InvokeOutcome::Threw(value, ThrowOrigin::Bytecode) if value == Value::int32(42)
         ));
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::UNDEFINED),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED)),
             Value::UNDEFINED,
             true,
         );
@@ -7776,12 +7960,12 @@ mod tests {
         let second = invoke_test_generator(&engine);
         assert_iterator_result(
             &engine,
-            engine.resume_generator(first, Value::UNDEFINED),
+            engine.resume_generator(first, ResumeCompletion::Next(Value::UNDEFINED)),
             Value::int32(4),
             false,
         );
         assert!(matches!(
-            engine.resume_generator(second, Value::UNDEFINED),
+            engine.resume_generator(second, ResumeCompletion::Next(Value::UNDEFINED)),
             InvokeOutcome::Fatal
         ));
         assert!(matches!(
@@ -7888,30 +8072,31 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let generator = invoke_test_generator(&engine);
         assert_eq!(entries.call.get(), 0, "generator call is lazy");
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(999)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(999))),
             Value::int32(4),
             false,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(99)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(99))),
             Value::int32(5),
             false,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::int32(7)),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::int32(7))),
             Value::int32(7),
             true,
         );
         assert_iterator_result(
             &engine,
-            engine.resume_generator(generator, Value::UNDEFINED),
+            engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED)),
             Value::UNDEFINED,
             true,
         );
@@ -7932,24 +8117,25 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let resumed_value = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("resume")))
+            .allocate(HeapEntry::String(EcmaString::encode("resume")))
             .unwrap();
         engine.activations.borrow_mut().push(Activation {
             this_value: Value::UNDEFINED,
             new_target: Value::UNDEFINED,
             args: Vec::new(),
             arguments_object: None,
-            pending_resume: Some(resumed_value),
+            pending_resume: Some(ResumeCompletion::Next(resumed_value)),
             target: test_target(),
         });
-        let mut registers = vec![Value::UNINITIALIZED];
+        let mut registers = vec![Value::UNINITIALIZED, Value::UNINITIALIZED];
         engine.push_native_roots(&registers);
         engine.machine.borrow_mut().set_gc_watermarks_for_test(0, 0);
-        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 2, 0, registers.as_mut_ptr(), 1);
+        let mut shadow = ShadowFrame::new(std::ptr::null_mut(), 2, 0, registers.as_mut_ptr(), 2);
         let mut frame = NativeFrame::new(&mut shadow, &mut registers).unwrap();
         let resumed = engine.dispatch(&mut frame, HelperCall::ResumeValue);
         assert_eq!(resumed, HelperResult::normal(resumed_value));
@@ -7961,9 +8147,32 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let mode = engine.dispatch(&mut frame, HelperCall::ResumeMode);
+        assert_eq!(mode, HelperResult::normal(Value::int32(0)));
+        assert!(
+            engine
+                .activations
+                .borrow()
+                .last()
+                .unwrap()
+                .pending_resume
+                .is_none()
+        );
         assert_eq!(
             engine.dispatch(&mut frame, HelperCall::ResumeValue).tag,
             CompletionTag::FatalTrap
+        );
+        engine
+            .activations
+            .borrow_mut()
+            .last_mut()
+            .expect("active generator frame")
+            .pending_resume = Some(ResumeCompletion::Throw(Value::int32(42)));
+        let thrown = engine.dispatch(&mut frame, HelperCall::ResumeValue);
+        assert_eq!(thrown, HelperResult::throw(Value::int32(42)));
+        assert_eq!(
+            engine.pending_throw.get().map(|p| (p.value, p.origin)),
+            Some((Value::int32(42), ThrowOrigin::Bytecode))
         );
         engine.pop_native_roots();
         engine.activations.borrow_mut().pop();
@@ -7984,9 +8193,11 @@ mod tests {
                 &mut host,
                 Limits::default(),
                 Backend::Linked,
+                bamts_cancel::CancellationToken::new(),
             );
             let generator = invoke_test_generator(&engine);
-            let outcome = engine.resume_generator(generator, Value::UNDEFINED);
+            let outcome =
+                engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED));
             if expected_throw {
                 assert!(matches!(
                     outcome,
@@ -7998,7 +8209,7 @@ mod tests {
             }
             assert_iterator_result(
                 &engine,
-                engine.resume_generator(generator, Value::UNDEFINED),
+                engine.resume_generator(generator, ResumeCompletion::Next(Value::UNDEFINED)),
                 Value::UNDEFINED,
                 true,
             );
@@ -8019,6 +8230,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let generator = invoke_test_generator(&engine);
         let array = {
@@ -8056,6 +8268,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED];
         engine.activations.borrow_mut().push(Activation {
@@ -8101,6 +8314,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let values = {
             let mut machine = engine.machine.borrow_mut();
@@ -8115,7 +8329,7 @@ mod tests {
             ]
             .map(|text| {
                 machine
-                    .allocate(HeapEntry::String(EcmaString::from_utf8(text)))
+                    .allocate(HeapEntry::String(EcmaString::encode(text)))
                     .unwrap()
             })
         };
@@ -8124,7 +8338,7 @@ mod tests {
             new_target: values[2],
             args: vec![values[3]],
             arguments_object: Some(values[4]),
-            pending_resume: Some(values[5]),
+            pending_resume: Some(ResumeCompletion::Next(values[5])),
             target: test_target(),
         });
         engine.pending_throw.set(Some(PendingThrow {
@@ -8167,7 +8381,7 @@ mod tests {
     impl Host for ImportMetaHost {
         fn import_meta_url(&mut self, module_name: &EcmaString) -> EcmaString {
             self.seen.push(module_name.clone());
-            EcmaString::from_utf8("host://modules/entry.mjs")
+            EcmaString::encode("host://modules/entry.mjs")
         }
     }
 
@@ -8177,8 +8391,8 @@ mod tests {
             vec![program_module(
                 "entry",
                 vec![
-                    Constant::String(EcmaString::from_utf8("url")),
-                    Constant::String(EcmaString::from_utf8("host://modules/entry.mjs")),
+                    Constant::String(EcmaString::encode("url")),
+                    Constant::String(EcmaString::encode("host://modules/entry.mjs")),
                 ],
                 vec![entry_function(
                     7,
@@ -8233,8 +8447,8 @@ mod tests {
         assert_eq!(native.entry_registers[0], native.entry_registers[1]);
         assert_eq!(native.entry_registers[2], Value::TRUE);
         assert_eq!(native.value, Value::TRUE);
-        assert_eq!(interpreter_host.seen, vec![EcmaString::from_utf8("entry")]);
-        assert_eq!(native_host.seen, vec![EcmaString::from_utf8("entry")]);
+        assert_eq!(interpreter_host.seen, vec![EcmaString::encode("entry")]);
+        assert_eq!(native_host.seen, vec![EcmaString::encode("entry")]);
     }
 
     #[test]
@@ -8301,7 +8515,7 @@ mod tests {
     fn import_dynamic_instruction_matches_interpreter_and_native_engine() {
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![entry_function(
                 2,
                 vec![
@@ -8344,7 +8558,7 @@ mod tests {
             None,
             0,
             0,
-            1,
+            2,
             FunctionFlags::default(),
             vec![
                 Instruction::LoadConst {
@@ -8395,6 +8609,7 @@ mod tests {
                     dst: reg(0),
                     src: reg(0),
                     resume: pc(2),
+                    mode: reg(1),
                 },
                 "suspend outside an engine-owned event loop",
             ),
@@ -8469,8 +8684,8 @@ mod tests {
         verified(
             vec![
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("ReferenceError")),
-                Constant::String(EcmaString::from_utf8("missing_global")),
+                Constant::String(EcmaString::encode("ReferenceError")),
+                Constant::String(EcmaString::encode("missing_global")),
             ],
             vec![Function::new(
                 None,
@@ -8549,6 +8764,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED; 3];
         linked.activations.borrow_mut().push(Activation {
@@ -8594,6 +8810,7 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED];
         engine.activations.borrow_mut().push(Activation {
@@ -8669,7 +8886,7 @@ mod tests {
     /// Entry loads a missing global with no covering handler.
     fn uncaught_missing_global_module() -> Module<Verified> {
         verified(
-            vec![Constant::String(EcmaString::from_utf8("missing_global"))],
+            vec![Constant::String(EcmaString::encode("missing_global"))],
             vec![entry_function(
                 1,
                 vec![
@@ -8729,6 +8946,7 @@ mod tests {
             &mut linked_host,
             limits(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED; 1];
         linked.activations.borrow_mut().push(Activation {
@@ -8764,7 +8982,7 @@ mod tests {
     fn caught_missing_global_sentinel_module() -> Module<Verified> {
         verified(
             vec![
-                Constant::String(EcmaString::from_utf8("missing_global")),
+                Constant::String(EcmaString::encode("missing_global")),
                 Constant::Int32(99),
             ],
             vec![Function::new(
@@ -8839,6 +9057,7 @@ mod tests {
             &mut linked_host,
             limits(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED; 3];
         linked.activations.borrow_mut().push(Activation {
@@ -8877,7 +9096,7 @@ mod tests {
     /// materialization failure originates in the nested activation.
     fn nested_caught_missing_global_module() -> Module<Verified> {
         verified(
-            vec![Constant::String(EcmaString::from_utf8("missing_global"))],
+            vec![Constant::String(EcmaString::encode("missing_global"))],
             vec![
                 Function::new(
                     None,
@@ -9043,6 +9262,7 @@ mod tests {
             &mut linked_host,
             Limits::default(),
             Backend::Linked,
+            bamts_cancel::CancellationToken::new(),
         );
         let mut registers = vec![Value::UNINITIALIZED; 5];
         linked.activations.borrow_mut().push(Activation {
@@ -9096,11 +9316,12 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
         );
         let key = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .unwrap();
         let mut registers = vec![Value::UNINITIALIZED];
         engine.activations.borrow_mut().push(Activation {
@@ -9159,11 +9380,8 @@ mod tests {
             NativeHelper::WithHasBinding.symbol(),
             "bamts_with_has_binding"
         );
-        assert_eq!(
-            NativeHelper::from_u32(45),
-            Some(NativeHelper::WithHasBinding)
-        );
-        assert_eq!(bamts_native::HELPER_COUNT, 46);
+        assert_eq!(NativeHelper::ResumeMode.as_u32(), 46);
+        assert_eq!(HELPER_COUNT, 47);
     }
 
     #[test]
@@ -9177,16 +9395,17 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
         );
         let key_x = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .unwrap();
         let key_missing = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("missing")))
+            .allocate(HeapEntry::String(EcmaString::encode("missing")))
             .unwrap();
         let mut registers = vec![Value::UNINITIALIZED; 2];
         engine.activations.borrow_mut().push(Activation {
@@ -9285,7 +9504,7 @@ mod tests {
         let primitive = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("not-object")))
+            .allocate(HeapEntry::String(EcmaString::encode("not-object")))
             .unwrap();
         assert_eq!(
             engine
@@ -9318,8 +9537,8 @@ mod tests {
     fn with_has_binding_propagates_unscopables_getter_throw() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("<test>")),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("<test>")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(1),
             ],
             vec![
@@ -9345,11 +9564,12 @@ mod tests {
             &mut host,
             Limits::default(),
             Backend::Reference,
+            bamts_cancel::CancellationToken::new(),
         );
         let key_x = engine
             .machine
             .borrow_mut()
-            .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+            .allocate(HeapEntry::String(EcmaString::encode("x")))
             .unwrap();
         let mut registers = vec![Value::UNINITIALIZED; 2];
         engine.activations.borrow_mut().push(Activation {
@@ -9388,6 +9608,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(1),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(prototype),
                     extensible: true,
@@ -9462,10 +9683,10 @@ mod tests {
     fn load_own_descriptor_slot_parity_covers_absent_data_accessor_and_mismatch() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("accessor")),
-                Constant::String(EcmaString::from_utf8("missing")),
+                Constant::String(EcmaString::encode("accessor")),
+                Constant::String(EcmaString::encode("missing")),
             ],
             vec![entry_function(
                 10,
@@ -9566,12 +9787,12 @@ mod tests {
     fn define_own_descriptor_slot_parity_creates_absent_preserves_and_rejects_mismatch() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("created")),
+                Constant::String(EcmaString::encode("created")),
                 Constant::Int32(9),
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(1),
                 Constant::Int32(8),
-                Constant::String(EcmaString::from_utf8("accessor")),
+                Constant::String(EcmaString::encode("accessor")),
             ],
             vec![entry_function(
                 8,
@@ -9637,9 +9858,9 @@ mod tests {
             )],
         );
         let program = one_module_program(&module);
-        let created = PropertyKey::Named(EcmaString::from_utf8("created"));
-        let data = PropertyKey::Named(EcmaString::from_utf8("data"));
-        let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+        let created = PropertyKey::Named(EcmaString::encode("created"));
+        let data = PropertyKey::Named(EcmaString::encode("data"));
+        let accessor = PropertyKey::Named(EcmaString::encode("accessor"));
 
         let mut interpreter_host = SilentHost;
         let mut interpreter = Machine::new(&program, &mut interpreter_host, Limits::default());
@@ -9707,7 +9928,7 @@ mod tests {
 
         let mismatch = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(1),
                 Constant::Int32(2),
             ],
@@ -9776,8 +9997,14 @@ mod tests {
             let program = trivial_program();
             let entries = NoEntries;
             let mut host = SilentHost;
-            let engine =
-                NativeEngine::build(&program, &entries, &mut host, Limits::default(), backend);
+            let engine = NativeEngine::build(
+                &program,
+                &entries,
+                &mut host,
+                Limits::default(),
+                backend,
+                bamts_cancel::CancellationToken::new(),
+            );
             let mut registers = vec![Value::UNINITIALIZED; 2];
             engine.activations.borrow_mut().push(Activation {
                 this_value: Value::UNDEFINED,
@@ -9824,7 +10051,7 @@ mod tests {
             let accessor_key = engine
                 .machine
                 .borrow_mut()
-                .allocate(HeapEntry::String(EcmaString::from_utf8("acc")))
+                .allocate(HeapEntry::String(EcmaString::encode("acc")))
                 .unwrap();
             let installed = engine.dispatch(
                 &mut frame,
@@ -9909,5 +10136,84 @@ mod tests {
             engine.pop_native_roots();
             engine.activations.borrow_mut().pop();
         }
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_before_entry_invocation() {
+        let program = trivial_program();
+        let entries = RecordingEntries {
+            program_bytes: program.encode(),
+            ..RecordingEntries::default()
+        };
+        let token = bamts_cancel::CancellationToken::new();
+        token.cancel();
+        let mut host = SilentHost;
+        let error = super::run_linked_program_with_cancel(
+            &program,
+            &entries,
+            &mut host,
+            &Limits::default(),
+            token,
+        )
+        .expect_err("pre-cancelled token aborts");
+        assert_eq!(error, NativeError::Cancelled);
+        assert!(
+            entries.invoked.borrow().is_empty(),
+            "entry must not be invoked when pre-cancelled"
+        );
+    }
+
+    #[test]
+    fn fresh_token_preserves_existing_run_linked_program_behavior() {
+        let program = trivial_program();
+        let entries = RecordingEntries {
+            program_bytes: program.encode(),
+            ..RecordingEntries::default()
+        };
+        let mut host = SilentHost;
+        let outcome = run_linked_program(&program, &entries, &mut host, &Limits::default())
+            .expect("fresh token runs to completion");
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(entries.invoked.borrow().as_slice(), &[(0, 0)]);
+    }
+
+    #[test]
+    fn fuel_checkpoint_cancellation_aborts_long_execution() {
+        // A program that loops forever via a backward jump. The fuel
+        // checkpoint in `consume_fuel` checks the cancellation token before
+        // decrementing, so a token cancelled mid-flight aborts with
+        // `RuntimeErrorKind::Cancelled` surfaced through `NativeError`.
+        let code = verified(
+            vec![Constant::String(EcmaString::encode("<loop>"))],
+            vec![entry_function(1, vec![Instruction::Jump { target: pc(0) }])],
+        );
+        let program = linked(
+            vec![ProgramModule {
+                name: ConstantId::new(0),
+                code,
+                edges: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+            }],
+            0,
+        );
+        let entries = RecordingEntries {
+            program_bytes: program.encode(),
+            ..RecordingEntries::default()
+        };
+        let token = bamts_cancel::CancellationToken::new();
+        // Cancel after construction but before running — the pre-cancel
+        // check in `run_linked` catches it.
+        token.cancel();
+        let mut host = SilentHost;
+        let error = super::run_linked_program_with_cancel(
+            &program,
+            &entries,
+            &mut host,
+            &Limits::default(),
+            token,
+        )
+        .expect_err("cancelled token aborts loop");
+        assert_eq!(error, NativeError::Cancelled);
     }
 }

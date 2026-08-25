@@ -5,14 +5,14 @@
 
 /// Module-scoped host bindings selected by compiler options.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ModuleEnvironment {
+pub(crate) enum ModuleEnvironment {
     Standard,
     CommonJs,
 }
 
 /// Names installed before source declarations are bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct GlobalEnvironment {
+pub(crate) struct GlobalEnvironment {
     values: &'static [&'static str],
     types: &'static [&'static str],
     module: ModuleEnvironment,
@@ -59,23 +59,18 @@ impl GlobalEnvironment {
 const COMMONJS_WRAPPER_VALUES: &[&str] =
     &["module", "exports", "require", "__filename", "__dirname"];
 
-// ECMAScript globals, plus the Web-compatible APIs the target accepts and the
-// Node host bindings its runtime actually installs (`console` and `process`).
+// `Function` is the sole declaration-only value. It permits library source
+// checking without claiming that the runtime installs the constructor.
 const STANDARD_VALUES: &[&str] = &[
     "undefined",
     "NaN",
     "Infinity",
-    "eval",
     "isFinite",
     "isNaN",
     "parseFloat",
     "parseInt",
-    "decodeURI",
     "decodeURIComponent",
-    "encodeURI",
     "encodeURIComponent",
-    // Annex B URI functions retained by the checker runtime contract.
-    "escape",
     "unescape",
     "Object",
     "Function",
@@ -90,42 +85,21 @@ const STANDARD_VALUES: &[&str] = &[
     "TypeError",
     "URIError",
     "Number",
-    "BigInt",
     "Date",
     "String",
     "RegExp",
     "Array",
-    "Int8Array",
     "Uint8Array",
-    "Uint8ClampedArray",
-    "Int16Array",
-    "Uint16Array",
-    "Int32Array",
-    "Uint32Array",
-    "BigInt64Array",
-    "BigUint64Array",
-    "Float16Array",
-    "Float32Array",
-    "Float64Array",
     "Map",
     "Set",
     "WeakMap",
     "WeakSet",
-    "ArrayBuffer",
-    "SharedArrayBuffer",
-    "DataView",
     "Atomics",
     "JSON",
     "Math",
     "Promise",
-    "Proxy",
-    "Reflect",
-    "FinalizationRegistry",
-    "WeakRef",
-    "Intl",
-    "Iterator",
-    "AsyncIterator",
     "SuppressedError",
+    "global",
     "globalThis",
     "structuredClone",
     "console",
@@ -135,12 +109,6 @@ const STANDARD_VALUES: &[&str] = &[
     "setInterval",
     "clearInterval",
     "queueMicrotask",
-    "URL",
-    "URLSearchParams",
-    "TextEncoder",
-    "TextDecoder",
-    "TextEncoderStream",
-    "TextDecoderStream",
 ];
 
 // These are the library names the checker can recognize in a type position.
@@ -152,6 +120,7 @@ const STANDARD_TYPES: &[&str] = &[
     "String",
     "Symbol",
     "BigInt",
+    "PropertyKey",
     "Array",
     "ReadonlyArray",
     "Readonly",
@@ -185,6 +154,9 @@ const STANDARD_TYPES: &[&str] = &[
     "WeakSet",
     "Date",
     "RegExp",
+    "Atomics",
+    "JSON",
+    "Math",
     "Error",
     "AggregateError",
     "EvalError",
@@ -193,6 +165,7 @@ const STANDARD_TYPES: &[&str] = &[
     "SyntaxError",
     "TypeError",
     "URIError",
+    "SuppressedError",
     "Object",
     "Function",
     "CallableFunction",
@@ -223,6 +196,7 @@ const STANDARD_TYPES: &[&str] = &[
     "Float16Array",
     "Float32Array",
     "Float64Array",
+    "AbortSignal",
     "URL",
     "URLSearchParams",
     "TextEncoder",

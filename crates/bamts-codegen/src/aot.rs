@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use bamts_bytecode::{Program as BytecodeProgram, Verified};
+use bamts_cancel::{CancellationToken, Cancelled};
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{ExternalName, Function, UserExternalName};
 use cranelift_codegen::isa;
@@ -13,7 +14,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::{
     HELPER_NAMESPACE, Helper, LowerError, LoweredProgram, ProgramLowerError, function_symbol,
-    lower_program,
+    lower_program_with_cancel,
 };
 
 const HELPER_COUNT: u32 = bamts_native::HELPER_COUNT;
@@ -63,6 +64,14 @@ pub enum AotError {
     Module(String),
     /// Serializing the completed object failed.
     Emit(String),
+    /// A caller-supplied cancellation token was triggered at a checkpoint.
+    Cancelled,
+}
+
+impl From<Cancelled> for AotError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
+    }
 }
 
 impl fmt::Display for AotError {
@@ -79,6 +88,7 @@ impl fmt::Display for AotError {
             }
             Self::Module(message) => write!(f, "AOT object definition failed: {message}"),
             Self::Emit(message) => write!(f, "AOT object serialization failed: {message}"),
+            Self::Cancelled => f.write_str("operation cancelled"),
         }
     }
 }
@@ -114,6 +124,9 @@ fn require_64_bit_pointer_width(bits: u8) -> Result<(), LowerError> {
 /// `bamts_program_descriptor`. Runtime helpers remain ordinary undefined
 /// symbols for the final linker to resolve; no linker is invoked here.
 ///
+/// This is a convenience wrapper that uses a fresh, never-cancelled token; for
+/// cancellation support use [`compile_aot_with_cancel`].
+///
 /// # Errors
 ///
 /// Returns [`AotError`] when the target is unsupported, lowering fails, the
@@ -123,9 +136,24 @@ pub fn compile_aot(
     bytecode: &BytecodeProgram<Verified>,
     target: &str,
 ) -> Result<AotObject, AotError> {
+    compile_aot_with_cancel(bytecode, target, &CancellationToken::new())
+}
+
+/// [`compile_aot`] with cooperative cancellation.
+///
+/// Cancellation is checked at the entry, after lowering, before/after every
+/// Cranelift `declare_function`/`define_function`/`define_data`/`finish`/`emit`
+/// call, and per lowered function/data item.
+pub fn compile_aot_with_cancel(
+    bytecode: &BytecodeProgram<Verified>,
+    target: &str,
+    cancel: &CancellationToken,
+) -> Result<AotObject, AotError> {
+    cancel.check()?;
     let flags = Flags::new(settings::builder());
     let isa_builder =
         isa::lookup_by_name(target).map_err(|error| AotError::TargetLookup(error.to_string()))?;
+    cancel.check()?;
     let isa = isa_builder
         .finish(flags)
         .map_err(|error| AotError::TargetBuild(error.to_string()))?;
@@ -135,6 +163,7 @@ pub fn compile_aot(
             kind,
         })
     })?;
+    cancel.check()?;
     let target_endianness = isa
         .triple()
         .endianness()
@@ -145,22 +174,26 @@ pub fn compile_aot(
         .endianness()
         .expect("x86-64 has a defined byte order");
     let little_endian = target_endianness == little_endianness;
-    let lowered = lower_program(bytecode, isa.frontend_config())?;
+    let lowered = lower_program_with_cancel(bytecode, isa.frontend_config(), cancel)?;
+    crate::validate_lowered_program(&lowered)
+        .map_err(|error| AotError::InvalidLoweredModule(error.to_string()))?;
     let normalized_target = isa.triple().to_string();
     let call_conv = isa.frontend_config().default_call_conv;
+    cancel.check()?;
     let builder = ObjectBuilder::new(isa, "bamts", default_libcall_names())
         .map_err(|error| AotError::Module(error.to_string()))?;
     let mut object = ObjectModule::new(builder);
 
-    let function_ids = declare_functions(&mut object, &lowered)?;
-    let helper_ids = declare_helpers(&mut object, call_conv)?;
-    define_functions(&mut object, &lowered, &function_ids, &helper_ids)?;
+    let function_ids = declare_functions(&mut object, &lowered, cancel)?;
+    let helper_ids = declare_helpers(&mut object, call_conv, cancel)?;
+    define_functions(&mut object, &lowered, &function_ids, &helper_ids, cancel)?;
     define_program_data(
         &mut object,
         &lowered,
         &function_ids,
         bytecode.encode(),
         little_endian,
+        cancel,
     )?;
 
     let required_helpers = (0..HELPER_COUNT)
@@ -177,10 +210,13 @@ pub fn compile_aot(
         .collect();
     let entry_module = lowered.entry_module.get();
     let entry_function = lowered.entry_function.get();
-    let bytes = object
-        .finish()
+    cancel.check()?;
+    let finished = object.finish();
+    cancel.check()?;
+    let bytes = finished
         .emit()
         .map_err(|error| AotError::Emit(error.to_string()))?;
+    cancel.check()?;
 
     Ok(AotObject {
         bytes,
@@ -202,6 +238,7 @@ struct DeclaredUnit {
 fn declare_functions(
     object: &mut ObjectModule,
     lowered: &LoweredProgram,
+    cancel: &CancellationToken,
 ) -> Result<Vec<DeclaredUnit>, AotError> {
     let function_count = lowered
         .modules
@@ -209,27 +246,18 @@ fn declare_functions(
         .map(|module| module.functions.len())
         .sum();
     let mut units = Vec::with_capacity(function_count);
-    for (module_index, module) in lowered.modules.iter().enumerate() {
-        if module.id.get() as usize != module_index {
-            return Err(AotError::InvalidLoweredModule(format!(
-                "module {} appears at index {module_index}",
-                module.id.get()
-            )));
-        }
-        for (function_index, function) in module.functions.iter().enumerate() {
-            if function.id.get() as usize != function_index {
-                return Err(AotError::InvalidLoweredModule(format!(
-                    "module {} function {} appears at local index {function_index}",
-                    module.id.get(),
-                    function.id.get()
-                )));
-            }
+    for module in &lowered.modules {
+        cancel.check()?;
+        for function in &module.functions {
+            cancel.check()?;
+            let func_id = object
+                .declare_function(&function.symbol, Linkage::Export, &function.signature)
+                .map_err(|error| AotError::Module(error.to_string()))?;
+            cancel.check()?;
             units.push(DeclaredUnit {
                 module_id: module.id.get(),
                 function_id: function.id.get(),
-                function: object
-                    .declare_function(&function.symbol, Linkage::Export, &function.signature)
-                    .map_err(|error| AotError::Module(error.to_string()))?,
+                function: func_id,
             });
         }
     }
@@ -239,21 +267,26 @@ fn declare_functions(
 fn declare_helpers(
     object: &mut ObjectModule,
     call_conv: cranelift_codegen::isa::CallConv,
+    cancel: &CancellationToken,
 ) -> Result<Vec<FuncId>, AotError> {
-    (0..HELPER_COUNT)
-        .map(|index| {
-            let helper = Helper::from_external_index(index).ok_or_else(|| {
-                AotError::InvalidLoweredModule(format!("missing helper ABI index {index}"))
-            })?;
-            object
-                .declare_function(
-                    helper.symbol(),
-                    Linkage::Import,
-                    &helper.signature(call_conv),
-                )
-                .map_err(|error| AotError::Module(error.to_string()))
-        })
-        .collect()
+    let mut helpers = Vec::with_capacity(HELPER_COUNT as usize);
+    for index in 0..HELPER_COUNT {
+        cancel.check()?;
+        let helper = Helper::from_external_index(index).ok_or_else(|| {
+            AotError::InvalidLoweredModule(format!("missing helper ABI index {index}"))
+        })?;
+        cancel.check()?;
+        let func_id = object
+            .declare_function(
+                helper.symbol(),
+                Linkage::Import,
+                &helper.signature(call_conv),
+            )
+            .map_err(|error| AotError::Module(error.to_string()))?;
+        cancel.check()?;
+        helpers.push(func_id);
+    }
+    Ok(helpers)
 }
 
 fn define_functions(
@@ -261,22 +294,17 @@ fn define_functions(
     lowered: &LoweredProgram,
     units: &[DeclaredUnit],
     helper_ids: &[FuncId],
+    cancel: &CancellationToken,
 ) -> Result<(), AotError> {
     let mut declared_functions = std::collections::HashMap::with_capacity(units.len());
     for unit in units {
-        if declared_functions
-            .insert((unit.module_id, unit.function_id), unit.function)
-            .is_some()
-        {
-            return Err(AotError::InvalidLoweredModule(format!(
-                "duplicate declaration for module {} function {}",
-                unit.module_id, unit.function_id
-            )));
-        }
+        declared_functions.insert((unit.module_id, unit.function_id), unit.function);
     }
 
     for module in &lowered.modules {
+        cancel.check()?;
         for lowered_function in &module.functions {
+            cancel.check()?;
             let declared = declared_functions
                 .get(&(module.id.get(), lowered_function.id.get()))
                 .copied()
@@ -290,9 +318,11 @@ fn define_functions(
             let mut function = lowered_function.clif.clone();
             remap_helper_names(&mut function, helper_ids)?;
             let mut context = Context::for_function(function);
+            cancel.check()?;
             object
                 .define_function(declared, &mut context)
                 .map_err(|error| AotError::Module(error.to_string()))?;
+            cancel.check()?;
         }
     }
     Ok(())
@@ -329,6 +359,7 @@ fn define_program_data(
     function_ids: &[DeclaredUnit],
     bytecode: Vec<u8>,
     little_endian: bool,
+    cancel: &CancellationToken,
 ) -> Result<(), AotError> {
     let unit_bytes = function_ids
         .len()
@@ -340,15 +371,18 @@ fn define_program_data(
         ));
     }
 
+    cancel.check()?;
     let bytecode_id = object
         .declare_data(BYTECODE_SYMBOL, Linkage::Local, false, false)
         .map_err(|error| AotError::Module(error.to_string()))?;
     let mut bytecode_data = DataDescription::new();
     bytecode_data.define(bytecode.into_boxed_slice());
     bytecode_data.set_align(1);
+    cancel.check()?;
     object
         .define_data(bytecode_id, &bytecode_data)
         .map_err(|error| AotError::Module(error.to_string()))?;
+    cancel.check()?;
 
     let units_id = object
         .declare_data(UNITS_SYMBOL, Linkage::Local, false, false)
@@ -371,9 +405,11 @@ fn define_program_data(
         let function_ref = object.declare_func_in_data(unit.function, &mut units_data);
         units_data.write_function_addr((index * UNIT_DESCRIPTOR_BYTES + 8) as u32, function_ref);
     }
+    cancel.check()?;
     object
         .define_data(units_id, &units_data)
         .map_err(|error| AotError::Module(error.to_string()))?;
+    cancel.check()?;
 
     let descriptor_id = object
         .declare_data(PROGRAM_DESCRIPTOR_SYMBOL, Linkage::Export, false, false)
@@ -414,6 +450,7 @@ fn define_program_data(
     descriptor_data.write_data_addr(16, bytecode_ref, 0);
     let units_ref = object.declare_data_in_data(units_id, &mut descriptor_data);
     descriptor_data.write_data_addr(32, units_ref, 0);
+    cancel.check()?;
     object
         .define_data(descriptor_id, &descriptor_data)
         .map_err(|error| AotError::Module(error.to_string()))
@@ -440,6 +477,7 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64, little_endian: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lower_program;
     use bamts_bytecode::{
         Constant, ConstantId, EcmaString, Function as BytecodeFunction, FunctionFlags, FunctionId,
         Instruction, Module, ModuleId, Program, ProgramDecodeLimits, ProgramModule, Register,
@@ -479,7 +517,7 @@ mod tests {
             name: ConstantId::new(0),
             code: Module::new(
                 vec![
-                    Constant::String(EcmaString::from_utf8(name)),
+                    Constant::String(EcmaString::encode(name)),
                     Constant::Int32(value),
                 ],
                 vec![function(code, u32::from(loads_constant))],
@@ -637,12 +675,13 @@ mod tests {
         let builder = ObjectBuilder::new(isa, "bamts-test", default_libcall_names())
             .expect("object builder constructs");
         let mut object = ObjectModule::new(builder);
-        let units = declare_functions(&mut object, &lowered).expect("functions declare");
-        let helpers = declare_helpers(&mut object, call_conv).expect("helpers declare");
+        let cancel = CancellationToken::new();
+        let units = declare_functions(&mut object, &lowered, &cancel).expect("functions declare");
+        let helpers = declare_helpers(&mut object, call_conv, &cancel).expect("helpers declare");
         lowered.modules[0].functions[0].id = FunctionId::new(1);
 
         assert!(matches!(
-            define_functions(&mut object, &lowered, &units, &helpers),
+            define_functions(&mut object, &lowered, &units, &helpers, &cancel),
             Err(AotError::InvalidLoweredModule(message))
                 if message.contains("missing declaration for module 0 function 1")
         ));
@@ -666,5 +705,13 @@ mod tests {
         let error = compile_aot(&test_program(), "i686-unknown-linux-gnu")
             .expect_err("i686 AOT target is rejected");
         assert!(matches!(error, AotError::TargetLookup(_)));
+    }
+
+    #[test]
+    fn pre_cancelled_token_aborts_compile_aot() {
+        let cancel = bamts_cancel::CancellationToken::new();
+        cancel.cancel();
+        let result = compile_aot_with_cancel(&test_program(), target(), &cancel);
+        assert!(matches!(result, Err(AotError::Cancelled)));
     }
 }

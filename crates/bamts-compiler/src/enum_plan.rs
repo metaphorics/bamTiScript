@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bamts_bytecode::{EcmaString, EcmaStringBuilder, NumberBits};
+use bamts_bytecode::{EcmaString, EcmaStringBuilder, NumberBits, format_number};
 
 use crate::checker::{SemanticModel, SymbolId, SymbolKind};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
@@ -20,6 +20,8 @@ pub const CONST_ENUM_NONFINITE: DiagnosticCode = DiagnosticCode::new("BAMTS-C008
 pub const ENUM_SELF_OR_FORWARD_REFERENCE: DiagnosticCode = DiagnosticCode::new("BAMTS-C009");
 pub const MIXED_ENUM_CONSTNESS: DiagnosticCode = DiagnosticCode::new("BAMTS-C010");
 pub const MERGED_ENUM_MULTIPLE_AUTO_FIRST: DiagnosticCode = DiagnosticCode::new("BAMTS-C011");
+pub const ENUM_ARITHMETIC_LEFT_NOT_NUMBER: DiagnosticCode = DiagnosticCode::new("BAMTS-C042");
+pub const ENUM_ARITHMETIC_RIGHT_NOT_NUMBER: DiagnosticCode = DiagnosticCode::new("BAMTS-C043");
 
 const INVALID_NAME_MESSAGE: &str =
     "An enum member name must be an identifier, string literal, or numeric literal.";
@@ -33,6 +35,8 @@ const SELF_OR_FORWARD_MESSAGE: &str =
 const MIXED_CONSTNESS_MESSAGE: &str = "All declarations of a merged enum must agree on constness.";
 const MULTIPLE_AUTO_FIRST_MESSAGE: &str =
     "Only one declaration of a merged enum may omit its first member initializer.";
+const ENUM_ARITHMETIC_LEFT_NOT_NUMBER_MESSAGE: &str = "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.";
+const ENUM_ARITHMETIC_RIGHT_NOT_NUMBER_MESSAGE: &str = "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.";
 
 /// The checked meaning of all enum declarations in one source file.
 #[derive(Clone, Debug)]
@@ -348,14 +352,14 @@ pub(crate) fn cook_member_name(
     match name {
         PropertyName::Identifier(identifier) => source
             .identifier_text(identifier.data().token())
-            .map(|name| EcmaString::from_utf8(name.as_ref())),
+            .map(|name| EcmaString::encode(name.as_ref())),
         PropertyName::String(string) => source
             .token_text(string.data().token())
             .and_then(string_value),
         PropertyName::Number(number) => source
             .token_text(number.data().token())
             .and_then(number_value)
-            .map(|value| EcmaString::from_utf8(&number_name(value))),
+            .map(|value| EcmaString::encode(&format_number(value))),
         PropertyName::Private(_) | PropertyName::Computed(_) | PropertyName::Missing(_) => None,
     }
 }
@@ -602,7 +606,7 @@ pub(crate) fn build_with_imports(
                         value: EnumValue::Constant(value),
                     },
                     Evaluated::Runtime
-                        if const_enum || binding.ambient && entry.initializer.is_some() =>
+                        if const_enum || (binding.ambient && entry.initializer.is_some()) =>
                     {
                         diagnostics.push(error(
                             source_id,
@@ -890,9 +894,8 @@ fn evaluate(
             }
             other => other,
         },
-        Expression::Binary(binary) => binary_value(
-            binary.operator,
-            evaluate(
+        Expression::Binary(binary) => {
+            let left = evaluate(
                 &binary.left,
                 current,
                 model,
@@ -905,8 +908,8 @@ fn evaluate(
                 imported_values,
                 source_id,
                 diagnostics,
-            ),
-            evaluate(
+            );
+            let right = evaluate(
                 &binary.right,
                 current,
                 model,
@@ -919,8 +922,47 @@ fn evaluate(
                 imported_values,
                 source_id,
                 diagnostics,
-            ),
-        ),
+            );
+            // `+` is the only binary operator that accepts string operands;
+            // `-`, `*`, etc. require numeric/bigint/enum operands.
+            if matches!(
+                binary.operator,
+                BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Remainder
+                    | BinaryOperator::Exponentiate
+                    | BinaryOperator::LeftShift
+                    | BinaryOperator::SignedRightShift
+                    | BinaryOperator::UnsignedRightShift
+                    | BinaryOperator::BitAnd
+                    | BinaryOperator::BitOr
+                    | BinaryOperator::BitXor
+            ) {
+                let left_error = matches!(left, Evaluated::Constant(EnumScalar::String(_)));
+                let right_error = matches!(right, Evaluated::Constant(EnumScalar::String(_)));
+                if left_error {
+                    diagnostics.push(error(
+                        source_id,
+                        ENUM_ARITHMETIC_LEFT_NOT_NUMBER,
+                        binary.left.range(),
+                        ENUM_ARITHMETIC_LEFT_NOT_NUMBER_MESSAGE,
+                    ));
+                }
+                if right_error {
+                    diagnostics.push(error(
+                        source_id,
+                        ENUM_ARITHMETIC_RIGHT_NOT_NUMBER,
+                        binary.right.range(),
+                        ENUM_ARITHMETIC_RIGHT_NOT_NUMBER_MESSAGE,
+                    ));
+                }
+                if left_error || right_error {
+                    return Evaluated::Invalid;
+                }
+            }
+            binary_value(binary.operator, left, right)
+        }
         _ => Evaluated::Runtime,
     }
 }
@@ -1030,11 +1072,15 @@ pub(crate) fn cook_member_property_name(
     match property {
         MemberProperty::Named(identifier) => source
             .token_text(identifier.data().token())
-            .map(EcmaString::from_utf8),
+            .map(EcmaString::encode),
         MemberProperty::Computed(expression) => match expression.data() {
             Expression::Literal(Literal::String(string)) => source
                 .token_text(string.data().token())
                 .and_then(string_value),
+            Expression::Literal(Literal::Number(number)) => source
+                .token_text(number.data().token())
+                .and_then(number_value)
+                .map(|value| EcmaString::encode(&format_number(value))),
             _ => None,
         },
         MemberProperty::Private(_) => None,
@@ -1087,19 +1133,6 @@ fn to_u32(value: f64) -> u32 {
     modulo as u32
 }
 
-fn number_name(value: f64) -> String {
-    if value == 0.0 {
-        "0".to_owned()
-    } else if value.fract() == 0.0
-        && value.is_finite()
-        && (0.0..=9_007_199_254_740_991.0).contains(&value)
-    {
-        format!("{}", value as u64)
-    } else {
-        format!("{value}")
-    }
-}
-
 fn error(
     source: SourceId,
     code: DiagnosticCode,
@@ -1120,4 +1153,141 @@ pub(crate) fn enum_declaration(statement: &Stmt) -> Option<(&EnumDeclaration, No
         return None;
     };
     Some((declaration, statement.id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ENUM_ARITHMETIC_LEFT_NOT_NUMBER, ENUM_ARITHMETIC_RIGHT_NOT_NUMBER};
+    use super::{cook_member_name, cook_member_property_name};
+    use crate::checker::{SemanticModel, check};
+    use crate::diagnostic::Recovered;
+    use crate::source::{ScriptKind, SourceId, SourceText};
+    use crate::syntax::{Expression, MemberProperty, SourceFile, Statement};
+    use crate::{parser, scanner};
+    use std::sync::Arc;
+
+    fn check_text(text: &str) -> Recovered<SemanticModel> {
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source,
+        ));
+        check(&parsed)
+    }
+
+    fn arithmetic_codes(result: &Recovered<SemanticModel>) -> Vec<&'static str> {
+        result
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .filter(|code| {
+                *code == ENUM_ARITHMETIC_LEFT_NOT_NUMBER.as_str()
+                    || *code == ENUM_ARITHMETIC_RIGHT_NOT_NUMBER.as_str()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn relational_operator_with_string_operand_does_not_trigger_arithmetic_diagnostic() {
+        // `<` is relational, not arithmetic — a string operand is legal, so
+        // C042/C043 must not fire even though the operand is a string constant.
+        let checked = check_text(r#"enum E { A = "x" < "y" }"#);
+        assert!(
+            arithmetic_codes(&checked).is_empty(),
+            "relational operator should not trigger C042/C043: {:?}",
+            arithmetic_codes(&checked)
+        );
+    }
+
+    #[test]
+    fn arithmetic_operator_with_string_operand_still_triggers_diagnostic() {
+        // `-` is arithmetic — a string left operand is invalid, so C042 fires.
+        let checked = check_text(r#"enum E { A = "x" - 1 }"#);
+        assert_eq!(
+            arithmetic_codes(&checked),
+            [ENUM_ARITHMETIC_LEFT_NOT_NUMBER.as_str()]
+        );
+    }
+    fn source_text(text: &str) -> SourceFile {
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source,
+        ));
+        assert!(
+            parsed.diagnostics().is_empty(),
+            "test source should parse cleanly: {:?}",
+            parsed.diagnostics()
+        );
+        parsed.into_product()
+    }
+
+    fn member_properties(source: &SourceFile) -> Vec<&MemberProperty> {
+        let mut properties = Vec::new();
+        for statement in source.statements() {
+            let Statement::Expression(statement) = statement.data() else {
+                continue;
+            };
+            let Expression::Member(member) = statement.expression.data() else {
+                continue;
+            };
+            properties.push(&member.property);
+        }
+        properties
+    }
+
+    #[test]
+    fn computed_numeric_member_property_name_normalizes_equivalent_spellings() {
+        // Decimal, exponent, separator, and hexadecimal spellings of the same
+        // numeric value must resolve to the same enum member name so computed
+        // access like `E[1e3]` finds the member declared as `1000`.
+        let source = source_text("o[1e3]; o[1_000]; o[0x3e8]; o[1000];");
+        let properties = member_properties(&source);
+        assert_eq!(properties.len(), 4, "expected four member expressions");
+        let names: Vec<_> = properties
+            .iter()
+            .map(|property| cook_member_property_name(&source, property))
+            .collect();
+        let first = names[0]
+            .as_ref()
+            .expect("first access should produce a name");
+        for name in &names[1..] {
+            assert_eq!(
+                name.as_ref().map(|n| n.to_utf8_lossy()),
+                Some(first.to_utf8_lossy()),
+                "all equivalent numeric spellings must normalize to the same member name"
+            );
+        }
+        assert_eq!(first.to_utf8_lossy(), "1000");
+    }
+
+    #[test]
+    fn exponent_boundary_numeric_names_use_ecmascript_format() {
+        let source = source_text("enum E { 1e21, 1e-7 }\no[1e21]; o[1e-7];");
+        let Statement::Enum(declaration) = source.statements()[0].data() else {
+            panic!("first statement should be an enum declaration");
+        };
+        let declared: Vec<String> = declaration
+            .members
+            .iter()
+            .map(|member| {
+                cook_member_name(&source, &member.data().name)
+                    .expect("numeric enum member should have a cooked name")
+                    .to_utf8_lossy()
+            })
+            .collect();
+        assert_eq!(declared, ["1e+21", "1e-7"]);
+
+        let accessed: Vec<String> = member_properties(&source)
+            .into_iter()
+            .map(|property| {
+                cook_member_property_name(&source, property)
+                    .expect("computed numeric access should have a cooked name")
+                    .to_utf8_lossy()
+            })
+            .collect();
+        assert_eq!(accessed, ["1e+21", "1e-7"]);
+    }
 }

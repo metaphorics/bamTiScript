@@ -1,33 +1,43 @@
 [workspace]
 members = [
     "crates/bamts-compiler",
+    "crates/bamts-cancel",
     "crates/bamts-bytecode",
     "crates/bamts-runtime",
     "crates/bamts-native",
     "crates/bamts-node",
     "crates/bamts-codegen",
     "crates/bamts-cli",
+    "crates/bamts-napi",
     "crates/bamts-verification",
     "crates/bamts",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "MIT"
 repository = "https://github.com/metaphorics/bamTiScript"
 
 [workspace.dependencies]
-bamts = { path = "crates/bamts", version = "0.1.0" }
-bamts-bytecode = { path = "crates/bamts-bytecode", version = "0.1.0" }
-bamts-cli = { path = "crates/bamts-cli", version = "0.1.0" }
-bamts-codegen = { path = "crates/bamts-codegen", version = "0.1.0" }
-bamts-compiler = { path = "crates/bamts-compiler", version = "0.1.0" }
-bamts-native = { path = "crates/bamts-native", version = "0.1.0" }
-bamts-node = { path = "crates/bamts-node", version = "0.1.0" }
-bamts-runtime = { path = "crates/bamts-runtime", version = "0.1.0" }
+bamts = { path = "crates/bamts", version = "0.2.0" }
+bamts-cancel = { path = "crates/bamts-cancel", version = "0.2.0" }
+bamts-bytecode = { path = "crates/bamts-bytecode", version = "0.2.0" }
+bamts-cli = { path = "crates/bamts-cli", version = "0.2.0" }
+bamts-codegen = { path = "crates/bamts-codegen", version = "0.2.0" }
+bamts-compiler = { path = "crates/bamts-compiler", version = "0.2.0" }
+bamts-native = { path = "crates/bamts-native", version = "0.2.0" }
+bamts-node = { path = "crates/bamts-node", version = "0.2.0" }
+bamts-runtime = { path = "crates/bamts-runtime", version = "0.2.0" }
+libc = "=0.2.189"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+
+# The corpus harness enforces production-scale case budgets in `cargo test`.
+# Optimize the checker so those budgets measure compiler work, not debug codegen.
+[profile.test.package.bamts-compiler]
+opt-level = 2

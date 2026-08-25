@@ -1,0 +1,12 @@
+[package]
+name = "bamts-cancel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = true
+license.workspace = true
+repository.workspace = true
+description = "Cooperative cancellation for BamTS compiler invocations"
+
+[lints]
+workspace = true

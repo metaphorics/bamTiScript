@@ -6,8 +6,8 @@ use bamts_bytecode::EcmaString;
 
 use crate::checker::{ScopeId, SemanticModel, SymbolId};
 use crate::syntax::{
-    BindingPattern, ExportDeclaration, ExportNamedDeclaration, NamespaceDeclaration, NodeId,
-    Statement, VariableDeclaration,
+    BindingPattern, ExportDeclaration, ExportNamedDeclaration, NamespaceDeclaration, NamespaceName,
+    NodeId, Statement, VariableDeclaration,
 };
 
 /// The checked meaning of all namespace declarations in one source file.
@@ -20,6 +20,9 @@ pub struct NamespaceFacts {
     member_uses: HashMap<NodeId, NamespaceMemberUse>,
     qualified_type_paths: HashMap<NodeId, Box<[SymbolId]>>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
+    /// Built from the per-plan export lists so `exports_for_member_declaration`
+    /// is linear in the number of matching exports.
+    exports_by_declaration: HashMap<NodeId, Vec<(NodeId, u32)>>,
 }
 
 impl NamespaceFacts {
@@ -34,6 +37,7 @@ impl NamespaceFacts {
             member_uses: HashMap::new(),
             qualified_type_paths: HashMap::new(),
             qualified_import_paths: HashMap::new(),
+            exports_by_declaration: HashMap::new(),
         }
     }
 
@@ -60,15 +64,19 @@ impl NamespaceFacts {
         &self,
         declaration: NodeId,
     ) -> Vec<(SymbolId, &NamespaceExport)> {
-        let mut matched = Vec::new();
-        for plan in self.declarations.values() {
-            for export in plan.exports.iter() {
-                if export.declaration() == declaration {
-                    matched.push((plan.container, export));
-                }
-            }
-        }
-        matched
+        let Some(positions) = self.exports_by_declaration.get(&declaration) else {
+            return Vec::new();
+        };
+        positions
+            .iter()
+            .map(|(plan_id, index)| {
+                let plan = self
+                    .declarations
+                    .get(plan_id)
+                    .expect("export index entry must resolve to a built plan");
+                (plan.container, &plan.exports[*index as usize])
+            })
+            .collect()
     }
 
     #[must_use]
@@ -163,11 +171,6 @@ impl NamespaceExport {
     pub(crate) const fn storage(&self) -> ExportStorage {
         self.storage
     }
-
-    #[must_use]
-    pub(crate) const fn declaration(&self) -> NodeId {
-        self.declaration
-    }
 }
 
 /// Whether an exported declaration is represented only by a property or also
@@ -247,14 +250,7 @@ pub(crate) fn build(
 
     let mut export_identities: HashMap<SymbolId, Vec<ExportIdentity>> = HashMap::new();
     for binding in bindings {
-        let is_value_bearing = !binding.ambient
-            && binding
-                .declaration
-                .body
-                .data()
-                .statements
-                .iter()
-                .any(|statement| statement_is_value_bearing(statement, &by_declaration));
+        let is_value_bearing = namespace_is_value_bearing(binding, &by_declaration);
         let mut exports = Vec::new();
         if is_value_bearing {
             for statement in &binding.declaration.body.data().statements {
@@ -306,6 +302,19 @@ pub(crate) fn build(
             },
         );
     }
+    // Build an export-by-declaration index once, in the same plan-iteration
+    // order as the original full scan, so the lookup order is preserved and
+    // each query is proportional to its number of matches.
+    let mut exports_by_declaration: HashMap<NodeId, Vec<(NodeId, u32)>> = HashMap::new();
+    for (plan_id, plan) in &facts.declarations {
+        for (i, export) in plan.exports.iter().enumerate() {
+            exports_by_declaration
+                .entry(export.declaration)
+                .or_default()
+                .push((*plan_id, i as u32));
+        }
+    }
+    facts.exports_by_declaration = exports_by_declaration;
 
     facts
 }
@@ -387,12 +396,16 @@ fn collect_runtime_exports(
             identities,
         ),
         Statement::Namespace(namespace)
-            if by_declaration.get(&declaration.id()).is_some_and(|child| {
-                !child.ambient && namespace_is_value_bearing(child, by_declaration)
-            }) =>
+            if matches!(namespace.name, NamespaceName::Identifier { .. })
+                && by_declaration.get(&declaration.id()).is_some_and(|child| {
+                    !child.ambient && namespace_is_value_bearing(child, by_declaration)
+                }) =>
         {
             add_identifier_export(
-                &namespace.name,
+                namespace
+                    .name
+                    .as_identifier()
+                    .expect("guarded identifier name"),
                 ExportStorage::LocalAndProperty,
                 declaration.id(),
                 binding,
@@ -446,7 +459,7 @@ fn add_export(
     let Some(symbol) = model.scope(binding.export_scope).value(name) else {
         return;
     };
-    let name = EcmaString::from_utf8(name);
+    let name = EcmaString::encode(name);
     exports.push(NamespaceExport {
         name: name.clone(),
         storage,
@@ -497,7 +510,8 @@ fn namespace_is_value_bearing(
     binding: &NamespaceDeclarationBinding<'_>,
     by_declaration: &HashMap<NodeId, &NamespaceDeclarationBinding<'_>>,
 ) -> bool {
-    !binding.ambient
+    matches!(binding.declaration.name, NamespaceName::Identifier { .. })
+        && !binding.ambient
         && binding
             .declaration
             .body

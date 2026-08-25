@@ -14,11 +14,15 @@ path = "src/main.rs"
 
 [dependencies]
 bamts = { workspace = true, features = ["node-host"] }
+bamts-cancel.workspace = true
 bamts-compiler.workspace = true
 bamts-runtime.workspace = true
 bamts-codegen = { workspace = true, features = ["aot", "host-jit"] }
 bamts-node.workspace = true
+bamts-native = { workspace = true, features = ["cache-guard"] }
+processkit = "=3.3.1"
 tempfile = "=3.27.0"
+tokio = { version = "1.39", features = ["rt", "time", "macros"] }
 
 [build-dependencies]
 bamts-node = { workspace = true, features = ["aot-main", "script-compiler"] }

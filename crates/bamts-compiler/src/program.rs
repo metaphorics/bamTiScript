@@ -12,8 +12,10 @@ use bamts_bytecode::{
     EdgeId, EdgeKind, EdgeTarget, Export, ExportSource, ModuleId, Program as BytecodeProgram,
     ProgramModule, ProgramVerifyError, Verified,
 };
+use bamts_cancel::{CancellationToken, Cancelled};
 
 use crate::{
+    diagnostic::DiagnosticCode,
     enum_plan::EnumFacts,
     lower::{self, LowerError, LowerOptions},
     namespace_plan::NamespaceFacts,
@@ -24,7 +26,9 @@ use crate::{
         PackageTarget, ProjectRoot, ResolutionConditions, ResolutionFlavor, plan_relative_module,
     },
     scanner,
-    source::{ScriptKind, SourceId, SourceIdentity, SourceText, TextRange, Utf16Pos},
+    source::{
+        MAX_SOURCE_BYTES, ScriptKind, SourceId, SourceIdentity, SourceText, TextRange, Utf16Pos,
+    },
     syntax::{
         ExportDeclaration, ExportDefaultValue, ExportNamedDeclaration, ExportSpecifierMode,
         ImportBinding, ImportSpecifierMode, ModuleExportName, SourceFile, Statement, TokenKind,
@@ -65,12 +69,14 @@ impl ModuleTarget {
     }
 }
 
-/// One source-anchored, resolved dependency.
+/// One source-anchored, resolved dependency. `target` is the runtime and lowering
+/// identity; `type_target` is a checker-only declaration overlay when one exists.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleEdge {
     kind: ModuleEdgeKind,
     specifier: Arc<str>,
     target: ModuleTarget,
+    type_target: Option<ModuleTarget>,
     range: TextRange,
 }
 
@@ -88,6 +94,11 @@ impl ModuleEdge {
     #[must_use]
     pub const fn target(&self) -> &ModuleTarget {
         &self.target
+    }
+
+    #[must_use]
+    pub const fn type_target(&self) -> Option<&ModuleTarget> {
+        self.type_target.as_ref()
     }
 
     #[must_use]
@@ -139,8 +150,11 @@ impl ResolvedModule {
 
 /// The canonical whole-program value shared by every compiler and execution phase.
 ///
-/// Modules are stored in deterministic dependency-first DFS postorder. Cycles are
-/// retained as ordinary edges; each canonical file still appears exactly once.
+/// Runtime and type-only modules are stored in deterministic dependency-first DFS
+/// postorder. Declaration overlays are appended afterward in deterministic discovery
+/// order. Cycles remain ordinary edges; each canonical file appears exactly once.
+/// Overlays are reachable only through [`ModuleEdge::type_target`], so eager runtime
+/// closure and lowering continue to follow only [`ModuleEdge::target`].
 #[derive(Clone, Debug)]
 pub struct ResolvedProgram {
     root: ProjectRoot,
@@ -148,6 +162,11 @@ pub struct ResolvedProgram {
     modules: Arc<[ResolvedModule]>,
     module_indices: HashMap<SourceId, usize>,
     commonjs: bool,
+    strict_null_checks: bool,
+    no_implicit_any: bool,
+    always_strict: bool,
+    es5: bool,
+    check_js: bool,
 }
 
 impl ResolvedProgram {
@@ -183,6 +202,40 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn is_commonjs(&self) -> bool {
         self.commonjs
+    }
+
+    /// Whether compiler options enable `strictNullChecks`.
+    #[must_use]
+    pub const fn is_strict_null_checks(&self) -> bool {
+        self.strict_null_checks
+    }
+
+    /// Whether compiler options enable `noImplicitAny`.
+    #[must_use]
+    pub const fn is_no_implicit_any(&self) -> bool {
+        self.no_implicit_any
+    }
+
+    /// Whether compiler options enable `alwaysStrict`.
+    #[must_use]
+    pub const fn is_always_strict(&self) -> bool {
+        self.always_strict
+    }
+    /// Whether compiler options target ES5 or earlier.
+    #[must_use]
+    pub const fn is_target_es5(&self) -> bool {
+        self.es5
+    }
+
+    /// Whether compiler options enable `checkJs`.
+    #[must_use]
+    pub const fn is_check_js(&self) -> bool {
+        self.check_js
+    }
+
+    /// Enables semantic diagnostics for JavaScript modules.
+    pub fn enable_javascript_checking(&mut self) {
+        self.check_js = true;
     }
 
     /// Returns the eager runtime closure in the program's canonical order.
@@ -245,9 +298,24 @@ impl UnresolvedModuleDiagnostic {
     }
 }
 
+/// Stable diagnostic code for a per-file source budget breach.
+pub const SOURCE_TOO_LARGE: DiagnosticCode = DiagnosticCode::new("BAMTS-R001");
+/// Stable diagnostic code for a session aggregate source budget breach.
+pub const SESSION_TOO_LARGE: DiagnosticCode = DiagnosticCode::new("BAMTS-R002");
+
+/// The session aggregate UTF-8 byte budget across every source a
+/// [`ProgramLoader`] loads for one module graph (256 MiB, the S1 frontend
+/// session bound).
+///
+/// Each canonical file is counted once. A graph whose total reaches exactly
+/// this budget is accepted; one byte more is rejected with
+/// [`ProgramLoadError::SessionTooLarge`].
+pub const MAX_SESSION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Fail-fast program loading errors. No partially resolved graph is exposed.
 #[derive(Debug)]
 pub enum ProgramLoadError {
+    Cancelled(Cancelled),
     InvalidRoot(io::Error),
     EntryOutsideRoot(PathBuf),
     TraversalRejected {
@@ -273,11 +341,22 @@ pub enum ProgramLoadError {
         source: PackageError,
     },
     UnresolvedModule(UnresolvedModuleDiagnostic),
+    /// One source file exceeded the 16 MiB per-file input budget.
+    SourceTooLarge {
+        path: PathBuf,
+        len: usize,
+    },
+    /// Loading one more source would exceed the 256 MiB session budget.
+    SessionTooLarge {
+        path: PathBuf,
+        total: usize,
+    },
 }
 
 impl fmt::Display for ProgramLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(error) => error.fmt(formatter),
             Self::InvalidRoot(error) => {
                 write!(formatter, "cannot canonicalize project root: {error}")
             }
@@ -330,6 +409,51 @@ impl fmt::Display for ProgramLoadError {
                 diagnostic.specifier(),
                 diagnostic.importer().display()
             ),
+            Self::SourceTooLarge { path, len } => write!(
+                formatter,
+                "source file {} is {len} bytes, exceeding the {MAX_SOURCE_BYTES}-byte per-file budget",
+                path.display()
+            ),
+            Self::SessionTooLarge { path, total } => write!(
+                formatter,
+                "loading {} would raise the session source total to {total} bytes, exceeding the {MAX_SESSION_SOURCE_BYTES}-byte session budget",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl ProgramLoadError {
+    /// The stable diagnostic code identifying a frontend budget breach, when
+    /// this failure is one.
+    #[must_use]
+    pub const fn code(&self) -> Option<DiagnosticCode> {
+        match self {
+            Self::SourceTooLarge { .. } => Some(SOURCE_TOO_LARGE),
+            Self::SessionTooLarge { .. } => Some(SESSION_TOO_LARGE),
+            _ => None,
+        }
+    }
+}
+
+impl From<Cancelled> for ProgramLoadError {
+    fn from(error: Cancelled) -> Self {
+        Self::Cancelled(error)
+    }
+}
+
+impl From<crate::scanner::ScanError> for ProgramLoadError {
+    fn from(error: crate::scanner::ScanError) -> Self {
+        match error {
+            crate::scanner::ScanError::Cancelled(cancelled) => Self::Cancelled(cancelled),
+        }
+    }
+}
+
+impl From<crate::parser::ParseError> for ProgramLoadError {
+    fn from(error: crate::parser::ParseError) -> Self {
+        match error {
+            crate::parser::ParseError::Cancelled(cancelled) => Self::Cancelled(cancelled),
         }
     }
 }
@@ -337,6 +461,7 @@ impl fmt::Display for ProgramLoadError {
 impl std::error::Error for ProgramLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Cancelled(error) => Some(error),
             Self::InvalidRoot(error) | Self::Read { source: error, .. } => Some(error),
             Self::InvalidSpecifier { source, .. } => Some(source),
             Self::InvalidPackage { source, .. } => Some(source),
@@ -367,12 +492,23 @@ impl ProgramLoader {
 
     /// Resolves and loads an entrypoint. The entrypoint may be root-relative or absolute.
     pub fn load(&self, entrypoint: impl AsRef<Path>) -> Result<ResolvedProgram, ProgramLoadError> {
+        let cancel = CancellationToken::new();
+        self.load_with_cancel(entrypoint, &cancel)
+    }
+
+    /// Resolves and loads an entrypoint with cooperative cancellation.
+    pub fn load_with_cancel(
+        &self,
+        entrypoint: impl AsRef<Path>,
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedProgram, ProgramLoadError> {
+        cancel.check()?;
         let requested = self
             .root
             .resolve(entrypoint.as_ref())
             .map_err(|_| ProgramLoadError::EntryOutsideRoot(entrypoint.as_ref().to_path_buf()))?;
         let entrypoint = self
-            .select_absolute(&requested, ResolutionFlavor::Runtime)?
+            .select_absolute(&requested, ResolutionFlavor::Runtime, cancel)?
             .ok_or_else(|| ProgramLoadError::Read {
                 path: requested,
                 source: io::Error::new(io::ErrorKind::NotFound, "entrypoint does not exist"),
@@ -380,10 +516,15 @@ impl ProgramLoader {
 
         let mut state = LoadState {
             loader: self,
+            cancel,
             identities: HashMap::new(),
             modules: Vec::new(),
+            overlay_worklist: Vec::new(),
+            type_overlays: Vec::new(),
+            session_bytes: 0,
         };
-        let entrypoint = state.visit(entrypoint)?;
+        let entrypoint = state.visit_with_cancel(entrypoint)?;
+        state.load_declaration_overlays_with_cancel()?;
         let module_indices = state
             .modules
             .iter()
@@ -399,6 +540,14 @@ impl ProgramLoader {
                 .options
                 .module()
                 .is_some_and(|module| module.eq_ignore_ascii_case("commonjs")),
+            strict_null_checks: self.options.strict_null_checks(),
+            no_implicit_any: self.options.no_implicit_any(),
+            always_strict: self.options.always_strict(),
+            es5: self
+                .options
+                .target()
+                .is_some_and(|target| matches!(target, "es5" | "ES5" | "es3" | "ES3")),
+            check_js: self.options.check_js(),
         })
     }
 
@@ -406,6 +555,7 @@ impl ProgramLoader {
         &self,
         requested: &Path,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
         let relative = requested.strip_prefix(self.root.path()).map_err(|_| {
             ProgramLoadError::TraversalRejected {
@@ -432,35 +582,53 @@ impl ProgramLoader {
             ),
             source,
         })?;
-        self.canonical_selection(plan.candidates(), flavor)
+        self.canonical_selection(plan.candidates(), flavor, cancel)
     }
 
     fn canonical_selection(
         &self,
         candidates: &[PathBuf],
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
         if flavor == ResolutionFlavor::Runtime {
             for candidate in candidates {
-                if is_declaration_path(candidate) || !candidate.is_file() {
+                cancel.check()?;
+                if is_declaration_path(candidate) {
                     continue;
                 }
-                return self.canonical_candidate(candidate).map(Some);
+                cancel.check()?;
+                let is_file = candidate.is_file();
+                cancel.check()?;
+                if !is_file {
+                    continue;
+                }
+                return self.canonical_candidate(candidate, cancel).map(Some);
             }
         }
         for candidate in candidates {
-            if candidate.is_file() {
-                return self.canonical_candidate(candidate).map(Some);
+            cancel.check()?;
+            cancel.check()?;
+            let is_file = candidate.is_file();
+            cancel.check()?;
+            if is_file {
+                return self.canonical_candidate(candidate, cancel).map(Some);
             }
         }
         Ok(None)
     }
 
-    fn canonical_candidate(&self, candidate: &Path) -> Result<PathBuf, ProgramLoadError> {
+    fn canonical_candidate(
+        &self,
+        candidate: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<PathBuf, ProgramLoadError> {
+        cancel.check()?;
         let canonical = fs::canonicalize(candidate).map_err(|source| ProgramLoadError::Read {
             path: candidate.to_path_buf(),
             source,
         })?;
+        cancel.check()?;
         if !canonical.starts_with(self.root.path()) {
             return Err(ProgramLoadError::TraversalRejected {
                 path: canonical,
@@ -474,18 +642,51 @@ impl ProgramLoader {
         &self,
         importer: &Path,
         edge: &UnresolvedEdge,
-    ) -> Result<ResolvedEdgeTarget, ProgramLoadError> {
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedEdge, ProgramLoadError> {
+        cancel.check()?;
         if edge.specifier.starts_with("node:") {
-            return Ok(ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)));
+            return Ok(ResolvedEdge {
+                target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
+                type_overlay: None,
+            });
         }
 
-        let flavor = match edge.kind {
-            ModuleEdgeKind::TypeOnly => ResolutionFlavor::Types,
-            ModuleEdgeKind::StaticRuntime | ModuleEdgeKind::DynamicRuntime => {
-                ResolutionFlavor::Runtime
-            }
+        let flavor = if edge.kind == ModuleEdgeKind::TypeOnly || is_declaration_path(importer) {
+            ResolutionFlavor::Types
+        } else {
+            ResolutionFlavor::Runtime
         };
-        let selected = if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
+        if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
+            let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
+            return Ok(ResolvedEdge {
+                target,
+                type_overlay,
+            });
+        }
+        if flavor == ResolutionFlavor::Types && split_package_specifier(&edge.specifier).is_some() {
+            return Ok(ResolvedEdge {
+                target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
+                type_overlay: None,
+            });
+        }
+        Err(ProgramLoadError::UnresolvedModule(diagnostic(
+            importer,
+            &edge.specifier,
+            edge.kind,
+            edge.range,
+        )))
+    }
+
+    fn resolve_local(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
+        cancel.check()?;
+        if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
             let plan = plan_relative_module(
                 &self.root,
                 importer,
@@ -497,46 +698,61 @@ impl ProgramLoader {
                 diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
                 source,
             })?;
-            self.canonical_selection(plan.candidates(), flavor)?
-                .map(ResolvedEdgeTarget::Local)
-        } else if edge.specifier.starts_with('#') {
-            self.resolve_package_import(importer, edge, flavor)?
-        } else {
-            match self.resolve_mapped(&edge.specifier, flavor)? {
+            return Ok(self
+                .canonical_selection(plan.candidates(), flavor, cancel)?
+                .map(ResolvedEdgeTarget::Local));
+        }
+        if edge.specifier.starts_with('#') {
+            return self.resolve_package_import(importer, edge, flavor, cancel);
+        }
+        Ok(
+            match self.resolve_mapped(&edge.specifier, flavor, cancel)? {
                 Some(mapped) => Some(ResolvedEdgeTarget::Local(mapped)),
                 None => self
-                    .resolve_package(importer, edge, flavor)?
+                    .resolve_package(importer, edge, flavor, cancel)?
                     .map(ResolvedEdgeTarget::Local),
-            }
+            },
+        )
+    }
+
+    fn type_overlay(
+        &self,
+        importer: &Path,
+        edge: &UnresolvedEdge,
+        runtime_target: &ResolvedEdgeTarget,
+        cancel: &CancellationToken,
+    ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        cancel.check()?;
+        if edge.kind == ModuleEdgeKind::TypeOnly || is_declaration_path(importer) {
+            return Ok(None);
+        }
+        let ResolvedEdgeTarget::Local(runtime_path) = runtime_target else {
+            return Ok(None);
         };
-        if let Some(target) = selected {
-            return Ok(target);
-        }
-        if edge.kind == ModuleEdgeKind::TypeOnly
-            && split_package_specifier(&edge.specifier).is_some()
-        {
-            return Ok(ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)));
-        }
-        Err(ProgramLoadError::UnresolvedModule(diagnostic(
-            importer,
-            &edge.specifier,
-            edge.kind,
-            edge.range,
-        )))
+        let Some(ResolvedEdgeTarget::Local(type_path)) =
+            self.resolve_local(importer, edge, ResolutionFlavor::Types, cancel)?
+        else {
+            return Ok(None);
+        };
+        Ok((type_path != *runtime_path).then_some(type_path))
     }
 
     fn resolve_mapped(
         &self,
         specifier: &str,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        cancel.check()?;
         for mapping in self.options.paths() {
+            cancel.check()?;
             let Some(capture) = pattern_capture(mapping.pattern(), specifier) else {
                 continue;
             };
             for target in mapping.targets() {
+                cancel.check()?;
                 let target = PathBuf::from(target.to_string_lossy().replace('*', capture));
-                if let Some(selected) = self.select_absolute(&target, flavor)? {
+                if let Some(selected) = self.select_absolute(&target, flavor, cancel)? {
                     return Ok(Some(selected));
                 }
             }
@@ -549,23 +765,31 @@ impl ProgramLoader {
         importer: &Path,
         edge: &UnresolvedEdge,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
+        cancel.check()?;
         let Some((package_name, subpath)) = split_package_specifier(&edge.specifier) else {
             return Ok(None);
         };
         let mut directory = importer.parent();
         while let Some(current) = directory {
+            cancel.check()?;
             if !current.starts_with(self.root.path()) {
                 break;
             }
             let package_directory = current.join("node_modules").join(package_name);
             let package_path = package_directory.join("package.json");
-            if package_path.is_file() {
+            cancel.check()?;
+            let is_file = package_path.is_file();
+            cancel.check()?;
+            if is_file {
+                cancel.check()?;
                 let package_source =
                     fs::read_to_string(&package_path).map_err(|source| ProgramLoadError::Read {
                         path: package_path.clone(),
                         source,
                     })?;
+                cancel.check()?;
                 let package = PackageJson::parse(&self.root, &package_path, &package_source)
                     .map_err(|source| ProgramLoadError::InvalidPackage {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
@@ -583,7 +807,7 @@ impl ProgramLoader {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
                         source,
                     })?;
-                return self.select_absolute(&target, flavor);
+                return self.select_absolute(&target, flavor, cancel);
             }
             if current == self.root.path() {
                 break;
@@ -597,19 +821,26 @@ impl ProgramLoader {
         importer: &Path,
         edge: &UnresolvedEdge,
         flavor: ResolutionFlavor,
+        cancel: &CancellationToken,
     ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
         let mut directory = importer.parent();
         while let Some(current) = directory {
+            cancel.check()?;
             if !current.starts_with(self.root.path()) {
                 break;
             }
             let package_path = current.join("package.json");
-            if package_path.is_file() {
+            cancel.check()?;
+            let is_file = package_path.is_file();
+            cancel.check()?;
+            if is_file {
+                cancel.check()?;
                 let package_source =
                     fs::read_to_string(&package_path).map_err(|source| ProgramLoadError::Read {
                         path: package_path.clone(),
                         source,
                     })?;
+                cancel.check()?;
                 let package = PackageJson::parse(&self.root, &package_path, &package_source)
                     .map_err(|source| ProgramLoadError::InvalidPackage {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
@@ -629,7 +860,7 @@ impl ProgramLoader {
                     })?;
                 return match target {
                     PackageTarget::Path(path) => Ok(self
-                        .select_absolute(&path, flavor)?
+                        .select_absolute(&path, flavor, cancel)?
                         .map(ResolvedEdgeTarget::Local)),
                     PackageTarget::External(specifier) => {
                         let external = UnresolvedEdge {
@@ -637,9 +868,11 @@ impl ProgramLoader {
                             specifier,
                             range: edge.range,
                         };
-                        match self.resolve_mapped(&external.specifier, flavor)? {
+                        match self.resolve_mapped(&external.specifier, flavor, cancel)? {
                             Some(mapped) => Ok(Some(ResolvedEdgeTarget::Local(mapped))),
-                            None => match self.resolve_package(importer, &external, flavor)? {
+                            None => match self
+                                .resolve_package(importer, &external, flavor, cancel)?
+                            {
                                 Some(package) => Ok(Some(ResolvedEdgeTarget::Local(package))),
                                 None => Ok(Some(ResolvedEdgeTarget::External(external.specifier))),
                             },
@@ -662,31 +895,112 @@ enum ResolvedEdgeTarget {
     External(Arc<str>),
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedEdge {
+    target: ResolvedEdgeTarget,
+    type_overlay: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingEdge {
+    edge: UnresolvedEdge,
+    type_overlay: Option<PathBuf>,
+}
+
+/// Accumulates `added` UTF-8 source bytes into the session budget, returning
+/// the new total, or the budget-breaching total once
+/// [`MAX_SESSION_SOURCE_BYTES`] would be exceeded.
+fn accumulate_session_bytes(session_bytes: usize, added: usize) -> Result<usize, usize> {
+    let total = session_bytes.saturating_add(added);
+    if total > MAX_SESSION_SOURCE_BYTES {
+        return Err(total);
+    }
+    Ok(total)
+}
+
 struct LoadState<'a> {
     loader: &'a ProgramLoader,
+    cancel: &'a CancellationToken,
     identities: HashMap<PathBuf, SourceId>,
     modules: Vec<ResolvedModule>,
+    overlay_worklist: Vec<PathBuf>,
+    type_overlays: Vec<(SourceId, usize, PathBuf)>,
+    /// UTF-8 bytes loaded so far, checked against `MAX_SESSION_SOURCE_BYTES`.
+    session_bytes: usize,
+}
+#[derive(Clone)]
+struct Frame {
+    path: PathBuf,
+    source_id: SourceId,
+    script_kind: ScriptKind,
+    source: Arc<SourceText>,
+    remaining: std::vec::IntoIter<UnresolvedEdge>,
+    dependencies: Vec<ModuleEdge>,
+    /// Local edge whose target visit is in flight (child on the stack).
+    pending_edge: Option<PendingEdge>,
 }
 
 impl LoadState<'_> {
+    fn complete_local_edge(
+        frame: &mut Frame,
+        pending: PendingEdge,
+        runtime_target: SourceId,
+        type_overlays: &mut Vec<(SourceId, usize, PathBuf)>,
+        overlay_worklist: &mut Vec<PathBuf>,
+    ) {
+        let dependency_index = frame.dependencies.len();
+        frame.dependencies.push(ModuleEdge {
+            kind: pending.edge.kind,
+            specifier: pending.edge.specifier,
+            target: ModuleTarget::Local(runtime_target),
+            type_target: None,
+            range: pending.edge.range,
+        });
+        if let Some(path) = pending.type_overlay {
+            type_overlays.push((frame.source_id, dependency_index, path.clone()));
+            overlay_worklist.push(path);
+        }
+    }
+
+    fn load_declaration_overlays_with_cancel(&mut self) -> Result<(), ProgramLoadError> {
+        let mut next = 0;
+        while next < self.overlay_worklist.len() {
+            self.cancel.check()?;
+            let path = self.overlay_worklist[next].clone();
+            next += 1;
+            if !self.identities.contains_key(&path) {
+                self.visit_with_cancel(path)?;
+            }
+        }
+
+        let module_indices: HashMap<SourceId, usize> = self
+            .modules
+            .iter()
+            .enumerate()
+            .map(|(index, module)| (module.source_id(), index))
+            .collect();
+        for (importer, dependency_index, path) in &self.type_overlays {
+            self.cancel.check()?;
+            let type_source_id = *self
+                .identities
+                .get(path)
+                .expect("every recorded declaration overlay was loaded");
+            let module_index = module_indices[importer];
+            let module = &mut self.modules[module_index];
+            let mut dependencies = module.dependencies.to_vec();
+            dependencies[*dependency_index].type_target = Some(ModuleTarget::Local(type_source_id));
+            module.dependencies = Arc::from(dependencies);
+        }
+        Ok(())
+    }
+
     /// Loads `entrypoint` and its local import graph with an explicit stack.
     ///
     /// SourceIds are assigned in DFS preorder (first discovery). Modules are
     /// appended in DFS postorder. Local edges are resolved left-to-right; a path
     /// already present in `identities` is reused immediately, which both
     /// deduplicates diamonds and retains cycle edges without re-entering.
-    fn visit(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
-        struct Frame {
-            path: PathBuf,
-            source_id: SourceId,
-            script_kind: ScriptKind,
-            source: Arc<SourceText>,
-            remaining: std::vec::IntoIter<UnresolvedEdge>,
-            dependencies: Vec<ModuleEdge>,
-            /// Local edge whose target visit is in flight (child on the stack).
-            pending_edge: Option<UnresolvedEdge>,
-        }
-
+    fn visit_with_cancel(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
         enum Resume {
             Enter(PathBuf),
             Advance,
@@ -696,21 +1010,23 @@ impl LoadState<'_> {
         let mut resume = Resume::Enter(entrypoint);
 
         loop {
+            self.cancel.check()?;
             match resume {
                 Resume::Enter(path) => {
                     if let Some(&source_id) = self.identities.get(&path) {
                         let Some(parent) = stack.last_mut() else {
                             return Ok(source_id);
                         };
-                        let edge = parent.pending_edge.take().expect(
+                        let pending = parent.pending_edge.take().expect(
                             "deduplicated or cyclic local resume belongs to a pending edge",
                         );
-                        parent.dependencies.push(ModuleEdge {
-                            kind: edge.kind,
-                            specifier: edge.specifier,
-                            target: ModuleTarget::Local(source_id),
-                            range: edge.range,
-                        });
+                        Self::complete_local_edge(
+                            parent,
+                            pending,
+                            source_id,
+                            &mut self.type_overlays,
+                            &mut self.overlay_worklist,
+                        );
                         resume = Resume::Advance;
                         continue;
                     }
@@ -723,14 +1039,33 @@ impl LoadState<'_> {
 
                     let script_kind = script_kind(&path)
                         .ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
+                    self.cancel.check()?;
                     let text =
                         fs::read_to_string(&path).map_err(|source| ProgramLoadError::Read {
                             path: path.clone(),
                             source,
                         })?;
-                    let source = Arc::new(SourceText::new(text));
-                    let parsed =
-                        parser::parse(scanner::scan(source_id, script_kind, Arc::clone(&source)));
+                    self.cancel.check()?;
+                    let len = text.len();
+                    let source = SourceText::new(text)
+                        .map_err(|_| ProgramLoadError::SourceTooLarge {
+                            path: path.clone(),
+                            len,
+                        })?
+                        .with_declaration_file(is_declaration_path(&path));
+                    self.session_bytes = accumulate_session_bytes(self.session_bytes, len)
+                        .map_err(|total| ProgramLoadError::SessionTooLarge {
+                            path: path.clone(),
+                            total,
+                        })?;
+                    let source = Arc::new(source);
+                    let scanned = scanner::scan_with_cancel(
+                        source_id,
+                        script_kind,
+                        Arc::clone(&source),
+                        self.cancel.clone(),
+                    )?;
+                    let parsed = parser::parse_with_cancel(scanned, self.cancel.clone())?;
                     let unresolved = collect_edges(parsed.product()).map_err(|range| {
                         ProgramLoadError::IllFormedModuleSpecifier {
                             importer: path.clone(),
@@ -755,19 +1090,25 @@ impl LoadState<'_> {
                             .last_mut()
                             .expect("Advance always runs with a frame on the stack");
                         loop {
+                            self.cancel.check()?;
                             let Some(edge) = frame.remaining.next() else {
                                 break None;
                             };
-                            match self.loader.resolve_edge(&frame.path, &edge)? {
+                            let resolved =
+                                self.loader.resolve_edge(&frame.path, &edge, self.cancel)?;
+                            let target = resolved.target;
+                            let type_overlay = resolved.type_overlay;
+                            match target {
                                 ResolvedEdgeTarget::Local(target_path) => {
-                                    frame.pending_edge = Some(edge);
+                                    frame.pending_edge = Some(PendingEdge { edge, type_overlay });
                                     break Some(target_path);
                                 }
                                 ResolvedEdgeTarget::External(specifier) => {
                                     frame.dependencies.push(ModuleEdge {
                                         kind: edge.kind,
-                                        specifier: edge.specifier,
+                                        specifier: Arc::clone(&edge.specifier),
                                         target: ModuleTarget::External(specifier),
+                                        type_target: None,
                                         range: edge.range,
                                     });
                                 }
@@ -794,16 +1135,17 @@ impl LoadState<'_> {
                     let Some(parent) = stack.last_mut() else {
                         return Ok(source_id);
                     };
-                    let edge = parent
+                    let pending = parent
                         .pending_edge
                         .take()
                         .expect("finished child always completes a parent local edge");
-                    parent.dependencies.push(ModuleEdge {
-                        kind: edge.kind,
-                        specifier: edge.specifier,
-                        target: ModuleTarget::Local(source_id),
-                        range: edge.range,
-                    });
+                    Self::complete_local_edge(
+                        parent,
+                        pending,
+                        source_id,
+                        &mut self.type_overlays,
+                        &mut self.overlay_worklist,
+                    );
                     resume = Resume::Advance;
                 }
             }
@@ -1060,6 +1402,7 @@ impl DynamicEdgeCollector<'_> {
                 ExportDefaultValue::Class(class) => self.scan_class(class),
                 ExportDefaultValue::Expression(expression) => self.scan_expression(expression),
                 ExportDefaultValue::Missing(_) => {}
+                ExportDefaultValue::Interface(_) => {}
             },
             Statement::Export(ExportDeclaration::Assignment(expression)) => {
                 self.scan_expression(expression)
@@ -1192,6 +1535,14 @@ impl DynamicEdgeCollector<'_> {
             ArrayElement, Expression, Literal, MemberProperty, ObjectMember, PropertyName,
         };
         match expression.data() {
+            Expression::JsxElement(value) => {
+                self.scan_jsx_attributes(&value.opening.data().attributes);
+                self.scan_jsx_children(&value.children);
+            }
+            Expression::JsxFragment(value) => self.scan_jsx_children(&value.children),
+            Expression::JsxSelfClosingElement(value) => {
+                self.scan_jsx_attributes(&value.attributes);
+            }
             Expression::Template(value) => {
                 for expression in &value.expressions {
                     self.scan_expression(expression);
@@ -1308,6 +1659,41 @@ impl DynamicEdgeCollector<'_> {
             | Expression::Literal(_)
             | Expression::Meta(_)
             | Expression::Missing(_) => {}
+        }
+    }
+
+    fn scan_jsx_attributes(&mut self, attributes: &[crate::syntax::JsxAttributeItem]) {
+        use crate::syntax::JsxAttributeInitializer;
+        for attribute in attributes {
+            match attribute {
+                crate::syntax::JsxAttributeItem::Attribute(attribute) => {
+                    if let Some(JsxAttributeInitializer::Expression(container)) =
+                        &attribute.data().initializer
+                        && let Some(expression) = &container.data().expression
+                    {
+                        self.scan_expression(expression);
+                    }
+                }
+                crate::syntax::JsxAttributeItem::Spread(spread) => {
+                    self.scan_expression(&spread.data().expression);
+                }
+            }
+        }
+    }
+
+    fn scan_jsx_children(&mut self, children: &[crate::syntax::JsxChild]) {
+        use crate::syntax::JsxChild;
+        for child in children {
+            match child {
+                JsxChild::ExpressionContainer(container) => {
+                    if let Some(expression) = &container.data().expression {
+                        self.scan_expression(expression);
+                    }
+                }
+                JsxChild::Spread(spread) => self.scan_expression(&spread.data().expression),
+                JsxChild::Element(expression) => self.scan_expression(expression),
+                JsxChild::Text(_) => {}
+            }
         }
     }
 
@@ -1459,7 +1845,7 @@ fn parse_hex(bytes: &[u8]) -> Option<u32> {
     bytes.iter().try_fold(0_u32, |value, byte| {
         char::from(*byte)
             .to_digit(16)
-            .map(|digit| value * 16 + digit)
+            .and_then(|digit| value.checked_mul(16)?.checked_add(digit))
     })
 }
 
@@ -1596,6 +1982,7 @@ pub enum ProgramLowerPhase {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramLowerErrorKind {
+    Cancelled(Cancelled),
     FrontendEntrypointMismatch {
         resolved: SourceId,
         frontend: SourceId,
@@ -1628,22 +2015,36 @@ pub struct ProgramLowerError {
 
 impl fmt::Display for ProgramLowerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "program lowering failed in {} during {:?}: {:?}",
-            self.module.display(),
-            self.phase,
-            self.kind
-        )
+        match &self.kind {
+            ProgramLowerErrorKind::Cancelled(error) => error.fmt(formatter),
+            _ => write!(
+                formatter,
+                "program lowering failed in {} during {:?}: {:?}",
+                self.module.display(),
+                self.phase,
+                self.kind
+            ),
+        }
     }
 }
 
 impl std::error::Error for ProgramLowerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
+            ProgramLowerErrorKind::Cancelled(error) => Some(error),
             ProgramLowerErrorKind::Lower(error) => Some(error),
             ProgramLowerErrorKind::Link(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+impl From<Cancelled> for ProgramLowerError {
+    fn from(error: Cancelled) -> Self {
+        Self {
+            module: PathBuf::new(),
+            phase: ProgramLowerPhase::Frontend,
+            kind: ProgramLowerErrorKind::Cancelled(error),
         }
     }
 }
@@ -1711,6 +2112,17 @@ pub fn lower_program(
     frontend: &ProgramFrontendOutput,
     options: LowerOptions,
 ) -> Result<ExecutableProgram, ProgramLowerError> {
+    lower_program_with_cancel(resolved, frontend, options, &CancellationToken::new())
+}
+
+/// Lowers one canonical resolved program with cooperative cancellation.
+pub fn lower_program_with_cancel(
+    resolved: &ResolvedProgram,
+    frontend: &ProgramFrontendOutput,
+    options: LowerOptions,
+    cancel: &CancellationToken,
+) -> Result<ExecutableProgram, ProgramLowerError> {
+    cancel.check()?;
     if frontend.entrypoint_id() != resolved.entrypoint_id() {
         return Err(program_lower_error(
             resolved.entrypoint().path(),
@@ -1722,6 +2134,7 @@ pub fn lower_program(
         ));
     }
     for output in frontend.modules() {
+        cancel.check()?;
         let source = output.source_file().source_id();
         if resolved.module(source).is_none() {
             return Err(program_lower_error(
@@ -1740,6 +2153,7 @@ pub fn lower_program(
         .collect();
     let mut raw_modules = Vec::with_capacity(resolved.modules().len());
     for module in resolved.modules() {
+        cancel.check()?;
         let output = frontend.module(module.source_id()).ok_or_else(|| {
             program_lower_error(
                 module.path(),
@@ -1764,9 +2178,13 @@ pub fn lower_program(
             name,
             &module_ids,
         )?);
+        cancel.check()?;
     }
+    cancel.check()?;
     resolve_import_equals_bindings(&mut raw_modules);
+    cancel.check()?;
     expand_star_exports(&mut raw_modules);
+    cancel.check()?;
 
     let mut linked_modules = Vec::with_capacity(raw_modules.len());
     let mut provenance = Vec::with_capacity(raw_modules.len());
@@ -1776,6 +2194,7 @@ pub fn lower_program(
         .zip(raw_modules.iter())
         .enumerate()
     {
+        cancel.check()?;
         let output = frontend
             .module(resolved_module.source_id())
             .expect("frontend presence checked above");
@@ -1802,6 +2221,7 @@ pub fn lower_program(
                 ProgramLowerErrorKind::Lower(error),
             )
         })?;
+        cancel.check()?;
         linked_modules.push(materialize_program_module(code, raw));
         provenance.push(ExecutableModuleProvenance {
             module: ModuleId::new(index as u32),
@@ -1809,6 +2229,7 @@ pub fn lower_program(
             edges: Arc::from(resolved_module.dependencies()),
         });
     }
+    cancel.check()?;
     let entry = module_ids[&resolved.entrypoint_id()];
     let wire = BytecodeProgram::link(linked_modules, entry).map_err(|error| {
         let path = error
@@ -1821,6 +2242,7 @@ pub fn lower_program(
             ProgramLowerErrorKind::Link(error),
         )
     })?;
+    cancel.check()?;
     Ok(ExecutableProgram { wire, provenance })
 }
 
@@ -2062,12 +2484,14 @@ fn collect_top_level_statement(
                 let Statement::Namespace(declaration) = statement.data() else {
                     unreachable!("namespace plan belongs to namespace statement");
                 };
-                let name = identifier(file, &declaration.name);
-                if !bindings.iter().any(|binding| binding.name == name) {
-                    bindings.push(RawBinding {
-                        name,
-                        kind: RawBindingKind::Hoisted,
-                    });
+                if let Some(name_node) = declaration.name.as_identifier() {
+                    let name = identifier(file, name_node);
+                    if !bindings.iter().any(|binding| binding.name == name) {
+                        bindings.push(RawBinding {
+                            name,
+                            kind: RawBindingKind::Hoisted,
+                        });
+                    }
                 }
             }
         }
@@ -2344,12 +2768,14 @@ fn expand_star_exports(modules: &mut [RawModule]) {
                 }
                 let mut visited = BTreeSet::new();
                 visited.insert((index, name.clone()));
+                let mut truncated = false;
                 let candidates = star_export_origins(
                     modules,
                     &mut cache,
                     target.get() as usize,
                     &name,
                     &mut visited,
+                    &mut truncated,
                 );
                 if !candidates.is_empty() {
                     additions[index].entry(name).or_default().extend(candidates);
@@ -2376,12 +2802,14 @@ fn expand_star_exports(modules: &mut [RawModule]) {
                 };
                 let mut visited = BTreeSet::new();
                 visited.insert((index, name.clone()));
+                let mut truncated = false;
                 star_export_origins(
                     modules,
                     &mut cache,
                     target.get() as usize,
                     name,
                     &mut visited,
+                    &mut truncated,
                 )
                 .contains(origin)
             });
@@ -2410,8 +2838,12 @@ fn star_export_origins(
     module_index: usize,
     name: &str,
     visited: &mut BTreeSet<(usize, String)>,
+    truncated: &mut bool,
 ) -> BTreeSet<ExportOrigin> {
     if !visited.insert((module_index, name.to_owned())) {
+        // Truncation: this (module, name) is already on the current path. The
+        // result is path-dependent, so the caller must not cache it.
+        *truncated = true;
         return BTreeSet::new();
     }
     if let Some(candidates) = cache.get(&(module_index, name.to_owned())) {
@@ -2432,16 +2864,23 @@ fn star_export_origins(
             let EdgeTarget::Local(target) = module.edges[star.get() as usize].target else {
                 continue;
             };
+            let mut child_truncated = false;
             candidates.extend(star_export_origins(
                 modules,
                 cache,
                 target.get() as usize,
                 name,
                 visited,
+                &mut child_truncated,
             ));
+            if child_truncated {
+                *truncated = true;
+            }
         }
     }
-    cache.insert((module_index, name.to_owned()), candidates.clone());
+    if !*truncated {
+        cache.insert((module_index, name.to_owned()), candidates.clone());
+    }
     candidates
 }
 
@@ -2613,7 +3052,11 @@ fn module_has_binding_namespace(
         let Statement::Namespace(declaration) = statement.data() else {
             return false;
         };
-        if identifier(file, &declaration.name) != name {
+        if !declaration
+            .name
+            .as_identifier()
+            .is_some_and(|n| identifier(file, n) == name)
+        {
             return false;
         }
         namespace_facts
@@ -3122,7 +3565,7 @@ mod tests {
             .unwrap();
         assert!(matches!(export.source, ExportSource::Local(_)));
         assert!(matches!(
-            executable.wire().resolve_export(main_id, &EcmaString::from_utf8("observed")),
+            executable.wire().resolve_export(main_id, &EcmaString::encode("observed")),
             Some(ResolvedExport::Local { module, .. })
                 if module != main_id
         ));
@@ -3237,7 +3680,7 @@ mod tests {
         assert!(matches!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("renamed")),
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("renamed")),
             Some(ResolvedExport::Local { module, .. })
                 if module != executable.wire().entry()
         ));
@@ -3287,7 +3730,7 @@ mod tests {
         assert!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
                 .is_some()
         );
     }
@@ -3309,10 +3752,9 @@ mod tests {
             1
         );
         assert!(matches!(
-            executable.wire().resolve_export(
-                executable.wire().entry(),
-                &EcmaString::from_utf8("readFile")
-            ),
+            executable
+                .wire()
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("readFile")),
             Some(ResolvedExport::External { .. })
         ));
     }
@@ -3334,7 +3776,7 @@ mod tests {
         assert!(matches!(export.source, ExportSource::Indirect { .. }));
         let resolved = executable
             .wire()
-            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
             .expect("transitive star export must resolve");
         let ResolvedExport::Local {
             module: resolved, ..
@@ -3373,7 +3815,7 @@ mod tests {
         assert!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
                 .is_some()
         );
     }
@@ -3399,7 +3841,7 @@ mod tests {
         );
         let resolved = executable
             .wire()
-            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
             .expect("downstream star must expose mid's explicit value unambiguously");
         let ResolvedExport::Local {
             module: resolved, ..
@@ -3430,7 +3872,7 @@ mod tests {
         assert!(
             executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("default"))
+                .resolve_export(executable.wire().entry(), &EcmaString::encode("default"))
                 .is_none()
         );
     }
@@ -3453,7 +3895,7 @@ mod tests {
         for name in ["a", "b"] {
             let resolved = executable
                 .wire()
-                .resolve_export(executable.wire().entry(), &EcmaString::from_utf8(name))
+                .resolve_export(executable.wire().entry(), &EcmaString::encode(name))
                 .expect("cyclic star graph must resolve both direct exports");
             let ResolvedExport::Local {
                 module: resolved, ..
@@ -3494,7 +3936,7 @@ mod tests {
             .unwrap() as u32;
         let resolved = executable
             .wire()
-            .resolve_export(executable.wire().entry(), &EcmaString::from_utf8("value"))
+            .resolve_export(executable.wire().entry(), &EcmaString::encode("value"))
             .expect("live imported cell reexport must resolve");
         let ResolvedExport::Local { module, binding } = resolved else {
             panic!("live imported cell reexport must stay local");
@@ -4101,6 +4543,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_overflowing_unicode_escape_in_module_specifier() {
+        // More than eight hex digits overflow u32 in parse_hex; the compiler
+        // must drop the edge rather than panicking.
+        let fixture = Fixture::new();
+        fixture.write("main.ts", r#"import "./\u{FFFFFFFFFF}";"#);
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        assert_eq!(names(&program), ["main.ts"]);
+        assert!(program.entrypoint().dependencies().is_empty());
+    }
+
+    #[test]
     fn rejects_ill_formed_utf16_module_specifiers() {
         for source in [
             r#"import type { T } from "\uD800";"#,
@@ -4146,6 +4600,23 @@ mod tests {
             ModuleEdgeKind::DynamicRuntime
         );
         assert_eq!(program.runtime_modules().len(), 1);
+    }
+
+    #[test]
+    fn retains_dynamic_imports_inside_jsx_expressions() {
+        let fixture = Fixture::new();
+        fixture.write("dep.ts", "export const value = 1;");
+        fixture.write(
+            "main.tsx",
+            "const element = <Foo onClick={() => import('./dep')} />;",
+        );
+
+        let program = fixture.loader().load("main.tsx").unwrap();
+        assert_eq!(names(&program), ["dep.ts", "main.tsx"]);
+        assert_eq!(
+            program.entrypoint().dependencies()[0].kind(),
+            ModuleEdgeKind::DynamicRuntime
+        );
     }
 
     #[test]
@@ -4374,5 +4845,212 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code().as_str() == "BAMTS-C002")
         }));
+    }
+
+    #[test]
+    fn program_loader_session_size_limit_arithmetic_and_codes() {
+        // The real `LoadState::visit` branch that emits `ProgramLoadError::SessionTooLarge`
+        // is exercised through `accumulate_session_bytes` here. A true end-to-end
+        // 256 MiB breach would require a ~256 MiB fixture, so the arithmetic path
+        // and error-code mapping are tested directly; the `visit` wiring itself
+        // is a straight call to the same helper with the returned total.
+        assert_eq!(
+            super::accumulate_session_bytes(0, super::MAX_SESSION_SOURCE_BYTES - 1),
+            Ok(super::MAX_SESSION_SOURCE_BYTES - 1)
+        );
+        assert_eq!(
+            super::accumulate_session_bytes(0, super::MAX_SESSION_SOURCE_BYTES),
+            Ok(super::MAX_SESSION_SOURCE_BYTES)
+        );
+        assert_eq!(
+            super::accumulate_session_bytes(0, super::MAX_SESSION_SOURCE_BYTES + 1),
+            Err(super::MAX_SESSION_SOURCE_BYTES + 1)
+        );
+        assert_eq!(
+            super::accumulate_session_bytes(super::MAX_SESSION_SOURCE_BYTES - 1, 1),
+            Ok(super::MAX_SESSION_SOURCE_BYTES)
+        );
+        assert_eq!(
+            super::accumulate_session_bytes(super::MAX_SESSION_SOURCE_BYTES - 1, 2),
+            Err(super::MAX_SESSION_SOURCE_BYTES + 1)
+        );
+        // The accumulation saturates rather than wrapping on extreme inputs.
+        assert_eq!(
+            super::accumulate_session_bytes(usize::MAX, 1),
+            Err(usize::MAX)
+        );
+
+        // End to end: a graph of small modules loads, and each canonical file
+        // is counted once even when the diamond imports it twice.
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import './left'; import './right';");
+        fixture.write("left.ts", "import './shared';");
+        fixture.write("right.ts", "import './shared';");
+        fixture.write("shared.ts", "export const shared = 1;");
+        let program = fixture.loader().load("main.ts").unwrap();
+        assert_eq!(program.modules().len(), 4);
+
+        // A file at exactly 16 MiB loads; one byte more is a typed per-file
+        // breach carrying the stable BAMTS-R001 code, never a panic.
+        let exact = "a".repeat(crate::source::MAX_SOURCE_BYTES);
+        fixture.write("exact.ts", &exact);
+        fixture.write("main_exact.ts", "import './exact';");
+        fixture.loader().load("main_exact.ts").unwrap();
+
+        let oversized = "a".repeat(crate::source::MAX_SOURCE_BYTES + 1);
+        fixture.write("oversized.ts", &oversized);
+        fixture.write("main_oversized.ts", "import './oversized';");
+        let error = fixture.loader().load("main_oversized.ts").unwrap_err();
+        let ProgramLoadError::SourceTooLarge { path, len } = &error else {
+            panic!("expected SourceTooLarge, got {error}");
+        };
+        assert_eq!(*len, crate::source::MAX_SOURCE_BYTES + 1);
+        assert!(path.ends_with("oversized.ts"));
+        assert_eq!(error.code(), Some(super::SOURCE_TOO_LARGE));
+        assert_eq!(
+            super::ProgramLoadError::SessionTooLarge {
+                path: PathBuf::from("next.ts"),
+                total: super::MAX_SESSION_SOURCE_BYTES + 1,
+            }
+            .code(),
+            Some(super::SESSION_TOO_LARGE)
+        );
+    }
+
+    fn target_name<'a>(
+        program: &'a super::ResolvedProgram,
+        target: &super::ModuleTarget,
+    ) -> &'a str {
+        let source_id = target.local_source_id().expect("local target");
+        program
+            .module(source_id)
+            .unwrap()
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    }
+
+    #[test]
+    fn declaration_overlay_resolves_beside_runtime_target() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js';");
+        fixture.write("index.js", "export default class Queue {}");
+        fixture.write(
+            "index.d.ts",
+            "export default class Queue<ValueType> implements Iterable<ValueType> {}",
+        );
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let main = resolved.entrypoint();
+        assert_eq!(main.dependencies().len(), 1);
+        let edge = &main.dependencies()[0];
+        assert_eq!(target_name(&resolved, edge.target()), "index.js");
+        assert_eq!(
+            target_name(&resolved, edge.type_target().expect("overlay edge")),
+            "index.d.ts"
+        );
+        assert_eq!(names(&resolved), ["index.js", "main.ts", "index.d.ts"]);
+        let runtime_names: Vec<_> = resolved
+            .runtime_modules()
+            .iter()
+            .map(|m| m.path().file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(runtime_names, ["index.js", "main.ts"]);
+    }
+
+    #[test]
+    fn declaration_overlay_dependencies_resolve_in_the_types_flavor() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js';");
+        fixture.write("index.js", "export default class Queue {}");
+        fixture.write(
+            "index.d.ts",
+            "import { Shape } from './types.js';\
+             export default class Queue { value: Shape; }",
+        );
+        fixture.write("types.js", "export const Shape = class {};");
+        fixture.write("types.d.ts", "export interface Shape { value: number; }");
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        assert_eq!(
+            names(&resolved),
+            ["index.js", "main.ts", "types.d.ts", "index.d.ts"]
+        );
+        let overlay = resolved
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("index.d.ts"))
+            .expect("declaration overlay");
+        let dependency = &overlay.dependencies()[0];
+        assert_eq!(dependency.kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(target_name(&resolved, dependency.target()), "types.d.ts");
+        assert!(dependency.type_target().is_none());
+    }
+
+    #[test]
+    fn declaration_overlay_preserves_external_type_dependencies() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js';");
+        fixture.write("index.js", "export default class Queue {}");
+        fixture.write(
+            "index.d.ts",
+            "import { Shape } from 'external-types';\
+             export default class Queue { value: Shape; }",
+        );
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let overlay = resolved
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("index.d.ts"))
+            .expect("declaration overlay");
+        let dependency = &overlay.dependencies()[0];
+        assert_eq!(dependency.kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(
+            dependency.target().external_specifier(),
+            Some("external-types")
+        );
+        assert!(dependency.type_target().is_none());
+    }
+
+    #[test]
+    fn declaration_overlays_append_in_import_discovery_order() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import './a.js'; import './b.js';");
+        fixture.write("a.js", "export const a = 1;");
+        fixture.write("a.d.ts", "export declare const a: number;");
+        fixture.write("b.js", "export const b = 1;");
+        fixture.write("b.d.ts", "export declare const b: number;");
+
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        assert_eq!(
+            names(&resolved),
+            ["a.js", "b.js", "main.ts", "a.d.ts", "b.d.ts"]
+        );
+    }
+
+    #[test]
+    fn declaration_overlay_absent_falls_back_to_runtime_source() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js';");
+        fixture.write("index.js", "export default class Queue {}");
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let edge = &resolved.entrypoint().dependencies()[0];
+        assert_eq!(target_name(&resolved, edge.target()), "index.js");
+        assert!(edge.type_target().is_none());
+        assert_eq!(names(&resolved), ["index.js", "main.ts"]);
+    }
+
+    #[test]
+    fn type_only_edge_has_no_overlay() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import type { Shape } from './shape';");
+        fixture.write("shape.d.ts", "export interface Shape { x: number; }");
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let edge = &resolved.entrypoint().dependencies()[0];
+        assert_eq!(edge.kind(), super::ModuleEdgeKind::TypeOnly);
+        assert_eq!(target_name(&resolved, edge.target()), "shape.d.ts");
+        assert!(edge.type_target().is_none());
     }
 }

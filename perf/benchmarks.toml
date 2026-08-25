@@ -1,0 +1,475 @@
+# Benchmark and fixture manifest (U0.10 / PB-3).
+#
+# [[benchmark]] retains the vertical-slice performance seams. [[fixture]] pins
+# tracked upstream workloads, corpus trees, CLI inputs, and generated boundaries.
+# Regenerate upstream/boundary inputs with `perf_budget materialize-fixtures` and
+# verify every hash offline with `perf_budget verify-fixtures`.
+schema = 2
+
+[[benchmark]]
+id = "s0-conformance-foundation"
+slice = "s0"
+input = "index.json"
+facets = ["harness"]
+backends = ["check"]
+expected = "perf/baselines/s0.json"
+selected = true
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s1-grammar-completeness"
+slice = "s1"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["parse"]
+backends = ["check"]
+expected = "perf/baselines/s1.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s2-core-checker-depth"
+slice = "s2"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["types", "symbols", "diagnostics"]
+backends = ["check"]
+expected = "perf/baselines/s2.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s3-declaration-constructs"
+slice = "s3"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["jsEmit"]
+backends = ["interpreter", "jit", "aot"]
+expected = "perf/baselines/s3.json"
+repeats = 3
+timeout_ms = 60000
+
+[[benchmark]]
+id = "s4-emit-and-declarations"
+slice = "s4"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["jsEmit", "dtsEmit"]
+backends = ["check"]
+expected = "perf/baselines/s4.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s5-module-resolution"
+slice = "s5"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["moduleResolution"]
+backends = ["check"]
+expected = "perf/baselines/s5.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s6-node-host-runtime"
+slice = "s6"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["jsEmit"]
+backends = ["interpreter", "jit", "aot"]
+expected = "perf/baselines/s6.json"
+repeats = 3
+timeout_ms = 60000
+
+[[benchmark]]
+id = "s7-cli-and-config"
+slice = "s7"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["cli", "config"]
+backends = ["check"]
+expected = "perf/baselines/s7.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s8-project-references-build"
+slice = "s8"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["build"]
+backends = ["check"]
+expected = "perf/baselines/s8.json"
+repeats = 3
+timeout_ms = 60000
+
+[[benchmark]]
+id = "s9-watch-mode"
+slice = "s9"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["watch"]
+backends = ["check"]
+expected = "perf/baselines/s9.json"
+repeats = 3
+timeout_ms = 60000
+
+[[benchmark]]
+id = "s10-node-api-shim"
+slice = "s10"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["nodeApi"]
+backends = ["check"]
+expected = "perf/baselines/s10.json"
+repeats = 3
+timeout_ms = 30000
+
+[[benchmark]]
+id = "s11-language-service"
+slice = "s11"
+input = "tests/cases/compiler/2dArrays.ts"
+facets = ["languageService"]
+backends = ["check"]
+selected = true
+expected = "perf/baselines/s11.json"
+repeats = 3
+timeout_ms = 30000
+
+[[fixture]]
+id = "bench-empty-ts"
+group = "bench"
+path = "perf/fixtures/upstream/empty.ts"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+bytes = 0
+origin = "generated"
+generator = "empty-file"
+
+[[fixture]]
+id = "bench-checker-ts"
+group = "bench"
+path = "perf/fixtures/upstream/checker.ts"
+sha256 = "f1752801dd8ebca0f7bce12a2f61e658c06c7c5a087159c22cf67eb7a7e0198d"
+bytes = 3151782
+origin = "typescript-suite"
+source_archive = "typescript-7-suite"
+source_path = "src/compiler/checker.ts"
+
+[[fixture]]
+id = "bench-dom-dts"
+group = "bench"
+path = "perf/fixtures/upstream/dom.generated.d.ts"
+sha256 = "056acdb4168b9fde08093fa6917ff5e26cfe067c003c0a4c55d05a8a94d54b1c"
+bytes = 2348669
+origin = "typescript-suite"
+source_archive = "typescript-7-suite"
+source_path = "src/lib/dom.generated.d.ts"
+
+[[fixture]]
+id = "bench-herebyfile"
+group = "bench"
+path = "perf/fixtures/upstream/Herebyfile.mjs"
+sha256 = "e0fa650f9c35a256ffd5c97db1a0588d7df5293b638e1f179a8231c4251c6e5d"
+bytes = 37354
+origin = "typescript-suite"
+source_archive = "typescript-7-suite"
+source_path = "Herebyfile.mjs"
+
+[[fixture]]
+id = "bench-jsx-complexity"
+group = "bench"
+path = "perf/fixtures/upstream/jsxComplexSignatureHasApplicabilityError.tsx"
+sha256 = "e2d2d8d47230600f5fb59d5417399b1fde427877e7ac3bddd963b2cfff25fba0"
+bytes = 19275
+origin = "typescript-suite"
+source_archive = "typescript-7-suite"
+source_path = "tests/cases/compiler/jsxComplexSignatureHasApplicabilityError.tsx"
+
+[[fixture]]
+id = "cli-startup-empty"
+group = "cli-startup"
+origin = "generated"
+input_fixture = "bench-empty-ts"
+argv = ["check", "{fixture}"]
+
+[[fixture]]
+id = "corpus-citty"
+group = "corpus"
+path = "corpus/projects/citty"
+spec = "corpus/specs/citty.toml"
+tree_sha256 = "a4ac35a8156379204fe1029ca3f9d8c35c46c203d25f897463aa8d556566f0d6"
+file_count = 39
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-defu"
+group = "corpus"
+path = "corpus/projects/defu"
+spec = "corpus/specs/defu.toml"
+tree_sha256 = "b248b84db2c3bc22dea9c4263c277552fc7cb4462d042bc6740e6bfc5b9bbc4b"
+file_count = 21
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-destr"
+group = "corpus"
+path = "corpus/projects/destr"
+spec = "corpus/specs/destr.toml"
+tree_sha256 = "a8f1720904d704d8456d279d8fb2d03d897f3b826a8402f2c0e168719158b04e"
+file_count = 19
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-dot-prop"
+group = "corpus"
+path = "corpus/projects/dot-prop"
+spec = "corpus/specs/dot-prop.toml"
+tree_sha256 = "95300adea127b7587e9dc6dd101794e9ea7bd86c3863acd4a27c1ddcddd742b1"
+file_count = 15
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-escape-string-regexp"
+group = "corpus"
+path = "corpus/projects/escape-string-regexp"
+spec = "corpus/specs/escape-string-regexp.toml"
+tree_sha256 = "89152e44197417879a02971bb81499dc845c21ae53936074856ab4a480c64a20"
+file_count = 13
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-hookable"
+group = "corpus"
+path = "corpus/projects/hookable"
+spec = "corpus/specs/hookable.toml"
+tree_sha256 = "0d824b0c9f6c9494708a3cdae91e9e329da42c65ebbe75283e7611d2560685c1"
+file_count = 27
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-is-plain-obj"
+group = "corpus"
+path = "corpus/projects/is-plain-obj"
+spec = "corpus/specs/is-plain-obj.toml"
+tree_sha256 = "6aca7c50746ee4b43813193ca1acda665274db0d41eed16c3cc2465539db1f7c"
+file_count = 15
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-mitt"
+group = "corpus"
+path = "corpus/projects/mitt"
+spec = "corpus/specs/mitt.toml"
+tree_sha256 = "7ba3dfbe6fdc747d070c7000164d29bd5f0ea33f6d10b0fa254bc1ecc55df600"
+file_count = 13
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-ohash"
+group = "corpus"
+path = "corpus/projects/ohash"
+spec = "corpus/specs/ohash.toml"
+tree_sha256 = "5d2608a271200fe8f76fbfc32d90144582b2b8a84b05ccdb99e4ba5d01e114e5"
+file_count = 29
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-p-defer"
+group = "corpus"
+path = "corpus/projects/p-defer"
+spec = "corpus/specs/p-defer.toml"
+tree_sha256 = "dc220d78c24097f5e132ebd7b5a90c3679397289626acd9ba9727b615b809aa5"
+file_count = 13
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-p-map"
+group = "corpus"
+path = "corpus/projects/p-map"
+spec = "corpus/specs/p-map.toml"
+tree_sha256 = "19df4fdb0c22819b4c0f4882a6ee0f6edbe379bcbcc24c91a73cc4419dbc4144"
+file_count = 15
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-p-queue"
+group = "corpus"
+path = "corpus/projects/p-queue"
+spec = "corpus/specs/p-queue.toml"
+tree_sha256 = "473ddf8c890b34bcc3f52231391d1850377af337f56473a86a8cd2e5967a8264"
+file_count = 24
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-pathe"
+group = "corpus"
+path = "corpus/projects/pathe"
+spec = "corpus/specs/pathe.toml"
+tree_sha256 = "c29779276fc36c80d9fde1ca7f48849a61067fad92d5c0bbe995deb5eefa94e1"
+file_count = 25
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-perfect-debounce"
+group = "corpus"
+path = "corpus/projects/perfect-debounce"
+spec = "corpus/specs/perfect-debounce.toml"
+tree_sha256 = "13a80c878caa11a817a7bc8270ae0a884fbc6f99e1cab1b1e9b3cd8811a17e10"
+file_count = 17
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-rou3"
+group = "corpus"
+path = "corpus/projects/rou3"
+spec = "corpus/specs/rou3.toml"
+tree_sha256 = "b793ec2286d7a0c4adb489ca1481c8262c1e542f9d921008f94a53596ab773d4"
+file_count = 61
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-tiny-invariant"
+group = "corpus"
+path = "corpus/projects/tiny-invariant"
+spec = "corpus/specs/tiny-invariant.toml"
+tree_sha256 = "69e9e1cd7bf2cf8b378fe209a8e481a5799fac4bf7297c3843e3f6f508f4478f"
+file_count = 21
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-tslib"
+group = "corpus"
+path = "corpus/projects/tslib"
+spec = "corpus/specs/tslib.toml"
+tree_sha256 = "aeb3325a9ed532c1863d359be70bf13692e61b416a415a6e6c2da27d68b67af1"
+file_count = 43
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-ufo"
+group = "corpus"
+path = "corpus/projects/ufo"
+spec = "corpus/specs/ufo.toml"
+tree_sha256 = "fd200a29e87f54d5e02dc064979f0623a24dca10f5976e1c2aa43de31e781c91"
+file_count = 39
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-valita"
+group = "corpus"
+path = "corpus/projects/valita"
+spec = "corpus/specs/valita.toml"
+tree_sha256 = "00348b0364667fcc2ad11d9ac93a397d46f38134b9d13c6808cb5d1864df199d"
+file_count = 3
+origin = "corpus"
+
+[[fixture]]
+id = "corpus-yocto-queue"
+group = "corpus"
+path = "corpus/projects/yocto-queue"
+spec = "corpus/specs/yocto-queue.toml"
+tree_sha256 = "4130a313de0a56e0c69292d85f9f5a039219408ed7d3db628c739b26a293bbcf"
+file_count = 13
+origin = "corpus"
+
+[[fixture]]
+id = "boundary-parser-depth-255"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-parser-depth-255.ts"
+sha256 = "164eb3b8c0e2c073235cc59a87f8e91cb6ca7f7430a6836723e352271c8750a9"
+bytes = 520
+origin = "generated"
+generator = "parser-depth"
+params = { depth = 255 }
+
+[[fixture]]
+id = "boundary-parser-depth-256"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-parser-depth-256.ts"
+sha256 = "c241d0a70554242147060b7525ac61c570f93c76a056f09d7e331cb214020486"
+bytes = 522
+origin = "generated"
+generator = "parser-depth"
+params = { depth = 256 }
+
+[[fixture]]
+id = "boundary-parser-depth-257"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-parser-depth-257.ts"
+sha256 = "e134674115f4a727409d062ae4cc4c62c59b580e36d621146a418bc1e5af7152"
+bytes = 524
+origin = "generated"
+generator = "parser-depth"
+params = { depth = 257 }
+
+[[fixture]]
+id = "boundary-json-depth-127"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-json-depth-127.ts"
+sha256 = "4b59109278cd44ed6ba5df90a136bfffaefa179d7fc0e90bcf85f9c4bfd4a667"
+bytes = 763
+origin = "generated"
+generator = "json-depth"
+params = { depth = 127 }
+
+[[fixture]]
+id = "boundary-json-depth-128"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-json-depth-128.ts"
+sha256 = "a4908c65856c2fb1e94d6b2b55620177bd082f54d43252b9e0648f9ccd53e3fe"
+bytes = 769
+origin = "generated"
+generator = "json-depth"
+params = { depth = 128 }
+
+[[fixture]]
+id = "boundary-json-depth-129"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-json-depth-129.ts"
+sha256 = "eeb23e8c9c090d0303063348ae7ca4a5914992972fc20e295e8e386802e2a95a"
+bytes = 775
+origin = "generated"
+generator = "json-depth"
+params = { depth = 129 }
+
+[[fixture]]
+id = "boundary-source-bytes-16777215"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-source-bytes-16777215.ts"
+sha256 = "6e4c7fcabfc44a37a7878e6bfb23f450e6df98d77c8162337f5b7a2b8109dd69"
+bytes = 16777215
+origin = "generated"
+generator = "source-bytes"
+params = { size = 16777215 }
+
+[[fixture]]
+id = "boundary-source-bytes-16777216"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-source-bytes-16777216.ts"
+sha256 = "e65ed8f3de864bcf15529e8f10bc44f75b0419942cc01f461ab183bc20ba325b"
+bytes = 16777216
+origin = "generated"
+generator = "source-bytes"
+params = { size = 16777216 }
+
+[[fixture]]
+id = "boundary-source-bytes-16777217"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-source-bytes-16777217.ts"
+sha256 = "d8731bdeeb56258ee8eb5c8d46fd1aa2c28f9204590a9d42d8a892129355ddef"
+bytes = 16777217
+origin = "generated"
+generator = "source-bytes"
+params = { size = 16777217 }
+
+[[fixture]]
+id = "boundary-string-units-1048576"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-string-units-1048576.ts"
+sha256 = "5981a8990bfdde21876089d60dcd1929bd691111c9a77ebe65d05bc1439ee18b"
+bytes = 1048590
+origin = "generated"
+generator = "string-units"
+params = { units = 1048576 }
+
+[[fixture]]
+id = "boundary-string-units-1048577"
+group = "boundary"
+path = "perf/fixtures/boundary/boundary-string-units-1048577.ts"
+sha256 = "1c3f0318b5912f32a0072d1cda4a9318fbcf8dab93595dd567e43a30cf51148b"
+bytes = 1048591
+origin = "generated"
+generator = "string-units"
+params = { units = 1048577 }

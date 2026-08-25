@@ -89,12 +89,16 @@ process.stdout.write(process.argv[1] + "\n");
 process.stdout.write(process.argv[2] + "\n");
 process.stdout.write(process.argv[3] + "\n");
 process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n" : "leaked\n");
+process.stdout.write(process.env.BAMTS_AOT_LAUNCH_TOKEN === undefined ? "hidden\n" : "leaked\n");
+process.stdout.write(process.env.BAMTS_CONTEXT_PROBE + "\n");
 "#,
     );
 
     let jit = project
         .command()
-        .env_remove("BAMTS_AOT_ENTRYPOINT")
+        .env("BAMTS_AOT_ENTRYPOINT", "stale.ts")
+        .env("BAMTS_AOT_LAUNCH_TOKEN", "stale-token")
+        .env("BAMTS_CONTEXT_PROBE", "shared")
         .args(["run", "--target", "jit", "main.ts", "--", "first", "second"])
         .current_dir(&project.path)
         .output()
@@ -103,14 +107,19 @@ process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n"
 
     let aot = project
         .command()
-        .env_remove("BAMTS_AOT_ENTRYPOINT")
+        .env("BAMTS_AOT_ENTRYPOINT", "stale.ts")
+        .env("BAMTS_AOT_LAUNCH_TOKEN", "stale-token")
+        .env("BAMTS_CONTEXT_PROBE", "shared")
         .args(["run", "--target", "aot", "main.ts", "--", "first", "second"])
         .current_dir(&project.path)
         .output()
         .expect("bamts AOT argv program starts");
     assert_success(&aot, "bamts AOT argv program");
 
-    assert_eq!(jit.stdout, b"bamts\nmain.ts\nfirst\nsecond\nhidden\n");
+    assert_eq!(
+        jit.stdout,
+        b"bamts\nmain.ts\nfirst\nsecond\nhidden\nhidden\nshared\n"
+    );
     assert_eq!(aot.stdout, jit.stdout);
 }
 
@@ -378,6 +387,165 @@ process.stdout.write(String(increment(alias)) + "\n");
             .unwrap_or_else(|error| panic!("bamts {target} escaped-name program starts: {error}"));
         assert_success(&output, &format!("bamts {target} escaped-name program"));
         assert_eq!(output.stdout, b"42\n", "{target}");
+    }
+}
+
+#[test]
+fn aot_and_jit_keep_non_exported_nested_namespaces_local() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"namespace A {
+    namespace B {
+        export const x = 1;
+    }
+    export namespace C {
+        export const x = 2;
+    }
+    export const localValue = B.x;
+}
+if (A.localValue !== 1 || "B" in A || A.C.x !== 2) {
+    throw "nested namespace visibility mismatch";
+}
+process.stdout.write("ok\n");
+"#,
+    );
+
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("bamts {target} nested-namespace program starts: {error}")
+            });
+        assert_success(&output, &format!("bamts {target} nested-namespace program"));
+        assert_eq!(output.stdout, b"ok\n", "{target}");
+    }
+}
+
+#[test]
+fn aot_and_jit_share_one_live_global_object() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"const root: any = globalThis;
+const stdout = process.stdout;
+const originalConsole = console;
+const replacementConsole = { marker: 1 };
+
+root.console = replacementConsole;
+if (console !== replacementConsole) throw "property-to-identifier mismatch";
+console = originalConsole;
+if (root.console !== originalConsole) throw "identifier-to-property mismatch";
+
+let lexicalBinding = 14;
+root.lexicalBinding = 99;
+if (lexicalBinding !== 14 || root.lexicalBinding !== 99) {
+    throw "module binding leaked into the global object";
+}
+
+root.globalThis = { fake: true };
+root.global = { fake: true };
+console = replacementConsole;
+if (root.console !== replacementConsole) throw "global alias redirected storage";
+delete root.globalThis;
+delete root.global;
+console = originalConsole;
+if (root.console !== originalConsole) throw "global alias deletion redirected storage";
+
+root.removable = 1;
+if (!delete root.removable || "removable" in root) {
+    throw "global property deletion mismatch";
+}
+
+let ownReceiver = false;
+let ownSet: unknown;
+Object.defineProperty(root, "console", {
+    get() { return replacementConsole; },
+    set(value) { ownReceiver = this === root; ownSet = value; },
+    configurable: true,
+});
+if (console !== replacementConsole) throw "own global getter mismatch";
+console = originalConsole;
+if (!ownReceiver || ownSet !== originalConsole) throw "own global setter mismatch";
+Object.defineProperty(root, "console", {
+    value: originalConsole,
+    writable: true,
+    configurable: true,
+});
+
+const originalQueueMicrotask = queueMicrotask;
+delete root.queueMicrotask;
+let prototypeReceiver = false;
+let prototypeSet: unknown;
+Object.defineProperty(Object.prototype, "queueMicrotask", {
+    get() { return originalQueueMicrotask; },
+    set(value) { prototypeReceiver = this === root; prototypeSet = value; },
+    configurable: true,
+});
+if (queueMicrotask !== originalQueueMicrotask) throw "prototype global getter mismatch";
+queueMicrotask = originalQueueMicrotask;
+if (!prototypeReceiver || prototypeSet !== originalQueueMicrotask) {
+    throw "prototype global setter mismatch";
+}
+delete Object.prototype.queueMicrotask;
+root.queueMicrotask = originalQueueMicrotask;
+
+let infinityFailed = false;
+let nanFailed = false;
+try { root.Infinity = 1; } catch { infinityFailed = true; }
+try { root.NaN = 1; } catch { nanFailed = true; }
+if (!infinityFailed || !nanFailed || root.Infinity !== Infinity || root.NaN === root.NaN) {
+    throw "frozen global constant mismatch";
+}
+
+stdout.write("ok\n");
+"#,
+    );
+
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| panic!("bamts {target} global-object program starts: {error}"));
+        assert_success(&output, &format!("bamts {target} global-object program"));
+        assert_eq!(output.stdout, b"ok\n", "{target}");
+    }
+}
+
+#[test]
+fn aot_and_jit_preserve_vm_context_for_escaped_closures() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"import { runInNewContext } from "node:vm";
+
+const context: any = { secret: 41 };
+const readSecret: any = runInNewContext(
+    "(function () { return secret + 1; })",
+    context,
+);
+context.secret = 99;
+if (readSecret() !== 100) {
+    throw "escaped closure lost its VM context";
+}
+process.stdout.write("ok\n");
+"#,
+    );
+
+    for target in ["jit", "aot"] {
+        let output = project
+            .command()
+            .args(["run", "--target", target, "main.ts"])
+            .current_dir(&project.path)
+            .output()
+            .unwrap_or_else(|error| panic!("bamts {target} VM-context program starts: {error}"));
+        assert_success(&output, &format!("bamts {target} VM-context program"));
+        assert_eq!(output.stdout, b"ok\n", "{target}");
     }
 }
 
@@ -673,6 +841,180 @@ fn check_applies_project_lint_config_to_dependencies() {
 }
 
 #[test]
+fn check_js_controls_javascript_dependency_diagnostics() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        "import { value } from './dependency.mjs';\nconst answer: number = value;\n",
+    );
+    project.write("dependency.mjs", "export const value = 1;\nmissingName;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
+    );
+
+    assert_success(
+        &project.check("main.ts"),
+        "bamts check with checkJs disabled",
+    );
+
+    let command_line_checked = project
+        .command()
+        .args([
+            "check",
+            "--check-js",
+            "--diagnostics-format",
+            "text",
+            "main.ts",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("bamts check --check-js starts");
+    assert!(!command_line_checked.status.success());
+    assert!(
+        stderr(&command_line_checked).contains("BAMTS-C002"),
+        "{}",
+        stderr(&command_line_checked)
+    );
+
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
+    );
+    let checked = project.check("main.ts");
+    assert!(!checked.status.success());
+    assert!(
+        stderr(&checked).contains("BAMTS-C002"),
+        "{}",
+        stderr(&checked)
+    );
+}
+
+#[test]
+fn check_js_honors_file_directives() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "bamts.toml",
+        "[lints.rules]\ndiagnostic-suppression-directive = \"warn\"\nts-check-directive = \"warn\"\n",
+    );
+    project.write("main.ts", "import './dependency.mjs';\n");
+    project.write("dependency.mjs", "// @ts-check\nmissingName;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
+    );
+
+    let checked = project.check("main.ts");
+    assert!(!checked.status.success());
+    assert!(
+        stderr(&checked).contains("BAMTS-C002"),
+        "{}",
+        stderr(&checked)
+    );
+    assert!(
+        stderr(&checked).contains("BAMTS-W057"),
+        "{}",
+        stderr(&checked)
+    );
+
+    project.write(
+        "dependency.mjs",
+        "// @ts-check\n// @ts-nocheck\nmissingName;\n",
+    );
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
+    );
+    let unchecked = project.check("main.ts");
+    assert_success(
+        &unchecked,
+        "bamts check with a file-level no-check directive",
+    );
+    assert!(
+        stderr(&unchecked).contains("BAMTS-W057"),
+        "{}",
+        stderr(&unchecked)
+    );
+    assert!(
+        !stderr(&unchecked).contains("BAMTS-C002"),
+        "{}",
+        stderr(&unchecked)
+    );
+
+    project.write(
+        "dependency.mjs",
+        "// @ts-nocheck\n// @ts-check\nmissingName;\n",
+    );
+    let reenabled = project.check("main.ts");
+    assert!(!reenabled.status.success());
+    assert!(
+        stderr(&reenabled).contains("BAMTS-C002"),
+        "{}",
+        stderr(&reenabled)
+    );
+    assert!(
+        stderr(&reenabled).contains("BAMTS-W057"),
+        "{}",
+        stderr(&reenabled)
+    );
+
+    project.write(
+        "dependency.mjs",
+        "// @ts-check\n// @ts-nocheck\nconst = 1;\n",
+    );
+    let malformed = project.check("main.ts");
+    assert!(!malformed.status.success());
+    assert!(
+        stderr(&malformed).contains("BAMTS-W057"),
+        "{}",
+        stderr(&malformed)
+    );
+    assert!(
+        !stderr(&malformed).contains("BAMTS-C002"),
+        "{}",
+        stderr(&malformed)
+    );
+
+    project.write(
+        "dependency.mjs",
+        "// documentation mentions @ts-check behavior\nmissingName;\n",
+    );
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
+    );
+    assert_success(
+        &project.check("main.ts"),
+        "bamts check with a directive mentioned in prose",
+    );
+
+    project.write("dependency.mjs", "// @ts-nochecking\nmissingName;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
+    );
+    let near_miss = project.check("main.ts");
+    assert!(!near_miss.status.success());
+    assert!(
+        stderr(&near_miss).contains("BAMTS-C002"),
+        "{}",
+        stderr(&near_miss)
+    );
+
+    project.write("main.ts", "// @ts-nocheck\nmissingName;\n");
+    let unchecked_typescript = project.check("main.ts");
+    assert_success(
+        &unchecked_typescript,
+        "bamts check with a TypeScript no-check directive",
+    );
+    assert!(
+        stderr(&unchecked_typescript).contains("BAMTS-W023"),
+        "{}",
+        stderr(&unchecked_typescript)
+    );
+}
+
+#[test]
 fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "import './first.ts';\nimport './second.ts';\n");
@@ -688,6 +1030,62 @@ fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     let first_position = stderr.find("first.ts").expect("first diagnostic");
     let second_position = stderr.find("second.ts").expect("second diagnostic");
     assert!(first_position < second_position, "{stderr}");
+}
+
+#[test]
+fn check_terminates_on_self_referential_generic_heritage() {
+    let project = ScratchDirectory::new();
+    project.write(
+        "main.ts",
+        r#"interface Base<T> {
+    first<U>(): Base<U>;
+    second<U>(): Base<U>;
+    third<U>(): Base<U>;
+    fourth<U>(): Base<U>;
+    fifth<U>(): Base<U>;
+}
+
+interface Derived<T> extends Base<T> {
+    first<U>(): Derived<U>;
+    second<U>(): Derived<U>;
+    third<U>(): Derived<U>;
+    fourth<U>(): Derived<U>;
+    fifth<U>(): Derived<U>;
+}
+
+class Implementation<T> implements Derived<T> {
+    first<U>(): Concrete<U> { return undefined as never; }
+    second<U>(): Concrete<U> { return undefined as never; }
+    third<U>(): Concrete<U> { return undefined as never; }
+    fourth<U>(): Concrete<U> { return undefined as never; }
+    fifth<U>(): Concrete<U> { return undefined as never; }
+}
+
+class Concrete<T> extends Implementation<T> {}
+"#,
+    );
+
+    let output = project.check("main.ts");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("main.ts:9:30"), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("error[BAMTS-C004]"))
+            .count(),
+        1,
+        "expected exactly one heritage error: {stderr}",
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("warning[BAMTS-W019]"))
+            .count(),
+        5,
+        "expected five return-assertion warnings: {stderr}",
+    );
 }
 
 fn bamts_binary() -> &'static str {
@@ -722,7 +1120,14 @@ impl ScratchDirectory {
         for _ in 0..128 {
             let index = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let path = root.join(format!("bamts-cli-test-{}-{index}", std::process::id()));
-            match fs::create_dir(&path) {
+            #[cfg(unix)]
+            let created = {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new().mode(0o700).create(&path)
+            };
+            #[cfg(not(unix))]
+            let created = fs::create_dir(&path);
+            match created {
                 Ok(()) => return Self { path },
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("could not create `{}`: {error}", path.display()),

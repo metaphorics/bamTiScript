@@ -9,7 +9,10 @@
 //! This module owns no filesystem, CLI, lowerer, runtime, or backend. It only
 //! composes the existing scanner, parser, checker, and emitter surfaces.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+use bamts_cancel::{CancellationToken, Cancelled};
 
 use crate::checker::{
     self, ProgramCheckInput, ProgramCheckOptions, ResolvedModuleEdge, SemanticModel,
@@ -17,11 +20,12 @@ use crate::checker::{
 use crate::diagnostic::{Diagnostic, Recovered};
 use crate::emitter::{self, EmitOptions, EmitOutput};
 use crate::lint::{LintProfile, LintTable};
-use crate::parser;
+use crate::parser::{self, ParseError};
 use crate::program::{ModuleTarget, ResolvedProgram};
 use crate::scanner;
 use crate::source::{ScriptKind, SourceId, SourceText};
 use crate::syntax::{ExportDeclaration, ExportNamedDeclaration, SourceFile};
+use crate::telemetry::{Phase, Telemetry};
 
 struct EdgeNode {
     id: crate::syntax::NodeId,
@@ -79,7 +83,7 @@ impl SourceEdgeNodeIndex {
             _ => {}
         }
 
-        let children = match statement.data() {
+        let mut children = match statement.data() {
             Statement::Function(function) => match &function.function.body {
                 Some(FunctionBody::Block(block)) => {
                     Self::statements(&block.data().statements, exact)
@@ -140,12 +144,11 @@ impl SourceEdgeNodeIndex {
             _ => Vec::new(),
         };
 
-        debug_assert!(
-            children
-                .windows(2)
-                .all(|pair| pair[0].range.end() <= pair[1].range.start()),
-            "edge node children must be source-ordered and non-overlapping"
-        );
+        // `smallest_containing` binary-searches this list by start position, so
+        // source-order is a correctness requirement, not a convention. Sort
+        // establishes the invariant by construction regardless of how each arm
+        // assembled its children, keeping the search sound in release builds.
+        children.sort_by_key(|node| node.range.start());
 
         EdgeNode {
             id,
@@ -312,7 +315,14 @@ pub fn compile_program_frontend(
     program: &ResolvedProgram,
     mode: FrontendMode,
 ) -> ProgramFrontendOutput {
-    compile_program_frontend_with_lints(program, mode, &LintTable::new(LintProfile::Default))
+    let cancel = CancellationToken::new();
+    compile_program_frontend_with_cancel(
+        program,
+        mode,
+        &LintTable::new(LintProfile::Default),
+        &cancel,
+    )
+    .expect("a fresh cancellation token cannot be cancelled")
 }
 
 /// Runs the frontend for every module with caller-resolved lint levels.
@@ -322,100 +332,169 @@ pub fn compile_program_frontend_with_lints(
     mode: FrontendMode,
     levels: &LintTable,
 ) -> ProgramFrontendOutput {
-    let parsed = program
-        .modules()
-        .iter()
-        .map(|module| {
-            parser::parse(scanner::scan(
-                module.source_id(),
-                module.script_kind(),
-                Arc::clone(module.source()),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let edges = resolved_checker_edges(program, &parsed);
-    let checked = checker::check_program_with_options(
-        ProgramCheckInput {
-            files: &parsed,
-            edges: &edges,
-        },
-        levels,
-        if program.is_commonjs() {
-            ProgramCheckOptions::commonjs()
-        } else {
-            ProgramCheckOptions::standard()
-        },
-    );
-    let program_diagnostics = checked.diagnostics();
-    let modules = parsed
-        .into_iter()
-        .map(|parsed| {
-            let source_id = parsed.product().source_id();
-            let semantic_model = checked
-                .product()
-                .file(source_id)
-                .expect("whole-program checker returns every parsed module")
-                .clone();
-            let emit = mode
-                .emit_options()
-                .map(|options| emitter::emit_checked(parsed.product(), &semantic_model, options));
-            let (source_file, mut diagnostics) = parsed.into_parts();
-            diagnostics.extend(
-                program_diagnostics
-                    .iter()
-                    .filter(|diagnostic| diagnostic.source_id() == source_id)
-                    .cloned(),
-            );
-            if let Some(output) = &emit {
-                diagnostics.extend(output.diagnostics.iter().cloned());
-            }
-            FrontendOutput {
-                mode,
-                source_file,
-                semantic_model,
-                emit,
-                diagnostics: canonicalize(diagnostics),
-            }
-        })
-        .collect();
-    ProgramFrontendOutput {
-        entrypoint: program.entrypoint_id(),
-        modules,
-    }
+    let cancel = CancellationToken::new();
+    compile_program_frontend_with_cancel(program, mode, levels, &cancel)
+        .expect("a fresh cancellation token cannot be cancelled")
 }
 
+/// Runs the cancellable frontend pipeline for every module.
+pub fn compile_program_frontend_with_cancel(
+    program: &ResolvedProgram,
+    mode: FrontendMode,
+    levels: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<ProgramFrontendOutput, Cancelled> {
+    Telemetry::measure(Phase::Total, || {
+        let parsed = program
+            .modules()
+            .iter()
+            .map(|module| {
+                cancel.check()?;
+                let source_id = module.source_id();
+                let script_kind = module.script_kind();
+                let source = Arc::clone(module.source());
+                let scanned = Telemetry::measure(Phase::Scan, || {
+                    scanner::scan_with_cancel(source_id, script_kind, source, cancel.clone())
+                })?;
+                Telemetry::measure(Phase::Parse, || {
+                    parser::parse_with_cancel(scanned, cancel.clone())
+                })
+            })
+            .collect::<Result<Vec<_>, ParseError>>()?;
+        let edges = resolved_checker_edges_with_cancel(program, &parsed, cancel)?;
+        let checked = Telemetry::measure(Phase::Check, || {
+            let options = if program.is_commonjs() {
+                ProgramCheckOptions::commonjs()
+            } else {
+                ProgramCheckOptions::standard()
+            }
+            .with_strict_null_checks(program.is_strict_null_checks())
+            .with_no_implicit_any(program.is_no_implicit_any())
+            .with_always_strict(program.is_always_strict())
+            .with_check_js(program.is_check_js())
+            .with_target(if program.is_target_es5() {
+                Some("es5")
+            } else {
+                None
+            });
+            checker::check_program_with_options_and_cancel(
+                ProgramCheckInput {
+                    files: &parsed,
+                    edges: &edges,
+                },
+                levels,
+                options,
+                cancel.clone(),
+            )
+        })?;
+        let (mut program_model, program_diagnostics) = checked.into_parts();
+        // Partition program diagnostics once into source-keyed buckets that
+        // preserve the canonical order from `Recovered`. The buckets are only
+        // looked up by module source id below; the module iteration order (not
+        // map iteration order) establishes output order, and diagnostics whose
+        // source id matches no module are left in the map and dropped, matching
+        // the previous per-module filter behavior.
+        let mut buckets: BTreeMap<SourceId, Vec<Diagnostic>> = BTreeMap::new();
+        for diagnostic in program_diagnostics {
+            cancel.check()?;
+            buckets
+                .entry(diagnostic.source_id())
+                .or_default()
+                .push(diagnostic);
+        }
+        let modules = parsed
+            .into_iter()
+            .map(|parsed| {
+                cancel.check()?;
+                let source_id = parsed.product().source_id();
+                let semantic_model = program_model
+                    .remove_file(source_id)
+                    .expect("whole-program checker returns every parsed module");
+                let emit = mode.emit_options().map(|options| {
+                    Telemetry::measure(Phase::Emit, || {
+                        emitter::emit_checked(parsed.product(), &semantic_model, options)
+                    })
+                });
+                cancel.check()?;
+                let (source_file, mut diagnostics) = parsed.into_parts();
+                if let Some(bucket) = buckets.remove(&source_id) {
+                    diagnostics.extend(bucket);
+                }
+                if let Some(output) = &emit {
+                    diagnostics.extend(output.diagnostics.iter().cloned());
+                }
+                Ok(FrontendOutput {
+                    mode,
+                    source_file,
+                    semantic_model,
+                    emit,
+                    diagnostics: canonicalize(diagnostics),
+                })
+            })
+            .collect::<Result<Vec<_>, Cancelled>>()?;
+        Ok(ProgramFrontendOutput {
+            entrypoint: program.entrypoint_id(),
+            modules,
+        })
+    })
+}
+
+fn resolved_checker_edges_with_cancel(
+    program: &ResolvedProgram,
+    files: &[Recovered<SourceFile>],
+    cancel: &CancellationToken,
+) -> Result<Vec<ResolvedModuleEdge>, Cancelled> {
+    let files_by_source_id: HashMap<SourceId, &SourceFile> = files
+        .iter()
+        .map(|file| {
+            cancel.check()?;
+            Ok((file.product().source_id(), file.product()))
+        })
+        .collect::<Result<_, Cancelled>>()?;
+    let mut resolved = Vec::new();
+    for module in program.modules() {
+        cancel.check()?;
+        let source = *files_by_source_id
+            .get(&module.source_id())
+            .expect("resolved module has one parsed source");
+        let nodes = SourceEdgeNodeIndex::new(source);
+        for edge in module.dependencies() {
+            cancel.check()?;
+            let to = if let Some(ModuleTarget::Local(to)) = edge.type_target() {
+                *to
+            } else {
+                let ModuleTarget::Local(to) = edge.target() else {
+                    continue;
+                };
+                *to
+            };
+            resolved.push(ResolvedModuleEdge {
+                from: module.source_id(),
+                specifier: nodes
+                    .node_for(edge.range())
+                    .expect("every resolved edge specifier range belongs to its parsed source"),
+                to,
+            });
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
 fn resolved_checker_edges(
     program: &ResolvedProgram,
     files: &[Recovered<SourceFile>],
 ) -> Vec<ResolvedModuleEdge> {
-    program
-        .modules()
-        .iter()
-        .flat_map(|module| {
-            let source = files
-                .iter()
-                .find(|file| file.product().source_id() == module.source_id())
-                .expect("resolved module has one parsed source")
-                .product();
-            let nodes = SourceEdgeNodeIndex::new(source);
-            module.dependencies().iter().filter_map(move |edge| {
-                let ModuleTarget::Local(to) = edge.target() else {
-                    return None;
-                };
-                Some(ResolvedModuleEdge {
-                    from: module.source_id(),
-                    specifier: nodes.node_for(edge.range())?,
-                    to: *to,
-                })
-            })
-        })
-        .collect()
+    resolved_checker_edges_with_cancel(program, files, &CancellationToken::new())
+        .expect("a fresh cancellation token cannot be cancelled")
 }
 
 /// Runs the fixed frontend pipeline with settled default lint levels.
 #[must_use]
 pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
-    compile_frontend_with_lints(request, &LintTable::new(LintProfile::Default))
+    let cancel = CancellationToken::new();
+    compile_frontend_with_cancel(request, &LintTable::new(LintProfile::Default), &cancel)
+        .expect("a fresh cancellation token cannot be cancelled")
 }
 
 /// Runs the fixed scan -> parse -> check -> optional emit frontend pipeline
@@ -428,40 +507,63 @@ pub fn compile_frontend(request: FrontendRequest) -> FrontendOutput {
 /// ordered, and de-duplicated into one vector.
 #[must_use]
 pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable) -> FrontendOutput {
-    let FrontendRequest {
-        source_id,
-        script_kind,
-        source,
-        mode,
-    } = request;
+    let cancel = CancellationToken::new();
+    compile_frontend_with_cancel(request, levels, &cancel)
+        .expect("a fresh cancellation token cannot be cancelled")
+}
 
-    let scanned = scanner::scan(source_id, script_kind, source);
-    let parsed = parser::parse(scanned);
-    let checked = checker::check_with_lints(&parsed, levels);
+/// Runs the cancellable scan -> parse -> check -> optional emit frontend pipeline.
+pub fn compile_frontend_with_cancel(
+    request: FrontendRequest,
+    levels: &LintTable,
+    cancel: &CancellationToken,
+) -> Result<FrontendOutput, Cancelled> {
+    Telemetry::measure(Phase::Total, || {
+        let FrontendRequest {
+            source_id,
+            script_kind,
+            source,
+            mode,
+        } = request;
 
-    // Emit consumes the recovered tree and this pass's semantic model; it never
-    // gates on prior diagnostics.
-    let emit = mode
-        .emit_options()
-        .map(|options| emitter::emit_checked(parsed.product(), checked.product(), options));
+        let scanned = Telemetry::measure(Phase::Scan, || {
+            scanner::scan_with_cancel(source_id, script_kind, source, cancel.clone())
+        })?;
+        let parsed = Telemetry::measure(Phase::Parse, || {
+            parser::parse_with_cancel(scanned, cancel.clone())
+        })?;
+        let checked = Telemetry::measure(Phase::Check, || {
+            checker::check_source_with_lints_with_cancel(parsed.product(), levels, cancel.clone())
+        })?;
 
-    let (source_file, parse_diagnostics) = parsed.into_parts();
-    let (semantic_model, check_diagnostics) = checked.into_parts();
+        // Emit consumes the recovered tree and this pass's semantic model; it never
+        // gates on prior diagnostics.
+        cancel.check()?;
+        let emit = mode.emit_options().map(|options| {
+            Telemetry::measure(Phase::Emit, || {
+                emitter::emit_checked(parsed.product(), checked.product(), options)
+            })
+        });
+        cancel.check()?;
 
-    let mut diagnostics = parse_diagnostics;
-    diagnostics.extend(check_diagnostics);
-    if let Some(output) = &emit {
-        diagnostics.extend(output.diagnostics.iter().cloned());
-    }
-    let diagnostics = canonicalize(diagnostics);
+        let (source_file, parse_diagnostics) = parsed.into_parts();
+        let (semantic_model, check_diagnostics) = checked.into_parts();
 
-    FrontendOutput {
-        mode,
-        source_file,
-        semantic_model,
-        emit,
-        diagnostics,
-    }
+        let mut diagnostics = parse_diagnostics;
+        diagnostics.extend(check_diagnostics);
+        if let Some(output) = &emit {
+            diagnostics.extend(output.diagnostics.iter().cloned());
+        }
+        let diagnostics = canonicalize(diagnostics);
+
+        Ok(FrontendOutput {
+            mode,
+            source_file,
+            semantic_model,
+            emit,
+            diagnostics,
+        })
+    })
 }
 
 /// Orders diagnostics by the canonical [`Diagnostic`] key and removes exact
@@ -488,7 +590,9 @@ mod tests {
         FrontendRequest {
             source_id: SourceId::new(0),
             script_kind: ScriptKind::TypeScript,
-            source: Arc::new(SourceText::new(source)),
+            source: Arc::new(
+                SourceText::new(source).expect("test source fits the per-file budget"),
+            ),
             mode,
         }
     }
@@ -703,6 +807,336 @@ mod tests {
                 .iter()
                 .any(|edge| edge.specifier == body.data().statements[0].id())
         );
+
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn resolved_edge_specifier_always_maps_to_node() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::{
+            parser,
+            program::{ModuleTarget, ProgramLoader},
+            project::{ProjectConfig, ProjectRoot},
+            scanner,
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-edge-map-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root_path).unwrap();
+        let write = |name: &str, source: &str| fs::write(root_path.join(name), source).unwrap();
+        write(
+            "main.ts",
+            "import { a } from \"./a\"; import b = require(\"./b\"); export { c } from \"./c\"; async function d() { return import(\"./d\"); }",
+        );
+        write("a.ts", "export const a = 1;");
+        write("b.ts", "export = 1;");
+        write("c.ts", "export const c = 1;");
+        write("d.ts", "export default 1;");
+
+        let root = ProjectRoot::new(fs::canonicalize(&root_path).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), "{}").unwrap();
+        let program = ProgramLoader::new(&root, config.options())
+            .unwrap()
+            .load("main.ts")
+            .unwrap();
+
+        let files = program
+            .modules()
+            .iter()
+            .map(|module| {
+                parser::parse(scanner::scan(
+                    module.source_id(),
+                    module.script_kind(),
+                    Arc::clone(module.source()),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let edges = super::resolved_checker_edges(&program, &files);
+
+        // Count local dependencies to ensure no resolved edge is silently dropped.
+        let expected_local_edges: usize = program
+            .modules()
+            .iter()
+            .map(|module| {
+                module
+                    .dependencies()
+                    .iter()
+                    .filter(|edge| matches!(edge.target(), ModuleTarget::Local(_)))
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            edges.len(),
+            expected_local_edges,
+            "every resolved local edge must produce an output edge"
+        );
+
+        // Build the same source index the production code uses.
+        let files_by_source_id: std::collections::HashMap<SourceId, &super::SourceFile> = files
+            .iter()
+            .map(|file| (file.product().source_id(), file.product()))
+            .collect();
+
+        let mut edge_iter = edges.iter();
+        for module in program.modules() {
+            let source = files_by_source_id[&module.source_id()];
+            let nodes = super::SourceEdgeNodeIndex::new(source);
+            for dependency in module.dependencies() {
+                let ModuleTarget::Local(to) = dependency.target() else {
+                    continue;
+                };
+                let resolved = edge_iter
+                    .next()
+                    .expect("output edge exists for every local dependency");
+                assert_eq!(resolved.from, module.source_id());
+                assert_eq!(resolved.to, *to);
+                assert_eq!(
+                    Some(resolved.specifier),
+                    nodes.node_for(dependency.range()),
+                    "resolved edge specifier must map from the dependency's source range"
+                );
+            }
+        }
+        assert!(edge_iter.next().is_none(), "no extra output edges");
+
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn telemetry_records_frontend_phases_when_a_collector_is_active() {
+        use crate::telemetry::{Phase, Telemetry, TelemetryCollector};
+
+        // Disabled path: no collector, so nothing is timed and nothing panics.
+        assert!(!Telemetry::enabled());
+        let _ = compile_frontend(request("const n: number = 1;", FrontendMode::JavaScript));
+
+        // Enabled path: a collector on this thread captures per-phase wall time.
+        let collector = TelemetryCollector::start();
+        let _ = compile_frontend(request(
+            "const n: number = 1;\nfunction f(x: number): number { return x + 1; }",
+            FrontendMode::JavaScript,
+        ));
+        let totals = collector.snapshot();
+        drop(collector);
+
+        assert!(
+            totals.total > std::time::Duration::ZERO,
+            "total wall recorded"
+        );
+        assert!(
+            totals.get(Phase::Scan) > std::time::Duration::ZERO,
+            "scan recorded"
+        );
+        assert!(
+            totals.get(Phase::Parse) > std::time::Duration::ZERO,
+            "parse recorded"
+        );
+        assert!(
+            totals.get(Phase::Check) > std::time::Duration::ZERO,
+            "check recorded"
+        );
+        // JavaScript mode emits, so the emit phase is timed too.
+        assert!(
+            totals.get(Phase::Emit) > std::time::Duration::ZERO,
+            "emit recorded"
+        );
+        assert!(!Telemetry::enabled());
+    }
+
+    #[test]
+    fn compile_program_frontend_attaches_one_model_and_ordered_unique_diagnostics_per_module() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::{
+            program::ProgramLoader,
+            project::{ProjectConfig, ProjectRoot},
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-multi-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root_path).unwrap();
+        let write = |name: &str, source: &str| fs::write(root_path.join(name), source).unwrap();
+        write(
+            "main.ts",
+            "import { value } from \"./dep\";\nconst n: number = \"oops\";",
+        );
+        write("dep.ts", "export const value: number = \"oops\";");
+
+        let root = ProjectRoot::new(fs::canonicalize(&root_path).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), "{}").unwrap();
+        let program = ProgramLoader::new(&root, config.options())
+            .unwrap()
+            .load("main.ts")
+            .unwrap();
+
+        let expected_ids: Vec<SourceId> = program
+            .modules()
+            .iter()
+            .map(|module| module.source_id())
+            .collect();
+        assert!(expected_ids.len() > 1, "fixture must load multiple modules");
+
+        let output = super::compile_program_frontend(&program, FrontendMode::Check);
+
+        // Module order stays stable: outputs appear in the same dependency-first
+        // order as the resolved program.
+        let actual_ids: Vec<SourceId> = output
+            .modules()
+            .iter()
+            .map(|module| module.source_file().source_id())
+            .collect();
+        assert_eq!(
+            actual_ids, expected_ids,
+            "module order must match program order"
+        );
+
+        // One semantic model per module, and every diagnostic is attached to the
+        // module that owns its source id.
+        let mut seen: Vec<&Diagnostic> = Vec::new();
+        for module in output.modules() {
+            assert!(
+                !module.semantic_model().scopes().is_empty(),
+                "each module must carry its own semantic model"
+            );
+            assert!(
+                module
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code().as_str() == "BAMTS-C004"),
+                "module {:?} missing its type-error diagnostic",
+                module.source_file().source_id(),
+            );
+            for diagnostic in module.diagnostics() {
+                assert_eq!(
+                    diagnostic.source_id(),
+                    module.source_file().source_id(),
+                    "diagnostic leaked across module boundaries",
+                );
+            }
+            assert!(
+                is_sorted_unique(module.diagnostics()),
+                "module diagnostics must be canonically ordered and unique",
+            );
+            seen.extend(module.diagnostics());
+        }
+
+        // No diagnostic is duplicated across modules.
+        let before = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "diagnostic duplicated across modules");
+
+        fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn resolved_checker_edges_prefer_declaration_overlay() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::{
+            parser,
+            program::{ModuleTarget, ProgramLoader},
+            project::{ProjectConfig, ProjectRoot},
+            scanner,
+        };
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-overlay-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root_path).unwrap();
+        fs::create_dir_all(root_path.join("queue")).unwrap();
+        let write = |name: &str, source: &str| fs::write(root_path.join(name), source).unwrap();
+        write("main.ts", "import Queue from \"./queue/index.js\";");
+        write(
+            "queue/index.js",
+            "export default class Queue { enqueue(value) {} }",
+        );
+        write(
+            "queue/index.d.ts",
+            "export default class Queue<T> implements Iterable<T> {\n    constructor();\n    enqueue(value: T): void;\n    [Symbol.iterator](): IterableIterator<T>;\n}",
+        );
+
+        let root = ProjectRoot::new(fs::canonicalize(&root_path).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), "{}").unwrap();
+        let program = ProgramLoader::new(&root, config.options())
+            .unwrap()
+            .load("main.ts")
+            .unwrap();
+
+        let files: Vec<_> = program
+            .modules()
+            .iter()
+            .map(|module| {
+                parser::parse(scanner::scan(
+                    module.source_id(),
+                    module.script_kind(),
+                    Arc::clone(module.source()),
+                ))
+            })
+            .collect();
+
+        let main_id = program.entrypoint_id();
+        let main_module = program
+            .modules()
+            .iter()
+            .find(|module| module.source_id() == main_id)
+            .unwrap();
+        let js_id = program
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("queue/index.js"))
+            .unwrap()
+            .source_id();
+        let dts_id = program
+            .modules()
+            .iter()
+            .find(|module| module.path().ends_with("queue/index.d.ts"))
+            .unwrap()
+            .source_id();
+
+        let edges = super::resolved_checker_edges(&program, &files);
+        assert_eq!(edges.len(), 1, "one edge is emitted per local dependency");
+
+        let main_file = files
+            .iter()
+            .find(|file| file.product().source_id() == main_id)
+            .unwrap()
+            .product();
+        let import_id = main_file.statements()[0].id();
+
+        assert_eq!(edges[0].from, main_id);
+        assert_eq!(
+            edges[0].to, dts_id,
+            "checker edge must target the declaration overlay, not the runtime .js file"
+        );
+        assert_eq!(edges[0].specifier, import_id);
+
+        let edge = &main_module.dependencies()[0];
+        assert_eq!(edge.target(), &ModuleTarget::Local(js_id));
+        assert_eq!(edge.type_target(), Some(&ModuleTarget::Local(dts_id)));
 
         fs::remove_dir_all(root_path).unwrap();
     }

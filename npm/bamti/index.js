@@ -1,7 +1,5 @@
-export {
-  ArtifactNotFoundError,
-  UnsupportedPlatformError,
-  artifactPackage,
-  resolveBinary,
-  run,
-} from "bamti-cli";
+import { runNative } from "./native-runner.js";
+
+export function run(args = [], options = {}) {
+  return runNative(args, options);
+}

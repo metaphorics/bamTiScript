@@ -30,6 +30,145 @@ pub(crate) fn number_value(lexeme: &str) -> Option<f64> {
         .parse()
         .ok()
 }
+pub(crate) const MAX_BIGINT_CONVERSION_LIMB_OPS: usize = 1 << 24;
+/// Failure while canonicalizing BigInt source text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BigIntTextError {
+    Invalid,
+    Bytes,
+    Work,
+}
+/// Canonicalizes a BigInt lexeme to bounded decimal text.
+pub(crate) fn canonical_bigint_text(
+    lexeme: &str,
+    max_bytes: usize,
+    max_limb_ops: usize,
+) -> Result<String, BigIntTextError> {
+    const LIMB_BASE: u64 = 1_000_000_000;
+    const DECIMAL_LIMB_DIGITS: usize = 9;
+    const LOG10_2_UPPER_NUMERATOR: usize = 30_103;
+    const LOG10_2_UPPER_DENOMINATOR: usize = 100_000;
+    let literal = lexeme.strip_suffix('n').ok_or(BigIntTextError::Invalid)?;
+    let (digits, radix) = literal
+        .strip_prefix("0x")
+        .or_else(|| literal.strip_prefix("0X"))
+        .map(|digits| (digits, 16))
+        .or_else(|| {
+            literal
+                .strip_prefix("0o")
+                .or_else(|| literal.strip_prefix("0O"))
+                .map(|digits| (digits, 8))
+        })
+        .or_else(|| {
+            literal
+                .strip_prefix("0b")
+                .or_else(|| literal.strip_prefix("0B"))
+                .map(|digits| (digits, 2))
+        })
+        .unwrap_or((literal, 10));
+    if digits.is_empty() {
+        return Err(BigIntTextError::Invalid);
+    }
+    let mut previous_was_digit = false;
+    let mut significant_digits = 0_usize;
+    let mut first_significant_bits = 0_usize;
+    for character in digits.chars() {
+        if character == '_' {
+            if !previous_was_digit {
+                return Err(BigIntTextError::Invalid);
+            }
+            previous_was_digit = false;
+            continue;
+        }
+        let digit = character.to_digit(radix).ok_or(BigIntTextError::Invalid)?;
+        previous_was_digit = true;
+        if first_significant_bits == 0 {
+            if digit == 0 {
+                continue;
+            }
+            first_significant_bits = (u32::BITS - digit.leading_zeros()) as usize;
+        }
+        significant_digits = significant_digits
+            .checked_add(1)
+            .ok_or(BigIntTextError::Work)?;
+    }
+    if !previous_was_digit {
+        return Err(BigIntTextError::Invalid);
+    }
+    if radix == 10 {
+        let output_bytes = significant_digits.max(1);
+        if output_bytes > max_bytes {
+            return Err(BigIntTextError::Bytes);
+        }
+        let mut output = String::with_capacity(output_bytes);
+        let mut significant = false;
+        for character in digits.chars().filter(|character| *character != '_') {
+            if character != '0' || significant {
+                significant = true;
+                output.push(character);
+            }
+        }
+        if output.is_empty() {
+            output.push('0');
+        }
+        return Ok(output);
+    }
+    let bit_length = significant_digits
+        .saturating_sub(1)
+        .checked_mul(radix.trailing_zeros() as usize)
+        .and_then(|remaining| remaining.checked_add(first_significant_bits))
+        .ok_or(BigIntTextError::Work)?;
+    let max_decimal_bytes = if bit_length == 0 {
+        1
+    } else {
+        bit_length
+            .checked_mul(LOG10_2_UPPER_NUMERATOR)
+            .and_then(|value| value.checked_add(LOG10_2_UPPER_DENOMINATOR - 1))
+            .map(|value| value / LOG10_2_UPPER_DENOMINATOR)
+            .ok_or(BigIntTextError::Work)?
+    };
+    if max_decimal_bytes > max_bytes {
+        return Err(BigIntTextError::Bytes);
+    }
+    let max_limb_count = max_decimal_bytes.div_ceil(DECIMAL_LIMB_DIGITS);
+    let worst_case_limb_ops = significant_digits
+        .checked_mul(max_limb_count)
+        .ok_or(BigIntTextError::Work)?;
+    if worst_case_limb_ops > max_limb_ops {
+        return Err(BigIntTextError::Work);
+    }
+    let mut limbs = vec![0_u32];
+    let mut significant = false;
+    for character in digits.chars().filter(|character| *character != '_') {
+        let digit = u64::from(
+            character
+                .to_digit(radix)
+                .expect("validated BigInt digit remains valid"),
+        );
+        if digit == 0 && !significant {
+            continue;
+        }
+        significant = true;
+        let mut carry = digit;
+        for limb in &mut limbs {
+            let value = u64::from(*limb) * u64::from(radix) + carry;
+            *limb = (value % LIMB_BASE) as u32;
+            carry = value / LIMB_BASE;
+        }
+        if carry != 0 {
+            limbs.push(carry as u32);
+        }
+    }
+    let mut output = limbs.pop().ok_or(BigIntTextError::Invalid)?.to_string();
+    for limb in limbs.iter().rev() {
+        use std::fmt::Write as _;
+        write!(output, "{limb:09}").expect("writing to String cannot fail");
+    }
+    if output.len() > max_bytes {
+        return Err(BigIntTextError::Bytes);
+    }
+    Ok(output)
+}
 
 /// Cooks one quoted JavaScript string literal.
 pub(crate) fn string_value(lexeme: &str) -> Option<EcmaString> {
@@ -44,7 +183,7 @@ pub(crate) fn string_value(lexeme: &str) -> Option<EcmaString> {
 /// Cooks JavaScript escape sequences in a string or template interior.
 pub(crate) fn cook_escapes(input: &str) -> EcmaString {
     if !input.contains('\\') {
-        return EcmaString::from_utf8(input);
+        return EcmaString::encode(input);
     }
     let mut output = EcmaStringBuilder::with_capacity(input.encode_utf16().count());
     let mut chars = input.chars().peekable();
@@ -73,6 +212,11 @@ pub(crate) fn cook_escapes(input: &str) -> EcmaString {
                     chars.next();
                 }
             }
+            // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are LineTerminator
+            // characters per spec; after a backslash they act as line continuations
+            // (the character is consumed and emits nothing), like \n and \r above.
+            '\u{2028}' => {}
+            '\u{2029}' => {}
             'x' => {
                 let hi = chars.next();
                 let lo = chars.next();
@@ -94,14 +238,67 @@ pub(crate) fn cook_escapes(input: &str) -> EcmaString {
 }
 
 fn radix_value(digits: &str, radix: u32) -> Option<f64> {
-    let mut value = 0.0_f64;
+    let bits_per_digit = radix.trailing_zeros();
     let mut any = false;
+    let mut significant = false;
+    let mut bit_length = 0_usize;
+    // Retain the 53-bit binary64 significand plus its guard bit. Every later
+    // one bit contributes only to the sticky bit, so the final rounding is
+    // performed exactly once regardless of the source integer's length.
+    let mut prefix = 0_u64;
+    let mut sticky = false;
+
     for character in digits.chars().filter(|character| *character != '_') {
         let digit = character.to_digit(radix)?;
-        value = value * f64::from(radix) + f64::from(digit);
         any = true;
+        for bit_index in (0..bits_per_digit).rev() {
+            let bit = (digit >> bit_index) & 1;
+            if !significant {
+                if bit == 0 {
+                    continue;
+                }
+                significant = true;
+            }
+            bit_length = bit_length.saturating_add(1);
+            if bit_length <= 54 {
+                prefix = (prefix << 1) | u64::from(bit);
+            } else {
+                sticky |= bit != 0;
+            }
+        }
     }
-    any.then_some(value)
+
+    if !any {
+        return None;
+    }
+    if !significant {
+        return Some(0.0);
+    }
+
+    let mut exponent = bit_length - 1;
+    let mut significand = if bit_length <= 53 {
+        prefix << (53 - bit_length)
+    } else {
+        let guard = prefix & 1 != 0;
+        let mut rounded = prefix >> 1;
+        if guard && (sticky || rounded & 1 != 0) {
+            rounded += 1;
+        }
+        if rounded == 1 << 53 {
+            exponent = exponent.saturating_add(1);
+            rounded >>= 1;
+        }
+        rounded
+    };
+
+    if exponent > 1023 {
+        return Some(f64::INFINITY);
+    }
+    debug_assert!((1 << 52..1 << 53).contains(&significand));
+    significand &= (1 << 52) - 1;
+    Some(f64::from_bits(
+        ((exponent as u64 + 1023) << 52) | significand,
+    ))
 }
 
 fn cook_unicode_escape(
@@ -166,5 +363,113 @@ mod tests {
         );
         assert_eq!(cook_escapes("\\uD800").as_units(), [0xD800]);
         assert_eq!(cook_escapes("\\u{1F603}").as_units(), [0xD83D, 0xDE03]);
+    }
+
+    #[test]
+    fn non_decimal_numbers_round_once_to_binary64() {
+        assert_eq!(
+            number_value("0x20000000000001"),
+            Some(9_007_199_254_740_992.0)
+        );
+        assert_eq!(
+            number_value("0x20000000000003"),
+            Some(9_007_199_254_740_996.0)
+        );
+        assert_eq!(
+            number_value("0b100000000000000000000000000000000000000000000000000011"),
+            Some(9_007_199_254_740_996.0)
+        );
+        assert_eq!(
+            number_value(&format!("0x1{}", "0".repeat(256))),
+            Some(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn non_decimal_radix_bit_patterns() {
+        // Leading zeros and separators are ignored without changing the value.
+        assert_eq!(number_value("0x0000000000000001"), Some(1.0));
+        assert_eq!(number_value("0x0000_0000_0000_0001"), Some(1.0));
+        assert_eq!(number_value("0o000000000000000000001"), Some(1.0));
+        assert_eq!(
+            number_value("0b00000000000000000000000000000000000000000000000000001"),
+            Some(1.0)
+        );
+        assert_eq!(number_value("0x0"), Some(0.0));
+        assert_eq!(number_value("0x0_0"), Some(0.0));
+
+        // 53-bit integers are represented exactly even when the leading 1 is
+        // not the most-significant bit of its source digit.
+        assert_eq!(
+            number_value("0x1fffffffffffff"),
+            Some(9_007_199_254_740_991.0)
+        );
+        assert_eq!(
+            number_value("0x20000000000000"),
+            Some(9_007_199_254_740_992.0)
+        );
+
+        // >53-bit halfway cases round to nearest, ties to even.
+        assert_eq!(
+            number_value("0x20000000000001"),
+            Some(9_007_199_254_740_992.0)
+        );
+        assert_eq!(
+            number_value("0x20000000000003"),
+            Some(9_007_199_254_740_996.0)
+        );
+        assert_eq!(
+            number_value("0x20000000000005"),
+            Some(9_007_199_254_740_996.0)
+        );
+
+        // Rounding carry propagates to the exponent when all retained bits are 1.
+        assert_eq!(
+            number_value("0x3fffffffffffff"),
+            Some(18_014_398_509_481_984.0)
+        );
+
+        // 2^54 - 2 is exactly representable.
+        assert_eq!(
+            number_value("0x3ffffffffffffe"),
+            Some(18_014_398_509_481_982.0)
+        );
+
+        // A large but still-finite integer rounds up to the next power of two.
+        assert_eq!(
+            number_value("0x3fffffffffffffff"),
+            Some(4_611_686_018_427_387_904.0)
+        );
+
+        // Arbitrary-length inputs overflow to Infinity without fixed-width
+        // integer conversion.
+        assert_eq!(
+            number_value(&format!("0x1{}", "0".repeat(300))),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(
+            number_value(&format!("0x{}", "f".repeat(300))),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(
+            number_value(&format!("0b1{}", "0".repeat(1024))),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(
+            number_value(&format!("0o1{}", "0".repeat(342))),
+            Some(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn cooks_line_continuations() {
+        assert_eq!(
+            cook_escapes("a\\\u{2028}b").as_units(),
+            [b'a'.into(), b'b'.into()]
+        );
+        assert_eq!(
+            cook_escapes("a\\\u{2029}b").as_units(),
+            [b'a'.into(), b'b'.into()]
+        );
     }
 }

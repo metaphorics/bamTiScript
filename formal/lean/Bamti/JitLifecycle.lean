@@ -341,15 +341,22 @@ def providerResultState : ProviderResult → ProviderPhase
   | .rejected next => next
 
 /-- W^X transitions for one provider. Allocation may repeat while writable.
-Finalization either publishes executable mappings or frees every mapping.
-Free changes a live phase to freed; later frees are accepted no-ops. -/
+Finalization from the writable phase either publishes executable mappings or
+frees every mapping. Finalization from any other phase is refused and leaves
+the phase unchanged. Free changes a live phase to freed; later frees are
+accepted no-ops. Every action from a phase without an accepted rule is
+explicitly rejected, matching the totality pattern of `JitStep` above. -/
 inductive ProviderStep : ProviderPhase → ProviderAction → ProviderResult → Prop where
   | allocateAccepted :
       ProviderStep .Writable .allocate (.accepted .Writable)
+  | allocateRejected (p : ProviderPhase) (h : p ≠ .Writable) :
+      ProviderStep p .allocate (.rejected p)
   | finalizeAccepted :
       ProviderStep .Writable .finalize (.accepted .Executable)
   | finalizeFailed :
       ProviderStep .Writable .finalize (.rejected .Freed)
+  | finalizeRejected (p : ProviderPhase) (h : p ≠ .Writable) :
+      ProviderStep p .finalize (.rejected p)
   | freeAccepted (p : ProviderPhase) (h : p = .Writable ∨ p = .Executable) :
       ProviderStep p .free (.accepted .Freed)
   | freeIdempotent :
@@ -376,19 +383,48 @@ theorem provider_finalization_exactly_once (p q : ProviderPhase)
   cases h
   exact ⟨rfl, rfl, fun h2 => by cases h2⟩
 
-theorem provider_finalization_failure_reclaims (p q : ProviderPhase)
+/-- A refused finalization never yields a writable phase, and never enables a
+later allocation or finalization. It does not imply reclamation; see
+`provider_finalization_failure_frees` for the writable-phase failure case,
+which is the only refused-finalization branch that reclaims. -/
+theorem provider_finalization_failure_never_writable (p q : ProviderPhase)
     (h : ProviderStep p .finalize (.rejected q)) :
-    q = .Freed ∧
+    q ≠ .Writable ∧
       (∀ next, ¬ ProviderStep q .allocate (.accepted next)) ∧
       (∀ next, ¬ ProviderStep q .finalize (.accepted next)) := by
-  cases h
-  constructor
-  · rfl
-  constructor
-  · intro next h2
-    cases h2
-  · intro next h2
-    cases h2
+  cases h with
+  | finalizeFailed =>
+      constructor
+      · intro hq
+        exact ProviderPhase.noConfusion hq
+      constructor
+      · intro next h2
+        cases h2
+      · intro next h2
+        cases h2
+  | finalizeRejected p hp =>
+      constructor
+      · intro hq
+        exact hp hq
+      constructor
+      · intro next h2
+        cases h2
+        exact hp rfl
+      · intro next h2
+        cases h2
+        exact hp rfl
+
+/-- Failed finalization of a writable provider frees every mapping: the only
+refused-finalization branch that starts from `.Writable` lands in `.Freed`.
+This is the reclamation claim; it holds only under the narrower hypothesis
+`p = .Writable`, whereas `provider_finalization_failure_never_writable` holds
+for any starting phase. -/
+theorem provider_finalization_failure_frees (q : ProviderPhase)
+    (h : ProviderStep .Writable .finalize (.rejected q)) :
+    q = .Freed := by
+  cases h with
+  | finalizeFailed => rfl
+  | finalizeRejected _ hp => exact absurd rfl hp
 
 theorem provider_free_is_idempotent (p q : ProviderPhase)
     (h : ProviderStep p .free (.accepted q)) :
@@ -417,6 +453,18 @@ theorem provider_trace_exclusivity (s u : ProviderPhase)
           constructor <;> intro h <;> cases h
       | finalizeFailed =>
           constructor <;> intro h <;> cases h
+      | finalizeRejected p hp =>
+          constructor
+          · intro h
+            exact ih.1 h
+          · intro h
+            exact ih.2 h
+      | allocateRejected p hp =>
+          constructor
+          · intro h
+            exact ih.1 h
+          · intro h
+            exact ih.2 h
       | freeAccepted p hp =>
           rcases hp with rfl | rfl
           · constructor <;> intro h <;> cases h
@@ -431,6 +479,48 @@ theorem provider_trace_exclusivity (s u : ProviderPhase)
             cases h
           · intro _
             exact ih.2 rfl
+
+/-- Allocation from an executable provider is rejected, not merely absent.
+This is the totality-strengthened W^X guarantee: the model refuses the call
+rather than having no rule for it. -/
+theorem allocate_from_executable_rejected (p : ProviderPhase)
+    (h : p = .Executable) :
+    ProviderStep p .allocate (.rejected p) := by
+  exact ProviderStep.allocateRejected p (fun hp => ProviderPhase.noConfusion (hp.symm.trans h))
+
+/-- Allocation from a freed provider is rejected. -/
+theorem allocate_from_freed_rejected (p : ProviderPhase)
+    (h : p = .Freed) :
+    ProviderStep p .allocate (.rejected p) := by
+  exact ProviderStep.allocateRejected p (fun hp => ProviderPhase.noConfusion (hp.symm.trans h))
+
+/-- Finalization from an executable provider is rejected. -/
+theorem finalize_from_executable_rejected (p : ProviderPhase)
+    (h : p = .Executable) :
+    ProviderStep p .finalize (.rejected p) := by
+  exact ProviderStep.finalizeRejected p (fun hp => ProviderPhase.noConfusion (hp.symm.trans h))
+
+/-- Finalization from a freed provider is rejected. -/
+theorem finalize_from_freed_rejected (p : ProviderPhase)
+    (h : p = .Freed) :
+    ProviderStep p .finalize (.rejected p) := by
+  exact ProviderStep.finalizeRejected p (fun hp => ProviderPhase.noConfusion (hp.symm.trans h))
+
+/-- No accepted transition is possible from an executable provider except free.
+This strengthens `provider_never_writable_executable` from a trace-level
+derivation property to a single-step refusal: `allocate` and `finalize`
+from `.Executable` are each explicitly rejected by the model. -/
+theorem executable_rejects_write_enabling (p : ProviderPhase)
+    (h : p = .Executable) :
+    (∀ q, ¬ ProviderStep p .allocate (.accepted q)) ∧
+      (∀ q, ¬ ProviderStep p .finalize (.accepted q)) := by
+  constructor
+  · intro q h2
+    cases h2
+    exact ProviderPhase.noConfusion h
+  · intro q h2
+    cases h2
+    exact ProviderPhase.noConfusion h
 
 /-- No phase reachable from an executable provider is writable. -/
 theorem provider_never_writable_executable (s u : ProviderPhase)

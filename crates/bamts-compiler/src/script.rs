@@ -37,6 +37,8 @@ pub enum ScriptCompileError {
     },
     /// A fixed compiler or bytecode capacity was exhausted.
     Capacity { message: String },
+    /// The compiler produced a program it could not itself accept.
+    Internal { message: String },
 }
 
 /// Compiles exact UTF-16 source into a one-module verified classic-script program.
@@ -52,7 +54,10 @@ pub fn compile_classic_script(
         .map_err(|error| ScriptCompileError::IllFormedSource {
             unit_offset: error.unit_offset,
         })?;
-    let source = Arc::new(SourceText::new(text));
+    let source = SourceText::new(text).map_err(|error| ScriptCompileError::Capacity {
+        message: error.to_string(),
+    })?;
+    let source = Arc::new(source);
     let parsed = parser::parse(scanner::scan(
         SourceId::new(0),
         ScriptKind::JavaScript,
@@ -85,19 +90,19 @@ pub fn compile_classic_script(
         &namespace_facts,
     )
     .map_err(|error| map_lower_error(&source, error))?;
-    let encoded_name = EcmaString::from_utf8(module_name);
+    let encoded_name = EcmaString::encode(module_name);
     let name = assembled
         .constants()
         .iter()
         .position(|constant| matches!(constant, Constant::String(value) if value == &encoded_name))
         .and_then(|index| u32::try_from(index).ok())
         .map(ConstantId::new)
-        .ok_or_else(|| ScriptCompileError::Capacity {
+        .ok_or_else(|| ScriptCompileError::Internal {
             message: "classic-script module name is absent from the constant pool".to_owned(),
         })?;
     let module = assembled
         .verify()
-        .map_err(|error| ScriptCompileError::Capacity {
+        .map_err(|error| ScriptCompileError::Internal {
             message: error.to_string(),
         })?;
 
@@ -134,7 +139,7 @@ fn map_lower_error(source: &SourceText, error: LowerError) -> ScriptCompileError
 }
 
 fn map_program_error(error: ProgramVerifyError) -> ScriptCompileError {
-    ScriptCompileError::Capacity {
+    ScriptCompileError::Internal {
         message: error.to_string(),
     }
 }

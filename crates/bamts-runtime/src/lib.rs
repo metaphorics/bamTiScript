@@ -31,8 +31,10 @@ use std::sync::Arc;
 use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
     EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
-    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
+    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, RESUME_NEXT, RESUME_RETURN,
+    RESUME_THROW, ResolvedExport, UnaryOp, Verified, format_number,
 };
+pub use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, SlotId, Value};
 
 mod external_modules;
@@ -42,7 +44,7 @@ mod intrinsics;
 mod native;
 mod vm;
 
-pub use native::{NativeEngine, NativeError, run_linked_program};
+pub use native::{NativeEngine, NativeError, run_linked_program, run_linked_program_with_cancel};
 
 const RUNTIME_HEAP_SEGMENT: u16 = 1;
 
@@ -129,6 +131,9 @@ pub enum ScriptCompileError {
     Capacity {
         message: String,
     },
+    Internal {
+        message: String,
+    },
 }
 
 /// A host capability for compiling a classic script without observing machine state.
@@ -148,8 +153,8 @@ pub trait Host {
 
     fn write_stderr(&mut self, _bytes: &[u8]) {}
 
-    fn exit_code(&self) -> i32 {
-        0
+    fn exit_code(&self) -> Option<i32> {
+        None
     }
 
     fn set_exit_code(&mut self, _exit_code: i32) {}
@@ -193,7 +198,10 @@ pub trait Host {
     /// This host's script compiler, or `None` when it provides none.
     ///
     /// Presence MUST remain stable for the lifetime of one machine because it
-    /// determines whether `node:vm` is installed during construction.
+    /// determines whether `node:vm` is installed during construction. When
+    /// present, `runInNewContext` provides a fresh `globalThis` per call but
+    /// still shares this machine's intrinsic objects and prototype graph; guest
+    /// code can mutate shared objects such as `Object.prototype`.
     fn script_compiler(&mut self) -> Option<&mut (dyn CompileProvider + 'static)> {
         None
     }
@@ -201,8 +209,8 @@ pub trait Host {
     /// This host's timer scheduler, or `None` when it provides none.
     ///
     /// Presence MUST remain stable for the lifetime of one machine because it
-    /// determines whether `setTimeout`/`clearTimeout` are installed during
-    /// construction.
+    /// determines whether `setTimeout`/`clearTimeout` and
+    /// `setInterval`/`clearInterval` are installed during construction.
     fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
         None
     }
@@ -263,8 +271,12 @@ pub trait TimerProvider {
     /// Drains every currently expired timer into `output` without blocking.
     fn poll_expired(&mut self, output: &mut Vec<TimerWakeup>) -> Result<(), TimerError>;
 
-    /// Blocks until the next timer expires, or returns `None` when none pend.
-    fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError>;
+    /// Blocks until the next timer expires, returns `None` when none pend, or
+    /// returns `None` early if `cancel` is triggered.
+    fn wait_expired(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TimerWakeup>, TimerError>;
 
     /// Reports whether the provider has any armed timer.
     fn has_pending(&self) -> bool;
@@ -364,6 +376,14 @@ pub enum RuntimeErrorKind {
     ModuleEvaluationStalled {
         module: ModuleId,
     },
+    /// The regexp backtracking step budget was exhausted by a pathologically
+    /// complex pattern. Surfaced as a runtime error (not a silent non-match)
+    /// so callers can distinguish an aborted match from a genuine non-match.
+    RegexpStepBudgetExceeded {
+        limit: usize,
+    },
+    /// A caller-supplied cancellation token was triggered at a checkpoint.
+    Cancelled,
 }
 
 impl fmt::Display for RuntimeError {
@@ -468,6 +488,10 @@ impl fmt::Display for RuntimeError {
                 "module {} evaluation cannot complete: no pending microtask or live timer",
                 module.get()
             ),
+            RuntimeErrorKind::RegexpStepBudgetExceeded { limit } => {
+                write!(formatter, "regular expression step budget {limit} exceeded")
+            }
+            RuntimeErrorKind::Cancelled => formatter.write_str("operation cancelled"),
         }
     }
 }
@@ -767,6 +791,7 @@ pub(crate) struct GeneratorStart {
     pub(crate) this_value: Value,
     pub(crate) new_target: Value,
     pub(crate) args: Vec<Value>,
+    pub(crate) context: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -778,6 +803,7 @@ pub(crate) struct SuspendedActivation {
     pub(crate) args: Vec<Value>,
     pub(crate) arguments_object: Option<Value>,
     pub(crate) resume_token: u32,
+    pub(crate) context: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -800,19 +826,59 @@ pub(crate) enum GeneratorResume {
         origin: ThrowOrigin,
     },
 }
+/// How a suspended generator body is re-entered. Abrupt completions are
+/// interpreted by the bytecode dispatch at the suspension's resume point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumeCompletion {
+    Next(Value),
+    Throw(Value),
+    Return(Value),
+}
 
-/// One `.next()` request on an async generator: the value sent into the body
-/// plus the Promise handed back to the caller that the request settles.
+impl ResumeCompletion {
+    pub(crate) const fn value(self) -> Value {
+        match self {
+            Self::Next(value) | Self::Throw(value) | Self::Return(value) => value,
+        }
+    }
+
+    pub(crate) const fn mode(self) -> u32 {
+        match self {
+            Self::Next(_) => RESUME_NEXT as u32,
+            Self::Throw(_) => RESUME_THROW as u32,
+            Self::Return(_) => RESUME_RETURN as u32,
+        }
+    }
+
+    pub(crate) const fn sync_operation(self) -> &'static str {
+        match self {
+            Self::Next(_) => "Generator.prototype.next called on incompatible receiver",
+            Self::Throw(_) => "Generator.prototype.throw called on incompatible receiver",
+            Self::Return(_) => "Generator.prototype.return called on incompatible receiver",
+        }
+    }
+
+    pub(crate) const fn async_operation(self) -> &'static str {
+        match self {
+            Self::Next(_) => "AsyncGenerator.prototype.next called on incompatible receiver",
+            Self::Throw(_) => "AsyncGenerator.prototype.throw called on incompatible receiver",
+            Self::Return(_) => "AsyncGenerator.prototype.return called on incompatible receiver",
+        }
+    }
+}
+
+/// One resume request on an async generator plus the Promise handed back to
+/// the caller that the request settles.
 #[derive(Clone, Debug)]
 pub(crate) struct AsyncGeneratorRequest {
-    pub(crate) resume_value: Value,
+    pub(crate) completion: ResumeCompletion,
     pub(crate) capability: Value,
 }
 
 /// Lifecycle of a `HeapEntry::AsyncGenerator`. `AwaitingOperand` parks on an
-/// `Await` inside the body; `AwaitingYield` parks awaiting a `yield` operand.
-/// While `Executing` or in either `Awaiting*` state the body is owned by one
-/// in-flight request and further `.next()` calls only enqueue.
+/// `Await` inside the body; `AwaitingYield` parks awaiting a yielded operand;
+/// `AwaitingResumption` parks while awaiting a return-resumption operand.
+/// While executing or awaiting, the body is owned by the front FIFO request.
 #[derive(Clone, Debug)]
 pub(crate) enum AsyncGeneratorState {
     SuspendedStart(GeneratorStart),
@@ -820,8 +886,8 @@ pub(crate) enum AsyncGeneratorState {
     Executing,
     AwaitingOperand(SuspendedActivation),
     AwaitingYield(SuspendedActivation),
-    /// The body returned; its return value is being awaited before the front
-    /// request settles `done: true`. No activation is held.
+    AwaitingResumption(SuspendedActivation),
+    /// The body is gone; the front request's return value is being awaited.
     AwaitingReturn,
     Completed,
 }
@@ -1098,6 +1164,7 @@ enum HeapEntry {
         module: ModuleId,
         function: FunctionId,
         captures: Vec<Value>,
+        context: Option<Value>,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
@@ -1196,10 +1263,13 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
-    /// A Node-compatible `Timeout` handle carrying its monotonic timer id and
-    /// ordinary object property/prototype fields.
+    /// A Node-compatible `Timeout` handle carrying its monotonic timer id,
+    /// its active cancellation generation, and ordinary object property/prototype fields.
     Timeout {
         id: u64,
+        /// The active generation for this id. A stale handle with a different
+        /// generation cannot cancel a re-used id after an interval re-arms.
+        generation: u64,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
@@ -1209,7 +1279,8 @@ enum HeapEntry {
         used: bool,
     },
     PromiseAll {
-        promise: Value,
+        resolve: Value,
+        reject: Value,
         values: Vec<Value>,
         remaining: usize,
         settled: bool,
@@ -1232,6 +1303,11 @@ enum HeapEntry {
         callable: NativeCallable,
         properties: PropertyMap,
         extensible: bool,
+        /// Explicit prototype override; `None` falls back to
+        /// `%Function.prototype%` at read time (see `prototype_index`).
+        /// Construct via [`HeapEntry::native_function`] so the intent is
+        /// stated explicitly at every call site.
+        prototype: Option<Value>,
     },
 }
 
@@ -1301,7 +1377,8 @@ impl HeapEntry {
                         .saturating_add(1),
                     AsyncGeneratorState::SuspendedYield(activation)
                     | AsyncGeneratorState::AwaitingOperand(activation)
-                    | AsyncGeneratorState::AwaitingYield(activation) => activation
+                    | AsyncGeneratorState::AwaitingYield(activation)
+                    | AsyncGeneratorState::AwaitingResumption(activation) => activation
                         .registers
                         .len()
                         .saturating_add(activation.args.len())
@@ -1339,6 +1416,27 @@ impl HeapEntry {
             | Self::PromiseAllElement { .. } => 1,
         }
     }
+
+    /// Construct a `NativeFunction` with an explicit prototype override.
+    ///
+    /// Pass `None` to fall back to `%Function.prototype%` at read time
+    /// (see [`Machine::prototype_index`]). Pass `Some(proto)` to inherit a
+    /// specific prototype — `Function.prototype.bind` passes the target's
+    /// prototype so the bound function inherits it. Routing every
+    /// construction site through this function makes the `None`-means-
+    /// fallback convention impossible to set by accident.
+    pub(crate) fn native_function(
+        callable: NativeCallable,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+    ) -> Self {
+        Self::NativeFunction {
+            callable,
+            properties,
+            extensible: true,
+            prototype,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1373,6 +1471,17 @@ pub(crate) struct RuntimeFunction {
     pub(crate) function: FunctionId,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ActivationRequest<'a> {
+    target: RuntimeFunction,
+    captures: &'a [Value],
+    context: Option<Value>,
+    this_value: Value,
+    new_target: Value,
+    arguments: &'a [Value],
+    return_to: Option<ReturnTo>,
+}
+
 #[derive(Clone, Debug)]
 struct Frame {
     module: ModuleId,
@@ -1380,6 +1489,8 @@ struct Frame {
     pc: usize,
     registers: Vec<Value>,
     return_to: Option<ReturnTo>,
+    context: Option<Value>,
+    outer_context: Option<Value>,
     this_value: Value,
     new_target: Value,
     args: Vec<Value>,
@@ -1387,19 +1498,15 @@ struct Frame {
 }
 
 impl Frame {
-    fn new(
-        target: RuntimeFunction,
-        metadata: &Function,
-        captures: &[Value],
-        this_value: Value,
-        new_target: Value,
-        arguments: &[Value],
-        return_to: Option<ReturnTo>,
-    ) -> Self {
+    fn new(metadata: &Function, request: ActivationRequest<'_>) -> Self {
         let mut registers = vec![Value::UNINITIALIZED; metadata.register_count() as usize];
         let capture_count = metadata.capture_count() as usize;
         for (index, slot) in registers.iter_mut().take(capture_count).enumerate() {
-            *slot = captures.get(index).copied().unwrap_or(Value::UNDEFINED);
+            *slot = request
+                .captures
+                .get(index)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
         }
         for (index, slot) in registers
             .iter_mut()
@@ -1407,17 +1514,23 @@ impl Frame {
             .take(metadata.parameter_count() as usize)
             .enumerate()
         {
-            *slot = arguments.get(index).copied().unwrap_or(Value::UNDEFINED);
+            *slot = request
+                .arguments
+                .get(index)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
         }
         Self {
-            module: target.module,
-            function: target.function.get() as usize,
+            module: request.target.module,
+            function: request.target.function.get() as usize,
             pc: 0,
             registers,
-            return_to,
-            this_value,
-            new_target,
-            args: arguments.to_vec(),
+            return_to: request.return_to,
+            context: request.context,
+            outer_context: None,
+            this_value: request.this_value,
+            new_target: request.new_target,
+            args: request.arguments.to_vec(),
             arguments_object: None,
         }
     }
@@ -1540,6 +1653,7 @@ enum CalleeKind {
     Runtime {
         target: RuntimeFunction,
         captures: Vec<Value>,
+        context: Option<Value>,
     },
     Builtin {
         id: intrinsics::BuiltinId,
@@ -1556,6 +1670,10 @@ struct TimerRecord {
     context: Option<Value>,
     deadline_ms: u64,
     sequence: u64,
+    generation: u64,
+    /// `Some(delay)` marks a repeating `setInterval` timer that re-arms with
+    /// `delay` milliseconds after each fire; `None` is a one-shot `setTimeout`.
+    interval_delay: Option<u32>,
 }
 
 /// The production bytecode interpreter.
@@ -1569,6 +1687,9 @@ pub struct Machine<'a, H: Host> {
     frames: Vec<Frame>,
     heap: Vec<HeapEntry>,
     slot_bytes: Vec<usize>,
+    /// Freed bootstrap bytes that runtime mutations can reuse before they
+    /// consume the runtime heap budget.
+    intrinsic_slot_credits: Vec<usize>,
     machine_bytes: usize,
     intrinsic_slots: usize,
     vacant_count: usize,
@@ -1576,8 +1697,17 @@ pub struct Machine<'a, H: Host> {
     live_registers: usize,
     native_depth: usize,
     fuel: u64,
-    globals: BTreeMap<EcmaString, Value>,
+    global_object: Value,
+    vm_context_marker: Value,
     /// The contextified global used only while executing `node:vm` code.
+    ///
+    /// `runInNewContext` creates a fresh `globalThis` for each call (or adopts
+    /// the supplied context object) but the new context still shares this
+    /// machine's intrinsic objects and prototype graph with the outer
+    /// environment. `Object`, `Array`, `Object.prototype`, and similar builtins
+    /// are identical across contexts, so guest code can mutate shared objects
+    /// such as `Object.prototype`. This is not a separate realm and is not a
+    /// security boundary.
     context_global: Option<Value>,
     last_completion: Option<Value>,
     /// Frame depths owned by native-to-runtime callback evaluations. A throw
@@ -1592,6 +1722,7 @@ pub struct Machine<'a, H: Host> {
     microtask_drain_active: bool,
     next_timer_id: Option<u64>,
     next_timer_sequence: Option<u64>,
+    next_timer_generation: Option<u64>,
     timers: BTreeMap<u64, TimerRecord>,
     ready_timers: BTreeSet<(u64, u64)>,
     timer_watermark: Option<u64>,
@@ -1599,12 +1730,21 @@ pub struct Machine<'a, H: Host> {
     intrinsics: intrinsics::Intrinsics<H>,
     current_builtin_id: Option<intrinsics::BuiltinId>,
     current_new_target: Value,
+    /// Cached heap index of the well-known `Symbol.hasInstance` symbol, used
+    /// by `instance_of` to consult a user-defined `@@hasInstance` handler.
+    /// Resolved lazily on the first `instanceof` so the hot common path pays
+    /// only the single property lookup the spec requires.
+    has_instance_symbol: Option<u32>,
     registry: ModuleRegistry,
     /// First machine-wide module ID reserved for host-compiled script modules.
     dynamic_base: usize,
     /// Host-compiled programs retained for the machine lifetime so their
     /// closures remain executable after the originating Script object dies.
     dynamic: Vec<DynamicModule>,
+    /// Cooperative cancellation signal checked at fuel, microtask, timer, and
+    /// quiescence checkpoints. A fresh token (never cancelled) preserves the
+    /// behavior of the existing fresh-token wrapper APIs.
+    cancel: CancellationToken,
 }
 
 #[derive(Clone, Debug)]
@@ -1737,6 +1877,50 @@ pub fn run<H: Host>(
         .map(|execution| execution.outcome)
 }
 
+/// Wall time and process peak memory observed while running a program.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RunTelemetry {
+    /// Interpreter execution wall time, in fractional milliseconds.
+    pub interpreter_wall_ms: f64,
+    /// Process peak resident set size in KiB (`/proc/self/status` `VmHWM`);
+    /// `0` when the platform does not expose it.
+    pub rss_kb: u64,
+}
+
+/// Runs a program and reports interpreter wall time plus process peak RSS.
+///
+/// This is the telemetry seam over [`run`]: it times only the interpreter call,
+/// then reads best-effort process peak RSS. The returned [`ExecutionOutcome`]
+/// and every observable effect are exactly those of [`run`].
+pub fn run_with_telemetry<H: Host>(
+    program: &Program<Verified>,
+    host: &mut H,
+    limits: &Limits,
+) -> (Result<ExecutionOutcome, RuntimeError>, RunTelemetry) {
+    let started = std::time::Instant::now();
+    let outcome = run(program, host, limits);
+    let interpreter_wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let telemetry = RunTelemetry {
+        interpreter_wall_ms,
+        rss_kb: peak_rss_kb().unwrap_or(0),
+    };
+    (outcome, telemetry)
+}
+
+/// Best-effort process peak resident set size, in KiB, from
+/// `/proc/self/status` `VmHWM`. Returns `None` when the file or field is
+/// unavailable (non-Linux hosts, sandboxes).
+fn peak_rss_kb() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/self/status").ok()?;
+    content.lines().find_map(|line| {
+        line.strip_prefix("VmHWM:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
 impl<'a, H: Host> Machine<'a, H> {
     #[must_use]
     pub fn new(program: &'a Program<Verified>, host: &'a mut H, limits: Limits) -> Self {
@@ -1744,7 +1928,31 @@ impl<'a, H: Host> Machine<'a, H> {
             .module(program.entry())
             .expect("verified program entry exists")
             .code;
-        Self::build(Some(program), module, host, limits)
+        Self::build(
+            Some(program),
+            module,
+            host,
+            limits,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Constructs a machine bound to a caller-supplied cancellation token.
+    /// The token is checked at fuel, microtask, timer, and quiescence
+    /// checkpoints; triggering it aborts execution with
+    /// [`RuntimeErrorKind::Cancelled`].
+    #[must_use]
+    pub fn new_with_cancel(
+        program: &'a Program<Verified>,
+        host: &'a mut H,
+        limits: Limits,
+        cancel: CancellationToken,
+    ) -> Self {
+        let module = &program
+            .module(program.entry())
+            .expect("verified program entry exists")
+            .code;
+        Self::build(Some(program), module, host, limits, cancel)
     }
 
     fn build(
@@ -1752,25 +1960,32 @@ impl<'a, H: Host> Machine<'a, H> {
         module: &'a Module<Verified>,
         host: &'a mut H,
         limits: Limits,
+        cancel: CancellationToken,
     ) -> Self {
         let entry = module.entry().get() as usize;
         let module_id = program.map_or(ModuleId::new(0), Program::entry);
         let frame = Frame::new(
-            RuntimeFunction {
-                module: module_id,
-                function: FunctionId::new(entry as u32),
-            },
             &module.functions()[entry],
-            &[],
-            Value::UNDEFINED,
-            Value::UNDEFINED,
-            &[],
-            None,
+            ActivationRequest {
+                target: RuntimeFunction {
+                    module: module_id,
+                    function: FunctionId::new(entry as u32),
+                },
+                captures: &[],
+                context: None,
+                this_value: Value::UNDEFINED,
+                new_target: Value::UNDEFINED,
+                arguments: &[],
+                return_to: None,
+            },
         );
         let live_registers = frame.registers.len();
         let mut heap = Vec::new();
         let timers_available = host.timers().is_some();
         let mut intrinsics = intrinsics::Intrinsics::<H>::initialize(&mut heap, timers_available);
+        let global_object = intrinsics
+            .global("globalThis")
+            .expect("host objects install globalThis");
         let script_compiler = host.script_compiler().is_some();
         let installed_external = external_modules::install(
             &mut heap,
@@ -1778,12 +1993,16 @@ impl<'a, H: Host> Machine<'a, H> {
             intrinsics.object_prototype,
             script_compiler,
         );
+        let vm_context_marker = intrinsics::push(
+            &mut heap,
+            HeapEntry::PrivateName {
+                description: EcmaString::encode("vm context"),
+            },
+        );
         let argv_text = host.argv().to_vec();
         let argv_values: Vec<Value> = argv_text
             .into_iter()
-            .map(|text| {
-                intrinsics::push(&mut heap, HeapEntry::String(EcmaString::from_utf8(&text)))
-            })
+            .map(|text| intrinsics::push(&mut heap, HeapEntry::String(EcmaString::encode(&text))))
             .collect();
         let process = intrinsics
             .global("process")
@@ -1808,6 +2027,7 @@ impl<'a, H: Host> Machine<'a, H> {
         *elements = argv_values;
         let intrinsic_slots = heap.len();
         let slot_bytes = vec![0; intrinsic_slots];
+        let intrinsic_slot_credits = vec![0; intrinsic_slots];
         let fuel = limits.fuel;
         Self {
             program,
@@ -1820,6 +2040,7 @@ impl<'a, H: Host> Machine<'a, H> {
             frames: vec![frame],
             heap,
             slot_bytes,
+            intrinsic_slot_credits,
             machine_bytes: 0,
             intrinsic_slots,
             vacant_count: 0,
@@ -1836,11 +2057,13 @@ impl<'a, H: Host> Machine<'a, H> {
             microtask_drain_active: false,
             next_timer_id: Some(1),
             next_timer_sequence: Some(0),
+            next_timer_generation: Some(0),
             timers: BTreeMap::new(),
             ready_timers: BTreeSet::new(),
             timer_watermark: None,
             timer_checkpoint_active: false,
-            globals: BTreeMap::new(),
+            global_object,
+            vm_context_marker,
             context_global: None,
             registry: ModuleRegistry {
                 external: installed_external
@@ -1852,7 +2075,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .map(|(name, value)| (name, ExternalExport { value, cell: None }))
                             .collect();
                         exports.insert(
-                            EcmaString::from_utf8("default"),
+                            EcmaString::encode("default"),
                             ExternalExport {
                                 value: module.namespace,
                                 cell: None,
@@ -1874,7 +2097,9 @@ impl<'a, H: Host> Machine<'a, H> {
             dynamic: Vec::new(),
             current_builtin_id: None,
             current_new_target: Value::UNDEFINED,
+            has_instance_symbol: None,
             intrinsics,
+            cancel,
         }
     }
 
@@ -2016,8 +2241,9 @@ impl<'a, H: Host> Machine<'a, H> {
             self.ready_timers.remove(&order);
             let timer = self
                 .timers
-                .remove(&id)
-                .expect("ready timer remains live until after fuel charging");
+                .get(&id)
+                .expect("ready timer remains live until after fuel charging")
+                .clone();
             let mut report = TimerRun {
                 executed: 1,
                 uncaught: Vec::new(),
@@ -2028,17 +2254,24 @@ impl<'a, H: Host> Machine<'a, H> {
             match callback_result {
                 Ok(_) => {}
                 Err(EvalFailure::Runtime(kind)) => {
+                    self.timers.remove(&id);
                     return Err(self.checkpoint_error(kind));
                 }
                 Err(failure) => {
-                    let (value, origin) =
-                        self.promise_rejection_value(failure)
-                            .map_err(|failure| match failure {
-                                EvalFailure::Runtime(kind) => self.checkpoint_error(kind),
-                                _ => self.checkpoint_error(RuntimeErrorKind::InvalidValue {
-                                    value: timer.callback,
-                                }),
-                            })?;
+                    let rejection = self.promise_rejection_value(failure);
+                    let (value, origin) = match rejection {
+                        Ok(pair) => pair,
+                        Err(EvalFailure::Runtime(kind)) => {
+                            self.timers.remove(&id);
+                            return Err(self.checkpoint_error(kind));
+                        }
+                        Err(_) => {
+                            self.timers.remove(&id);
+                            return Err(self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                                value: timer.callback,
+                            }));
+                        }
+                    };
                     report.uncaught.try_reserve(1).map_err(|_| {
                         self.checkpoint_error(RuntimeErrorKind::HeapByteLimitExceeded {
                             limit: self.limits.max_heap_bytes,
@@ -2046,6 +2279,84 @@ impl<'a, H: Host> Machine<'a, H> {
                     })?;
                     report.uncaught.push(CallbackException { value, origin });
                 }
+            }
+            // Re-arm a repeating interval with the same id and handle so
+            // JavaScript retains its original Timeout reference. A new
+            // sequence orders the next fire behind any timer armed during the
+            // callback. A provider failure here is fatal to the checkpoint.
+            if self.timers.remove(&id).is_some()
+                && let Some(delay_ms) = timer.interval_delay
+            {
+                let sequence = self
+                    .next_timer_sequence
+                    .take()
+                    .ok_or(
+                        self.checkpoint_error(RuntimeErrorKind::TimerCapacityExceeded {
+                            limit: self.limits.max_timers,
+                        }),
+                    )?;
+                self.next_timer_sequence = sequence.checked_add(1);
+                let generation = self
+                    .next_timer_generation
+                    .take()
+                    .ok_or(
+                        self.checkpoint_error(RuntimeErrorKind::TimerCapacityExceeded {
+                            limit: self.limits.max_timers,
+                        }),
+                    )?;
+                self.next_timer_generation = generation.checked_add(1);
+                let deadline_ms = match self.host.timers() {
+                    Some(provider) => provider.schedule(id, delay_ms).map_err(|error| {
+                        self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
+                            message: error.to_string(),
+                        })
+                    })?,
+                    None => {
+                        return Err(self.checkpoint_error(
+                            RuntimeErrorKind::TimerProviderFailure {
+                                message: "timer capability is unavailable".to_owned(),
+                            },
+                        ));
+                    }
+                };
+                if deadline_ms <= self.timer_watermark.unwrap_or(0) {
+                    self.ready_timers.insert((deadline_ms, sequence));
+                }
+                let handle_index = match self.runtime_slot(timer.handle) {
+                    Ok(Some(index)) => index,
+                    Ok(None) => {
+                        return Err(self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                            value: timer.handle,
+                        }));
+                    }
+                    Err(kind) => return Err(self.checkpoint_error(kind)),
+                };
+                match &mut self.heap[handle_index] {
+                    HeapEntry::Timeout {
+                        generation: handle_generation,
+                        ..
+                    } => {
+                        *handle_generation = generation;
+                    }
+                    _ => {
+                        return Err(self.checkpoint_error(RuntimeErrorKind::InvalidValue {
+                            value: timer.handle,
+                        }));
+                    }
+                }
+                self.timers.insert(
+                    id,
+                    TimerRecord {
+                        callback: timer.callback,
+                        arguments: timer.arguments,
+                        handle: timer.handle,
+                        context: timer.context,
+                        deadline_ms,
+                        sequence,
+                        generation,
+                        interval_delay: Some(delay_ms),
+                    },
+                );
             }
             Ok(report)
         })();
@@ -2055,10 +2366,6 @@ impl<'a, H: Host> Machine<'a, H> {
 
     /// Blocks in the host provider until an expiry report is available.
     /// Returns whether at least one live timer became ready.
-    pub fn wait_for_timer_expiry(&mut self) -> Result<bool, RuntimeError> {
-        Ok(self.wait_for_timer_expiry_state()? == TimerWait::Ready)
-    }
-
     fn wait_for_timer_expiry_state(&mut self) -> Result<TimerWait, RuntimeError> {
         if self.timer_checkpoint_active {
             return Err(self.checkpoint_error(RuntimeErrorKind::TimerCheckpointReentry));
@@ -2066,10 +2373,13 @@ impl<'a, H: Host> Machine<'a, H> {
         if !self.ready_timers.is_empty() {
             return Ok(TimerWait::Ready);
         }
+        self.check_cancel()
+            .map_err(|kind| self.checkpoint_error(kind))?;
+        let cancel = self.cancel.clone();
         self.timer_checkpoint_active = true;
         let result = (|| {
             let wakeup = match self.host.timers() {
-                Some(provider) => provider.wait_expired(),
+                Some(provider) => provider.wait_expired(&cancel),
                 None => return Ok(TimerWait::Idle),
             }
             .map_err(|error| {
@@ -2078,7 +2388,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 })
             })?;
             let Some(wakeup) = wakeup else {
-                return Ok(TimerWait::Idle);
+                return if cancel.is_cancelled() {
+                    Err(self.checkpoint_error(RuntimeErrorKind::Cancelled))
+                } else {
+                    Ok(TimerWait::Idle)
+                };
             };
             self.promote_timer_wakeup(wakeup);
             Ok(if self.ready_timers.is_empty() {
@@ -2089,6 +2403,18 @@ impl<'a, H: Host> Machine<'a, H> {
         })();
         self.timer_checkpoint_active = false;
         result
+    }
+
+    /// Public convenience wrapper around [`Self::wait_for_timer_expiry_state`].
+    ///
+    /// Returns `true` if at least one live timer became ready, `false` if the
+    /// provider reports an empty or stale pending set, and aborts on provider
+    /// failure or cancellation.
+    pub fn wait_for_timer_expiry(&mut self) -> Result<bool, RuntimeError> {
+        match self.wait_for_timer_expiry_state()? {
+            TimerWait::Ready => Ok(true),
+            TimerWait::Stale | TimerWait::Idle => Ok(false),
+        }
     }
 
     /// Returns whether any machine-owned live timer remains.
@@ -2116,6 +2442,8 @@ impl<'a, H: Host> Machine<'a, H> {
     /// exhausted work fails with [`RuntimeErrorKind::FuelExhausted`].
     pub(crate) fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
         self.drain_microtasks_automatic()?;
+        self.check_cancel()
+            .map_err(|kind| self.checkpoint_error(kind))?;
         while self.has_pending_timers() {
             match self.wait_for_timer_expiry_state()? {
                 TimerWait::Ready => {}
@@ -2128,6 +2456,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     );
                 }
             }
+            self.check_cancel()
+                .map_err(|kind| self.checkpoint_error(kind))?;
             let run = self.run_one_expired_timer()?;
             if let Some(exception) = run.uncaught.into_iter().next() {
                 return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
@@ -2145,6 +2475,25 @@ impl<'a, H: Host> Machine<'a, H> {
         callback: Value,
         delay_ms: u32,
         arguments: Vec<Value>,
+    ) -> Result<Value, EvalFailure> {
+        self.schedule_timer(callback, delay_ms, arguments, None)
+    }
+
+    pub(crate) fn schedule_interval(
+        &mut self,
+        callback: Value,
+        delay_ms: u32,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalFailure> {
+        self.schedule_timer(callback, delay_ms, arguments, Some(delay_ms))
+    }
+
+    fn schedule_timer(
+        &mut self,
+        callback: Value,
+        delay_ms: u32,
+        arguments: Vec<Value>,
+        interval_delay: Option<u32>,
     ) -> Result<Value, EvalFailure> {
         if self.timers.len() >= self.limits.max_timers {
             return Err(EvalFailure::Runtime(
@@ -2165,6 +2514,15 @@ impl<'a, H: Host> Machine<'a, H> {
             },
         ))?;
         self.next_timer_sequence = sequence.checked_add(1);
+        let generation = self
+            .next_timer_generation
+            .take()
+            .ok_or(EvalFailure::Runtime(
+                RuntimeErrorKind::TimerCapacityExceeded {
+                    limit: self.limits.max_timers,
+                },
+            ))?;
+        self.next_timer_generation = generation.checked_add(1);
         let deadline_ms = self
             .host
             .timers()
@@ -2181,6 +2539,7 @@ impl<'a, H: Host> Machine<'a, H> {
             })?;
         let handle = match self.allocate(HeapEntry::Timeout {
             id,
+            generation,
             properties: PropertyMap::default(),
             prototype: Some(self.intrinsics.object_prototype),
             extensible: true,
@@ -2202,41 +2561,48 @@ impl<'a, H: Host> Machine<'a, H> {
                 context: self.context_global,
                 deadline_ms,
                 sequence,
+                generation,
+                interval_delay,
             },
         );
         Ok(handle)
     }
 
     pub(crate) fn clear_timeout(&mut self, handle: Value) -> Result<(), EvalFailure> {
-        let id = match handle.decode() {
-            Some(Decoded::Int32(raw)) if (raw as i32) > 0 => Some(u64::from(raw)),
+        let (id, request_generation) = match handle.decode() {
+            Some(Decoded::Int32(raw)) if (raw as i32) > 0 => (u64::from(raw), None),
             Some(Decoded::Number(number))
                 if number.is_finite()
                     && number > 0.0
                     && number.fract() == 0.0
                     && number < u64::MAX as f64 =>
             {
-                Some(number as u64)
+                (number as u64, None)
             }
             Some(Decoded::HeapRef(_)) => {
-                self.runtime_slot(handle)
-                    .ok()
-                    .flatten()
-                    .and_then(|index| match &self.heap[index] {
-                        HeapEntry::Timeout { id, .. } => Some(*id),
+                match self.runtime_slot(handle).ok().flatten().and_then(|index| {
+                    match &self.heap[index] {
+                        HeapEntry::Timeout { id, generation, .. } => Some((*id, Some(*generation))),
                         _ => None,
-                    })
+                    }
+                }) {
+                    Some(pair) => pair,
+                    None => return Ok(()),
+                }
             }
-            _ => None,
+            _ => return Ok(()),
         };
-        let Some(id) = id else {
+        let Some(live_record) = self.timers.get(&id) else {
             return Ok(());
         };
-        let Some(timer) = self.timers.remove(&id) else {
+        if let Some(request_generation) = request_generation
+            && live_record.generation != request_generation
+        {
             return Ok(());
-        };
+        }
+        let record = self.timers.remove(&id).unwrap();
         self.ready_timers
-            .remove(&(timer.deadline_ms, timer.sequence));
+            .remove(&(record.deadline_ms, record.sequence));
         if let Some(provider) = self.host.timers() {
             provider.cancel(id).map_err(|error| {
                 EvalFailure::Runtime(RuntimeErrorKind::TimerProviderFailure {
@@ -2822,15 +3188,15 @@ impl<'a, H: Host> Machine<'a, H> {
         target: Value,
         record: Value,
     ) -> Result<Value, EvalFailure> {
-        self.allocate(HeapEntry::NativeFunction {
-            callable: NativeCallable::Bound(Box::new(BoundCallable {
+        self.allocate(HeapEntry::native_function(
+            NativeCallable::Bound(Box::new(BoundCallable {
                 target,
                 this_value: Value::UNDEFINED,
                 arguments: vec![record],
             })),
-            properties: PropertyMap::default(),
-            extensible: true,
-        })
+            PropertyMap::default(),
+            None,
+        ))
         .map_err(EvalFailure::Runtime)
     }
 
@@ -2995,13 +3361,15 @@ impl<'a, H: Host> Machine<'a, H> {
     pub(crate) fn promise_all_with_resolve(
         &mut self,
         iterable: Value,
-        resolve: Value,
+        resolve_method: Value,
         receiver: Value,
-    ) -> Result<Value, EvalFailure> {
-        let promise = self.create_promise()?;
+        capability_resolve: Value,
+        capability_reject: Value,
+    ) -> Result<(), EvalFailure> {
         let aggregate = self
             .allocate(HeapEntry::PromiseAll {
-                promise,
+                resolve: capability_resolve,
+                reject: capability_reject,
                 values: Vec::new(),
                 remaining: 1,
                 settled: false,
@@ -3011,8 +3379,8 @@ impl<'a, H: Host> Machine<'a, H> {
             Ok(iterator) => iterator,
             Err(failure) => {
                 self.mark_promise_all_settled(aggregate)?;
-                self.reject_promise_failure(promise, failure)?;
-                return Ok(promise);
+                self.call_promise_reject(capability_reject, failure)?;
+                return Ok(());
             }
         };
         loop {
@@ -3020,13 +3388,23 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok((true, _)) => break,
                 Ok((false, value)) => value,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
             let index = match self.add_promise_all_element(aggregate) {
                 Ok(index) => index,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
             let element = match self
@@ -3039,60 +3417,81 @@ impl<'a, H: Host> Machine<'a, H> {
             {
                 Ok(element) => element,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
-            let (fulfill_target, reject_target) = self.intrinsics.builtins.promise_all_targets();
+            let fulfill_target = self.intrinsics.builtins.promise_all_target();
             let on_fulfilled = match self.create_promise_resolver_function(fulfill_target, element)
             {
                 Ok(callback) => callback,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
-            let on_rejected = match self.create_promise_resolver_function(reject_target, element) {
-                Ok(callback) => callback,
-                Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
-                }
-            };
-            let resolved = match self.call_value(resolve, receiver, &[value]) {
+            let resolved = match self.call_value(resolve_method, receiver, &[value]) {
                 Ok(resolved) => resolved,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
             let then = match self.get_named_property(resolved, "then") {
                 Ok(then) => then,
                 Err(failure) => {
-                    return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+                    return self.reject_promise_all_abrupt(
+                        aggregate,
+                        capability_reject,
+                        iterator,
+                        failure,
+                    );
                 }
             };
-            if let Err(failure) = self.call_value(then, resolved, &[on_fulfilled, on_rejected]) {
-                return self.reject_promise_all_abrupt(aggregate, promise, iterator, failure);
+            if let Err(failure) =
+                self.call_value(then, resolved, &[on_fulfilled, capability_reject])
+            {
+                return self.reject_promise_all_abrupt(
+                    aggregate,
+                    capability_reject,
+                    iterator,
+                    failure,
+                );
             }
         }
         if self.finish_promise_all(aggregate)? {
             let array = self.move_promise_all_values_to_array(aggregate)?;
-            self.fulfill_promise(promise, array)
-                .map_err(EvalFailure::Runtime)?;
+            if let Err(failure) = self.call_value(capability_resolve, Value::UNDEFINED, &[array]) {
+                self.call_promise_reject(capability_reject, failure)?;
+            }
         }
-        Ok(promise)
+        Ok(())
     }
 
     fn reject_promise_all_abrupt(
         &mut self,
         aggregate: Value,
-        promise: Value,
+        reject: Value,
         iterator: Value,
         failure: EvalFailure,
-    ) -> Result<Value, EvalFailure> {
+    ) -> Result<(), EvalFailure> {
         self.mark_promise_all_settled(aggregate)?;
         if let Err(EvalFailure::Runtime(kind)) = self.close_iterator(iterator) {
             return Err(EvalFailure::Runtime(kind));
         }
-        self.reject_promise_failure(promise, failure)?;
-        Ok(promise)
+        self.call_promise_reject(reject, failure)
     }
 
     pub(crate) fn iterator_close_target(
@@ -3125,9 +3524,17 @@ impl<'a, H: Host> Machine<'a, H> {
             Ok(close) => close,
             Err(failure) => return (Err(failure), false),
         };
+        if matches!(close.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            return (Ok(Value::UNDEFINED), false);
+        }
         match self.is_callable(close) {
             Ok(true) => (self.call_value(close, target, &[]), true),
-            Ok(false) => (Ok(Value::UNDEFINED), false),
+            Ok(false) => (
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "iterator return method is not callable",
+                })),
+                false,
+            ),
             Err(failure) => (Err(failure), false),
         }
     }
@@ -3215,7 +3622,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let mut properties = PropertyMap::default();
         for (name, value) in [("error", error), ("suppressed", suppressed)] {
             properties.insert(
-                PropertyKey::Named(EcmaString::from_utf8(name)),
+                PropertyKey::Named(EcmaString::encode(name)),
                 Property::Data {
                     value,
                     writable: true,
@@ -3426,12 +3833,13 @@ impl<'a, H: Host> Machine<'a, H> {
             .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "Promise.all target",
             }))?;
-        let (promise, completed) = {
+        let (resolve, completed) = {
             let HeapEntry::PromiseAll {
-                promise,
+                resolve,
                 values,
                 remaining,
                 settled,
+                ..
             } = &mut self.heap[aggregate_index]
             else {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -3447,59 +3855,13 @@ impl<'a, H: Host> Machine<'a, H> {
             if completed {
                 *settled = true;
             }
-            (*promise, completed)
+            (*resolve, completed)
         };
         if completed {
             let array = self.move_promise_all_values_to_array(aggregate)?;
-            self.fulfill_promise(promise, array)
-                .map_err(EvalFailure::Runtime)?;
+            let _ = self.call_value(resolve, Value::UNDEFINED, &[array])?;
         }
         Ok(())
-    }
-
-    pub(crate) fn reject_promise_all_element(
-        &mut self,
-        element: Value,
-        reason: Value,
-    ) -> Result<(), EvalFailure> {
-        let index = self
-            .runtime_slot(element)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise.all target",
-            }))?;
-        let aggregate = {
-            let HeapEntry::PromiseAllElement {
-                aggregate, called, ..
-            } = &mut self.heap[index]
-            else {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "Promise.all target",
-                }));
-            };
-            if *called {
-                return Ok(());
-            }
-            *called = true;
-            *aggregate
-        };
-        let aggregate_index = self
-            .runtime_slot(aggregate)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise.all target",
-            }))?;
-        let HeapEntry::PromiseAll { promise, .. } = &self.heap[aggregate_index] else {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Promise.all target",
-            }));
-        };
-        let promise = *promise;
-        if !self.mark_promise_all_settled(aggregate)? {
-            return Ok(());
-        }
-        self.reject_promise(promise, reason, ThrowOrigin::Bytecode)
-            .map_err(EvalFailure::Runtime)
     }
 
     fn create_array(&mut self, elements: Vec<Value>) -> Result<Value, EvalFailure> {
@@ -3679,6 +4041,16 @@ impl<'a, H: Host> Machine<'a, H> {
         let (reason, origin) = self.promise_rejection_value(failure)?;
         self.reject_promise(promise, reason, origin)
             .map_err(EvalFailure::Runtime)
+    }
+
+    fn call_promise_reject(
+        &mut self,
+        reject: Value,
+        failure: EvalFailure,
+    ) -> Result<(), EvalFailure> {
+        let (reason, _) = self.promise_rejection_value(failure)?;
+        let _ = self.call_value(reject, Value::UNDEFINED, &[reason])?;
+        Ok(())
     }
 
     fn promise_rejection_value(
@@ -4036,7 +4408,7 @@ impl<'a, H: Host> Machine<'a, H> {
             .constant_text(module, self.program_module(module).name)
             .clone();
         let url = self.host.import_meta_url(&module_name);
-        let url_key = PropertyKey::Named(EcmaString::from_utf8("url"));
+        let url_key = PropertyKey::Named(EcmaString::encode("url"));
         let bytes = url
             .len_units()
             .saturating_mul(2)
@@ -4252,14 +4624,15 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         let function = self.module_code(module).entry();
         let stop_depth = self.frames.len();
-        if let Err(error) = self.push_frame(
-            RuntimeFunction { module, function },
-            &[],
-            Value::UNDEFINED,
-            Value::UNDEFINED,
-            &[],
-            None,
-        ) {
+        if let Err(error) = self.push_frame(ActivationRequest {
+            target: RuntimeFunction { module, function },
+            captures: &[],
+            context: None,
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            arguments: &[],
+            return_to: None,
+        }) {
             return ModuleStart::Settled(Err(error));
         }
         let step = self.drive_async_activation(stop_depth, None);
@@ -4347,14 +4720,15 @@ impl<'a, H: Host> Machine<'a, H> {
     fn run_sync_module_entry(&mut self, module: ModuleId) -> Result<Execution, RuntimeError> {
         let function = self.module_code(module).entry();
         let stop_depth = self.frames.len();
-        self.push_frame(
-            RuntimeFunction { module, function },
-            &[],
-            Value::UNDEFINED,
-            Value::UNDEFINED,
-            &[],
-            None,
-        )?;
+        self.push_frame(ActivationRequest {
+            target: RuntimeFunction { module, function },
+            captures: &[],
+            context: None,
+            this_value: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            arguments: &[],
+            return_to: None,
+        })?;
         let result = self.run_loop(stop_depth).and_then(|execution| {
             execution.ok_or_else(|| {
                 self.program_error(
@@ -4933,6 +5307,7 @@ impl<'a, H: Host> Machine<'a, H> {
                                 module: module_id,
                                 function,
                                 captures,
+                                context: self.frames[frame_index].context,
                                 properties: PropertyMap::default(),
                                 prototype: Some(self.intrinsics.function_prototype),
                                 extensible: true,
@@ -5182,7 +5557,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         Ok(value) => {
                             let text = value.map_or("undefined", |value| self.type_of(value));
                             let value = self
-                                .allocate(HeapEntry::String(EcmaString::from_utf8(text)))
+                                .allocate(HeapEntry::String(EcmaString::encode(text)))
                                 .map_err(|kind| self.error_at(kind, function_index, pc))?;
                             self.write_register(frame_index, dst.get(), value);
                             self.frames[frame_index].pc = pc + 1;
@@ -5259,11 +5634,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 } => {
                     let pattern = self.constant_string(pattern).clone();
                     let flags = self.constant_string(flags).clone();
+                    let properties = intrinsics::builtins::initial_regexp_properties();
                     let value = self
                         .allocate(HeapEntry::RegExp {
                             pattern,
                             flags,
-                            properties: PropertyMap::default(),
+                            properties,
                             prototype: Some(self.intrinsics.regexp_prototype()),
                             extensible: true,
                         })
@@ -5456,6 +5832,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 {
                     let awaited = self.read_register(frame_index, src.get());
                     let frame = self.frames.pop().expect("async activation is executing");
+                    self.context_global = frame.outer_context;
                     self.pending_async_suspend = Some((
                         awaited,
                         SuspendedActivation {
@@ -5467,6 +5844,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value: frame.this_value,
                             new_target: frame.new_target,
                             args: frame.args,
+                            context: frame.context,
                             arguments_object: frame.arguments_object,
                             resume_token: pc as u32 + 1,
                         },
@@ -5484,6 +5862,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .frames
                         .pop()
                         .expect("generator activation is executing");
+                    self.context_global = frame.outer_context;
                     self.pending_generator_resume = Some(GeneratorResume::Yield {
                         value,
                         activation: SuspendedActivation {
@@ -5496,6 +5875,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             new_target: frame.new_target,
                             args: frame.args,
                             arguments_object: frame.arguments_object,
+                            context: frame.context,
                             resume_token: pc as u32 + 1,
                         },
                     });
@@ -5641,15 +6021,37 @@ impl<'a, H: Host> Machine<'a, H> {
         bytes: usize,
     ) -> Result<(), RuntimeErrorKind> {
         self.sync_slot_ledger();
-        self.ensure_allocation_capacity(0, bytes)?;
-        self.slot_bytes[index] += bytes;
-        self.heap_bytes += bytes;
+        let credited = self
+            .intrinsic_slot_credits
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .min(bytes);
+        let charged = bytes - credited;
+        self.ensure_allocation_capacity(0, charged)?;
+        if let Some(credit) = self.intrinsic_slot_credits.get_mut(index) {
+            *credit -= credited;
+        }
+        self.slot_bytes[index] += charged;
+        self.heap_bytes += charged;
         self.request_garbage_collection();
         Ok(())
     }
 
     pub(crate) fn refund_slot(&mut self, index: usize, bytes: usize) {
         self.sync_slot_ledger();
+        if let Some(credit) = self.intrinsic_slot_credits.get_mut(index) {
+            let refunded = self.slot_bytes[index].min(bytes);
+            self.slot_bytes[index] -= refunded;
+            self.heap_bytes = self
+                .heap_bytes
+                .checked_sub(refunded)
+                .expect("slot refund cannot exceed heap charge");
+            *credit = credit
+                .checked_add(bytes - refunded)
+                .expect("intrinsic slot credit cannot overflow");
+            return;
+        }
         debug_assert!(self.slot_bytes[index] >= bytes);
         debug_assert!(self.heap_bytes >= bytes);
         self.slot_bytes[index] = self.slot_bytes[index]
@@ -5769,23 +6171,12 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(Some(value));
         }
         let name = self.constant_text(module, name).to_owned();
-        if let Some(context) = self.context_global {
-            if name.eq_ascii("globalThis") {
-                return Ok(Some(context));
-            }
-            let key = PropertyKey::Named(name.clone());
-            if self.own_descriptor(context, &key)?.is_some() {
-                return self.get_property_key(context, &key).map(Some);
-            }
-            return Ok(self
-                .intrinsics
-                .globals
-                .iter()
-                .find_map(|(candidate, value)| {
-                    (candidate == &name && !candidate.eq_ascii("globalThis")).then_some(*value)
-                }));
+        let key = PropertyKey::Named(name);
+        let global = self.context_global.unwrap_or(self.global_object);
+        if self.has_property(global, &key)? {
+            return self.get_property_key(global, &key).map(Some);
         }
-        Ok(self.resolve_global_binding(&name))
+        Ok(None)
     }
 
     pub(crate) fn store_global(
@@ -5818,39 +6209,29 @@ impl<'a, H: Host> Machine<'a, H> {
             self.registry.cells[cell.0].value = value;
         } else {
             let name = self.constant_text(module, name).to_owned();
-            if let Some(context) = self.context_global {
-                self.set_data_property_key(context, PropertyKey::Named(name), value)?;
-                return Ok(());
-            }
-            if let Some(global_this) = self.intrinsics.global("globalThis") {
-                let key = PropertyKey::Named(name.clone());
-                if matches!(
-                    self.own_descriptor(global_this, &key)?,
-                    Some(
-                        Property::Data {
-                            writable: false,
-                            ..
-                        } | Property::Accessor { setter: None, .. }
-                    )
-                ) {
-                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "assign to non-writable global property",
-                    }));
-                }
-            }
-            self.globals.insert(name, value);
+            let global = self.context_global.unwrap_or(self.global_object);
+            self.set_data_property_key(global, PropertyKey::Named(name), value)?;
         }
         Ok(())
     }
 
-    /// Resolves a true realm global after module bindings have been considered.
-    fn resolve_global_binding(&self, name: &EcmaString) -> Option<Value> {
-        self.globals.get(name).copied().or_else(|| {
-            self.intrinsics
-                .globals
-                .iter()
-                .find_map(|(candidate, value)| (candidate == name).then_some(*value))
-        })
+    #[cfg(test)]
+    fn test_set_global(&mut self, name: &str, value: Value) {
+        let global = self.global_object;
+        self.set_data_property(global, name, value)
+            .expect("test global is writable");
+    }
+
+    #[cfg(test)]
+    fn test_global(&self, name: &str) -> Option<Value> {
+        let key = PropertyKey::Named(EcmaString::encode(name));
+        match self
+            .own_descriptor(self.global_object, &key)
+            .expect("test global descriptor lookup succeeds")
+        {
+            Some(Property::Data { value, .. }) => Some(value),
+            _ => None,
+        }
     }
 
     /// Classifies a callee into the shared dispatch categories.
@@ -5861,6 +6242,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     module,
                     function,
                     captures,
+                    context,
                     ..
                 } => Ok(CalleeKind::Runtime {
                     target: RuntimeFunction {
@@ -5868,6 +6250,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         function: *function,
                     },
                     captures: captures.clone(),
+                    context: *context,
                 }),
                 HeapEntry::NativeFunction { callable, .. } => match callable {
                     NativeCallable::Builtin(id) => Ok(CalleeKind::Builtin { id: *id }),
@@ -6080,15 +6463,9 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(value)
     }
 
-    fn push_frame(
-        &mut self,
-        target: RuntimeFunction,
-        captures: &[Value],
-        this_value: Value,
-        new_target: Value,
-        arguments: &[Value],
-        return_to: Option<ReturnTo>,
-    ) -> Result<(), RuntimeError> {
+    fn push_frame(&mut self, request: ActivationRequest<'_>) -> Result<(), RuntimeError> {
+        let target = request.target;
+        let return_to = request.return_to;
         let function_index = target.function.get() as usize;
         let metadata = &self.module_code(target.module).functions()[function_index];
         let limit_error = |kind| match (self.frames.last(), return_to) {
@@ -6109,15 +6486,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 limit: self.limits.max_total_registers,
             }));
         }
-        let frame = Frame::new(
-            target, metadata, captures, this_value, new_target, arguments, return_to,
-        );
+        let mut frame = Frame::new(metadata, request);
+        frame.outer_context = std::mem::replace(&mut self.context_global, request.context);
         self.live_registers += next_registers;
         self.frames.push(frame);
         Ok(())
     }
 
     pub(crate) fn consume_fuel(&mut self, amount: u64) -> Result<(), RuntimeErrorKind> {
+        if self.cancel.is_cancelled() {
+            return Err(RuntimeErrorKind::Cancelled);
+        }
         if self.fuel < amount {
             self.fuel = 0;
             return Err(RuntimeErrorKind::FuelExhausted {
@@ -6126,6 +6505,16 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         self.fuel -= amount;
         Ok(())
+    }
+
+    /// Checks the cancellation token at a cooperative checkpoint. Returns
+    /// [`RuntimeErrorKind::Cancelled`] when the token has been triggered.
+    pub(crate) fn check_cancel(&self) -> Result<(), RuntimeErrorKind> {
+        if self.cancel.is_cancelled() {
+            Err(RuntimeErrorKind::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn reserve_native_activation(
@@ -6198,7 +6587,11 @@ impl<'a, H: Host> Machine<'a, H> {
         let mut arguments = Cow::Borrowed(arguments);
         loop {
             match self.callee_kind(callee) {
-                Ok(CalleeKind::Runtime { target, captures }) => {
+                Ok(CalleeKind::Runtime {
+                    target,
+                    captures,
+                    context,
+                }) => {
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
@@ -6207,6 +6600,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .create_async_generator(GeneratorStart {
                                 target,
                                 captures,
+                                context,
                                 this_value,
                                 new_target,
                                 args: arguments.as_ref().to_vec(),
@@ -6222,6 +6616,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .create_generator(GeneratorStart {
                                 target,
                                 captures,
+                                context,
                                 this_value,
                                 new_target,
                                 args: arguments.as_ref().to_vec(),
@@ -6236,6 +6631,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return match self.start_async_call(
                             target,
                             &captures,
+                            context,
                             this_value,
                             new_target,
                             arguments.as_ref(),
@@ -6249,18 +6645,19 @@ impl<'a, H: Host> Machine<'a, H> {
                             Err(failure) => self.resolve_failure(failure, call_pc),
                         };
                     }
-                    return self.push_frame(
+                    return self.push_frame(ActivationRequest {
                         target,
-                        &captures,
+                        captures: &captures,
+                        context,
                         this_value,
                         new_target,
-                        arguments.as_ref(),
-                        Some(ReturnTo {
+                        arguments: arguments.as_ref(),
+                        return_to: Some(ReturnTo {
                             destination: destination.map(|register| register as usize),
                             call_pc,
                             constructed,
                         }),
-                    );
+                    });
                 }
                 Ok(CalleeKind::Builtin { id }) => {
                     match self.call_builtin(id, this_value, arguments.as_ref(), false) {
@@ -6279,10 +6676,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
                         }
-                        Ok(intrinsics::BuiltinOutcome::GeneratorNext {
+                        Ok(intrinsics::BuiltinOutcome::GeneratorResume {
                             generator,
-                            resume_value,
-                        }) => match self.resume_generator(generator, resume_value) {
+                            completion,
+                        }) => match self.resume_generator(generator, completion) {
                             Ok(value) => {
                                 if let Some(register) = destination {
                                     self.write_register(self.frames.len() - 1, register, value);
@@ -6291,10 +6688,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             }
                             Err(failure) => return self.resolve_failure(failure, call_pc),
                         },
-                        Ok(intrinsics::BuiltinOutcome::AsyncGeneratorNext {
+                        Ok(intrinsics::BuiltinOutcome::AsyncGeneratorResume {
                             generator,
-                            resume_value,
-                        }) => match self.enqueue_async_generator_next(generator, resume_value) {
+                            completion,
+                        }) => match self.enqueue_async_generator_next(generator, completion) {
                             Ok(value) => {
                                 if let Some(register) = destination {
                                     self.write_register(self.frames.len() - 1, register, value);
@@ -6367,8 +6764,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Ok(
                     intrinsics::BuiltinOutcome::Call { .. }
-                    | intrinsics::BuiltinOutcome::GeneratorNext { .. }
-                    | intrinsics::BuiltinOutcome::AsyncGeneratorNext { .. },
+                    | intrinsics::BuiltinOutcome::GeneratorResume { .. }
+                    | intrinsics::BuiltinOutcome::AsyncGeneratorResume { .. },
                 ) => self.throw_type("construct", call_pc),
                 Err(failure) => self.resolve_failure(failure, call_pc),
             };
@@ -6439,9 +6836,19 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Returns the array length without cloning the element vector.
+    pub(crate) fn array_len(&self, value: Value) -> Result<Option<usize>, EvalFailure> {
+        let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(None);
+        };
+        match &self.heap[index] {
+            HeapEntry::Array { elements, .. } => Ok(Some(elements.len())),
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn array_length(&self, value: Value) -> Result<usize, EvalFailure> {
-        self.array_elements(value)?
-            .map(|elements| elements.len())
+        self.array_len(value)?
             .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "array method called on incompatible receiver",
             }))
@@ -6533,11 +6940,7 @@ impl<'a, H: Host> Machine<'a, H> {
         name: &str,
         value: Value,
     ) -> Result<(), EvalFailure> {
-        self.set_data_property_key(
-            object,
-            PropertyKey::Named(EcmaString::from_utf8(name)),
-            value,
-        )
+        self.set_data_property_key(object, PropertyKey::Named(EcmaString::encode(name)), value)
     }
 
     pub(crate) fn set_data_property_key(
@@ -6553,6 +6956,28 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok(())
             }
         }
+    }
+
+    /// `CreateDataProperty` — defines an own data property directly, bypassing
+    /// the prototype chain and any inherited setters. Used by JSON.parse and
+    /// JSON.stringify where the spec mandates `[[DefineOwnProperty]]` semantics
+    /// rather than `[[Set]]`.
+    pub(crate) fn create_data_property_key(
+        &mut self,
+        object: Value,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        self.define_descriptor(
+            object,
+            key,
+            Property::Data {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            },
+        )
     }
 
     pub(crate) fn is_callable(&self, value: Value) -> Result<bool, EvalFailure> {
@@ -6658,13 +7083,13 @@ impl<'a, H: Host> Machine<'a, H> {
         id: intrinsics::BuiltinId,
         message: String,
     ) -> EvalFailure {
-        let message = match self.allocate(HeapEntry::String(EcmaString::from_utf8(&message))) {
+        let message = match self.allocate(HeapEntry::String(EcmaString::encode(&message))) {
             Ok(value) => value,
             Err(kind) => return EvalFailure::Runtime(kind),
         };
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("message")),
+            PropertyKey::Named(EcmaString::encode("message")),
             Property::Data {
                 value: message,
                 writable: true,
@@ -6714,7 +7139,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     })),
                 }
             }
-            CalleeKind::Runtime { target, captures } => {
+            CalleeKind::Runtime {
+                target,
+                captures,
+                context,
+            } => {
                 let flags = self.module_code(target.module).functions()
                     [target.function.get() as usize]
                     .flags();
@@ -6732,8 +7161,16 @@ impl<'a, H: Host> Machine<'a, H> {
                     call_pc: frame.pc,
                     constructed: Some(object),
                 });
-                self.push_frame(target, &captures, object, callee, arguments, return_to)
-                    .map_err(|error| EvalFailure::Runtime(error.kind))?;
+                self.push_frame(ActivationRequest {
+                    target,
+                    captures: &captures,
+                    context,
+                    this_value: object,
+                    new_target: callee,
+                    arguments,
+                    return_to,
+                })
+                .map_err(|error| EvalFailure::Runtime(error.kind))?;
                 self.callback_boundaries.push(stop_depth);
                 let result = self.run_loop(stop_depth);
                 self.callback_boundaries
@@ -6790,17 +7227,21 @@ impl<'a, H: Host> Machine<'a, H> {
                             this_value = next_this;
                             arguments = Cow::Owned(next_arguments);
                         }
-                        intrinsics::BuiltinOutcome::GeneratorNext {
+                        intrinsics::BuiltinOutcome::GeneratorResume {
                             generator,
-                            resume_value,
-                        } => return self.resume_generator(generator, resume_value),
-                        intrinsics::BuiltinOutcome::AsyncGeneratorNext {
+                            completion,
+                        } => return self.resume_generator(generator, completion),
+                        intrinsics::BuiltinOutcome::AsyncGeneratorResume {
                             generator,
-                            resume_value,
-                        } => return self.enqueue_async_generator_next(generator, resume_value),
+                            completion,
+                        } => return self.enqueue_async_generator_next(generator, completion),
                     }
                 }
-                CalleeKind::Runtime { target, captures } => {
+                CalleeKind::Runtime {
+                    target,
+                    captures,
+                    context,
+                } => {
                     let flags = self.module_code(target.module).functions()
                         [target.function.get() as usize]
                         .flags();
@@ -6809,6 +7250,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             .create_async_generator(GeneratorStart {
                                 target,
                                 captures,
+                                context,
                                 this_value,
                                 new_target: Value::UNDEFINED,
                                 args: arguments.as_ref().to_vec(),
@@ -6819,6 +7261,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return self
                             .create_generator(GeneratorStart {
                                 target,
+                                context,
                                 captures,
                                 this_value,
                                 new_target: Value::UNDEFINED,
@@ -6830,6 +7273,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         return self.start_async_call(
                             target,
                             &captures,
+                            context,
                             this_value,
                             Value::UNDEFINED,
                             arguments.as_ref(),
@@ -6841,14 +7285,15 @@ impl<'a, H: Host> Machine<'a, H> {
                         call_pc: frame.pc,
                         constructed: None,
                     });
-                    self.push_frame(
+                    self.push_frame(ActivationRequest {
                         target,
-                        &captures,
+                        captures: &captures,
+                        context,
                         this_value,
-                        Value::UNDEFINED,
-                        arguments.as_ref(),
+                        new_target: Value::UNDEFINED,
+                        arguments: arguments.as_ref(),
                         return_to,
-                    )
+                    })
                     .map_err(|error| EvalFailure::Runtime(error.kind))?;
                     self.callback_boundaries.push(stop_depth);
                     let result = self.run_loop(stop_depth);
@@ -6893,12 +7338,14 @@ impl<'a, H: Host> Machine<'a, H> {
     fn unwind_frames_to(&mut self, depth: usize) {
         while self.frames.len() > depth {
             let frame = self.frames.pop().expect("frame depth was checked");
+            self.context_global = frame.outer_context;
             self.live_registers -= frame.registers.len();
         }
     }
 
     fn complete_frame(&mut self, returned: Value) -> Option<Execution> {
         let frame = self.frames.pop().expect("an activation is executing");
+        self.context_global = frame.outer_context;
         self.live_registers -= frame.registers.len();
         match frame.return_to {
             None => {
@@ -6993,6 +7440,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 return Ok(());
             }
             let frame = self.frames.pop().expect("throw walks live frames");
+            self.context_global = frame.outer_context;
             self.live_registers -= frame.registers.len();
             match frame.return_to {
                 Some(return_to) => search_pc = return_to.call_pc,
@@ -7084,7 +7532,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .to_utf8_strict()
                         .ok()
                         .and_then(|name| self.host.env(&name))
-                        .map(EcmaString::from_utf8);
+                        .map(EcmaString::encode);
                     return match text {
                         Some(text) => self
                             .allocate(HeapEntry::String(text))
@@ -7141,7 +7589,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let start = match slot {
             Some(index) => {
                 if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
-                    return match self.host.env(name).map(EcmaString::from_utf8) {
+                    return match self.host.env(name).map(EcmaString::encode) {
                         Some(text) => self
                             .allocate(HeapEntry::String(text))
                             .map(GetOutcome::Value)
@@ -7649,7 +8097,9 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Promise { prototype, .. }
             | HeapEntry::Timeout { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
-            HeapEntry::NativeFunction { .. } => Some(self.intrinsics.function_prototype),
+            HeapEntry::NativeFunction { prototype, .. } => {
+                prototype.or(Some(self.intrinsics.function_prototype))
+            }
             _ => None,
         };
         match prototype {
@@ -8088,15 +8538,26 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Uint8Array { properties, .. }
             | HeapEntry::Promise { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
-                properties.insert(
-                    key,
-                    Property::Data {
+                let descriptor = match properties.get(&key) {
+                    Some(Property::Data {
+                        writable,
+                        enumerable,
+                        configurable,
+                        ..
+                    }) => Property::Data {
+                        value,
+                        writable: *writable,
+                        enumerable: *enumerable,
+                        configurable: *configurable,
+                    },
+                    _ => Property::Data {
                         value,
                         writable: true,
                         enumerable: true,
                         configurable: true,
                     },
-                );
+                };
+                properties.insert(key, descriptor);
                 Ok(())
             }
             HeapEntry::Array {
@@ -8120,27 +8581,50 @@ impl<'a, H: Host> Machine<'a, H> {
                             }
                             elements[offset] = value;
                         } else {
-                            properties.insert(
-                                PropertyKey::Named(name),
-                                Property::Data {
+                            let key = PropertyKey::Named(name);
+                            let descriptor = match properties.get(&key) {
+                                Some(Property::Data {
+                                    writable,
+                                    enumerable,
+                                    configurable,
+                                    ..
+                                }) => Property::Data {
+                                    value,
+                                    writable: *writable,
+                                    enumerable: *enumerable,
+                                    configurable: *configurable,
+                                },
+                                _ => Property::Data {
                                     value,
                                     writable: true,
                                     enumerable: true,
                                     configurable: true,
                                 },
-                            );
+                            };
+                            properties.insert(key, descriptor);
                         }
                     }
                     identity @ (PropertyKey::Symbol(_) | PropertyKey::Private(_)) => {
-                        properties.insert(
-                            identity,
-                            Property::Data {
+                        let descriptor = match properties.get(&identity) {
+                            Some(Property::Data {
+                                writable,
+                                enumerable,
+                                configurable,
+                                ..
+                            }) => Property::Data {
+                                value,
+                                writable: *writable,
+                                enumerable: *enumerable,
+                                configurable: *configurable,
+                            },
+                            _ => Property::Data {
                                 value,
                                 writable: true,
                                 enumerable: true,
                                 configurable: true,
                             },
-                        );
+                        };
+                        properties.insert(identity, descriptor);
                     }
                 }
                 Ok(())
@@ -8573,6 +9057,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 | HeapEntry::Promise {
                     prototype: slot, ..
+                }
+                | HeapEntry::NativeFunction {
+                    prototype: slot, ..
                 } => {
                     *slot = prototype;
                     Ok(())
@@ -8602,11 +9089,28 @@ impl<'a, H: Host> Machine<'a, H> {
     fn resume_generator(
         &mut self,
         generator: Value,
-        resume_value: Value,
+        completion: ResumeCompletion,
     ) -> Result<Value, EvalFailure> {
-        let state = self.take_generator_state(generator)?;
+        let state = self.take_generator_state(generator).map_err(|failure| {
+            if let EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "Generator.prototype.next called on incompatible receiver",
+            }) = failure
+            {
+                return EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: completion.sync_operation(),
+                });
+            }
+            failure
+        })?;
         if matches!(&state, GeneratorState::Completed) {
-            return self.iterator_result(Value::UNDEFINED, true);
+            return match completion {
+                ResumeCompletion::Next(_) => self.iterator_result(Value::UNDEFINED, true),
+                ResumeCompletion::Throw(value) => Err(EvalFailure::ThrowValueOrigin {
+                    value,
+                    origin: ThrowOrigin::Bytecode,
+                }),
+                ResumeCompletion::Return(value) => self.iterator_result(value, true),
+            };
         }
 
         let stop_depth = self.frames.len();
@@ -8616,18 +9120,32 @@ impl<'a, H: Host> Machine<'a, H> {
             constructed: None,
         });
         let prepared = match state {
-            GeneratorState::SuspendedStart(start) => self
-                .push_frame(
-                    start.target,
-                    &start.captures,
-                    start.this_value,
-                    start.new_target,
-                    &start.args,
-                    return_to,
-                )
-                .map_err(|error| EvalFailure::Runtime(error.kind)),
+            GeneratorState::SuspendedStart(start) => match completion {
+                ResumeCompletion::Next(_) => self
+                    .push_frame(ActivationRequest {
+                        target: start.target,
+                        captures: &start.captures,
+                        context: start.context,
+                        this_value: start.this_value,
+                        new_target: start.new_target,
+                        arguments: &start.args,
+                        return_to,
+                    })
+                    .map_err(|error| EvalFailure::Runtime(error.kind)),
+                ResumeCompletion::Throw(value) => {
+                    self.settle_generator_completed(generator)?;
+                    return Err(EvalFailure::ThrowValueOrigin {
+                        value,
+                        origin: ThrowOrigin::Bytecode,
+                    });
+                }
+                ResumeCompletion::Return(value) => {
+                    self.settle_generator_completed(generator)?;
+                    return self.iterator_result(value, true);
+                }
+            },
             GeneratorState::Suspended(activation) => {
-                self.push_resumed_generator_frame(activation, resume_value, return_to)
+                self.push_resumed_generator_frame(activation, completion, return_to)
             }
             GeneratorState::Executing | GeneratorState::Completed => unreachable!(),
         };
@@ -8659,7 +9177,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn push_resumed_generator_frame(
         &mut self,
         activation: SuspendedActivation,
-        resume_value: Value,
+        completion: ResumeCompletion,
         return_to: Option<ReturnTo>,
     ) -> Result<(), EvalFailure> {
         if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
@@ -8675,10 +9193,19 @@ impl<'a, H: Host> Machine<'a, H> {
         let instruction = self.module_code(activation.target.module).functions()
             [activation.target.function.get() as usize]
             .code()[suspend_pc];
-        let (Instruction::Suspend { dst, resume, .. } | Instruction::Await { dst, resume, .. }) =
-            instruction
-        else {
-            unreachable!("generator resume token names a suspension instruction");
+        let (dst, resume, mode) = match instruction {
+            Instruction::Suspend {
+                dst,
+                src: _,
+                resume,
+                mode,
+            } => (dst, resume, Some(mode)),
+            Instruction::Await {
+                dst,
+                src: _,
+                resume,
+            } => (dst, resume, None),
+            _ => unreachable!("generator resume token names a suspension instruction"),
         };
         let mut frame = Frame {
             module: activation.target.module,
@@ -8690,8 +9217,14 @@ impl<'a, H: Host> Machine<'a, H> {
             new_target: activation.new_target,
             args: activation.args,
             arguments_object: activation.arguments_object,
+            context: activation.context,
+            outer_context: None,
         };
-        frame.registers[dst.get() as usize] = resume_value;
+        frame.registers[dst.get() as usize] = completion.value();
+        if let Some(mode) = mode {
+            frame.registers[mode.get() as usize] = Value::int32(completion.mode());
+        }
+        frame.outer_context = std::mem::replace(&mut self.context_global, frame.context);
         self.frames.push(frame);
         Ok(())
     }
@@ -8822,6 +9355,7 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         target: RuntimeFunction,
         captures: &[Value],
+        context: Option<Value>,
         this_value: Value,
         new_target: Value,
         arguments: &[Value],
@@ -8834,9 +9368,15 @@ impl<'a, H: Host> Machine<'a, H> {
             call_pc: frame.pc,
             constructed: None,
         });
-        self.push_frame(
-            target, captures, this_value, new_target, arguments, return_to,
-        )
+        self.push_frame(ActivationRequest {
+            target,
+            captures,
+            context,
+            this_value,
+            new_target,
+            arguments,
+            return_to,
+        })
         .map_err(|error| EvalFailure::Runtime(error.kind))?;
         let step = self.drive_async_activation(stop_depth, None);
         self.settle_async_step(record, promise, step)?;
@@ -8895,6 +9435,8 @@ impl<'a, H: Host> Machine<'a, H> {
             new_target: activation.new_target,
             args: activation.args,
             arguments_object: activation.arguments_object,
+            context: activation.context,
+            outer_context: None,
         };
         let inject = match rejection {
             None => {
@@ -8903,6 +9445,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             Some(origin) => Some((value, origin, suspend_pc)),
         };
+        frame.outer_context = std::mem::replace(&mut self.context_global, frame.context);
         self.frames.push(frame);
         let step = self.drive_async_activation(stop_depth, inject);
         match self.settle_async_step(record, promise, step) {
@@ -9073,16 +9616,15 @@ impl<'a, H: Host> Machine<'a, H> {
     pub(crate) fn enqueue_async_generator_next(
         &mut self,
         generator: Value,
-        resume_value: Value,
+        completion: ResumeCompletion,
     ) -> Result<Value, EvalFailure> {
         let capability = self.create_promise()?;
+        let operation = completion.async_operation();
         let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
             self.reject_promise(
                 capability,
                 Value::UNDEFINED,
-                ThrowOrigin::TypeError {
-                    operation: "AsyncGenerator.prototype.next called on incompatible receiver",
-                },
+                ThrowOrigin::TypeError { operation },
             )
             .map_err(EvalFailure::Runtime)?;
             return Ok(capability);
@@ -9091,15 +9633,13 @@ impl<'a, H: Host> Machine<'a, H> {
             self.reject_promise(
                 capability,
                 Value::UNDEFINED,
-                ThrowOrigin::TypeError {
-                    operation: "AsyncGenerator.prototype.next called on incompatible receiver",
-                },
+                ThrowOrigin::TypeError { operation },
             )
             .map_err(EvalFailure::Runtime)?;
             return Ok(capability);
         };
         queue.push_back(AsyncGeneratorRequest {
-            resume_value,
+            completion,
             capability,
         });
         let idle = !matches!(
@@ -9107,6 +9647,7 @@ impl<'a, H: Host> Machine<'a, H> {
             AsyncGeneratorState::Executing
                 | AsyncGeneratorState::AwaitingOperand(_)
                 | AsyncGeneratorState::AwaitingYield(_)
+                | AsyncGeneratorState::AwaitingResumption(_)
                 | AsyncGeneratorState::AwaitingReturn
         );
         if idle {
@@ -9123,68 +9664,159 @@ impl<'a, H: Host> Machine<'a, H> {
     /// done: true}`.
     pub(crate) fn drive_async_generator(&mut self, generator: Value) -> Result<(), EvalFailure> {
         loop {
-            let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
-                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
-                    value: generator,
-                }));
+            // Phase 1: inspect state and queue front without holding borrows
+            // across subsequent self-method calls (borrow checker).
+            let (is_completed, front_completion) = {
+                let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)?
+                else {
+                    return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                        value: generator,
+                    }));
+                };
+                let HeapEntry::AsyncGenerator { state, queue, .. } = &self.heap[index] else {
+                    return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                        value: generator,
+                    }));
+                };
+                if matches!(
+                    state,
+                    AsyncGeneratorState::Executing
+                        | AsyncGeneratorState::AwaitingOperand(_)
+                        | AsyncGeneratorState::AwaitingYield(_)
+                        | AsyncGeneratorState::AwaitingResumption(_)
+                        | AsyncGeneratorState::AwaitingReturn
+                ) {
+                    return Ok(());
+                }
+                if queue.is_empty() {
+                    return Ok(());
+                }
+                (
+                    matches!(state, AsyncGeneratorState::Completed),
+                    queue.front().expect("queue non-empty").completion,
+                )
             };
-            let HeapEntry::AsyncGenerator { state, queue, .. } = &mut self.heap[index] else {
-                return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
-                    value: generator,
-                }));
-            };
-            if matches!(
-                state,
-                AsyncGeneratorState::Executing
-                    | AsyncGeneratorState::AwaitingOperand(_)
-                    | AsyncGeneratorState::AwaitingYield(_)
-                    | AsyncGeneratorState::AwaitingReturn
-            ) {
-                return Ok(());
-            }
-            if queue.is_empty() {
-                return Ok(());
-            }
-            if matches!(state, AsyncGeneratorState::Completed) {
-                let request = queue.pop_front().expect("queue emptiness checked");
-                let result = self.iterator_result(Value::UNDEFINED, true)?;
-                self.resolve_promise(request.capability, result)
-                    .map_err(EvalFailure::Runtime)?;
+
+            // Phase 2: act on the state, dropping all borrows first.
+            if is_completed {
+                match front_completion {
+                    ResumeCompletion::Throw(value) => {
+                        let request = self.pop_async_generator_front(generator)?;
+                        self.reject_promise(request.capability, value, ThrowOrigin::Bytecode)
+                            .map_err(EvalFailure::Runtime)?;
+                    }
+                    ResumeCompletion::Return(value) => {
+                        // Don't pop; leave the request queued so the
+                        // AwaitingReturn reaction settles it. Transition
+                        // Completed → Executing → AwaitingReturn, then await.
+                        self.take_async_generator_state(generator)?;
+                        let result = self
+                            .replace_async_generator_state(
+                                generator,
+                                AsyncGeneratorState::AwaitingReturn,
+                            )
+                            .map_err(EvalFailure::Runtime)
+                            .and_then(|()| self.await_promise_for_generator(value, generator));
+                        if result.is_err() {
+                            self.complete_async_generator(generator)?;
+                        }
+                        return result;
+                    }
+                    ResumeCompletion::Next(_) => {
+                        let request = self.pop_async_generator_front(generator)?;
+                        let result = self.iterator_result(Value::UNDEFINED, true)?;
+                        self.resolve_promise(request.capability, result)
+                            .map_err(EvalFailure::Runtime)?;
+                    }
+                }
                 continue;
             }
-            let resume_value = queue.front().expect("queue emptiness checked").resume_value;
-            let taken = std::mem::replace(state, AsyncGeneratorState::Executing);
+
+            // Not Completed: SuspendedStart or SuspendedYield. Take the state
+            // (sets to Executing) and dispatch the body.
+            let state = self.take_async_generator_state(generator)?;
             let stop_depth = self.frames.len();
             let return_to = self.frames.last().map(|frame| ReturnTo {
                 destination: None,
                 call_pc: frame.pc,
                 constructed: None,
             });
-            let pushed = match taken {
-                AsyncGeneratorState::SuspendedStart(start) => self
-                    .push_frame(
-                        start.target,
-                        &start.captures,
-                        start.this_value,
-                        start.new_target,
-                        &start.args,
-                        return_to,
-                    )
-                    .map_err(|error| EvalFailure::Runtime(error.kind)),
-                AsyncGeneratorState::SuspendedYield(activation) => {
-                    self.push_resumed_generator_frame(activation, resume_value, return_to)
-                }
+            match state {
+                AsyncGeneratorState::SuspendedStart(start) => match front_completion {
+                    ResumeCompletion::Next(_) => {
+                        let pushed = self
+                            .push_frame(ActivationRequest {
+                                target: start.target,
+                                captures: &start.captures,
+                                context: start.context,
+                                this_value: start.this_value,
+                                new_target: start.new_target,
+                                arguments: &start.args,
+                                return_to,
+                            })
+                            .map_err(|error| EvalFailure::Runtime(error.kind));
+                        let step = match pushed {
+                            Ok(()) => self.drive_async_generator_activation(stop_depth, None),
+                            Err(failure) => Err(failure),
+                        };
+                        self.settle_async_generator_step(generator, step)?;
+                    }
+                    ResumeCompletion::Throw(value) => {
+                        let request = self.pop_async_generator_front(generator)?;
+                        self.complete_async_generator(generator)?;
+                        self.reject_promise(request.capability, value, ThrowOrigin::Bytecode)
+                            .map_err(EvalFailure::Runtime)?;
+                        continue;
+                    }
+                    ResumeCompletion::Return(value) => {
+                        let result = self
+                            .replace_async_generator_state(
+                                generator,
+                                AsyncGeneratorState::AwaitingReturn,
+                            )
+                            .map_err(EvalFailure::Runtime)
+                            .and_then(|()| self.await_promise_for_generator(value, generator));
+                        if result.is_err() {
+                            self.complete_async_generator(generator)?;
+                        }
+                        return result;
+                    }
+                },
+                AsyncGeneratorState::SuspendedYield(activation) => match front_completion {
+                    ResumeCompletion::Next(_) | ResumeCompletion::Throw(_) => {
+                        let step = self
+                            .push_resumed_generator_frame(activation, front_completion, return_to)
+                            .and_then(|()| self.drive_async_generator_activation(stop_depth, None));
+                        self.settle_async_generator_step(generator, step)?;
+                    }
+                    ResumeCompletion::Return(value) => {
+                        // Park in AwaitingResumption and await the return
+                        // operand. On fulfillment, resume_async_generator
+                        // re-enters with Return(value); on rejection, with
+                        // Throw(reason). Any setup failure must release the
+                        // activation registers and complete the generator.
+                        let register_count = activation.registers.len();
+                        let result = self
+                            .replace_async_generator_state(
+                                generator,
+                                AsyncGeneratorState::AwaitingResumption(activation),
+                            )
+                            .map_err(EvalFailure::Runtime)
+                            .and_then(|()| self.await_promise_for_generator(value, generator));
+                        if result.is_err() {
+                            self.release_suspended_activation_registers(register_count);
+                            self.complete_async_generator(generator)?;
+                        }
+                        return result;
+                    }
+                },
                 AsyncGeneratorState::Executing
                 | AsyncGeneratorState::AwaitingOperand(_)
                 | AsyncGeneratorState::AwaitingYield(_)
+                | AsyncGeneratorState::AwaitingResumption(_)
                 | AsyncGeneratorState::AwaitingReturn
                 | AsyncGeneratorState::Completed => unreachable!(),
-            };
-            let step = match pushed {
-                Ok(()) => self.drive_async_generator_activation(stop_depth, None),
-                Err(failure) => Err(failure),
-            };
-            self.settle_async_generator_step(generator, step)?;
+            }
         }
     }
 
@@ -9458,11 +10090,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.drive_async_generator(generator)
                     .map_err(|failure| async_generator_kind(generator, failure))
             }
-            (AsyncGeneratorState::AwaitingOperand(activation), None) => {
-                self.drive_resumed_async_generator(generator, activation, value, None)
-            }
-            (AsyncGeneratorState::AwaitingOperand(activation), Some(origin))
-            | (AsyncGeneratorState::AwaitingYield(activation), Some(origin)) => {
+            (AsyncGeneratorState::AwaitingOperand(activation), None) => self
+                .drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    ResumeCompletion::Next(value),
+                    None,
+                ),
+            (AsyncGeneratorState::AwaitingOperand(activation), Some(origin)) => {
                 let suspend_pc = activation
                     .resume_token
                     .checked_sub(1)
@@ -9471,7 +10106,38 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.drive_resumed_async_generator(
                     generator,
                     activation,
-                    Value::UNDEFINED,
+                    ResumeCompletion::Next(Value::UNDEFINED),
+                    Some((value, origin, suspend_pc)),
+                )
+            }
+            (AsyncGeneratorState::AwaitingResumption(activation), None) => self
+                .drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    ResumeCompletion::Return(value),
+                    None,
+                ),
+            (AsyncGeneratorState::AwaitingResumption(activation), Some(_)) => {
+                // The suspension is a Suspend instruction with a mode
+                // register; re-enter with Throw(value) and let the
+                // compiler's inline abrupt dispatch handle it — no inject.
+                self.drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    ResumeCompletion::Throw(value),
+                    None,
+                )
+            }
+            (AsyncGeneratorState::AwaitingYield(activation), Some(origin)) => {
+                let suspend_pc = activation
+                    .resume_token
+                    .checked_sub(1)
+                    .expect("suspended async generator token is nonzero")
+                    as usize;
+                self.drive_resumed_async_generator(
+                    generator,
+                    activation,
+                    ResumeCompletion::Next(Value::UNDEFINED),
                     Some((value, origin, suspend_pc)),
                 )
             }
@@ -9505,7 +10171,7 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         generator: Value,
         activation: SuspendedActivation,
-        resume_value: Value,
+        completion: ResumeCompletion,
         inject: Option<(Value, ThrowOrigin, usize)>,
     ) -> Result<(), RuntimeErrorKind> {
         let stop_depth = self.frames.len();
@@ -9515,7 +10181,7 @@ impl<'a, H: Host> Machine<'a, H> {
             constructed: None,
         });
         let step = self
-            .push_resumed_generator_frame(activation, resume_value, return_to)
+            .push_resumed_generator_frame(activation, completion, return_to)
             .and_then(|()| self.drive_async_generator_activation(stop_depth, inject));
         match self.settle_async_generator_step(generator, step) {
             // A completing step (throw) leaves the queue for the drain loop;
@@ -9917,7 +10583,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::Uint8Array {
                     bytes, properties, ..
                 } => Ok((0..bytes.len())
-                    .map(|index| PropertyKey::Named(EcmaString::from_utf8(&index.to_string())))
+                    .map(|index| PropertyKey::Named(EcmaString::encode(&index.to_string())))
                     .chain(ordered_property_keys(properties).into_iter().filter(|key| {
                         key.as_string()
                             .is_none_or(|name| uint8array_index(name).is_none())
@@ -9947,7 +10613,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .map(|(offset, _)| {
                             (
                                 offset,
-                                PropertyKey::Named(EcmaString::from_utf8(&offset.to_string())),
+                                PropertyKey::Named(EcmaString::encode(&offset.to_string())),
                             )
                         })
                         .collect();
@@ -9974,7 +10640,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         .collect())
                 }
                 HeapEntry::String(text) => Ok((0..text.len_units())
-                    .map(|index| PropertyKey::Named(EcmaString::from_utf8(&index.to_string())))
+                    .map(|index| PropertyKey::Named(EcmaString::encode(&index.to_string())))
                     .collect()),
                 HeapEntry::ModuleNamespace { module } => {
                     let mut names: Vec<EcmaString> = self
@@ -10310,26 +10976,40 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     pub(crate) fn iterable_values(&mut self, source: Value) -> Result<Vec<Value>, EvalFailure> {
+        let depth = self.native_roots.len();
         let iterator = self.create_iterator(source, IteratorKind::Sync)?;
-        let mut values = Vec::new();
-        loop {
-            let (done, value) = self.iterator_next(iterator)?;
-            if done {
-                return Ok(values);
+        self.push_native_roots(depth, &[iterator]);
+        let result: Result<Vec<Value>, EvalFailure> = (|| {
+            let mut values = Vec::new();
+            let mut roots = Vec::with_capacity(1);
+            loop {
+                roots.clear();
+                roots.push(iterator);
+                roots.extend_from_slice(&values);
+                self.refresh_native_roots(depth, &roots);
+                let (done, value) = self.iterator_next(iterator)?;
+                if done {
+                    return Ok(values);
+                }
+                values.push(value);
+                roots.clear();
+                roots.push(iterator);
+                roots.extend_from_slice(&values);
+                self.refresh_native_roots(depth, &roots);
+                let bytes = values
+                    .len()
+                    .checked_mul(std::mem::size_of::<Value>())
+                    .ok_or(EvalFailure::Runtime(
+                        RuntimeErrorKind::HeapByteLimitExceeded {
+                            limit: self.limits.max_heap_bytes,
+                        },
+                    ))?;
+                self.ensure_allocation_capacity(1, bytes)
+                    .map_err(EvalFailure::Runtime)?;
             }
-            let bytes = values
-                .len()
-                .checked_add(1)
-                .and_then(|length| length.checked_mul(std::mem::size_of::<Value>()))
-                .ok_or(EvalFailure::Runtime(
-                    RuntimeErrorKind::HeapByteLimitExceeded {
-                        limit: self.limits.max_heap_bytes,
-                    },
-                ))?;
-            self.ensure_allocation_capacity(1, bytes)
-                .map_err(EvalFailure::Runtime)?;
-            values.push(value);
-        }
+        })();
+        self.pop_native_roots(depth);
+        result
     }
 
     fn advance_iterator(&mut self, iterator_index: usize) {
@@ -10347,7 +11027,7 @@ impl<'a, H: Host> Machine<'a, H> {
         match op {
             UnaryOp::Void => Ok(Value::UNDEFINED),
             UnaryOp::TypeOf => {
-                let text = EcmaString::from_utf8(self.type_of(operand));
+                let text = EcmaString::encode(self.type_of(operand));
                 self.allocate(HeapEntry::String(text))
                     .map_err(EvalFailure::Runtime)
             }
@@ -10549,7 +11229,7 @@ impl<'a, H: Host> Machine<'a, H> {
         ))
     }
 
-    fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
+    pub(crate) fn coerce_primitive_default(&mut self, value: Value) -> Result<Value, EvalFailure> {
         let prefer_string = self
             .runtime_slot(value)
             .map_err(EvalFailure::Runtime)?
@@ -10799,12 +11479,45 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(left.partial_cmp(&right))
     }
 
-    /// `value instanceof constructor`: walks `value`'s prototype chain for the
-    /// constructor's own `prototype` object, matching by heap identity.
+    /// `value instanceof constructor` per ECMA-262 §13.10.3 InstanceofOperator.
+    ///
+    /// The right-hand side is first consulted for a callable
+    /// `Symbol.hasInstance`; when present and callable it is called with
+    /// `value` and its result coerced to boolean. Only when `@@hasInstance`
+    /// is absent (or nullish) does the operator fall back to the ordinary
+    /// prototype-chain check. A present-but-non-callable handler is a
+    /// TypeError, matching `GetMethod`.
     fn instance_of(&mut self, value: Value, constructor: Value) -> Result<bool, EvalFailure> {
         let constructor = self
             .bound_target(constructor)
             .map_err(EvalFailure::Runtime)?;
+        let key = self.has_instance_key()?;
+        let handler = self.get_property_key(constructor, &key)?;
+        if matches!(handler.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            // No `@@hasInstance`: ordinary prototype-chain check, byte-for-byte
+            // the pre-symbol `instanceof` behavior.
+            return self.ordinary_has_instance(value, constructor);
+        }
+        // GetMethod: a present, non-nullish handler must be callable.
+        if !self.is_callable(handler)? {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "instanceof Symbol.hasInstance is not callable",
+            }));
+        }
+        let result = self.call_value(handler, constructor, &[value])?;
+        Ok(self.to_boolean(result))
+    }
+
+    /// `OrdinaryHasInstance` (ECMA-262 §7.3.20): walks `value`'s prototype
+    /// chain for the constructor's own `prototype` object, matching by heap
+    /// identity. This is the fallback for a right-hand side that defines no
+    /// callable `Symbol.hasInstance` and is unchanged from the original
+    /// `instanceof` implementation.
+    fn ordinary_has_instance(
+        &mut self,
+        value: Value,
+        constructor: Value,
+    ) -> Result<bool, EvalFailure> {
         match self
             .runtime_slot(constructor)
             .map_err(EvalFailure::Runtime)?
@@ -10854,27 +11567,58 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Resolves and caches the `PropertyKey` for the well-known
+    /// `Symbol.hasInstance` symbol. The symbol is a read-only,
+    /// non-configurable property of the `Symbol` constructor installed once
+    /// during intrinsic initialization, so its heap index is stable for the
+    /// machine's lifetime; caching it keeps the per-`instanceof` cost to the
+    /// single property lookup the spec requires rather than re-deriving the
+    /// symbol key on every call.
+    fn has_instance_key(&mut self) -> Result<PropertyKey, EvalFailure> {
+        if let Some(index) = self.has_instance_symbol {
+            return Ok(PropertyKey::Symbol(index));
+        }
+        let symbol_constructor = self
+            .intrinsics
+            .global("Symbol")
+            .expect("Symbol intrinsics install before instanceof");
+        let index = self
+            .runtime_slot(symbol_constructor)
+            .map_err(EvalFailure::Runtime)?
+            .expect("Symbol constructor is an engine object");
+        let symbol = match self.own_get_ascii(index, "hasInstance") {
+            Some(Found::Value(value)) => value,
+            _ => unreachable!("Symbol.hasInstance is a readonly data property"),
+        };
+        let symbol_index = self
+            .runtime_slot(symbol)
+            .map_err(EvalFailure::Runtime)?
+            .expect("Symbol.hasInstance is an engine symbol") as u32;
+        self.has_instance_symbol = Some(symbol_index);
+        Ok(PropertyKey::Symbol(symbol_index))
+    }
+
     fn value_to_string(&self, value: Value, depth: usize) -> Result<EcmaString, EvalFailure> {
         if depth >= 32 {
             return Ok(EcmaString::default());
         }
-        let ascii = |text: String| EcmaString::from_utf8(&text);
+        let ascii = |text: String| EcmaString::encode(&text);
         match value.decode() {
             Some(Decoded::Number(number)) => Ok(ascii(Self::ordinary_number_to_string(number))),
             Some(Decoded::Int32(raw)) => Ok(ascii((raw as i32).to_string())),
             Some(Decoded::Undefined | Decoded::Uninitialized) => {
-                Ok(EcmaString::from_utf8("undefined"))
+                Ok(EcmaString::encode("undefined"))
             }
-            Some(Decoded::Null) => Ok(EcmaString::from_utf8("null")),
+            Some(Decoded::Null) => Ok(EcmaString::encode("null")),
             Some(Decoded::Boolean(value)) => {
-                Ok(EcmaString::from_utf8(if value { "true" } else { "false" }))
+                Ok(EcmaString::encode(if value { "true" } else { "false" }))
             }
             Some(Decoded::Hole) => Ok(EcmaString::default()),
             Some(Decoded::HeapRef(_)) => {
                 match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
                     Some(index) => match &self.heap[index] {
                         HeapEntry::String(text) => Ok(text.clone()),
-                        HeapEntry::BigInt(text) => Ok(EcmaString::from_utf8(text)),
+                        HeapEntry::BigInt(text) => Ok(EcmaString::encode(text)),
                         HeapEntry::Object { .. }
                         | HeapEntry::Generator { .. }
                         | HeapEntry::AsyncGenerator { .. }
@@ -10893,9 +11637,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. }
                         | HeapEntry::Timeout { .. }
-                        | HeapEntry::HashState { .. } => {
-                            Ok(EcmaString::from_utf8("[object Object]"))
-                        }
+                        | HeapEntry::HashState { .. } => Ok(EcmaString::encode("[object Object]")),
                         HeapEntry::RegExp { pattern, flags, .. } => {
                             let mut builder = EcmaStringBuilder::with_capacity(
                                 pattern
@@ -10929,7 +11671,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             let flags = self.module_code(*module).functions()
                                 [function.get() as usize]
                                 .flags();
-                            Ok(EcmaString::from_utf8(
+                            Ok(EcmaString::encode(
                                 match (flags.is_async, flags.is_generator) {
                                     (true, true) => "async function* () { [bytecode] }",
                                     (true, false) => "async function () { [bytecode] }",
@@ -10939,7 +11681,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             ))
                         }
                         HeapEntry::NativeFunction { .. } => {
-                            Ok(EcmaString::from_utf8("function () { [native code] }"))
+                            Ok(EcmaString::encode("function () { [native code] }"))
                         }
                         HeapEntry::Array { elements, .. } => {
                             let mut text = EcmaStringBuilder::new();
@@ -11107,72 +11849,6 @@ fn parse_number_utf8(text: &str) -> f64 {
     } else {
         trimmed.parse::<f64>().unwrap_or(f64::NAN)
     }
-}
-
-fn format_number(number: f64) -> String {
-    if number.is_nan() {
-        return "NaN".to_owned();
-    }
-    if number == f64::INFINITY {
-        return "Infinity".to_owned();
-    }
-    if number == f64::NEG_INFINITY {
-        return "-Infinity".to_owned();
-    }
-    if number == 0.0 {
-        return "0".to_owned();
-    }
-
-    let negative = number.is_sign_negative();
-    let raw = number.abs().to_string();
-    let (mantissa, explicit_exponent) = match raw.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (
-            mantissa,
-            exponent
-                .parse::<i32>()
-                .expect("Rust formats finite f64 exponents as i32"),
-        ),
-        None => (raw.as_str(), 0),
-    };
-    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
-    let untrimmed: String = mantissa.chars().filter(|ch| *ch != '.').collect();
-    let first = untrimmed
-        .find(|ch| ch != '0')
-        .expect("a nonzero number has a nonzero decimal digit");
-    let digits = untrimmed[first..].trim_end_matches('0');
-    let exponent = explicit_exponent + decimal as i32 - first as i32 - 1;
-
-    let mut result = String::new();
-    if negative {
-        result.push('-');
-    }
-    if !(-6..21).contains(&exponent) {
-        result.push(digits.as_bytes()[0] as char);
-        if digits.len() > 1 {
-            result.push('.');
-            result.push_str(&digits[1..]);
-        }
-        result.push('e');
-        if exponent >= 0 {
-            result.push('+');
-        }
-        result.push_str(&exponent.to_string());
-    } else if exponent >= 0 {
-        let integer_digits = exponent as usize + 1;
-        if digits.len() <= integer_digits {
-            result.push_str(digits);
-            result.extend(std::iter::repeat_n('0', integer_digits - digits.len()));
-        } else {
-            result.push_str(&digits[..integer_digits]);
-            result.push('.');
-            result.push_str(&digits[integer_digits..]);
-        }
-    } else {
-        result.push_str("0.");
-        result.extend(std::iter::repeat_n('0', (-exponent - 1) as usize));
-        result.push_str(digits);
-    }
-    result
 }
 
 fn to_uint32(number: f64) -> u32 {
@@ -11478,7 +12154,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::intrinsics::BuiltinOutcome;
+    use crate::intrinsics::{BuiltinDef, BuiltinOutcome};
     use bamts_bytecode::{
         Binding, DescriptorSlot, Edge, EdgeKind, ExceptionHandler, Export, ExportSource,
         FunctionFlags, NumberBits, ProgramModule, Register,
@@ -11592,7 +12268,7 @@ mod tests {
 
     fn verified(mut constants: Vec<Constant>, functions: Vec<Function>) -> Program<Verified> {
         let name = ConstantId::new(constants.len() as u32);
-        constants.push(Constant::String(EcmaString::from_utf8("<test>")));
+        constants.push(Constant::String(EcmaString::encode("<test>")));
         let code = Module::new(constants, functions, FunctionId::new(0))
             .verify()
             .expect("valid test bytecode");
@@ -11616,7 +12292,7 @@ mod tests {
         bindings: Vec<Binding>,
         exports: Vec<Export>,
     ) -> ProgramModule<Verified> {
-        constants.insert(0, Constant::String(EcmaString::from_utf8(name)));
+        constants.insert(0, Constant::String(EcmaString::encode(name)));
         let code = Module::new(constants, functions, FunctionId::new(0))
             .verify()
             .expect("valid test bytecode");
@@ -11631,6 +12307,28 @@ mod tests {
 
     fn linked(modules: Vec<ProgramModule<Verified>>, entry: u32) -> Program<Verified> {
         Program::link(modules, ModuleId::new(entry)).expect("valid linked test program")
+    }
+
+    #[test]
+    fn run_with_telemetry_reports_wall_and_matches_run() {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let (outcome, telemetry) =
+            super::run_with_telemetry(&program, &mut host, &Limits::default());
+        let outcome = outcome.expect("halt program runs");
+        assert_eq!(outcome.exit_code, 0);
+        // The interpreter wall is a finite, non-negative measurement.
+        assert!(telemetry.interpreter_wall_ms >= 0.0);
+        assert!(telemetry.interpreter_wall_ms.is_finite());
+        // On this Linux host VmHWM is readable, so peak RSS is populated.
+        assert!(telemetry.rss_kb > 0, "peak RSS should be read from /proc");
+        // The telemetry seam produces the same outcome as `run`.
+        let mut plain_host = TestHost;
+        let plain = super::run(&program, &mut plain_host, &Limits::default()).expect("halt runs");
+        assert_eq!(plain, outcome);
     }
 
     fn namespace_descriptor_entry() -> Function {
@@ -11725,7 +12423,7 @@ mod tests {
             );
             assert!(
                 machine
-                    .own_descriptor(outer, &PropertyKey::Named(EcmaString::from_utf8("message")))
+                    .own_descriptor(outer, &PropertyKey::Named(EcmaString::encode("message")))
                     .unwrap()
                     .is_none()
             );
@@ -11736,7 +12434,7 @@ mod tests {
                 (inner, "suppressed", body_error),
             ] {
                 let descriptor = machine
-                    .own_descriptor(object, &PropertyKey::Named(EcmaString::from_utf8(name)))
+                    .own_descriptor(object, &PropertyKey::Named(EcmaString::encode(name)))
                     .unwrap()
                     .expect("suppression field is own");
                 assert!(matches!(
@@ -11779,7 +12477,7 @@ mod tests {
                 .unwrap();
             let index = machine.runtime_slot(typed).unwrap().unwrap();
             for name in ["4294967295", "-0", "NaN", "Infinity", "1.5"] {
-                let key = PropertyKey::Named(EcmaString::from_utf8(name));
+                let key = PropertyKey::Named(EcmaString::encode(name));
                 machine
                     .set_own_data(index, key.clone(), Value::int32(7))
                     .unwrap();
@@ -11806,7 +12504,7 @@ mod tests {
                 );
             }
 
-            let ordinary = PropertyKey::Named(EcmaString::from_utf8("01"));
+            let ordinary = PropertyKey::Named(EcmaString::encode("01"));
             machine
                 .set_own_data(index, ordinary.clone(), Value::int32(7))
                 .unwrap();
@@ -11823,7 +12521,7 @@ mod tests {
         with_machine(Limits::default(), |machine| {
             machine.assert_heap_ledger();
             let value = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             let index = machine.runtime_slot(value).unwrap().unwrap();
             machine.charge_slot(index, 3).unwrap();
@@ -11836,19 +12534,104 @@ mod tests {
     }
 
     #[test]
+    fn failed_intrinsic_slot_charge_preserves_credit_and_ledgers() {
+        with_machine(Limits::default(), |machine| {
+            let global = machine.global_object;
+            let index = machine.runtime_slot(global).unwrap().unwrap();
+            assert!(
+                machine
+                    .delete_property(
+                        global,
+                        &PropertyKey::Named(EcmaString::encode("globalThis")),
+                    )
+                    .unwrap()
+            );
+            let credit = machine.intrinsic_slot_credits[index];
+            assert!(credit > 0);
+            let slot_bytes = machine.slot_bytes[index];
+            let heap_bytes = machine.heap_bytes;
+            machine.limits.max_heap_bytes = heap_bytes;
+
+            assert!(matches!(
+                machine.charge_slot(index, credit + 1),
+                Err(RuntimeErrorKind::HeapByteLimitExceeded { .. })
+            ));
+            assert_eq!(machine.intrinsic_slot_credits[index], credit);
+            assert_eq!(machine.slot_bytes[index], slot_bytes);
+            assert_eq!(machine.heap_bytes, heap_bytes);
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn intrinsic_property_churn_tracks_only_bytes_above_bootstrap() {
+        with_machine(Limits::default(), |machine| {
+            let global = machine.global_object;
+            let index = machine.runtime_slot(global).unwrap().unwrap();
+            let property_bytes = |machine: &Machine<'_, TestHost>| match &machine.heap[index] {
+                HeapEntry::Object { properties, .. } => properties.charge_bytes(),
+                _ => panic!("global object remains ordinary"),
+            };
+            let baseline = property_bytes(machine);
+            let assert_accounted = |machine: &Machine<'_, TestHost>| {
+                let current = property_bytes(machine);
+                assert_eq!(machine.slot_bytes[index], current.saturating_sub(baseline));
+                assert_eq!(
+                    machine.intrinsic_slot_credits[index],
+                    baseline.saturating_sub(current)
+                );
+                machine.assert_heap_ledger();
+            };
+            assert_accounted(machine);
+
+            let global_this = PropertyKey::Named(EcmaString::encode("globalThis"));
+            assert!(machine.delete_property(global, &global_this).unwrap());
+            assert_accounted(machine);
+
+            let replacement =
+                PropertyKey::Named(EcmaString::encode("global-replacement-with-a-long-name"));
+            machine
+                .set_data_property_key(global, replacement.clone(), Value::int32(1))
+                .unwrap();
+            assert_accounted(machine);
+
+            machine
+                .define_descriptor(
+                    global,
+                    replacement.clone(),
+                    Property::Accessor {
+                        getter: None,
+                        setter: None,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            assert_accounted(machine);
+
+            assert!(machine.delete_property(global, &replacement).unwrap());
+            assert_accounted(machine);
+            machine
+                .set_data_property_key(global, global_this, global)
+                .unwrap();
+            assert_accounted(machine);
+        });
+    }
+
+    #[test]
     fn gc_pending_arms_after_successful_mutations_without_preflight_side_effects() {
         with_machine(Limits::default(), |machine| {
             machine.set_gc_watermarks_for_test(usize::MAX, 1);
             assert!(!machine.gc_pending());
             machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             assert!(machine.gc_pending());
 
             machine.collect_garbage();
             machine.set_gc_watermarks_for_test(usize::MAX, usize::MAX);
             let value = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             let index = machine.runtime_slot(value).unwrap().unwrap();
             let bytes = machine.heap_bytes + 1;
@@ -11873,7 +12656,7 @@ mod tests {
             |machine| {
                 machine.set_gc_watermarks_for_test(usize::MAX, usize::MAX);
                 assert!(matches!(
-                    machine.allocate(HeapEntry::String(EcmaString::from_utf8("x"))),
+                    machine.allocate(HeapEntry::String(EcmaString::encode("x"))),
                     Err(RuntimeErrorKind::HeapByteLimitExceeded { limit: 1 })
                 ));
                 assert!(!machine.gc_pending());
@@ -11886,9 +12669,9 @@ mod tests {
     fn gc_recomputes_watermarks_from_live_usage() {
         with_machine(Limits::default(), |machine| {
             let value = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
-            machine.globals.insert(EcmaString::from_utf8("live"), value);
+            machine.test_set_global("live", value);
 
             machine.collect_garbage();
 
@@ -12015,6 +12798,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(0),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -12047,7 +12831,7 @@ mod tests {
                 })
                 .unwrap();
             let index = machine.runtime_slot(object).unwrap().unwrap();
-            let key = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+            let key = PropertyKey::Named(EcmaString::encode("accessor"));
 
             machine
                 .define_accessor(object, key.clone(), Value::int32(1), AccessorKind::Getter)
@@ -12099,7 +12883,7 @@ mod tests {
                 })
                 .unwrap();
             let index = machine.runtime_slot(array).unwrap().unwrap();
-            let key = PropertyKey::Named(EcmaString::from_utf8("0"));
+            let key = PropertyKey::Named(EcmaString::encode("0"));
             let baseline_slot = machine.slot_bytes[index];
             let baseline_heap = machine.heap_bytes;
 
@@ -12186,7 +12970,7 @@ mod tests {
     #[test]
     fn array_length_shrink_refunds_storage_charged_by_array_replacement() {
         with_machine(Limits::default(), |machine| {
-            let indexed = PropertyKey::Named(EcmaString::from_utf8("1"));
+            let indexed = PropertyKey::Named(EcmaString::encode("1"));
             let indexed_bytes = indexed.charge_bytes();
             let mut properties = PropertyMap::default();
             properties.insert(
@@ -12284,8 +13068,8 @@ mod tests {
                 })
                 .unwrap();
             let index = machine.runtime_slot(object).unwrap().unwrap();
-            let data = PropertyKey::Named(EcmaString::from_utf8("data"));
-            let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+            let data = PropertyKey::Named(EcmaString::encode("data"));
+            let accessor = PropertyKey::Named(EcmaString::encode("accessor"));
             let baseline_slot = machine.slot_bytes[index];
             let baseline_heap = machine.heap_bytes;
 
@@ -12323,9 +13107,9 @@ mod tests {
                 })
                 .unwrap();
             let index = machine.runtime_slot(array).unwrap().unwrap();
-            let element = PropertyKey::Named(EcmaString::from_utf8("3"));
-            let indexed_accessor = PropertyKey::Named(EcmaString::from_utf8("5"));
-            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
+            let element = PropertyKey::Named(EcmaString::encode("3"));
+            let indexed_accessor = PropertyKey::Named(EcmaString::encode("5"));
+            let length = PropertyKey::Named(EcmaString::encode("length"));
             let baseline_slot = machine.slot_bytes[index];
             let baseline_heap = machine.heap_bytes;
 
@@ -12448,9 +13232,19 @@ mod tests {
     fn promise_all_values_charge_moves_to_output_before_aggregate_collection() {
         with_machine(Limits::default(), |machine| {
             let promise = machine.create_promise().unwrap();
+            let record = machine.create_promise_resolver(promise).unwrap();
+            let (resolve_target, reject_target) =
+                machine.intrinsics.builtins.promise_resolver_targets();
+            let resolve = machine
+                .create_promise_resolver_function(resolve_target, record)
+                .unwrap();
+            let reject = machine
+                .create_promise_resolver_function(reject_target, record)
+                .unwrap();
             let aggregate = machine
                 .allocate(HeapEntry::PromiseAll {
-                    promise,
+                    resolve,
+                    reject,
                     values: Vec::new(),
                     remaining: 1,
                     settled: false,
@@ -12486,9 +13280,7 @@ mod tests {
             );
             machine.assert_heap_ledger();
 
-            machine
-                .globals
-                .insert(EcmaString::from_utf8("promiseAllOutput"), output);
+            machine.test_set_global("promiseAllOutput", output);
             machine.collect_garbage();
             assert!(matches!(machine.heap[aggregate_index], HeapEntry::Vacant));
             assert_eq!(machine.slot_bytes[aggregate_index], 0);
@@ -12504,7 +13296,7 @@ mod tests {
     fn vacant_runtime_handle_is_rejected() {
         with_machine(Limits::default(), |machine| {
             let value = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             let index = machine.runtime_slot(value).unwrap().unwrap();
             machine.heap_bytes -= machine.slot_bytes[index];
@@ -12527,7 +13319,7 @@ mod tests {
     fn slot_ids_stay_append_only_after_a_tombstone() {
         with_machine(Limits::default(), |machine| {
             let stale = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("stale")))
+                .allocate(HeapEntry::String(EcmaString::encode("stale")))
                 .unwrap();
             let stale_index = machine.runtime_slot(stale).unwrap().unwrap();
             machine.heap_bytes -= machine.slot_bytes[stale_index];
@@ -12536,7 +13328,7 @@ mod tests {
             machine.vacant_count += 1;
 
             let live = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("live")))
+                .allocate(HeapEntry::String(EcmaString::encode("live")))
                 .unwrap();
             assert_ne!(stale, live);
             assert!(matches!(
@@ -12557,7 +13349,7 @@ mod tests {
             },
             |machine| {
                 let value = machine
-                    .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                    .allocate(HeapEntry::String(EcmaString::encode("x")))
                     .unwrap();
                 assert!(matches!(
                     machine.ensure_allocation_capacity(1, 0),
@@ -12874,6 +13666,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(function),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -12911,6 +13704,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(2),
                         },
                         Instruction::Binary {
                             dst: reg(2),
@@ -12940,7 +13734,7 @@ mod tests {
         );
         assert_eq!(
             machine.own_property_keys(generator).unwrap(),
-            vec![PropertyKey::Named(EcmaString::from_utf8("visible"))],
+            vec![PropertyKey::Named(EcmaString::encode("visible"))],
         );
         assert!(
             machine
@@ -13037,7 +13831,7 @@ mod tests {
             vec![
                 Constant::Int32(7),
                 Constant::Undefined,
-                Constant::String(EcmaString::from_utf8("next")),
+                Constant::String(EcmaString::encode("next")),
             ],
             vec![
                 function(
@@ -13123,6 +13917,7 @@ mod tests {
                             dst: reg(2),
                             src: reg(1),
                             resume: pc(3),
+                            mode: reg(0),
                         },
                         Instruction::Return { value: reg(2) },
                     ],
@@ -13170,6 +13965,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(2),
                         },
                         Instruction::Return { value: reg(1) },
                     ],
@@ -13227,6 +14023,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(0),
                         },
                         Instruction::Return { value: reg(1) },
                     ],
@@ -13268,6 +14065,8 @@ mod tests {
             new_target: Value::UNDEFINED,
             args: Vec::new(),
             arguments_object: None,
+            context: None,
+            outer_context: None,
         });
         machine.limits.max_call_depth = machine.frames.len();
 
@@ -13320,6 +14119,7 @@ mod tests {
                             dst: reg(2),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(1),
                         },
                         Instruction::LoadConst {
                             dst: reg(1),
@@ -13329,6 +14129,7 @@ mod tests {
                             dst: reg(2),
                             src: reg(1),
                             resume: pc(4),
+                            mode: reg(1),
                         },
                         Instruction::Return { value: reg(2) },
                     ],
@@ -13417,7 +14218,7 @@ mod tests {
         let program = verified(
             vec![
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("started")),
+                Constant::String(EcmaString::encode("started")),
             ],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
@@ -13447,7 +14248,7 @@ mod tests {
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
         assert_eq!(machine.live_registers, 0, "calling must not start the body");
-        assert_eq!(machine.globals.get(&EcmaString::from_utf8("started")), None);
+        assert_eq!(machine.test_global("started"), None);
         let index = machine.runtime_slot(generator).unwrap().unwrap();
         assert!(matches!(
             machine.heap[index],
@@ -13469,10 +14270,7 @@ mod tests {
         let capability = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
         assert!(pending_promise(&machine, capability));
         machine.drain_microtasks().unwrap();
-        assert_eq!(
-            machine.globals.get(&EcmaString::from_utf8("started")),
-            Some(&Value::int32(1)),
-        );
+        assert_eq!(machine.test_global("started"), Some(Value::int32(1)));
         assert_eq!(
             settled_iterator_result(&mut machine, capability),
             (Value::int32(1), true),
@@ -13498,6 +14296,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(2),
                         },
                         Instruction::Return { value: reg(1) },
                     ],
@@ -13536,7 +14335,7 @@ mod tests {
         let program = verified(
             vec![
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("p")),
+                Constant::String(EcmaString::encode("p")),
             ],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
@@ -13561,6 +14360,7 @@ mod tests {
                             dst: reg(3),
                             src: reg(2),
                             resume: pc(4),
+                            mode: reg(2),
                         },
                         Instruction::Return { value: reg(3) },
                     ],
@@ -13574,7 +14374,7 @@ mod tests {
         machine.live_registers = 0;
         let awaited = machine.create_promise().unwrap();
         machine.resolve_promise(awaited, Value::int32(9)).unwrap();
-        machine.globals.insert(EcmaString::from_utf8("p"), awaited);
+        machine.test_set_global("p", awaited);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
@@ -13597,7 +14397,7 @@ mod tests {
     #[test]
     fn async_generator_resume_call_depth_failure_releases_registers_once() {
         let program = verified(
-            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![Constant::String(EcmaString::encode("p"))],
             vec![
                 function(0, 0, vec![Instruction::Halt], Vec::new()),
                 async_generator_function(
@@ -13624,7 +14424,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let awaited = machine.create_promise().unwrap();
-        machine.globals.insert(EcmaString::from_utf8("p"), awaited);
+        machine.test_set_global("p", awaited);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
         async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
@@ -13645,7 +14445,7 @@ mod tests {
     #[test]
     fn async_generator_yield_awaits_its_operand() {
         let program = verified(
-            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![Constant::String(EcmaString::encode("p"))],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
                 async_generator_function(
@@ -13660,6 +14460,7 @@ mod tests {
                             dst: reg(1),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(0),
                         },
                         Instruction::Return { value: reg(1) },
                     ],
@@ -13673,7 +14474,7 @@ mod tests {
         machine.live_registers = 0;
         let yielded = machine.create_promise().unwrap();
         machine.resolve_promise(yielded, Value::int32(41)).unwrap();
-        machine.globals.insert(EcmaString::from_utf8("p"), yielded);
+        machine.test_set_global("p", yielded);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
@@ -13704,6 +14505,7 @@ mod tests {
                             dst: reg(4),
                             src: reg(0),
                             resume: pc(2),
+                            mode: reg(3),
                         },
                         Instruction::LoadConst {
                             dst: reg(1),
@@ -13713,6 +14515,7 @@ mod tests {
                             dst: reg(4),
                             src: reg(1),
                             resume: pc(4),
+                            mode: reg(3),
                         },
                         Instruction::LoadConst {
                             dst: reg(2),
@@ -13722,6 +14525,7 @@ mod tests {
                             dst: reg(4),
                             src: reg(2),
                             resume: pc(6),
+                            mode: reg(3),
                         },
                         Instruction::Return { value: reg(4) },
                     ],
@@ -13854,7 +14658,7 @@ mod tests {
     #[test]
     fn async_generator_return_awaits_a_returned_promise() {
         let program = verified(
-            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![Constant::String(EcmaString::encode("p"))],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
                 async_generator_function(
@@ -13877,7 +14681,7 @@ mod tests {
         machine.live_registers = 0;
         let returned = machine.create_promise().unwrap();
         machine.resolve_promise(returned, Value::int32(1)).unwrap();
-        machine.globals.insert(EcmaString::from_utf8("p"), returned);
+        machine.test_set_global("p", returned);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
@@ -13895,7 +14699,7 @@ mod tests {
     #[test]
     fn async_generator_returned_promise_rejection_rejects_front() {
         let program = verified(
-            vec![Constant::String(EcmaString::from_utf8("p"))],
+            vec![Constant::String(EcmaString::encode("p"))],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
                 async_generator_function(
@@ -13920,7 +14724,7 @@ mod tests {
         machine
             .reject_promise(returned, Value::int32(5), ThrowOrigin::Bytecode)
             .unwrap();
-        machine.globals.insert(EcmaString::from_utf8("p"), returned);
+        machine.test_set_global("p", returned);
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
 
@@ -14137,6 +14941,103 @@ mod tests {
     }
 
     #[test]
+    fn close_iterator_raw_get_method_rejects_non_callable_return() {
+        let program = verified(
+            vec![Constant::Int32(99)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                function(
+                    0,
+                    1,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Return { value: reg(0) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let non_callable = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(non_callable, "return", Value::int32(42))
+            .unwrap();
+        let iterator = machine
+            .create_protocol_iterator(non_callable, Value::UNDEFINED)
+            .unwrap();
+        let (result, called) = machine.close_iterator_raw(iterator);
+        assert!(matches!(
+            result,
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+        ));
+        assert!(!called);
+
+        let absent = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let iterator = machine
+            .create_protocol_iterator(absent, Value::UNDEFINED)
+            .unwrap();
+        let (result, called) = machine.close_iterator_raw(iterator);
+        assert_eq!(result.unwrap(), Value::UNDEFINED);
+        assert!(!called);
+
+        let null_return = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .set_data_property(null_return, "return", Value::NULL)
+            .unwrap();
+        let iterator = machine
+            .create_protocol_iterator(null_return, Value::UNDEFINED)
+            .unwrap();
+        let (result, called) = machine.close_iterator_raw(iterator);
+        assert_eq!(result.unwrap(), Value::UNDEFINED);
+        assert!(!called);
+
+        let callable_return = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let returner = generator_callable(&mut machine, 1);
+        machine
+            .set_data_property(callable_return, "return", returner)
+            .unwrap();
+        let iterator = machine
+            .create_protocol_iterator(callable_return, Value::UNDEFINED)
+            .unwrap();
+        let (result, called) = machine.close_iterator_raw(iterator);
+        assert_eq!(result.unwrap(), Value::int32(99));
+        assert!(called);
+    }
+
+    #[test]
     fn runtime_callback_without_interpreter_caller_propagates_throw() {
         let program = verified(
             Vec::new(),
@@ -14154,6 +15055,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -14193,6 +15095,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -14254,9 +15157,9 @@ mod tests {
     fn addition_coerces_objects_left_to_right_and_interpolates_errors() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("L")),
-                Constant::String(EcmaString::from_utf8("additionOrder")),
-                Constant::String(EcmaString::from_utf8("message")),
+                Constant::String(EcmaString::encode("L")),
+                Constant::String(EcmaString::encode("additionOrder")),
+                Constant::String(EcmaString::encode("message")),
             ],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
@@ -14315,6 +15218,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -14325,6 +15229,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(2),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -14345,7 +15250,7 @@ mod tests {
 
         let error_constructor = machine.intrinsics.global("Error").unwrap();
         let message = machine
-            .allocate(HeapEntry::String(EcmaString::from_utf8("message")))
+            .allocate(HeapEntry::String(EcmaString::encode("message")))
             .unwrap();
         let error = machine
             .call_value(error_constructor, Value::UNDEFINED, &[message])
@@ -14388,8 +15293,8 @@ mod tests {
         // key = "a" + "b"; obj[key] = 7; return obj[key].
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
-                Constant::String(EcmaString::from_utf8("b")),
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("b")),
                 Constant::Int32(7),
             ],
             vec![function(
@@ -14437,7 +15342,7 @@ mod tests {
     fn property_delete_and_array_holes_are_real_mutations() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("0")),
+                Constant::String(EcmaString::encode("0")),
                 Constant::Int32(5),
             ],
             vec![function(
@@ -14612,7 +15517,7 @@ mod tests {
             vec![
                 Constant::Int32(1),
                 Constant::Undefined,
-                Constant::String(EcmaString::from_utf8("length")),
+                Constant::String(EcmaString::encode("length")),
             ],
             vec![entry, callee],
         );
@@ -14675,7 +15580,7 @@ mod tests {
                 Constant::Int32(1),
                 Constant::Int32(2),
                 Constant::Int32(3),
-                Constant::String(EcmaString::from_utf8("length")),
+                Constant::String(EcmaString::encode("length")),
             ],
             vec![entry],
         );
@@ -14837,7 +15742,7 @@ mod tests {
                     let mut properties = PropertyMap::default();
                     for (key, property) in [
                         (
-                            PropertyKey::Named(EcmaString::from_utf8("order")),
+                            PropertyKey::Named(EcmaString::encode("order")),
                             Property::Data {
                                 value: Value::int32(0),
                                 writable: true,
@@ -14846,7 +15751,7 @@ mod tests {
                             },
                         ),
                         (
-                            PropertyKey::Named(EcmaString::from_utf8("done")),
+                            PropertyKey::Named(EcmaString::encode("done")),
                             Property::Accessor {
                                 getter: Some(done_getter),
                                 setter: None,
@@ -14855,7 +15760,7 @@ mod tests {
                             },
                         ),
                         (
-                            PropertyKey::Named(EcmaString::from_utf8("value")),
+                            PropertyKey::Named(EcmaString::encode("value")),
                             Property::Accessor {
                                 getter: Some(value_getter),
                                 setter: None,
@@ -14890,7 +15795,7 @@ mod tests {
                             },
                         ),
                         (
-                            PropertyKey::Named(EcmaString::from_utf8("next")),
+                            PropertyKey::Named(EcmaString::encode("next")),
                             Property::Accessor {
                                 getter: Some(next_getter),
                                 setter: None,
@@ -14899,7 +15804,7 @@ mod tests {
                             },
                         ),
                         (
-                            PropertyKey::Named(EcmaString::from_utf8("nextReads")),
+                            PropertyKey::Named(EcmaString::encode("nextReads")),
                             Property::Data {
                                 value: Value::int32(0),
                                 writable: true,
@@ -14908,7 +15813,7 @@ mod tests {
                             },
                         ),
                         (
-                            PropertyKey::Named(EcmaString::from_utf8("nextFunction")),
+                            PropertyKey::Named(EcmaString::encode("nextFunction")),
                             Property::Data {
                                 value: next_result,
                                 writable: true,
@@ -14917,7 +15822,7 @@ mod tests {
                             },
                         ),
                         (
-                            PropertyKey::Named(EcmaString::from_utf8("result")),
+                            PropertyKey::Named(EcmaString::encode("result")),
                             Property::Data {
                                 value: result,
                                 writable: true,
@@ -14952,7 +15857,7 @@ mod tests {
 
         let mut completed_properties = PropertyMap::default();
         completed_properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("done")),
+            PropertyKey::Named(EcmaString::encode("done")),
             Property::Data {
                 value: Value::TRUE,
                 writable: true,
@@ -14961,7 +15866,7 @@ mod tests {
             },
         );
         completed_properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("value")),
+            PropertyKey::Named(EcmaString::encode("value")),
             Property::Accessor {
                 getter: Some(value_getter),
                 setter: None,
@@ -14986,7 +15891,7 @@ mod tests {
         );
 
         machine
-            .delete_property(source, &PropertyKey::Named(EcmaString::from_utf8("next")))
+            .delete_property(source, &PropertyKey::Named(EcmaString::encode("next")))
             .unwrap();
         machine
             .set_data_property(source, "next", Value::int32(1))
@@ -15007,7 +15912,7 @@ mod tests {
         };
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(9),
             ],
             vec![function(
@@ -15067,7 +15972,7 @@ mod tests {
         let target = object(&mut machine);
         let symbol = machine
             .allocate(HeapEntry::Symbol {
-                description: EcmaString::from_utf8("key"),
+                description: EcmaString::encode("key"),
             })
             .unwrap();
         let key = machine.to_property_key(symbol).unwrap();
@@ -15091,7 +15996,7 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
-            machine.delete_property(this, &PropertyKey::Named(EcmaString::from_utf8("next")))?;
+            machine.delete_property(this, &PropertyKey::Named(EcmaString::encode("next")))?;
             Ok(intrinsics::BuiltinOutcome::Value(Value::int32(1)))
         }
 
@@ -15110,8 +16015,8 @@ mod tests {
                 handler: delete_next::<TestHost>,
             });
         let getter = intrinsics::native_function(&mut machine.heap, getter_id, "delete next", 0);
-        let first = PropertyKey::Named(EcmaString::from_utf8("first"));
-        let next = PropertyKey::Named(EcmaString::from_utf8("next"));
+        let first = PropertyKey::Named(EcmaString::encode("first"));
+        let next = PropertyKey::Named(EcmaString::encode("next"));
         let mut source_properties = PropertyMap::default();
         source_properties.insert(
             first.clone(),
@@ -15163,7 +16068,7 @@ mod tests {
         // Two private names with the same description are distinct keys.
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(1),
                 Constant::Int32(2),
             ],
@@ -15228,6 +16133,59 @@ mod tests {
     }
 
     #[test]
+    fn set_preserves_attributes_but_create_data_property_resets_them() {
+        with_machine(Limits::default(), |machine| {
+            let object = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .unwrap();
+            let key = PropertyKey::Named(EcmaString::encode("x"));
+            machine
+                .define_descriptor(
+                    object,
+                    key.clone(),
+                    Property::Data {
+                        value: Value::int32(1),
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+
+            machine
+                .set_data_property_key(object, key.clone(), Value::int32(2))
+                .unwrap();
+            assert!(matches!(
+                machine.own_descriptor(object, &key).unwrap(),
+                Some(Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                }) if value == Value::int32(2)
+            ));
+
+            machine
+                .create_data_property_key(object, key.clone(), Value::int32(3))
+                .unwrap();
+            assert!(matches!(
+                machine.own_descriptor(object, &key).unwrap(),
+                Some(Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                }) if value == Value::int32(3)
+            ));
+        });
+    }
+
+    #[test]
     fn accessor_getter_is_invoked_on_property_read() {
         // Define a getter returning 99, then read the property.
         let entry = function(
@@ -15274,7 +16232,7 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("g")),
+                Constant::String(EcmaString::encode("g")),
                 Constant::Int32(99),
             ],
             vec![entry, getter],
@@ -15288,7 +16246,7 @@ mod tests {
         // writable / non-enumerable / configurable.
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(7),
             ],
             vec![function(
@@ -15324,7 +16282,7 @@ mod tests {
         let execution = machine.evaluate().unwrap();
         assert_eq!(execution.entry_registers[3], Value::int32(7));
         let object = execution.value;
-        let key = PropertyKey::Named(EcmaString::from_utf8("x"));
+        let key = PropertyKey::Named(EcmaString::encode("x"));
         let descriptor = machine
             .own_descriptor(object, &key)
             .unwrap()
@@ -15358,7 +16316,7 @@ mod tests {
         let module = verified(
             vec![
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(7),
             ],
             vec![function(
@@ -15404,8 +16362,8 @@ mod tests {
     fn define_data_property_preserves_descriptor_errors_on_non_extensible() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("sealed")),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("sealed")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(7),
             ],
             vec![function(
@@ -15444,9 +16402,7 @@ mod tests {
                 boxed_primitive: None,
             })
             .unwrap();
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("sealed"), sealed);
+        machine.test_set_global("sealed", sealed);
         let error = machine
             .run()
             .expect_err("DefineDataProperty on a non-extensible object must throw");
@@ -15464,10 +16420,10 @@ mod tests {
         // Tag 49 LoadOwnDescriptorSlot is own-only and non-invoking.
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("accessor")),
-                Constant::String(EcmaString::from_utf8("missing")),
+                Constant::String(EcmaString::encode("accessor")),
+                Constant::String(EcmaString::encode("missing")),
             ],
             vec![function(
                 0,
@@ -15611,7 +16567,7 @@ mod tests {
                 })
                 .unwrap();
             let key = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("missing")))
+                .allocate(HeapEntry::String(EcmaString::encode("missing")))
                 .unwrap();
             assert!(!machine.with_has_binding(object, key).unwrap());
             LOG.with(|log| assert!(log.borrow().is_empty(), "absent binding must short-circuit"));
@@ -15624,9 +16580,9 @@ mod tests {
             let unscopables_key = machine
                 .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
                 .unwrap();
-            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let name = PropertyKey::Named(EcmaString::encode("x"));
             let key = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             let make = |machine: &mut Machine<'_, TestHost>, blocked: Value| {
                 let blocklist = machine
@@ -15692,9 +16648,9 @@ mod tests {
             let unscopables_key = machine
                 .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
                 .unwrap();
-            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let name = PropertyKey::Named(EcmaString::encode("x"));
             let key = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             let candidate_proto = machine
                 .allocate(HeapEntry::Object {
@@ -15899,7 +16855,7 @@ mod tests {
             );
             let block_get = install("get x", block_getter::<TestHost>);
             let candidate_get = install("get candidate x", candidate_getter::<TestHost>);
-            let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+            let name = PropertyKey::Named(EcmaString::encode("x"));
             let unscopables_key = machine
                 .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
                 .unwrap();
@@ -15955,7 +16911,7 @@ mod tests {
             EXPECTED_BINDING.set(object.to_bits());
             EXPECTED_BLOCKLIST.set(blocklist.to_bits());
             let key = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             assert!(machine.with_has_binding(object, key).unwrap());
             LOG.with(|log| assert_eq!(&*log.borrow(), &["unscopables", "block"]));
@@ -15987,8 +16943,8 @@ mod tests {
 
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("o")),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("o")),
+                Constant::String(EcmaString::encode("x")),
             ],
             vec![function(
                 0,
@@ -16047,7 +17003,7 @@ mod tests {
                 properties: {
                     let mut properties = PropertyMap::default();
                     properties.insert(
-                        PropertyKey::Named(EcmaString::from_utf8("x")),
+                        PropertyKey::Named(EcmaString::encode("x")),
                         Property::Data {
                             value: Value::int32(1),
                             writable: true,
@@ -16071,7 +17027,7 @@ mod tests {
                 extensible: true,
             })
             .unwrap();
-        machine.globals.insert(EcmaString::from_utf8("o"), object);
+        machine.test_set_global("o", object);
         let execution = machine.evaluate().unwrap();
         assert_eq!(execution.value, sentinel);
         assert_ne!(
@@ -16094,14 +17050,14 @@ mod tests {
                 .set_data_property(machine.intrinsics.string_prototype, "x", Value::TRUE)
                 .unwrap();
             let primitive_blocklist = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("blocklist")))
+                .allocate(HeapEntry::String(EcmaString::encode("blocklist")))
                 .unwrap();
             let object = machine
                 .allocate(HeapEntry::Object {
                     properties: {
                         let mut properties = PropertyMap::default();
                         properties.insert(
-                            PropertyKey::Named(EcmaString::from_utf8("x")),
+                            PropertyKey::Named(EcmaString::encode("x")),
                             Property::Data {
                                 value: Value::int32(1),
                                 writable: true,
@@ -16126,7 +17082,7 @@ mod tests {
                 })
                 .unwrap();
             let key = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             assert!(
                 machine.with_has_binding(object, key).unwrap(),
@@ -16139,9 +17095,9 @@ mod tests {
     fn with_has_binding_instruction_reports_allowed_and_blocked() {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("allowed")),
-                Constant::String(EcmaString::from_utf8("blocked")),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("allowed")),
+                Constant::String(EcmaString::encode("blocked")),
+                Constant::String(EcmaString::encode("x")),
             ],
             vec![function(
                 0,
@@ -16179,7 +17135,7 @@ mod tests {
         let unscopables_key = machine
             .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
             .unwrap();
-        let name = PropertyKey::Named(EcmaString::from_utf8("x"));
+        let name = PropertyKey::Named(EcmaString::encode("x"));
         let mk = |machine: &mut Machine<'_, TestHost>, blocked: bool| {
             let blocklist = machine
                 .allocate(HeapEntry::Object {
@@ -16233,12 +17189,8 @@ mod tests {
         };
         let allowed = mk(&mut machine, false);
         let blocked = mk(&mut machine, true);
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("allowed"), allowed);
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("blocked"), blocked);
+        machine.test_set_global("allowed", allowed);
+        machine.test_set_global("blocked", blocked);
         let execution = machine.evaluate().unwrap();
         assert_eq!(execution.value, Value::TRUE);
         assert_eq!(execution.entry_registers[3], Value::TRUE);
@@ -16250,12 +17202,12 @@ mod tests {
         // Tag 50 DefineOwnDescriptorSlot creates when absent and preserves shape.
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("created")),
+                Constant::String(EcmaString::encode("created")),
                 Constant::Int32(9),
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(1),
                 Constant::Int32(8),
-                Constant::String(EcmaString::from_utf8("accessor")),
+                Constant::String(EcmaString::encode("accessor")),
             ],
             vec![function(
                 0,
@@ -16326,9 +17278,9 @@ mod tests {
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let execution = machine.evaluate().unwrap();
         let object = execution.value;
-        let created = PropertyKey::Named(EcmaString::from_utf8("created"));
-        let data = PropertyKey::Named(EcmaString::from_utf8("data"));
-        let accessor = PropertyKey::Named(EcmaString::from_utf8("accessor"));
+        let created = PropertyKey::Named(EcmaString::encode("created"));
+        let data = PropertyKey::Named(EcmaString::encode("data"));
+        let accessor = PropertyKey::Named(EcmaString::encode("accessor"));
         assert!(matches!(
             machine.own_descriptor(object, &created).unwrap(),
             Some(Property::Data {
@@ -16367,7 +17319,7 @@ mod tests {
 
         let mismatch = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("data")),
+                Constant::String(EcmaString::encode("data")),
                 Constant::Int32(1),
                 Constant::Int32(2),
             ],
@@ -16489,9 +17441,9 @@ mod tests {
         let ctor = function(0, 1, vec![Instruction::Halt], vec![]);
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("m")),
+                Constant::String(EcmaString::encode("m")),
                 Constant::Int32(5),
-                Constant::String(EcmaString::from_utf8("prototype")),
+                Constant::String(EcmaString::encode("prototype")),
             ],
             vec![entry, ctor],
         );
@@ -16600,7 +17552,7 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::encode("a")),
                 Constant::Int32(1),
             ],
             vec![entry],
@@ -16681,6 +17633,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -16738,8 +17691,8 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("y")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("y")),
                 Constant::Int32(5),
             ],
             vec![entry],
@@ -16895,7 +17848,7 @@ mod tests {
     #[test]
     fn load_undeclared_global_throws_reference_error() {
         let module = verified(
-            vec![Constant::String(EcmaString::from_utf8("missing"))],
+            vec![Constant::String(EcmaString::encode("missing"))],
             vec![function(
                 0,
                 2,
@@ -16990,7 +17943,7 @@ mod tests {
     #[test]
     fn uncaught_reference_error_reports_origin() {
         let module = verified(
-            vec![Constant::String(EcmaString::from_utf8("missing"))],
+            vec![Constant::String(EcmaString::encode("missing"))],
             vec![function(
                 0,
                 1,
@@ -17060,7 +18013,7 @@ mod tests {
     fn assert_uri_error(global: &str, argument: EcmaString) {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8(global)),
+                Constant::String(EcmaString::encode(global)),
                 Constant::String(argument),
                 Constant::Undefined,
             ],
@@ -17116,18 +18069,15 @@ mod tests {
     fn uri_builtins_report_uri_error() {
         for (global, argument) in [
             ("encodeURIComponent", EcmaString::from_units(&[0xd800])),
-            ("decodeURIComponent", EcmaString::from_utf8("%")),
-            ("decodeURIComponent", EcmaString::from_utf8("%GG")),
-            ("decodeURIComponent", EcmaString::from_utf8("%FF")),
-            ("decodeURIComponent", EcmaString::from_utf8("%80")),
-            ("decodeURIComponent", EcmaString::from_utf8("%C0%80")),
-            ("decodeURIComponent", EcmaString::from_utf8("%E2%82")),
-            ("decodeURIComponent", EcmaString::from_utf8("%ED%A0%80")),
-            ("decodeURIComponent", EcmaString::from_utf8("%F4%90%80%80")),
-            (
-                "decodeURIComponent",
-                EcmaString::from_utf8("%F8%80%80%80%80"),
-            ),
+            ("decodeURIComponent", EcmaString::encode("%")),
+            ("decodeURIComponent", EcmaString::encode("%GG")),
+            ("decodeURIComponent", EcmaString::encode("%FF")),
+            ("decodeURIComponent", EcmaString::encode("%80")),
+            ("decodeURIComponent", EcmaString::encode("%C0%80")),
+            ("decodeURIComponent", EcmaString::encode("%E2%82")),
+            ("decodeURIComponent", EcmaString::encode("%ED%A0%80")),
+            ("decodeURIComponent", EcmaString::encode("%F4%90%80%80")),
+            ("decodeURIComponent", EcmaString::encode("%F8%80%80%80%80")),
         ] {
             assert_uri_error(global, argument);
         }
@@ -17136,7 +18086,7 @@ mod tests {
     fn assert_uri_decode(argument: EcmaString, expected: EcmaString) {
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("decodeURIComponent")),
+                Constant::String(EcmaString::encode("decodeURIComponent")),
                 Constant::String(argument),
                 Constant::Undefined,
                 Constant::String(expected),
@@ -17195,16 +18145,10 @@ mod tests {
         let exact = EcmaString::from_units(&[0xd800, 0x61, 0xdfff]);
         for (argument, expected) in [
             (exact.clone(), exact),
-            (EcmaString::from_utf8("%2F"), EcmaString::from_utf8("/")),
-            (
-                EcmaString::from_utf8("%F0%9F%98%80"),
-                EcmaString::from_utf8("😀"),
-            ),
-            (
-                EcmaString::from_utf8("%E4%B8%ADA"),
-                EcmaString::from_utf8("中A"),
-            ),
-            (EcmaString::from_utf8("%00"), EcmaString::from_units(&[0])),
+            (EcmaString::encode("%2F"), EcmaString::encode("/")),
+            (EcmaString::encode("%F0%9F%98%80"), EcmaString::encode("😀")),
+            (EcmaString::encode("%E4%B8%ADA"), EcmaString::encode("中A")),
+            (EcmaString::encode("%00"), EcmaString::from_units(&[0])),
         ] {
             assert_uri_decode(argument, expected);
         }
@@ -17215,10 +18159,10 @@ mod tests {
         // typeof re === "object" is not directly returnable; return re.source.
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("ab")),
-                Constant::String(EcmaString::from_utf8("gi")),
-                Constant::String(EcmaString::from_utf8("source")),
-                Constant::String(EcmaString::from_utf8("global")),
+                Constant::String(EcmaString::encode("ab")),
+                Constant::String(EcmaString::encode("gi")),
+                Constant::String(EcmaString::encode("source")),
+                Constant::String(EcmaString::encode("global")),
             ],
             vec![function(
                 0,
@@ -17374,8 +18318,8 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("nt")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("nt")),
             ],
             vec![entry, ctor],
         );
@@ -17452,8 +18396,8 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("nt")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("nt")),
             ],
             vec![entry, ctor],
         );
@@ -17565,10 +18509,10 @@ mod tests {
         let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("marker")),
                 Constant::Int32(42),
-                Constant::String(EcmaString::from_utf8("nt")),
+                Constant::String(EcmaString::encode("nt")),
             ],
             vec![entry, ctor, nt_fn],
         );
@@ -17673,8 +18617,8 @@ mod tests {
         let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("tag")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("tag")),
                 Constant::Int32(77),
                 Constant::Int32(99),
             ],
@@ -17753,9 +18697,9 @@ mod tests {
         let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("Object")),
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::String(EcmaString::encode("Object")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("marker")),
                 Constant::Int32(42),
             ],
             vec![entry, nt_fn],
@@ -17832,9 +18776,9 @@ mod tests {
         let nt_fn = function(0, 1, vec![Instruction::Halt], vec![]);
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("Error")),
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("custom")),
+                Constant::String(EcmaString::encode("Error")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("custom")),
                 Constant::Int32(99),
             ],
             vec![entry, nt_fn],
@@ -17936,10 +18880,10 @@ mod tests {
         let target_ctor = function(0, 1, vec![Instruction::Halt], vec![]);
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("prototype")),
-                Constant::String(EcmaString::from_utf8("tag")),
+                Constant::String(EcmaString::encode("prototype")),
+                Constant::String(EcmaString::encode("tag")),
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::String(EcmaString::encode("bind")),
                 Constant::Undefined,
             ],
             vec![entry, target_ctor],
@@ -18132,7 +19076,7 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("bind")),
+                Constant::String(EcmaString::encode("bind")),
                 Constant::Undefined,
             ],
             vec![entry, base, unrelated],
@@ -18195,7 +19139,7 @@ mod tests {
         let module = verified(
             vec![
                 Constant::Int32(42),
-                Constant::String(EcmaString::from_utf8("0")),
+                Constant::String(EcmaString::encode("0")),
             ],
             vec![entry, callee],
         );
@@ -18294,7 +19238,7 @@ mod tests {
         let module = verified(
             vec![
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("map")),
+                Constant::String(EcmaString::encode("map")),
             ],
             vec![entry, callback],
         );
@@ -18378,7 +19322,7 @@ mod tests {
         let module = verified(
             vec![
                 Constant::Int32(0),
-                Constant::String(EcmaString::from_utf8("map")),
+                Constant::String(EcmaString::encode("map")),
             ],
             vec![entry, callback],
         );
@@ -18476,7 +19420,7 @@ mod tests {
         let module = verified(
             vec![
                 Constant::Int32(0),
-                Constant::String(EcmaString::from_utf8("map")),
+                Constant::String(EcmaString::encode("map")),
             ],
             vec![entry, callback],
         );
@@ -18544,6 +19488,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -18632,7 +19577,7 @@ mod tests {
         let module = verified(
             vec![
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("map")),
+                Constant::String(EcmaString::encode("map")),
                 Constant::Int32(42),
             ],
             vec![entry, callback, simple],
@@ -18657,6 +19602,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(2),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -18894,7 +19840,7 @@ mod tests {
         );
         let module = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("marker")),
+                Constant::String(EcmaString::encode("marker")),
                 Constant::Int32(5),
             ],
             vec![entry, returns_object],
@@ -18941,14 +19887,14 @@ mod tests {
             machine
                 .set_own_data(
                     index,
-                    PropertyKey::Named(EcmaString::from_utf8(key)),
+                    PropertyKey::Named(EcmaString::encode(key)),
                     Value::int32(value),
                 )
                 .unwrap();
         }
         assert_eq!(
             machine.enumerable_keys(object).unwrap(),
-            ["1", "2", "b", "a"].map(EcmaString::from_utf8)
+            ["1", "2", "b", "a"].map(EcmaString::encode)
         );
     }
 
@@ -19037,10 +19983,10 @@ mod tests {
             let console = machine.intrinsics.global("console").unwrap();
             let log = machine.get_named_property(console, "log").unwrap();
             let string = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("hello")))
+                .allocate(HeapEntry::String(EcmaString::encode("hello")))
                 .unwrap();
             let array_string = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("x")))
+                .allocate(HeapEntry::String(EcmaString::encode("x")))
                 .unwrap();
             let array = machine
                 .allocate(HeapEntry::Array {
@@ -19053,7 +19999,7 @@ mod tests {
                 .unwrap();
             let mut inner_properties = PropertyMap::default();
             inner_properties.insert(
-                PropertyKey::Named(EcmaString::from_utf8("answer")),
+                PropertyKey::Named(EcmaString::encode("answer")),
                 Property::Data {
                     value: Value::int32(42),
                     writable: true,
@@ -19071,7 +20017,7 @@ mod tests {
                 .unwrap();
             let mut outer_properties = PropertyMap::default();
             outer_properties.insert(
-                PropertyKey::Named(EcmaString::from_utf8("nested")),
+                PropertyKey::Named(EcmaString::encode("nested")),
                 Property::Data {
                     value: inner,
                     writable: true,
@@ -19089,7 +20035,7 @@ mod tests {
                 .unwrap();
             let symbol = machine
                 .allocate(HeapEntry::Symbol {
-                    description: EcmaString::from_utf8("token"),
+                    description: EcmaString::encode("token"),
                 })
                 .unwrap();
             for value in [
@@ -19144,10 +20090,7 @@ mod tests {
             );
             assert!(
                 machine
-                    .delete_property(
-                        env,
-                        &PropertyKey::Named(EcmaString::from_utf8("BAMTS_MODE"))
-                    )
+                    .delete_property(env, &PropertyKey::Named(EcmaString::encode("BAMTS_MODE")))
                     .unwrap()
             );
             assert_eq!(
@@ -19164,7 +20107,7 @@ mod tests {
             program_module(
                 name,
                 vec![
-                    Constant::String(EcmaString::from_utf8("x")),
+                    Constant::String(EcmaString::encode("x")),
                     Constant::Int32(value),
                 ],
                 vec![function(
@@ -19197,9 +20140,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("left")),
-                Constant::String(EcmaString::from_utf8("right")),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("left")),
+                Constant::String(EcmaString::encode("right")),
+                Constant::String(EcmaString::encode("x")),
             ],
             vec![function(
                 0,
@@ -19274,10 +20217,10 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(1),
                 Constant::Int32(2),
-                Constant::String(EcmaString::from_utf8("set")),
+                Constant::String(EcmaString::encode("set")),
             ],
             vec![
                 function(
@@ -19348,9 +20291,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("set")),
-                Constant::String(EcmaString::from_utf8("dep")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("set")),
+                Constant::String(EcmaString::encode("dep")),
             ],
             vec![function(
                 0,
@@ -19409,9 +20352,9 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(10),
-                Constant::String(EcmaString::from_utf8("read")),
+                Constant::String(EcmaString::encode("read")),
             ],
             vec![
                 function(
@@ -19472,10 +20415,10 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(20),
-                Constant::String(EcmaString::from_utf8("read")),
-                Constant::String(EcmaString::from_utf8("dep")),
+                Constant::String(EcmaString::encode("read")),
+                Constant::String(EcmaString::encode("dep")),
             ],
             vec![function(
                 0,
@@ -19535,9 +20478,9 @@ mod tests {
         let first = program_module(
             "first",
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::encode("a")),
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("second")),
+                Constant::String(EcmaString::encode("second")),
             ],
             vec![function(
                 0,
@@ -19572,8 +20515,8 @@ mod tests {
         let second = program_module(
             "second",
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
-                Constant::String(EcmaString::from_utf8("first")),
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("first")),
             ],
             vec![function(
                 0,
@@ -19618,9 +20561,9 @@ mod tests {
         let first = program_module(
             "first",
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
+                Constant::String(EcmaString::encode("a")),
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("second")),
+                Constant::String(EcmaString::encode("second")),
             ],
             vec![function(
                 0,
@@ -19655,8 +20598,8 @@ mod tests {
         let second = program_module(
             "second",
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
-                Constant::String(EcmaString::from_utf8("first")),
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("first")),
             ],
             vec![function(
                 0,
@@ -19695,9 +20638,9 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("z")),
-                Constant::String(EcmaString::from_utf8("a")),
-                Constant::String(EcmaString::from_utf8("mutate")),
+                Constant::String(EcmaString::encode("z")),
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("mutate")),
                 Constant::Int32(1),
                 Constant::Int32(2),
                 Constant::Int32(3),
@@ -19787,19 +20730,19 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("ns1")),
-                Constant::String(EcmaString::from_utf8("ns2")),
-                Constant::String(EcmaString::from_utf8("mutate")),
-                Constant::String(EcmaString::from_utf8("z")),
-                Constant::String(EcmaString::from_utf8("a")),
-                Constant::String(EcmaString::from_utf8("dep")),
-                Constant::String(EcmaString::from_utf8("Object")),
-                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
-                Constant::String(EcmaString::from_utf8("value")),
-                Constant::String(EcmaString::from_utf8("writable")),
-                Constant::String(EcmaString::from_utf8("enumerable")),
-                Constant::String(EcmaString::from_utf8("configurable")),
-                Constant::String(EcmaString::from_utf8("missing")),
+                Constant::String(EcmaString::encode("ns1")),
+                Constant::String(EcmaString::encode("ns2")),
+                Constant::String(EcmaString::encode("mutate")),
+                Constant::String(EcmaString::encode("z")),
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("dep")),
+                Constant::String(EcmaString::encode("Object")),
+                Constant::String(EcmaString::encode("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::encode("value")),
+                Constant::String(EcmaString::encode("writable")),
+                Constant::String(EcmaString::encode("enumerable")),
+                Constant::String(EcmaString::encode("configurable")),
+                Constant::String(EcmaString::encode("missing")),
             ],
             vec![function(
                 0,
@@ -20018,7 +20961,7 @@ mod tests {
             let dependency = program_module(
                 "dependency",
                 vec![
-                    Constant::String(EcmaString::from_utf8("count")),
+                    Constant::String(EcmaString::encode("count")),
                     Constant::Int32(0),
                     Constant::Int32(1),
                 ],
@@ -20086,9 +21029,9 @@ mod tests {
             let root = program_module(
                 "root",
                 vec![
-                    Constant::String(EcmaString::from_utf8("count")),
-                    Constant::String(EcmaString::from_utf8("dep-one")),
-                    Constant::String(EcmaString::from_utf8("dep-two")),
+                    Constant::String(EcmaString::encode("count")),
+                    Constant::String(EcmaString::encode("dep-one")),
+                    Constant::String(EcmaString::encode("dep-two")),
                 ],
                 vec![function(
                     0,
@@ -20124,9 +21067,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("./target")),
+                Constant::String(EcmaString::encode("./target")),
                 Constant::Undefined,
-                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::encode("value")),
             ],
             vec![function(
                 0,
@@ -20175,7 +21118,7 @@ mod tests {
             "target",
             vec![
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::encode("value")),
             ],
             vec![function(
                 0,
@@ -20221,7 +21164,7 @@ mod tests {
         let module = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("after")),
+                Constant::String(EcmaString::encode("after")),
                 Constant::Int32(7),
             ],
             vec![function(
@@ -20258,10 +21201,7 @@ mod tests {
 
         assert_eq!(execution.value, Value::int32(7));
         assert_eq!(execution.entry_registers[1], Value::int32(7));
-        assert_eq!(
-            machine.globals.get(&EcmaString::from_utf8("after")),
-            Some(&Value::int32(7)),
-        );
+        assert_eq!(machine.test_global("after"), Some(Value::int32(7)));
     }
 
     #[test]
@@ -20304,7 +21244,7 @@ mod tests {
     fn external_static_edge_is_a_typed_runtime_error() {
         let module = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("external"))],
+            vec![Constant::String(EcmaString::encode("external"))],
             vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
             vec![Edge {
                 specifier: cid(1),
@@ -20332,8 +21272,8 @@ mod tests {
             let module = program_module(
                 "root",
                 vec![
-                    Constant::String(EcmaString::from_utf8(export)),
-                    Constant::String(EcmaString::from_utf8(specifier)),
+                    Constant::String(EcmaString::encode(export)),
+                    Constant::String(EcmaString::encode(specifier)),
                 ],
                 vec![function(
                     0,
@@ -20365,11 +21305,11 @@ mod tests {
             let mut host = TestHost;
             let mut machine = Machine::new(&program, &mut host, Limits::default());
             machine.registry.external.insert(
-                EcmaString::from_utf8(specifier),
+                EcmaString::encode(specifier),
                 ExternalModuleInstance {
                     namespace: Value::UNDEFINED,
                     exports: BTreeMap::from([(
-                        EcmaString::from_utf8(export),
+                        EcmaString::encode(export),
                         ExternalExport {
                             value: Value::int32(7),
                             cell: None,
@@ -20388,10 +21328,10 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("./dependency")),
-                Constant::String(EcmaString::from_utf8("count")),
+                Constant::String(EcmaString::encode("./dependency")),
+                Constant::String(EcmaString::encode("count")),
                 Constant::Int32(0),
-                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::encode("value")),
             ],
             vec![function(
                 0,
@@ -20447,11 +21387,11 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("./root")),
-                Constant::String(EcmaString::from_utf8("count")),
+                Constant::String(EcmaString::encode("./root")),
+                Constant::String(EcmaString::encode("count")),
                 Constant::Int32(1),
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::encode("value")),
             ],
             vec![function(
                 0,
@@ -20521,7 +21461,7 @@ mod tests {
         );
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![function(
                 0,
                 1,
@@ -20573,8 +21513,8 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("./target")),
-                Constant::String(EcmaString::from_utf8("count")),
+                Constant::String(EcmaString::encode("./target")),
+                Constant::String(EcmaString::encode("count")),
                 Constant::Int32(0),
             ],
             vec![function(
@@ -20631,7 +21571,7 @@ mod tests {
         let target = program_module(
             "target",
             vec![
-                Constant::String(EcmaString::from_utf8("count")),
+                Constant::String(EcmaString::encode("count")),
                 Constant::Int32(1),
                 Constant::Int32(9),
             ],
@@ -20684,7 +21624,7 @@ mod tests {
         // not undefined from a stripped origin.
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![function(
                 0,
                 2,
@@ -20764,7 +21704,7 @@ mod tests {
     fn dynamic_import_returns_the_registered_external_namespace() {
         let module = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("external"))],
+            vec![Constant::String(EcmaString::encode("external"))],
             vec![function(
                 0,
                 3,
@@ -20807,7 +21747,7 @@ mod tests {
             })
             .unwrap();
         machine.registry.external.insert(
-            EcmaString::from_utf8("external"),
+            EcmaString::encode("external"),
             ExternalModuleInstance {
                 namespace,
                 exports: BTreeMap::new(),
@@ -20826,7 +21766,7 @@ mod tests {
         let requester = |name, target| {
             program_module(
                 name,
-                vec![Constant::String(EcmaString::from_utf8("./target"))],
+                vec![Constant::String(EcmaString::encode("./target"))],
                 vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
                 vec![Edge {
                     specifier: cid(1),
@@ -20873,7 +21813,7 @@ mod tests {
     fn dynamic_import_of_a_missing_external_is_a_runtime_error() {
         let module = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("dynamic"))],
+            vec![Constant::String(EcmaString::encode("dynamic"))],
             vec![function(
                 0,
                 1,
@@ -20910,7 +21850,7 @@ mod tests {
     fn unbound_global_names_fall_back_to_the_realm_global_map() {
         let program = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("realmOnly")),
+                Constant::String(EcmaString::encode("realmOnly")),
                 Constant::Int32(7),
             ],
             vec![function(
@@ -20941,7 +21881,7 @@ mod tests {
     fn module_cell_limit_is_enforced_before_evaluation() {
         let module = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("x"))],
+            vec![Constant::String(EcmaString::encode("x"))],
             vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
             Vec::new(),
             vec![Binding {
@@ -20972,7 +21912,7 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(1),
             ],
             vec![function(
@@ -21004,9 +21944,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(2),
-                Constant::String(EcmaString::from_utf8("dep")),
+                Constant::String(EcmaString::encode("dep")),
             ],
             vec![function(
                 0,
@@ -21054,9 +21994,9 @@ mod tests {
         let root = program_module(
             "root",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("x")),
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("dependency")),
+                Constant::String(EcmaString::encode("dependency")),
             ],
             vec![function(
                 0,
@@ -21091,11 +22031,11 @@ mod tests {
         let dependency = program_module(
             "dependency",
             vec![
-                Constant::String(EcmaString::from_utf8("ns")),
-                Constant::String(EcmaString::from_utf8("root")),
-                Constant::String(EcmaString::from_utf8("Object")),
-                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("ns")),
+                Constant::String(EcmaString::encode("root")),
+                Constant::String(EcmaString::encode("Object")),
+                Constant::String(EcmaString::encode("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::encode("x")),
             ],
             vec![namespace_descriptor_entry()],
             vec![Edge {
@@ -21128,8 +22068,8 @@ mod tests {
         let exported = program_module(
             "exported",
             vec![
-                Constant::String(EcmaString::from_utf8("x")),
-                Constant::String(EcmaString::from_utf8("external")),
+                Constant::String(EcmaString::encode("x")),
+                Constant::String(EcmaString::encode("external")),
             ],
             vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
             vec![Edge {
@@ -21149,11 +22089,11 @@ mod tests {
         let importer = program_module(
             "importer",
             vec![
-                Constant::String(EcmaString::from_utf8("ns")),
-                Constant::String(EcmaString::from_utf8("exported")),
-                Constant::String(EcmaString::from_utf8("Object")),
-                Constant::String(EcmaString::from_utf8("getOwnPropertyDescriptor")),
-                Constant::String(EcmaString::from_utf8("x")),
+                Constant::String(EcmaString::encode("ns")),
+                Constant::String(EcmaString::encode("exported")),
+                Constant::String(EcmaString::encode("Object")),
+                Constant::String(EcmaString::encode("getOwnPropertyDescriptor")),
+                Constant::String(EcmaString::encode("x")),
             ],
             vec![namespace_descriptor_entry()],
             vec![Edge {
@@ -21219,6 +22159,7 @@ mod tests {
                 module,
                 function: FunctionId::new(0),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -21321,9 +22262,9 @@ mod tests {
     fn promise_resolver_settles_once_and_reactions_wait_for_drain() {
         let program = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("resolve")),
-                Constant::String(EcmaString::from_utf8("reject")),
-                Constant::String(EcmaString::from_utf8("observed")),
+                Constant::String(EcmaString::encode("resolve")),
+                Constant::String(EcmaString::encode("reject")),
+                Constant::String(EcmaString::encode("observed")),
             ],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
@@ -21366,6 +22307,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -21376,6 +22318,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(2),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -21400,16 +22343,8 @@ mod tests {
         machine
             .call_value(then, promise, &[observer])
             .expect("then returns a derived Promise");
-        let resolve = machine
-            .globals
-            .get(&EcmaString::from_utf8("resolve"))
-            .copied()
-            .unwrap();
-        let reject = machine
-            .globals
-            .get(&EcmaString::from_utf8("reject"))
-            .copied()
-            .unwrap();
+        let resolve = machine.test_global("resolve").unwrap();
+        let reject = machine.test_global("reject").unwrap();
         assert_eq!(
             machine
                 .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
@@ -21422,31 +22357,21 @@ mod tests {
                 .unwrap(),
             Value::UNDEFINED
         );
-        assert!(
-            !machine
-                .globals
-                .contains_key(&EcmaString::from_utf8("observed"))
-        );
+        assert!(machine.test_global("observed").is_none());
 
         let drain = machine.drain_microtasks().unwrap();
         assert_eq!(drain.executed, 1);
         assert!(drain.uncaught.is_empty());
-        assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::from_utf8("observed"))
-                .copied(),
-            Some(Value::int32(1))
-        );
+        assert_eq!(machine.test_global("observed"), Some(Value::int32(1)));
     }
 
     #[test]
     fn promise_resolution_adopts_thenables_with_a_fresh_resolver() {
         let program = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("resolve")),
-                Constant::String(EcmaString::from_utf8("reject")),
-                Constant::String(EcmaString::from_utf8("observed")),
+                Constant::String(EcmaString::encode("resolve")),
+                Constant::String(EcmaString::encode("reject")),
+                Constant::String(EcmaString::encode("observed")),
                 Constant::Int32(7),
                 Constant::Int32(8),
                 Constant::Int32(9),
@@ -21540,6 +22465,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(function),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.function_prototype),
                     extensible: true,
@@ -21576,16 +22502,8 @@ mod tests {
         else {
             panic!("Promise construction returns a Promise");
         };
-        let resolve = machine
-            .globals
-            .get(&EcmaString::from_utf8("resolve"))
-            .copied()
-            .unwrap();
-        let reject = machine
-            .globals
-            .get(&EcmaString::from_utf8("reject"))
-            .copied()
-            .unwrap();
+        let resolve = machine.test_global("resolve").unwrap();
+        let reject = machine.test_global("reject").unwrap();
         machine
             .call_value(resolve, Value::UNDEFINED, &[thenable])
             .unwrap();
@@ -21594,31 +22512,21 @@ mod tests {
         machine
             .call_value(reject, Value::UNDEFINED, &[Value::int32(9)])
             .unwrap();
-        assert!(
-            !machine
-                .globals
-                .contains_key(&EcmaString::from_utf8("observed"))
-        );
+        assert!(machine.test_global("observed").is_none());
 
         let drain = machine.drain_microtasks().unwrap();
         assert_eq!(drain.executed, 2);
         assert!(drain.uncaught.is_empty());
-        assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::from_utf8("observed"))
-                .copied(),
-            Some(Value::int32(7))
-        );
+        assert_eq!(machine.test_global("observed"), Some(Value::int32(7)));
     }
 
     #[test]
     fn queue_microtask_drains_fifo_including_jobs_added_during_drain() {
         let program = verified(
             vec![
-                Constant::String(EcmaString::from_utf8("order")),
-                Constant::String(EcmaString::from_utf8("queueMicrotask")),
-                Constant::String(EcmaString::from_utf8("third")),
+                Constant::String(EcmaString::encode("order")),
+                Constant::String(EcmaString::encode("queueMicrotask")),
+                Constant::String(EcmaString::encode("third")),
                 Constant::Int32(1),
                 Constant::Int32(2),
                 Constant::Int32(3),
@@ -21721,6 +22629,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(function),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.function_prototype),
                     extensible: true,
@@ -21739,12 +22648,8 @@ mod tests {
                 length_writable: true,
             })
             .unwrap();
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("order"), order);
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("third"), third);
+        machine.test_set_global("order", order);
+        machine.test_set_global("third", third);
         let queue = machine.intrinsics.global("queueMicrotask").unwrap();
         machine
             .call_value(queue, Value::UNDEFINED, &[first])
@@ -21772,7 +22677,7 @@ mod tests {
             vec![
                 Constant::Int32(7),
                 Constant::Int32(1),
-                Constant::String(EcmaString::from_utf8("observed")),
+                Constant::String(EcmaString::encode("observed")),
             ],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
@@ -21816,6 +22721,7 @@ mod tests {
                     module: ModuleId::new(0),
                     function: FunctionId::new(function),
                     captures: Vec::new(),
+                    context: None,
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.function_prototype),
                     extensible: true,
@@ -21841,13 +22747,7 @@ mod tests {
                 origin: ThrowOrigin::Bytecode,
             }]
         );
-        assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::from_utf8("observed"))
-                .copied(),
-            Some(Value::int32(1))
-        );
+        assert_eq!(machine.test_global("observed"), Some(Value::int32(1)));
     }
 
     #[test]
@@ -21886,6 +22786,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(1),
                 captures: Vec::new(),
+                context: None,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -21983,7 +22884,13 @@ mod tests {
             Ok(())
         }
 
-        fn wait_expired(&mut self) -> Result<Option<TimerWakeup>, TimerError> {
+        fn wait_expired(
+            &mut self,
+            cancel: &CancellationToken,
+        ) -> Result<Option<TimerWakeup>, TimerError> {
+            if cancel.is_cancelled() {
+                return Ok(None);
+            }
             Ok(self.state.borrow_mut().reports.pop_front())
         }
 
@@ -22003,13 +22910,137 @@ mod tests {
         }
     }
 
+    /// A timer provider that blocks on a cross-thread wake channel and checks
+    /// the supplied [`CancellationToken`]. Used to prove that `Machine` timer
+    /// wait can be cancelled promptly from another thread.
+    struct BlockingTimerProvider {
+        started_tx: std::sync::mpsc::Sender<()>,
+        wake_rx: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl BlockingTimerProvider {
+        fn new() -> (
+            Self,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+            (
+                Self {
+                    started_tx,
+                    wake_rx,
+                },
+                started_rx,
+                wake_tx,
+            )
+        }
+    }
+
+    impl TimerProvider for BlockingTimerProvider {
+        fn schedule(&mut self, _id: u64, delay_ms: u32) -> Result<u64, TimerError> {
+            Ok(u64::from(delay_ms))
+        }
+
+        fn cancel(&mut self, _id: u64) -> Result<bool, TimerError> {
+            Ok(false)
+        }
+
+        fn poll_expired(&mut self, _output: &mut Vec<TimerWakeup>) -> Result<(), TimerError> {
+            Ok(())
+        }
+
+        fn wait_expired(
+            &mut self,
+            cancel: &CancellationToken,
+        ) -> Result<Option<TimerWakeup>, TimerError> {
+            // Notify the test that we have entered the blocking wait.
+            let _ = self.started_tx.send(());
+            loop {
+                if cancel.is_cancelled() {
+                    return Ok(None);
+                }
+                match self.wake_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(()) => {
+                        if cancel.is_cancelled() {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(TimerError::new("wake channel disconnected"));
+                    }
+                }
+            }
+        }
+
+        fn has_pending(&self) -> bool {
+            true
+        }
+    }
+
+    struct BlockingTimerTestHost {
+        provider: BlockingTimerProvider,
+    }
+
+    impl Host for BlockingTimerTestHost {
+        fn timers(&mut self) -> Option<&mut (dyn TimerProvider + 'static)> {
+            Some(&mut self.provider)
+        }
+    }
+
+    #[test]
+    fn timer_wait_is_cancelled_promptly_from_another_thread() {
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+
+        let token = CancellationToken::new();
+        let (provider, started_rx, wake_tx) = BlockingTimerProvider::new();
+        let mut host = BlockingTimerTestHost { provider };
+        let mut machine =
+            Machine::new_with_cancel(&program, &mut host, Limits::default(), token.clone());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callback = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(0),
+                captures: Vec::new(),
+                context: None,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .schedule_timeout(callback, 1_000_000, Vec::new())
+            .unwrap();
+
+        let cancel_handle = std::thread::spawn(move || {
+            started_rx.recv().expect("provider entered wait");
+            token.cancel();
+            wake_tx.send(()).expect("wake the wait");
+        });
+
+        let error = machine
+            .run_to_quiescence()
+            .expect_err("cancelled wait aborts");
+        assert!(matches!(error.kind, RuntimeErrorKind::Cancelled));
+
+        cancel_handle.join().expect("cancel thread joins");
+    }
+
     fn timer_program() -> Program<Verified> {
         verified(
             vec![
-                Constant::String(EcmaString::from_utf8("a")),
-                Constant::String(EcmaString::from_utf8("b")),
-                Constant::String(EcmaString::from_utf8("this_seen")),
-                Constant::String(EcmaString::from_utf8("arg_seen")),
+                Constant::String(EcmaString::encode("a")),
+                Constant::String(EcmaString::encode("b")),
+                Constant::String(EcmaString::encode("this_seen")),
+                Constant::String(EcmaString::encode("arg_seen")),
                 Constant::Int32(1),
                 Constant::Int32(7),
             ],
@@ -22081,11 +23112,20 @@ mod tests {
     }
 
     fn timer_fn(machine: &mut Machine<'_, TimerTestHost>, index: u32) -> Value {
+        timer_fn_in_context(machine, index, None)
+    }
+
+    fn timer_fn_in_context(
+        machine: &mut Machine<'_, TimerTestHost>,
+        index: u32,
+        context: Option<Value>,
+    ) -> Value {
         machine
             .allocate(HeapEntry::Function {
                 module: ModuleId::new(0),
                 function: FunctionId::new(index),
                 captures: Vec::new(),
+                context,
                 properties: PropertyMap::default(),
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,
@@ -22094,7 +23134,7 @@ mod tests {
     }
 
     fn read_global(machine: &Machine<'_, TimerTestHost>, name: &str) -> Option<Value> {
-        machine.globals.get(&EcmaString::from_utf8(name)).copied()
+        machine.test_global(name)
     }
 
     fn set_timeout_global(machine: &Machine<'_, TimerTestHost>) -> Value {
@@ -22116,7 +23156,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_jobs_restore_their_captured_contexts() {
+    fn deferred_jobs_do_not_override_callback_lexical_context() {
         let program = timer_program();
         let mut host = TimerTestHost::default();
         let shared = host.provider.state.clone();
@@ -22125,19 +23165,23 @@ mod tests {
         machine.live_registers = 0;
         let first = test_context(&mut machine);
         let second = test_context(&mut machine);
-        let write_a = timer_fn(&mut machine, 1);
-        let write_b = timer_fn(&mut machine, 2);
+        let write_root_a = timer_fn(&mut machine, 1);
+        let write_first_b = timer_fn_in_context(&mut machine, 2, Some(first));
+        let write_second_a = timer_fn_in_context(&mut machine, 1, Some(second));
 
         machine.context_global = Some(first);
-        machine.enqueue_microtask_callback(write_a).unwrap();
-        let promise = machine.create_promise().unwrap();
-        machine
-            .promise_then(promise, write_b, Value::UNDEFINED)
-            .unwrap();
+        machine.enqueue_microtask_callback(write_root_a).unwrap();
 
         machine.context_global = Some(second);
-        machine.enqueue_microtask_callback(write_b).unwrap();
-        machine.schedule_timeout(write_a, 1, Vec::new()).unwrap();
+        let promise = machine.create_promise().unwrap();
+        machine
+            .promise_then(promise, write_first_b, Value::UNDEFINED)
+            .unwrap();
+
+        machine.context_global = Some(first);
+        machine
+            .schedule_timeout(write_second_a, 1, Vec::new())
+            .unwrap();
         machine.context_global = None;
 
         machine.fulfill_promise(promise, Value::UNDEFINED).unwrap();
@@ -22148,9 +23192,11 @@ mod tests {
         });
         machine.run_one_expired_timer().unwrap();
 
+        assert_eq!(read_global(&machine, "a"), Some(Value::int32(1)));
+        assert_eq!(read_global(&machine, "b"), None);
         assert_eq!(
             machine.get_named_property(first, "a").unwrap(),
-            Value::int32(1)
+            Value::UNDEFINED
         );
         assert_eq!(
             machine.get_named_property(first, "b").unwrap(),
@@ -22162,10 +23208,8 @@ mod tests {
         );
         assert_eq!(
             machine.get_named_property(second, "b").unwrap(),
-            Value::int32(1)
+            Value::UNDEFINED
         );
-        assert_eq!(read_global(&machine, "a"), None);
-        assert_eq!(read_global(&machine, "b"), None);
         assert_eq!(machine.context_global, None);
     }
 
@@ -22194,9 +23238,7 @@ mod tests {
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let callback = machine
-            .globals
-            .get(&EcmaString::from_utf8("nestedCallback"))
-            .copied()
+            .test_global("nestedCallback")
             .expect("test installs nested callback");
         let set_timeout = set_timeout_global(machine);
         machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(1)])?;
@@ -22210,9 +23252,7 @@ mod tests {
         _constructing: bool,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let callback = machine
-            .globals
-            .get(&EcmaString::from_utf8("recursiveTimerCallback"))
-            .copied()
+            .test_global("recursiveTimerCallback")
             .expect("test installs recursive timer callback");
         let set_timeout = set_timeout_global(machine);
         machine.call_value(set_timeout, Value::UNDEFINED, &[callback, Value::int32(0)])?;
@@ -22244,6 +23284,8 @@ mod tests {
         machine.live_registers = 0;
         assert!(machine.intrinsics.global("setTimeout").is_none());
         assert!(machine.intrinsics.global("clearTimeout").is_none());
+        assert!(machine.intrinsics.global("setInterval").is_none());
+        assert!(machine.intrinsics.global("clearInterval").is_none());
         assert!(!machine.has_pending_timers());
         assert_eq!(
             machine.run_one_expired_timer().unwrap(),
@@ -22492,9 +23534,7 @@ mod tests {
         machine.live_registers = 0;
         let set_timeout = set_timeout_global(&machine);
         let nested = timer_fn(&mut machine, 2);
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("nestedCallback"), nested);
+        machine.test_set_global("nestedCallback", nested);
         let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[creator, Value::int32(1)])
@@ -22708,14 +23748,14 @@ mod tests {
     fn loop_test_program() -> Program<Verified> {
         verified(
             vec![
-                Constant::String(EcmaString::from_utf8("order")), // 0
-                Constant::Int32(1),                               // 1
-                Constant::Int32(2),                               // 2
-                Constant::Int32(3),                               // 3
-                Constant::Int32(4),                               // 4
-                Constant::String(EcmaString::from_utf8("queueMicrotask")), // 5
-                Constant::String(EcmaString::from_utf8("job")),   // 6
-                Constant::Undefined,                              // 7
+                Constant::String(EcmaString::encode("order")), // 0
+                Constant::Int32(1),                            // 1
+                Constant::Int32(2),                            // 2
+                Constant::Int32(3),                            // 3
+                Constant::Int32(4),                            // 4
+                Constant::String(EcmaString::encode("queueMicrotask")), // 5
+                Constant::String(EcmaString::encode("job")),   // 6
+                Constant::Undefined,                           // 7
             ],
             vec![
                 function(
@@ -22859,10 +23899,10 @@ mod tests {
     fn promise_throw_program() -> Program<Verified> {
         verified(
             vec![
-                Constant::String(EcmaString::from_utf8("resolve")), // 0
-                Constant::String(EcmaString::from_utf8("reject")),  // 1
-                Constant::String(EcmaString::from_utf8("observed")), // 2
-                Constant::Int32(7),                                 // 3
+                Constant::String(EcmaString::encode("resolve")),  // 0
+                Constant::String(EcmaString::encode("reject")),   // 1
+                Constant::String(EcmaString::encode("observed")), // 2
+                Constant::Int32(7),                               // 3
             ],
             vec![
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
@@ -22920,17 +23960,13 @@ mod tests {
                 length_writable: true,
             })
             .unwrap();
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("order"), order);
+        machine.test_set_global("order", order);
         order
     }
 
     fn order_markers(machine: &Machine<'_, TimerTestHost>) -> Vec<Value> {
         let order = machine
-            .globals
-            .get(&EcmaString::from_utf8("order"))
-            .copied()
+            .test_global("order")
             .expect("order array is installed");
         let index = machine
             .runtime_slot(order)
@@ -22947,9 +23983,7 @@ mod tests {
         global: &str,
     ) -> Result<BuiltinOutcome, EvalFailure> {
         let job = machine
-            .globals
-            .get(&EcmaString::from_utf8(global))
-            .copied()
+            .test_global(global)
             .unwrap_or_else(|| panic!("test installs the {global} job"));
         let queue = machine
             .intrinsics
@@ -23003,9 +24037,7 @@ mod tests {
         first.live_registers = 0;
         install_order_array(&mut first);
         let first_job = timer_fn(&mut first, 2);
-        first
-            .globals
-            .insert(EcmaString::from_utf8("job"), first_job);
+        first.test_set_global("job", first_job);
         let snapshot = first.evaluate().unwrap();
         assert!(order_markers(&first).is_empty());
         first.run_to_quiescence().unwrap();
@@ -23018,9 +24050,7 @@ mod tests {
         second.live_registers = 0;
         install_order_array(&mut second);
         let second_job = timer_fn(&mut second, 2);
-        second
-            .globals
-            .insert(EcmaString::from_utf8("job"), second_job);
+        second.test_set_global("job", second_job);
         let execution = second.run().unwrap();
         assert_eq!(execution, snapshot);
     }
@@ -23036,7 +24066,7 @@ mod tests {
         let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
         let second = timer_fn(&mut machine, 2); // pushes 2
         let third = timer_fn(&mut machine, 3); // pushes 3
-        machine.globals.insert(EcmaString::from_utf8("job"), third);
+        machine.test_set_global("job", third);
         let queue = machine.intrinsics.global("queueMicrotask").unwrap();
         machine
             .call_value(queue, Value::UNDEFINED, &[first])
@@ -23065,9 +24095,7 @@ mod tests {
         let first = timer_fn(&mut machine, 1); // pushes 1, queues "job"
         let second = timer_fn(&mut machine, 3); // pushes 3
         let microtask = timer_fn(&mut machine, 2); // pushes 2
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("job"), microtask);
+        machine.test_set_global("job", microtask);
         let set_timeout = set_timeout_global(&machine);
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[first, Value::int32(5)])
@@ -23103,9 +24131,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let nested = timer_fn(&mut machine, 2);
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("nestedCallback"), nested);
+        machine.test_set_global("nestedCallback", nested);
         let creator = timer_native(&mut machine, "schedule nested", schedule_nested_timer);
         let set_timeout = set_timeout_global(&machine);
         shared.borrow_mut().auto_report = true;
@@ -23180,6 +24206,256 @@ mod tests {
         assert!(!machine.timer_checkpoint_active);
     }
 
+    fn set_interval_global(machine: &Machine<'_, TimerTestHost>) -> Value {
+        machine
+            .intrinsics
+            .global("setInterval")
+            .expect("setInterval is installed")
+    }
+
+    fn clear_interval_global(machine: &Machine<'_, TimerTestHost>) -> Value {
+        machine
+            .intrinsics
+            .global("clearInterval")
+            .expect("clearInterval is installed")
+    }
+
+    fn increment_count(
+        machine: &mut Machine<'_, TimerTestHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let current = machine
+            .test_global("count")
+            .and_then(|v| match v.decode() {
+                Some(Decoded::Int32(i)) => Some(i),
+                _ => None,
+            })
+            .unwrap_or(0);
+        machine.test_set_global("count", Value::int32(current + 1));
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    #[test]
+    fn set_interval_fires_repeatedly_and_stays_live() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let callback = timer_native(&mut machine, "increment", increment_count);
+        machine
+            .call_value(set_interval, Value::UNDEFINED, &[callback, Value::int32(5)])
+            .unwrap();
+        assert!(machine.has_pending_timers());
+
+        // First fire: the callback runs and the interval re-arms.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(1)));
+        assert!(machine.has_pending_timers());
+
+        // Second fire: the callback runs again and the interval is still live.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 10,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(2)));
+        assert!(machine.has_pending_timers());
+    }
+
+    #[test]
+    fn clear_interval_cancels_a_repeating_callback() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let clear_interval = clear_interval_global(&machine);
+        let callback = timer_native(&mut machine, "increment", increment_count);
+        let handle = machine
+            .call_value(set_interval, Value::UNDEFINED, &[callback, Value::int32(5)])
+            .unwrap();
+        // setInterval returns the Timeout handle object, not a raw id.
+        assert!(matches!(handle.decode(), Some(Decoded::HeapRef(_))));
+        assert!(machine.has_pending_timers());
+
+        // Fire once to confirm the interval is live, then clear it.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert!(machine.has_pending_timers());
+
+        machine
+            .call_value(clear_interval, Value::UNDEFINED, &[handle])
+            .unwrap();
+        assert!(!machine.has_pending_timers());
+        // A late report for the cleared interval does not fire.
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 10,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 0);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(1)));
+    }
+
+    #[test]
+    fn set_interval_rejects_a_non_callable_callback_before_coercion() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let failure = machine
+            .call_value(
+                set_interval,
+                Value::UNDEFINED,
+                &[Value::int32(3), Value::int32(5)],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            EvalFailure::Throw(ThrowOrigin::TypeError { .. })
+        ));
+        // Nothing was armed, so no delay coercion or provider call happened.
+        assert!(shared.borrow().scheduled.is_empty());
+        assert!(!machine.has_pending_timers());
+    }
+
+    #[test]
+    fn set_interval_clamps_and_truncates_like_node() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let callback = timer_fn(&mut machine, 1);
+        for delay in [
+            Value::int32(0),
+            Value::number(-5.0),
+            Value::number(f64::NAN),
+            Value::number(2_147_483_648.0),
+            Value::int32(2_147_483_647),
+            Value::number(3.9),
+        ] {
+            machine
+                .call_value(set_interval, Value::UNDEFINED, &[callback, delay])
+                .unwrap();
+        }
+        let delays: Vec<u32> = shared.borrow().scheduled.iter().map(|(_, d)| *d).collect();
+        assert_eq!(delays, vec![1, 1, 1, 1, 2_147_483_647, 3]);
+    }
+
+    fn clear_self_and_count(
+        machine: &mut Machine<'_, TimerTestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let current = machine
+            .test_global("count")
+            .and_then(|v| match v.decode() {
+                Some(Decoded::Int32(i)) => Some(i),
+                _ => None,
+            })
+            .unwrap_or(0);
+        machine.test_set_global("count", Value::int32(current + 1));
+        let clear_interval = machine.intrinsics.global("clearInterval").unwrap();
+        machine.call_value(clear_interval, Value::UNDEFINED, &[this])?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    #[test]
+    fn interval_self_cancel_runs_once_and_reaches_quiescence() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let callback = timer_native(&mut machine, "clearSelf", clear_self_and_count);
+        machine.test_set_global("count", Value::int32(0));
+        machine
+            .call_value(set_interval, Value::UNDEFINED, &[callback, Value::int32(5)])
+            .unwrap();
+        assert!(machine.has_pending_timers());
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        machine.run_to_quiescence().unwrap();
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(1)));
+        assert!(!machine.has_pending_timers());
+        assert!(shared.borrow().cancelled.contains(&1));
+    }
+
+    #[test]
+    fn stale_interval_handle_cannot_cancel_a_reused_generation() {
+        let program = timer_program();
+        let mut host = TimerTestHost::default();
+        let shared = host.provider.state.clone();
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let set_interval = set_interval_global(&machine);
+        let clear_interval = clear_interval_global(&machine);
+        let callback = timer_native(&mut machine, "increment", increment_count);
+        let handle = machine
+            .call_value(set_interval, Value::UNDEFINED, &[callback, Value::int32(5)])
+            .unwrap();
+        machine.test_set_global("count", Value::int32(0));
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 5,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(1)));
+        assert!(machine.has_pending_timers());
+
+        let stale = machine
+            .allocate(HeapEntry::Timeout {
+                id: 1,
+                generation: 0,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        machine
+            .call_value(clear_interval, Value::UNDEFINED, &[stale])
+            .unwrap();
+        assert!(machine.has_pending_timers());
+
+        shared.borrow_mut().reports.push_back(TimerWakeup {
+            id: 1,
+            deadline_ms: 10,
+        });
+        assert_eq!(machine.run_one_expired_timer().unwrap().executed, 1);
+        assert_eq!(read_global(&machine, "count"), Some(Value::int32(2)));
+        assert!(machine.has_pending_timers());
+
+        machine
+            .call_value(clear_interval, Value::UNDEFINED, &[handle])
+            .unwrap();
+        assert!(!machine.has_pending_timers());
+    }
+
     #[test]
     fn automatic_loop_maps_the_first_uncaught_microtask_throw_and_stops() {
         let program = timer_program();
@@ -23220,10 +24496,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let suppressed_microtask = timer_fn(&mut machine, 2); // stores b = 1
-        machine.globals.insert(
-            EcmaString::from_utf8("nestedCallback"),
-            suppressed_microtask,
-        );
+        machine.test_set_global("nestedCallback", suppressed_microtask);
         let thrower = timer_native(&mut machine, "queue then throw", queue_job_then_throw);
         let later_timer = timer_fn(&mut machine, 1); // stores a = 1
         let set_timeout = set_timeout_global(&machine);
@@ -23289,11 +24562,7 @@ mod tests {
         else {
             panic!("Promise construction returns a Promise");
         };
-        let resolve = machine
-            .globals
-            .get(&EcmaString::from_utf8("resolve"))
-            .copied()
-            .unwrap();
+        let resolve = machine.test_global("resolve").unwrap();
         machine
             .call_value(resolve, Value::UNDEFINED, &[Value::int32(1)])
             .unwrap();
@@ -23307,13 +24576,7 @@ mod tests {
         machine.run_to_quiescence().unwrap();
         // The thrown handler rejects the derived promise, whose rejection
         // observer runs instead of aborting the loop.
-        assert_eq!(
-            machine
-                .globals
-                .get(&EcmaString::from_utf8("observed"))
-                .copied(),
-            Some(Value::int32(7))
-        );
+        assert_eq!(machine.test_global("observed"), Some(Value::int32(7)));
         assert!(machine.microtasks.is_empty());
     }
 
@@ -23325,9 +24588,7 @@ mod tests {
         machine.frames.clear();
         machine.live_registers = 0;
         let respawn = timer_native(&mut machine, "respawn", respawn_job);
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("nestedCallback"), respawn);
+        machine.test_set_global("nestedCallback", respawn);
         let queue = machine.intrinsics.global("queueMicrotask").unwrap();
         machine
             .call_value(queue, Value::UNDEFINED, &[respawn])
@@ -23351,9 +24612,7 @@ mod tests {
         machine.live_registers = 0;
         shared.borrow_mut().auto_report = true;
         let respawn = timer_native(&mut machine, "respawn timer", schedule_recursive_timer);
-        machine
-            .globals
-            .insert(EcmaString::from_utf8("recursiveTimerCallback"), respawn);
+        machine.test_set_global("recursiveTimerCallback", respawn);
         let set_timeout = set_timeout_global(&machine);
         machine
             .call_value(set_timeout, Value::UNDEFINED, &[respawn, Value::int32(0)])
@@ -23414,7 +24673,7 @@ mod tests {
     impl Host for ImportMetaHost {
         fn import_meta_url(&mut self, module_name: &EcmaString) -> EcmaString {
             self.seen.push(module_name.clone());
-            EcmaString::from_utf8("host://modules/entry.mjs")
+            EcmaString::encode("host://modules/entry.mjs")
         }
     }
 
@@ -23424,8 +24683,8 @@ mod tests {
             vec![program_module(
                 "entry",
                 vec![
-                    Constant::String(EcmaString::from_utf8("url")),
-                    Constant::String(EcmaString::from_utf8("host://modules/entry.mjs")),
+                    Constant::String(EcmaString::encode("url")),
+                    Constant::String(EcmaString::encode("host://modules/entry.mjs")),
                 ],
                 vec![function(
                     0,
@@ -23476,7 +24735,7 @@ mod tests {
         assert_eq!(execution.entry_registers[0], execution.entry_registers[1]);
         assert_eq!(execution.entry_registers[2], Value::TRUE);
         assert_eq!(execution.value, Value::TRUE);
-        assert_eq!(host.seen, vec![EcmaString::from_utf8("entry")]);
+        assert_eq!(host.seen, vec![EcmaString::encode("entry")]);
     }
 
     #[test]
@@ -23530,12 +24789,12 @@ mod tests {
     fn raw_string_own_properties_expose_length_and_in_range_indices() {
         with_machine(Limits::default(), |machine| {
             let string = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("ab")))
+                .allocate(HeapEntry::String(EcmaString::encode("ab")))
                 .unwrap();
-            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
-            let zero = PropertyKey::Named(EcmaString::from_utf8("0"));
-            let one = PropertyKey::Named(EcmaString::from_utf8("1"));
-            let two = PropertyKey::Named(EcmaString::from_utf8("2"));
+            let length = PropertyKey::Named(EcmaString::encode("length"));
+            let zero = PropertyKey::Named(EcmaString::encode("0"));
+            let one = PropertyKey::Named(EcmaString::encode("1"));
+            let two = PropertyKey::Named(EcmaString::encode("2"));
 
             assert!(machine.has_own_property_key(string, &length).unwrap());
             assert!(machine.has_own_property_key(string, &zero).unwrap());
@@ -23552,12 +24811,12 @@ mod tests {
             let zero_value = machine.get_property_key(string, &zero).unwrap();
             assert_eq!(
                 machine.string_value(zero_value).unwrap(),
-                EcmaString::from_utf8("a")
+                EcmaString::encode("a")
             );
             let one_value = machine.get_property_key(string, &one).unwrap();
             assert_eq!(
                 machine.string_value(one_value).unwrap(),
-                EcmaString::from_utf8("b")
+                EcmaString::encode("b")
             );
         });
     }
@@ -23566,13 +24825,13 @@ mod tests {
     fn boxed_string_own_properties_expose_length_and_in_range_indices() {
         with_machine(Limits::default(), |machine| {
             let string = machine
-                .allocate(HeapEntry::String(EcmaString::from_utf8("ab")))
+                .allocate(HeapEntry::String(EcmaString::encode("ab")))
                 .unwrap();
             let boxed = machine.value_to_object(string).unwrap();
-            let length = PropertyKey::Named(EcmaString::from_utf8("length"));
-            let zero = PropertyKey::Named(EcmaString::from_utf8("0"));
-            let one = PropertyKey::Named(EcmaString::from_utf8("1"));
-            let two = PropertyKey::Named(EcmaString::from_utf8("2"));
+            let length = PropertyKey::Named(EcmaString::encode("length"));
+            let zero = PropertyKey::Named(EcmaString::encode("0"));
+            let one = PropertyKey::Named(EcmaString::encode("1"));
+            let two = PropertyKey::Named(EcmaString::encode("2"));
 
             assert!(machine.has_own_property_key(boxed, &length).unwrap());
             assert!(machine.has_own_property_key(boxed, &zero).unwrap());
@@ -23593,12 +24852,12 @@ mod tests {
             let zero_value = machine.get_property_key(boxed, &zero).unwrap();
             assert_eq!(
                 machine.string_value(zero_value).unwrap(),
-                EcmaString::from_utf8("a")
+                EcmaString::encode("a")
             );
             let one_value = machine.get_property_key(boxed, &one).unwrap();
             assert_eq!(
                 machine.string_value(one_value).unwrap(),
-                EcmaString::from_utf8("b")
+                EcmaString::encode("b")
             );
         });
     }
@@ -23607,7 +24866,7 @@ mod tests {
     fn import_dynamic_instruction_resolves_local_module_namespace() {
         let root = program_module(
             "root",
-            vec![Constant::String(EcmaString::from_utf8("./target"))],
+            vec![Constant::String(EcmaString::encode("./target"))],
             vec![function(
                 0,
                 2,
@@ -23636,7 +24895,7 @@ mod tests {
             "target",
             vec![
                 Constant::Int32(7),
-                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::encode("value")),
             ],
             vec![function(
                 0,
@@ -23695,7 +24954,7 @@ mod tests {
         let program = linked(
             vec![program_module(
                 "root",
-                vec![Constant::String(EcmaString::from_utf8("external"))],
+                vec![Constant::String(EcmaString::encode("external"))],
                 vec![function(
                     0,
                     2,
@@ -23729,7 +24988,7 @@ mod tests {
             })
             .unwrap();
         machine.registry.external.insert(
-            EcmaString::from_utf8("external"),
+            EcmaString::encode("external"),
             ExternalModuleInstance {
                 namespace,
                 exports: BTreeMap::new(),
@@ -23761,7 +25020,7 @@ mod tests {
         let missing = linked(
             vec![program_module(
                 "root",
-                vec![Constant::String(EcmaString::from_utf8("missing"))],
+                vec![Constant::String(EcmaString::encode("missing"))],
                 vec![function(
                     0,
                     2,
@@ -23811,7 +25070,7 @@ mod tests {
         let coercion = linked(
             vec![program_module(
                 "root",
-                vec![Constant::String(EcmaString::from_utf8("specifier"))],
+                vec![Constant::String(EcmaString::encode("specifier"))],
                 vec![function(
                     0,
                     2,
@@ -23838,12 +25097,10 @@ mod tests {
         let mut coercion_machine = Machine::new(&coercion, &mut coercion_host, Limits::default());
         let symbol = coercion_machine
             .allocate(HeapEntry::Symbol {
-                description: EcmaString::from_utf8("specifier"),
+                description: EcmaString::encode("specifier"),
             })
             .unwrap();
-        coercion_machine
-            .globals
-            .insert(EcmaString::from_utf8("specifier"), symbol);
+        coercion_machine.test_set_global("specifier", symbol);
         let coercion_promise = coercion_machine
             .evaluate()
             .expect("uncoercible dynamic import returns a rejected promise")
@@ -23870,30 +25127,30 @@ mod tests {
     #[test]
     fn normalize_relative_module_name_collapses_dot_components() {
         assert_eq!(
-            normalize_relative_module_name(&EcmaString::from_utf8("a/b/.././c//d")),
-            EcmaString::from_utf8("a/c/d")
+            normalize_relative_module_name(&EcmaString::encode("a/b/.././c//d")),
+            EcmaString::encode("a/c/d")
         );
         assert_eq!(
-            normalize_relative_module_name(&EcmaString::from_utf8("../x")),
-            EcmaString::from_utf8("x")
+            normalize_relative_module_name(&EcmaString::encode("../x")),
+            EcmaString::encode("x")
         );
         assert_eq!(
-            normalize_relative_module_name(&EcmaString::from_utf8("./")),
+            normalize_relative_module_name(&EcmaString::encode("./")),
             EcmaString::default()
         );
         assert_eq!(
             resolve_relative_against_module_name(
-                &EcmaString::from_utf8("src/nested/main.ts"),
-                &EcmaString::from_utf8("../dependency.ts"),
+                &EcmaString::encode("src/nested/main.ts"),
+                &EcmaString::encode("../dependency.ts"),
             ),
-            EcmaString::from_utf8("src/dependency.ts")
+            EcmaString::encode("src/dependency.ts")
         );
         assert_eq!(
             resolve_relative_against_module_name(
-                &EcmaString::from_utf8("main.ts"),
-                &EcmaString::from_utf8("./dependency.ts"),
+                &EcmaString::encode("main.ts"),
+                &EcmaString::encode("./dependency.ts"),
             ),
-            EcmaString::from_utf8("dependency.ts")
+            EcmaString::encode("dependency.ts")
         );
     }
 
@@ -23901,7 +25158,7 @@ mod tests {
     fn import_dynamic_expression_resolves_computed_relative_bundled_module() {
         let root = program_module(
             "main.ts",
-            vec![Constant::String(EcmaString::from_utf8("./dependency.ts"))],
+            vec![Constant::String(EcmaString::encode("./dependency.ts"))],
             vec![function(
                 0,
                 2,
@@ -23926,7 +25183,7 @@ mod tests {
             "dependency.ts",
             vec![
                 Constant::Int32(41),
-                Constant::String(EcmaString::from_utf8("answer")),
+                Constant::String(EcmaString::encode("answer")),
             ],
             vec![function(
                 0,
@@ -23982,7 +25239,7 @@ mod tests {
             machine
                 .registry
                 .local_modules
-                .get(&EcmaString::from_utf8("dependency.ts")),
+                .get(&EcmaString::encode("dependency.ts")),
             Some(&ModuleId::new(1))
         );
     }
@@ -23992,8 +25249,8 @@ mod tests {
         let nested = program_module(
             "src/app.ts",
             vec![
-                Constant::String(EcmaString::from_utf8("./lib/dependency.ts")),
-                Constant::String(EcmaString::from_utf8("./missing.ts")),
+                Constant::String(EcmaString::encode("./lib/dependency.ts")),
+                Constant::String(EcmaString::encode("./missing.ts")),
             ],
             vec![function(
                 0,
@@ -24027,7 +25284,7 @@ mod tests {
             "src/lib/dependency.ts",
             vec![
                 Constant::Int32(17),
-                Constant::String(EcmaString::from_utf8("value")),
+                Constant::String(EcmaString::encode("value")),
             ],
             vec![function(
                 0,
@@ -24106,8 +25363,8 @@ mod tests {
                 program_module(
                     "main.ts",
                     vec![
-                        Constant::String(EcmaString::from_utf8("dependency.ts")),
-                        Constant::String(EcmaString::from_utf8("/dependency.ts")),
+                        Constant::String(EcmaString::encode("dependency.ts")),
+                        Constant::String(EcmaString::encode("/dependency.ts")),
                     ],
                     vec![function(
                         0,
@@ -24141,7 +25398,7 @@ mod tests {
                     "dependency.ts",
                     vec![
                         Constant::Int32(9),
-                        Constant::String(EcmaString::from_utf8("value")),
+                        Constant::String(EcmaString::encode("value")),
                     ],
                     vec![function(
                         0,
@@ -24197,5 +25454,731 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn iterable_values_roots_iterator_and_yields_across_collection() {
+        with_machine(Limits::default(), |machine| {
+            let next_id = machine.intrinsics.builtins.register(BuiltinDef {
+                name: "collecting iterator next",
+                length: 0,
+                handler: collecting_iterator_next,
+            });
+            let next_fn = super::intrinsics::native_function(
+                &mut machine.heap,
+                next_id,
+                "collecting iterator next",
+                0,
+            );
+
+            let create_id = machine.intrinsics.builtins.register(BuiltinDef {
+                name: "collecting iterator create",
+                length: 0,
+                handler: collecting_iterator_create,
+            });
+            let create_fn = super::intrinsics::native_function(
+                &mut machine.heap,
+                create_id,
+                "collecting iterator create",
+                0,
+            );
+
+            let iterator_symbol = machine.intrinsics.builtins.symbol_iterator();
+            let iterator_key = machine.to_property_key(iterator_symbol).unwrap();
+
+            let iterable = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .expect("iterable allocation succeeds");
+            machine
+                .set_data_property(iterable, "_next", next_fn)
+                .unwrap();
+            machine
+                .set_data_property_key(iterable, iterator_key, create_fn)
+                .unwrap();
+
+            let collected = machine
+                .iterable_values(iterable)
+                .expect("iteration succeeds");
+            assert_eq!(collected.len(), 3, "expected three yielded values");
+
+            for (index, value) in collected.into_iter().enumerate() {
+                let tag = machine
+                    .get_named_property(value, "tag")
+                    .expect("yielded object survived collection");
+                assert_eq!(tag, Value::int32(index as u32));
+            }
+        });
+    }
+
+    fn collecting_iterator_create(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let next = machine.get_named_property(this, "_next")?;
+        let iter = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        machine.set_data_property(iter, "next", next)?;
+        machine.set_data_property(iter, "_index", Value::int32(0))?;
+        Ok(BuiltinOutcome::Value(iter))
+    }
+
+    fn collecting_iterator_next(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        let index_val = machine.get_named_property(this, "_index")?;
+        let index = match index_val.decode() {
+            Some(Decoded::Int32(i)) => i as usize,
+            _ => 0,
+        };
+
+        let (value, done) = if index < 3 {
+            let obj = machine
+                .allocate(HeapEntry::Object {
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.object_prototype),
+                    boxed_primitive: None,
+                    extensible: true,
+                })
+                .map_err(EvalFailure::Runtime)?;
+            machine.set_data_property(obj, "tag", Value::int32(index as u32))?;
+            (obj, false)
+        } else {
+            (Value::UNDEFINED, true)
+        };
+
+        let result = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .map_err(EvalFailure::Runtime)?;
+        machine.set_data_property(result, "done", Value::boolean(done))?;
+        machine.set_data_property(result, "value", value)?;
+        machine.set_data_property(this, "_index", Value::int32((index + 1) as u32))?;
+
+        // Force a collection between guest yields. The result is still on the
+        // native call stack, so root it temporarily; iterable_values must keep
+        // the iterator and all previously yielded values alive for the next step.
+        let depth = machine.native_roots.len();
+        machine.push_native_roots(depth, &[result]);
+        machine.collect_garbage();
+        machine.pop_native_roots(depth);
+
+        Ok(BuiltinOutcome::Value(result))
+    }
+
+    fn generator_return<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<(Value, bool), EvalFailure> {
+        let method = machine.get_named_property(generator, "return")?;
+        let result = machine.call_value(method, generator, &[resume_value])?;
+        let done = machine.get_named_property(result, "done")?;
+        let value = machine.get_named_property(result, "value")?;
+        Ok((value, machine.truthy(done)))
+    }
+
+    fn generator_throw<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<(Value, bool), EvalFailure> {
+        let method = machine.get_named_property(generator, "throw")?;
+        let result = machine.call_value(method, generator, &[resume_value])?;
+        let done = machine.get_named_property(result, "done")?;
+        let value = machine.get_named_property(result, "value")?;
+        Ok((value, machine.truthy(done)))
+    }
+
+    #[test]
+    fn sync_generator_resume_next_return_throw_modes() {
+        let program = verified(
+            vec![Constant::Int32(42), Constant::Int32(0), Constant::Int32(1)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    6,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(4),
+                            constant: cid(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(4),
+                            mode: reg(2),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(2),
+                            right: reg(3),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(11),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(2),
+                            right: reg(4),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(9),
+                        },
+                        Instruction::Return { value: reg(1) },
+                        Instruction::Throw { value: reg(1) },
+                        Instruction::Return { value: reg(5) },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(8),
+                        end: pc(10),
+                        handler: pc(10),
+                        catch_register: reg(5),
+                    }],
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callable = generator_callable(&mut machine, 1);
+
+        // next resumes from SuspendedStart and yields the first value.
+        let g1 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, g1, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false)
+        );
+        // next with a value reaches the Next dispatch arm and returns it.
+        assert_eq!(
+            generator_next(&mut machine, g1, Value::int32(5)).unwrap(),
+            (Value::int32(5), true)
+        );
+        // next on Completed returns undefined/done.
+        assert_eq!(
+            generator_next(&mut machine, g1, Value::UNDEFINED).unwrap(),
+            (Value::UNDEFINED, true)
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // return from SuspendedYield reaches the Return dispatch arm.
+        let g2 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, g2, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false)
+        );
+        assert_eq!(
+            generator_return(&mut machine, g2, Value::int32(7)).unwrap(),
+            (Value::int32(7), true)
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // throw from SuspendedYield reaches the Throw dispatch arm and is caught.
+        let g3 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, g3, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false)
+        );
+        assert_eq!(
+            generator_throw(&mut machine, g3, Value::int32(55)).unwrap(),
+            (Value::int32(55), true)
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // return before the body starts returns the supplied value and completes.
+        let g4 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_return(&mut machine, g4, Value::int32(9)).unwrap(),
+            (Value::int32(9), true)
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // throw before the body starts is reported as a Bytecode-origin throw.
+        let g5 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let err = generator_throw(&mut machine, g5, Value::int32(13)).unwrap_err();
+        assert!(matches!(
+            err,
+            EvalFailure::ThrowValueOrigin { value, origin }
+                if value == Value::int32(13) && origin == ThrowOrigin::Bytecode
+        ));
+
+        // next/return/throw on a completed generator have the expected final states.
+        let g6 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, g6, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false)
+        );
+        assert_eq!(
+            generator_next(&mut machine, g6, Value::int32(2)).unwrap(),
+            (Value::int32(2), true)
+        );
+        assert_eq!(
+            generator_next(&mut machine, g6, Value::UNDEFINED).unwrap(),
+            (Value::UNDEFINED, true)
+        );
+        assert_eq!(
+            generator_return(&mut machine, g6, Value::int32(3)).unwrap(),
+            (Value::int32(3), true)
+        );
+        let err = generator_throw(&mut machine, g6, Value::int32(4)).unwrap_err();
+        assert!(matches!(
+            err,
+            EvalFailure::ThrowValueOrigin { value, origin }
+                if value == Value::int32(4) && origin == ThrowOrigin::Bytecode
+        ));
+
+        // Operation brand messages are exact for next/return/throw on
+        // an incompatible receiver.
+        let proto = machine.intrinsics.builtins.generator_prototype();
+        let bad = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        for (name, expected) in [
+            (
+                "next",
+                "Generator.prototype.next called on incompatible receiver",
+            ),
+            (
+                "return",
+                "Generator.prototype.return called on incompatible receiver",
+            ),
+            (
+                "throw",
+                "Generator.prototype.throw called on incompatible receiver",
+            ),
+        ] {
+            let method = machine.get_named_property(proto, name).unwrap();
+            let err = machine.call_value(method, bad, &[]).unwrap_err();
+            assert!(matches!(
+                err,
+                EvalFailure::Throw(ThrowOrigin::TypeError { operation })
+                    if operation == expected
+            ));
+        }
+    }
+    fn async_generator_return<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let method = machine.get_named_property(generator, "return")?;
+        machine.call_value(method, generator, &[resume_value])
+    }
+
+    fn async_generator_throw<H: Host>(
+        machine: &mut Machine<'_, H>,
+        generator: Value,
+        resume_value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let method = machine.get_named_property(generator, "throw")?;
+        machine.call_value(method, generator, &[resume_value])
+    }
+
+    #[test]
+    fn async_generator_start_and_completed_abrupt_completions() {
+        let program = verified(
+            vec![
+                Constant::Int32(42),
+                Constant::Int32(1),
+                Constant::String(EcmaString::encode("started")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    3,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(4),
+                            mode: reg(2),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        // A1/A5/A6: .return() at SuspendedStart awaits the value, then drains the
+        // queued next/return/throw requests in FIFO order without entering the body.
+        let callable = generator_callable(&mut machine, 1);
+        let g1 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let r1 = async_generator_return(&mut machine, g1, Value::int32(7)).unwrap();
+        let n1 = async_generator_next(&mut machine, g1, Value::UNDEFINED).unwrap();
+        let r2 = async_generator_return(&mut machine, g1, Value::int32(8)).unwrap();
+        let t1 = async_generator_throw(&mut machine, g1, Value::int32(9)).unwrap();
+
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, r1),
+            (Value::int32(7), true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, n1),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, r2),
+            (Value::int32(8), true),
+        );
+        assert_eq!(rejected_reason(&machine, t1), Value::int32(9));
+        assert_eq!(machine.test_global("started"), None);
+        assert_eq!(machine.live_registers, 0);
+
+        // A2: .throw() at SuspendedStart rejects and completes without entering the body.
+        let callable = generator_callable(&mut machine, 1);
+        let g2 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let t2 = async_generator_throw(&mut machine, g2, Value::int32(5)).unwrap();
+        let n2 = async_generator_next(&mut machine, g2, Value::UNDEFINED).unwrap();
+        let r3 = async_generator_return(&mut machine, g2, Value::int32(6)).unwrap();
+
+        machine.drain_microtasks().unwrap();
+        assert_eq!(rejected_reason(&machine, t2), Value::int32(5));
+        assert_eq!(
+            settled_iterator_result(&mut machine, n2),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, r3),
+            (Value::int32(6), true),
+        );
+        assert_eq!(machine.test_global("started"), None);
+        assert_eq!(machine.live_registers, 0);
+    }
+
+    #[test]
+    fn async_generator_yield_and_await_abrupt_completions() {
+        // A3/A5: .return(v) at SuspendedYield awaits the operand, runs the body's
+        // "finally" path, and preserves FIFO for a request queued behind the return.
+        let return_program = verified(
+            vec![
+                Constant::Int32(0),
+                Constant::Int32(42),
+                Constant::Int32(99),
+                Constant::String(EcmaString::encode("finally")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    6,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(2),
+                            src: reg(1),
+                            resume: pc(3),
+                            mode: reg(3),
+                        },
+                        Instruction::Binary {
+                            dst: reg(4),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(3),
+                            right: reg(0),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(4),
+                            target: pc(8),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(5),
+                            constant: cid(2),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(3),
+                            value: reg(5),
+                        },
+                        Instruction::Return { value: reg(2) },
+                        Instruction::Return { value: reg(2) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let mut host = TestHost;
+        let mut machine = Machine::new(&return_program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callable = generator_callable(&mut machine, 1);
+        let g1 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, g1, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(42), false),
+        );
+
+        let awaited = machine.create_promise().unwrap();
+        let result = async_generator_return(&mut machine, g1, awaited).unwrap();
+        let later = async_generator_next(&mut machine, g1, Value::UNDEFINED).unwrap();
+        assert!(pending_promise(&machine, result));
+        assert!(pending_promise(&machine, later));
+        assert_eq!(machine.test_global("finally"), None);
+
+        machine.resolve_promise(awaited, Value::int32(7)).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, result),
+            (Value::int32(7), true),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, later),
+            (Value::UNDEFINED, true),
+        );
+        assert_eq!(machine.test_global("finally"), Some(Value::int32(99)));
+        assert_eq!(machine.live_registers, 0);
+
+        // A4: .throw() at SuspendedYield is catchable by a handler around the yield.
+        let throw_program = verified(
+            vec![
+                Constant::Int32(0),
+                Constant::Int32(1),
+                Constant::Int32(42),
+                Constant::Int32(99),
+                Constant::String(EcmaString::encode("finally")),
+                Constant::String(EcmaString::encode("caught")),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    8,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(2),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(3),
+                            src: reg(2),
+                            resume: pc(4),
+                            mode: reg(4),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(4),
+                            right: reg(0),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(11),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(4),
+                            right: reg(1),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(12),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(3),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(4),
+                            value: reg(6),
+                        },
+                        Instruction::Return { value: reg(3) },
+                        Instruction::Return { value: reg(3) },
+                        Instruction::Throw { value: reg(3) },
+                        Instruction::StoreGlobal {
+                            name: cid(5),
+                            value: reg(7),
+                        },
+                        Instruction::Return { value: reg(7) },
+                    ],
+                    vec![ExceptionHandler {
+                        start: pc(4),
+                        end: pc(13),
+                        handler: pc(13),
+                        catch_register: reg(7),
+                    }],
+                ),
+            ],
+        );
+
+        let mut throw_host = TestHost;
+        let mut machine = Machine::new(&throw_program, &mut throw_host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let callable = generator_callable(&mut machine, 1);
+        let g2 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, g2, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(42), false),
+        );
+
+        let result = async_generator_throw(&mut machine, g2, Value::int32(5)).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(machine.test_global("caught"), Some(Value::int32(5)));
+        assert_eq!(
+            settled_iterator_result(&mut machine, result),
+            (Value::int32(5), true),
+        );
+        assert_eq!(machine.live_registers, 0);
+
+        // A8: .return() while the generator is parked on an Await is queued only
+        // and does not disturb the await resumption path.
+        let await_program = verified(
+            vec![
+                Constant::String(EcmaString::encode("p")),
+                Constant::Int32(1),
+                Constant::String(EcmaString::encode("after_await")),
+                Constant::Int32(9),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    6,
+                    vec![
+                        Instruction::LoadGlobal {
+                            dst: reg(0),
+                            name: cid(0),
+                        },
+                        Instruction::Await {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(1),
+                        },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(2),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(3),
+                            constant: cid(3),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(4),
+                            src: reg(3),
+                            resume: pc(6),
+                            mode: reg(5),
+                        },
+                        Instruction::Return { value: reg(4) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let mut await_host = TestHost;
+        let mut machine = Machine::new(&await_program, &mut await_host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+
+        let awaited = machine.create_promise().unwrap();
+        machine.test_set_global("p", awaited);
+
+        let callable = generator_callable(&mut machine, 1);
+        let g3 = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let first = async_generator_next(&mut machine, g3, Value::UNDEFINED).unwrap();
+        let result = async_generator_return(&mut machine, g3, Value::int32(7)).unwrap();
+        assert!(pending_promise(&machine, first));
+        assert!(pending_promise(&machine, result));
+
+        machine.resolve_promise(awaited, Value::int32(9)).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(machine.test_global("after_await"), Some(Value::int32(1)));
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(9), false),
+        );
+        assert_eq!(
+            settled_iterator_result(&mut machine, result),
+            (Value::int32(7), true),
+        );
+        assert_eq!(machine.live_registers, 0);
     }
 }

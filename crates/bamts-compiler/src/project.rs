@@ -907,6 +907,9 @@ pub struct CompilerOptions {
     module_resolution: Option<Arc<str>>,
     jsx: Option<Arc<str>>,
     strict: bool,
+    strict_null_checks: bool,
+    no_implicit_any: bool,
+    always_strict: bool,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
@@ -940,6 +943,21 @@ impl CompilerOptions {
     #[must_use]
     pub const fn strict(&self) -> bool {
         self.strict
+    }
+
+    #[must_use]
+    pub const fn strict_null_checks(&self) -> bool {
+        self.strict_null_checks
+    }
+
+    #[must_use]
+    pub const fn no_implicit_any(&self) -> bool {
+        self.no_implicit_any
+    }
+
+    #[must_use]
+    pub const fn always_strict(&self) -> bool {
+        self.always_strict
     }
 
     #[must_use]
@@ -1024,12 +1042,19 @@ impl ProjectConfig {
         let base_url = optional_path(root, directory, compiler, "baseUrl")?
             .unwrap_or_else(|| directory.to_path_buf());
         let paths = parse_path_mappings(root, &base_url, compiler)?;
+        let strict = optional_bool(compiler, "strict")?.unwrap_or(false);
+        let strict_null_checks = optional_bool(compiler, "strictNullChecks")?.unwrap_or(strict);
+        let no_implicit_any = optional_bool(compiler, "noImplicitAny")?.unwrap_or(strict);
+        let always_strict = optional_bool(compiler, "alwaysStrict")?.unwrap_or(strict);
         let options = CompilerOptions {
             target: optional_nested_string(compiler, "target")?,
             module: optional_nested_string(compiler, "module")?,
             module_resolution: optional_nested_string(compiler, "moduleResolution")?,
             jsx: optional_nested_string(compiler, "jsx")?,
-            strict: optional_bool(compiler, "strict")?.unwrap_or(false),
+            strict,
+            strict_null_checks,
+            no_implicit_any,
+            always_strict,
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
             resolve_json_module: optional_bool(compiler, "resolveJsonModule")?.unwrap_or(false),

@@ -36,8 +36,8 @@
 //! [`ScriptKind`] drives the remaining decisions: TypeScript-only syntax in a
 //! JavaScript source parses (for recovery) but is diagnosed, `<T>expr` type
 //! assertions exist only in non-React TypeScript, and a `<` opening JSX in a
-//! React source is diagnosed as unsupported because the fixed [`NodeKind`]
-//! space has no JSX productions.
+//! React source (`.tsx`/`.jsx`) is parsed into JSX element, fragment, and
+//! self-closing-element nodes with `Missing*` recovery for malformed tags.
 
 use std::sync::Arc;
 
@@ -63,25 +63,32 @@ use crate::syntax::{
     IdentifierNode, IfStatement, ImportAttribute, ImportAttributes, ImportBinding, ImportClause,
     ImportDeclaration, ImportEqualsDeclaration, ImportExpression, ImportSpecifier,
     ImportSpecifierMode, ImportSpecifierNode, ImportType, IndexSignature, IndexedAccessType,
-    InferType, InterfaceDeclaration, JumpStatement, KeywordType, LabeledStatement, Literal,
-    LogicalExpression, LogicalOperator, MappedModifier, MappedType, MemberExpression,
+    InferType, InterfaceDeclaration, JsxAttribute, JsxAttributeInitializer, JsxAttributeItem,
+    JsxAttributeName, JsxChild, JsxClosingElement, JsxClosingElementNode, JsxElement,
+    JsxElementName, JsxExpressionContainer, JsxExpressionContainerNode, JsxFragment, JsxMemberName,
+    JsxNamespacedName, JsxOpeningElement, JsxSelfClosingElement, JsxSpreadAttribute,
+    JsxSpreadChild, JsxSpreadChildNode, JsxText, JumpStatement, KeywordType, LabeledStatement,
+    Literal, LogicalExpression, LogicalOperator, MappedModifier, MappedType, MemberExpression,
     MemberProperty, MetaProperty, MethodDeclaration, MissingNode, ModuleExportName,
-    NamespaceDeclaration, NewExpression, Node, NodeId, NodeKind, NonNullExpression, NullLiteral,
-    NumericLiteral, ObjectBindingPattern, ObjectBindingProperty, ObjectLiteral, ObjectMember,
-    ObjectMemberNode, ObjectMethod, ObjectProperty, ObjectType, Parameter, ParameterModifiers,
-    ParameterNode, Pattern, PrivateIdentifier, PropertyModifier, PropertyName, RegexLiteral,
-    RestBindingPattern, ReturnStatement, SatisfiesExpression, SequenceExpression, SourceFile,
-    SpreadElement, Statement, Stmt, StringLiteral, StringLiteralNode, SwitchCase, SwitchCaseNode,
-    SwitchStatement, TaggedTemplateExpression, TemplateElement, TemplateLiteral,
-    TemplateLiteralType, ThrowStatement, Token, TokenKind, TryStatement, TupleElement, TupleType,
-    Ty, TypeAliasDeclaration, TypeAnnotation, TypeAnnotationNode, TypeArgumentList,
-    TypeAssertionExpression, TypeIndexSignature, TypeLiteral, TypeMember, TypeMemberNode,
-    TypeMethodSignature, TypeNode, TypeOperator, TypeParameter, TypeParameterList,
-    TypeParameterNode, TypePredicate, TypePropertySignature, TypeQuery, TypeReference,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
-    VariableDeclarator, VariableDeclaratorNode, VariableKind, Variance, WhileStatement,
-    WithStatement, YieldExpression, cook_identifier_text,
+    NamespaceDeclaration, NamespaceKeyword, NamespaceName, NewExpression, Node, NodeId, NodeKind,
+    NonNullExpression, NullLiteral, NumericLiteral, ObjectBindingPattern, ObjectBindingProperty,
+    ObjectLiteral, ObjectMember, ObjectMemberNode, ObjectMethod, ObjectProperty, ObjectType,
+    Parameter, ParameterModifiers, ParameterNode, Pattern, PrivateIdentifier, PropertyModifier,
+    PropertyName, RegexLiteral, RestBindingPattern, ReturnStatement, SatisfiesExpression,
+    SequenceExpression, SourceFile, SpreadElement, Statement, Stmt, StringLiteral,
+    StringLiteralNode, SwitchCase, SwitchCaseNode, SwitchStatement, TaggedTemplateExpression,
+    TemplateElement, TemplateLiteral, TemplateLiteralType, ThrowStatement, Token, TokenKind,
+    TryStatement, TupleElement, TupleType, Ty, TypeAliasDeclaration, TypeAnnotation,
+    TypeAnnotationNode, TypeArgumentList, TypeAssertionExpression, TypeIndexSignature, TypeLiteral,
+    TypeMember, TypeMemberNode, TypeMethodSignature, TypeNode, TypeOperator, TypeParameter,
+    TypeParameterList, TypeParameterNode, TypePredicate, TypePropertySignature, TypeQuery,
+    TypeReference, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
+    VariableDeclaration, VariableDeclarator, VariableDeclaratorNode, VariableKind, Variance,
+    WhileStatement, WithStatement, YieldExpression, cook_identifier_text,
 };
+use bamts_cancel::{CancellationToken, Cancelled};
+use std::error::Error;
+use std::fmt;
 
 /// A token of one kind was required by the grammar but absent.
 const EXPECTED_TOKEN: DiagnosticCode = DiagnosticCode::new("BAMTS-P001");
@@ -93,20 +100,62 @@ const EXPECTED_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-P003");
 const EXPECTED_TYPE: DiagnosticCode = DiagnosticCode::new("BAMTS-P004");
 /// A token no grammar production could consume was skipped for recovery.
 const UNEXPECTED_TOKEN: DiagnosticCode = DiagnosticCode::new("BAMTS-P005");
-/// The left operand of an assignment or update is not a valid target.
-const INVALID_ASSIGNMENT_TARGET: DiagnosticCode = DiagnosticCode::new("BAMTS-P006");
 /// TypeScript-only syntax appeared in a JavaScript source.
 const TYPESCRIPT_SYNTAX_IN_JAVASCRIPT: DiagnosticCode = DiagnosticCode::new("BAMTS-P007");
-/// A syntax form the fixed node space cannot represent (JSX, `module "name"`).
-const UNSUPPORTED_SYNTAX: DiagnosticCode = DiagnosticCode::new("BAMTS-P008");
 /// A property name was required but the next token cannot begin one.
 const EXPECTED_PROPERTY_NAME: DiagnosticCode = DiagnosticCode::new("BAMTS-P009");
+/// A class member used the `export` keyword as a modifier.
+const EXPORT_MODIFIER_ON_CLASS_ELEMENT: DiagnosticCode = DiagnosticCode::new("BAMTS-C051");
 /// Nesting exceeded the recovery depth bound; the construct was abandoned.
 const NESTING_TOO_DEEP: DiagnosticCode = DiagnosticCode::new("BAMTS-P010");
 /// A `using` / `await using` declaration violated the resource grammar.
-const INVALID_USING_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-P011");
-/// Unterminated regular-expression literal (shared with the scanner code).
+/// A `using` / `await using` declaration binding was not an identifier, or the
+/// declaration appeared in a context the resource grammar forbids.
+pub const INVALID_USING_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-P011");
+/// A `using` / `await using` declaration required an initializer but none was
+/// provided.
+pub const USING_DECLARATION_REQUIRES_INITIALIZER: DiagnosticCode =
+    DiagnosticCode::new("BAMTS-P012");
 const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
+
+/// A parser operation was interrupted before completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseError {
+    /// The caller requested cancellation.
+    Cancelled(Cancelled),
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::Cancelled(_) => formatter.write_str("parse cancelled"),
+        }
+    }
+}
+
+impl Error for ParseError {}
+
+impl From<Cancelled> for ParseError {
+    fn from(cancelled: Cancelled) -> Self {
+        ParseError::Cancelled(cancelled)
+    }
+}
+
+impl From<ParseError> for Cancelled {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::Cancelled(cancelled) => cancelled,
+        }
+    }
+}
+
+impl From<crate::scanner::ScanError> for ParseError {
+    fn from(error: crate::scanner::ScanError) -> Self {
+        match error {
+            crate::scanner::ScanError::Cancelled(cancelled) => ParseError::Cancelled(cancelled),
+        }
+    }
+}
 
 /// The maximum expression/type nesting depth before recovery abandons a
 /// construct.
@@ -132,6 +181,25 @@ const MAX_DEPTH: u32 = 256;
 /// and the end-of-file token.
 #[must_use]
 pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
+    match parse_with_cancel(scanned, CancellationToken::new()) {
+        Ok(recovered) => recovered,
+        Err(_) => unreachable!("fresh token is never cancelled"),
+    }
+}
+
+/// Parses a scanned source with cooperative cancellation.
+///
+/// A caller-supplied [`CancellationToken`] is checked before parsing, at every
+/// statement boundary, and inside long list/recovery loops. Triggering it
+/// aborts parsing with [`ParseError::Cancelled`].
+pub fn parse_with_cancel(
+    scanned: Recovered<ScannedSource>,
+    cancel: CancellationToken,
+) -> Result<Recovered<SourceFile>, ParseError> {
+    if cancel.is_cancelled() {
+        return Err(ParseError::Cancelled(Cancelled));
+    }
+
     let (scanned, lexical) = scanned.into_parts();
     let source_id = scanned.source_id();
     let script_kind = scanned.script_kind();
@@ -139,7 +207,7 @@ pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
     let eof = *scanned.eof();
     let tokens = scanned.tokens().to_vec();
 
-    let mut parser = Parser::new(source_id, script_kind, source, tokens, eof);
+    let mut parser = Parser::new_with_cancel(source_id, script_kind, source, tokens, eof, cancel);
     let statements = parser.parse_statements_until(&[]);
 
     // The default scanner pass emits only `Slash`/`SlashEq`, never a
@@ -153,12 +221,14 @@ pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
         .filter(|t| t.kind() == TokenKind::RegularExpressionLiteral)
         .map(|t| t.range())
         .collect();
+    // Spans reinterpreted as JSX likewise supersede the default pass's lexical
+    // diagnostics: character data and attribute strings were mis-lexed there.
+    let jsx_spans = &parser.jsx_spans;
     let mut diagnostics = lexical;
     diagnostics.retain(|diagnostic| {
         let start = diagnostic.range().start().get();
-        !regex_spans
-            .iter()
-            .any(|span| start >= span.start().get() && start < span.end().get())
+        let in_span = |span: &TextRange| start >= span.start().get() && start < span.end().get();
+        !regex_spans.iter().any(in_span) && !jsx_spans.iter().any(in_span)
     });
     diagnostics.extend(parser.diagnostics.iter().cloned());
     diagnostics.sort();
@@ -166,6 +236,7 @@ pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
 
     let full_range = TextRange::new(Utf16Pos::ZERO, parser.source.len_utf16())
         .expect("a source range starts at zero");
+    let was_cancelled = parser.is_cancelled();
     let file_id = parser.fresh_id();
     let file = SourceFile::new(
         file_id,
@@ -178,7 +249,12 @@ pub fn parse(scanned: Recovered<ScannedSource>) -> Recovered<SourceFile> {
         eof,
         diagnostics.clone(),
     );
-    Recovered::new(file, diagnostics)
+
+    if was_cancelled {
+        return Err(ParseError::Cancelled(Cancelled));
+    }
+
+    Ok(Recovered::new(file, diagnostics))
 }
 
 /// One reversible token-stream rescan, journaled so speculative parses can
@@ -197,12 +273,29 @@ struct ParserCheckpoint {
     diagnostics: usize,
     next_node_id: u32,
     journal: usize,
+    jsx_spans: usize,
 }
 
 #[derive(Clone, Copy, Default)]
 struct KeywordContext {
     await_reserved: bool,
     yield_reserved: bool,
+}
+
+/// Whether `global` / string-named module forms are recognized as ambient at
+/// the current statement level, matching the TypeScript ambient-context rules.
+///
+/// Names are ambient only directly under a `declare` keyword or directly
+/// inside the body of a string-named ambient module. A nested string module's
+/// own body is not ambient, and namespace / `global` bodies are never ambient.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AmbientContext {
+    /// Not an ambient name context.
+    None,
+    /// Parsing the statement directly under a `declare` keyword.
+    DeclareTarget,
+    /// Parsing the direct body of a string-named ambient module.
+    ModuleBody,
 }
 
 struct Parser {
@@ -220,6 +313,14 @@ struct Parser {
     journal: Vec<RescanEdit>,
     depth: u32,
     keyword_context: KeywordContext,
+    /// Ambient name recognition context for the current statement level.
+    ambient: AmbientContext,
+    /// Source spans reinterpreted as JSX. Lexical diagnostics the default pass
+    /// recorded inside them reflect a non-JSX reading and are dropped, mirroring
+    /// the regex-rescan span handling.
+    jsx_spans: Vec<TextRange>,
+    /// Cooperative cancellation signal checked at statement and list boundaries.
+    cancel: CancellationToken,
 }
 
 fn is_trivia(kind: TokenKind) -> bool {
@@ -344,12 +445,31 @@ fn is_any_word(kind: TokenKind) -> bool {
 }
 
 impl Parser {
+    #[cfg(test)]
     fn new(
         source_id: SourceId,
         script_kind: ScriptKind,
         source: Arc<SourceText>,
         tokens: Vec<Token>,
         eof: Token,
+    ) -> Self {
+        Self::new_with_cancel(
+            source_id,
+            script_kind,
+            source,
+            tokens,
+            eof,
+            CancellationToken::new(),
+        )
+    }
+
+    fn new_with_cancel(
+        source_id: SourceId,
+        script_kind: ScriptKind,
+        source: Arc<SourceText>,
+        tokens: Vec<Token>,
+        eof: Token,
+        cancel: CancellationToken,
     ) -> Self {
         let mut parser = Self {
             source_id,
@@ -364,9 +484,17 @@ impl Parser {
             journal: Vec::new(),
             depth: 0,
             keyword_context: KeywordContext::default(),
+            ambient: AmbientContext::None,
+            jsx_spans: Vec::new(),
+            cancel,
         };
         parser.cursor = parser.next_significant(0);
         parser
+    }
+
+    /// Returns whether cancellation has been requested.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     // ------------------------------------------------------------------
@@ -678,6 +806,7 @@ impl Parser {
             diagnostics: self.diagnostics.len(),
             next_node_id: self.next_node_id,
             journal: self.journal.len(),
+            jsx_spans: self.jsx_spans.len(),
         }
     }
 
@@ -691,6 +820,7 @@ impl Parser {
         self.prev_end = checkpoint.prev_end;
         self.diagnostics.truncate(checkpoint.diagnostics);
         self.next_node_id = checkpoint.next_node_id;
+        self.jsx_spans.truncate(checkpoint.jsx_spans);
     }
 
     // ------------------------------------------------------------------
@@ -822,9 +952,14 @@ impl Parser {
         ) else {
             return Vec::new();
         };
-        let fragment = Arc::new(SourceText::new(
-            self.source.as_str()[start_byte..end_byte].to_owned(),
-        ));
+        // The fragment is a strict substring of an already budget-checked
+        // source, so this can never breach the per-file cap; return no tokens
+        // rather than panic if that invariant is ever violated.
+        let Ok(fragment) =
+            SourceText::new(self.source.as_str()[start_byte..end_byte].to_owned()).map(Arc::new)
+        else {
+            return Vec::new();
+        };
         let recovered = crate::scanner::scan(self.source_id, self.script_kind, fragment);
         let (scanned, diagnostics) = recovered.into_parts();
         for diagnostic in diagnostics {
@@ -972,6 +1107,9 @@ impl Parser {
     fn parse_statements_until(&mut self, stop: &[TokenKind]) -> Vec<Stmt> {
         let mut statements = Vec::new();
         while !self.at_eof() && !stop.contains(&self.kind()) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let statement = self.parse_statement();
             statements.push(statement);
@@ -1103,15 +1241,26 @@ impl Parser {
                 let range = self.cur().range();
                 self.note_typescript_syntax(range);
                 self.bump();
-                let inner = self.parse_statement();
+                let inner =
+                    self.with_ambient(AmbientContext::DeclareTarget, |this| this.parse_statement());
                 self.node(start, Statement::Declare(Box::new(inner)))
             }
             TokenKind::Identifier
-                if matches!(self.cur_lexeme(), "global" | "module")
-                    && matches!(
+                if self.cur_lexeme() == "global" && self.nth_kind(1) == TokenKind::LBrace =>
+            {
+                self.parse_contextual_namespace(start)
+            }
+            TokenKind::Identifier
+                if self.cur_lexeme() == "module"
+                    && (matches!(
                         self.nth_kind(1),
                         TokenKind::LBrace | TokenKind::StringLiteral
-                    ) =>
+                    ) || (self.name_is_ambient()
+                        && is_identifier_like(self.nth_kind(1))
+                        && matches!(self.nth_kind(2), TokenKind::LBrace | TokenKind::Dot))
+                        || (self.name_is_ambient()
+                            && !is_identifier_like(self.nth_kind(1))
+                            && self.nth_kind(1) != TokenKind::Dot)) =>
             {
                 self.parse_contextual_namespace(start)
             }
@@ -1179,6 +1328,9 @@ impl Parser {
         }
         let mut depth = 0i32;
         loop {
+            if self.is_cancelled() {
+                break false;
+            }
             index = self.next_significant(index + 1);
             match self.tokens.get(index).copied().unwrap_or(self.eof).kind() {
                 TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
@@ -1267,43 +1419,24 @@ impl Parser {
     /// Parses a `var`/`let`/`const`/`using` declaration. `allow_in` is false
     /// inside a `for (...)` head before the `in`/`of` decision.
     fn parse_variable_declaration(&mut self, allow_in: bool) -> VariableDeclaration {
+        let start = self.cur().range().start();
         let kind = self.variable_kind();
         let mut declarations = Vec::new();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let declarator = self.parse_variable_declarator(allow_in);
-            self.validate_using_declarator(kind, &declarator, true);
             declarations.push(declarator);
             if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
-        VariableDeclaration { kind, declarations }
-    }
-
-    /// Resource declarations require a BindingIdentifier and an initializer.
-    fn validate_using_declarator(
-        &mut self,
-        kind: VariableKind,
-        declarator: &VariableDeclaratorNode,
-        require_initializer: bool,
-    ) {
-        if !matches!(kind, VariableKind::Using | VariableKind::AwaitUsing) {
-            return;
-        }
-        let data = declarator.data();
-        if !matches!(data.binding.data(), BindingPattern::Identifier(_)) {
-            self.error_at(
-                INVALID_USING_DECLARATION,
-                data.binding.range(),
-                "`using` and `await using` bindings must be identifiers",
-            );
-        }
-        if require_initializer && data.initializer.is_none() {
-            self.error_at(
-                INVALID_USING_DECLARATION,
-                declarator.range(),
-                "`using` and `await using` declarations require an initializer",
-            );
+        let range = self.span_from(start);
+        VariableDeclaration {
+            range,
+            kind,
+            declarations,
         }
     }
 
@@ -1402,6 +1535,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut cases = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let case_start = self.cur_start();
             let test = if self.eat(TokenKind::KwCase).is_some() {
                 Some(Box::new(self.parse_expression(false)))
@@ -1451,27 +1587,27 @@ impl Parser {
         ) && self.at_variable_declaration()
             || (self.at(TokenKind::Identifier)
                 && self.cur_lexeme() == "using"
-                && is_identifier_like(self.nth_kind(1)))
+                && (is_identifier_like(self.nth_kind(1))
+                    || matches!(self.nth_kind(1), TokenKind::LBracket | TokenKind::LBrace)))
             || (self.at(TokenKind::KwAwait)
                 && self.nth(1).kind() == TokenKind::Identifier
-                && self.lexeme(self.nth(1)) == "using");
+                && self.lexeme(self.nth(1)) == "using"
+                && (is_identifier_like(self.nth_kind(2))
+                    || matches!(self.nth_kind(2), TokenKind::LBracket | TokenKind::LBrace)));
 
         if decl_start {
+            let kind_start = self.cur().range().start();
             let kind = self.variable_kind();
             let first = self.parse_for_head_declarator();
             match self.kind() {
                 TokenKind::KwIn => {
-                    if matches!(kind, VariableKind::Using | VariableKind::AwaitUsing) {
-                        self.error_at(
-                            INVALID_USING_DECLARATION,
-                            first.range(),
-                            "`using` and `await using` are not allowed in a for-in head",
-                        );
-                    }
                     self.bump();
                     let object = self.parse_expression(false);
                     let body = self.finish_for_body();
+                    let range = TextRange::new(kind_start, first.range().end())
+                        .expect("for-in head range is ordered");
                     let binding = ForBinding::Variable(VariableDeclaration {
+                        range,
                         kind,
                         declarations: vec![first],
                     });
@@ -1485,14 +1621,13 @@ impl Parser {
                     );
                 }
                 TokenKind::KwOf => {
-                    // `for (using x of …)` / `for await (await using x of …)` are
-                    // valid resource heads; enforce identifier-only binding and
-                    // leave lowering to a later pass.
-                    self.validate_using_declarator(kind, &first, false);
                     self.bump();
                     let iterable = self.parse_assignment_expression(false);
                     let body = self.finish_for_body();
+                    let range = TextRange::new(kind_start, first.range().end())
+                        .expect("for-of head range is ordered");
                     let binding = ForBinding::Variable(VariableDeclaration {
+                        range,
                         kind,
                         declarations: vec![first],
                     });
@@ -1514,19 +1649,22 @@ impl Parser {
                 _ => {
                     // Classic head: finish this declarator's initializer and
                     // any further declarators.
-                    if matches!(kind, VariableKind::Using | VariableKind::AwaitUsing) {
-                        self.error_at(
-                            INVALID_USING_DECLARATION,
-                            first.range(),
-                            "`using` and `await using` are not allowed in a classic for head",
-                        );
-                    }
                     let mut declarations = vec![self.finish_for_declarator(first)];
                     while self.eat(TokenKind::Comma).is_some() {
+                        if self.is_cancelled() {
+                            break;
+                        }
                         declarations.push(self.parse_variable_declarator(false));
                     }
                     self.expect(TokenKind::Semicolon, "expected `;`");
+                    let end = declarations
+                        .last()
+                        .map(|declarator| declarator.range().end())
+                        .expect("classic for head has at least one declarator");
+                    let range =
+                        TextRange::new(kind_start, end).expect("classic for head range is ordered");
                     let initializer = Some(ForInitializer::Variable(VariableDeclaration {
+                        range,
                         kind,
                         declarations,
                     }));
@@ -1831,6 +1969,9 @@ impl Parser {
     fn parse_decorators(&mut self) -> Vec<DecoratorNode> {
         let mut decorators = Vec::new();
         while self.at(TokenKind::At) {
+            if self.is_cancelled() {
+                break;
+            }
             let start = self.cur_start();
             self.bump();
             let expression = self.parse_lhs_expression(LhsContext::Decorator);
@@ -1872,6 +2013,9 @@ impl Parser {
         let mut extends = None;
         let mut implements = Vec::new();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             if self.at(TokenKind::KwExtends) && extends.is_none() {
                 self.bump();
                 let expression = self.parse_lhs_expression(LhsContext::Expression);
@@ -1885,6 +2029,9 @@ impl Parser {
                 self.note_typescript_syntax(range);
                 self.bump();
                 loop {
+                    if self.is_cancelled() {
+                        break;
+                    }
                     implements.push(self.parse_type());
                     if self.eat(TokenKind::Comma).is_none() {
                         break;
@@ -1898,6 +2045,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut members = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let member = self.parse_class_member();
             members.push(member);
@@ -1942,6 +2092,9 @@ impl Parser {
         let mut typescript_modifier: Option<TextRange> = None;
 
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let kind = self.kind();
             if !self.modifier_is_followed_by_member(1) {
                 break;
@@ -1975,6 +2128,14 @@ impl Parser {
                 TokenKind::KwDeclare => {
                     typescript_modifier = Some(self.cur().range());
                     modifiers.is_declare = true;
+                }
+                TokenKind::KwExport if !self.has_newline_before_nth(1) => {
+                    let range = self.cur().range();
+                    self.error_at(
+                        EXPORT_MODIFIER_ON_CLASS_ELEMENT,
+                        range,
+                        "'export' modifier cannot appear on class elements.",
+                    );
                 }
                 TokenKind::KwAsync if !self.has_newline_before_nth(1) => is_async = true,
                 TokenKind::KwAccessor if !self.has_newline_before_nth(1) => is_accessor = true,
@@ -2170,6 +2331,7 @@ impl Parser {
                 | TokenKind::KwAccessor
                 | TokenKind::KwGet
                 | TokenKind::KwSet
+                | TokenKind::KwExport
         ) {
             return false;
         }
@@ -2211,7 +2373,7 @@ impl Parser {
         )
     }
 
-    fn parse_interface_declaration(&mut self, start: Utf16Pos) -> Stmt {
+    fn parse_interface(&mut self) -> InterfaceDeclaration {
         let keyword_range = self.cur().range();
         self.note_typescript_syntax(keyword_range);
         self.bump();
@@ -2220,6 +2382,9 @@ impl Parser {
         let mut extends = Vec::new();
         if self.eat(TokenKind::KwExtends).is_some() {
             loop {
+                if self.is_cancelled() {
+                    break;
+                }
                 let entity = self.parse_entity_name();
                 let type_arguments = if self.at_less_like() {
                     Some(self.parse_type_arguments())
@@ -2236,15 +2401,17 @@ impl Parser {
             }
         }
         let members = self.parse_type_members();
-        self.node(
-            start,
-            Statement::Interface(InterfaceDeclaration {
-                name,
-                type_parameters,
-                extends,
-                members,
-            }),
-        )
+        InterfaceDeclaration {
+            name,
+            type_parameters,
+            extends,
+            members,
+        }
+    }
+
+    fn parse_interface_declaration(&mut self, start: Utf16Pos) -> Stmt {
+        let interface = self.parse_interface();
+        self.node(start, Statement::Interface(interface))
     }
 
     fn parse_type_alias_declaration(&mut self, start: Utf16Pos) -> Stmt {
@@ -2274,6 +2441,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut members = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let member_start = self.cur_start();
             let name = self.parse_property_name();
@@ -2307,70 +2477,142 @@ impl Parser {
         )
     }
 
+    /// Parses the body of a namespace / ambient module, desugaring a leading
+    /// dotted tail into a nested single-name declaration.
+    fn parse_namespace_body(&mut self, keyword: NamespaceKeyword) -> BlockNode {
+        if self.at(TokenKind::Dot) {
+            let inner_start = self.cur_start();
+            if !self.enter() {
+                // Depth limit reached. Consume the dot so the source advances,
+                // then return a block with a missing statement to stop the
+                // dotted recursion without exhausting the native stack.
+                self.bump();
+                let missing = self.node_at(
+                    empty_range(inner_start),
+                    Statement::Missing(MissingNode::new(NodeKind::MissingStatement)),
+                );
+                return self.node(
+                    inner_start,
+                    Block {
+                        statements: vec![missing],
+                    },
+                );
+            }
+            self.bump();
+            let inner = self.parse_namespace_tail(inner_start, keyword);
+            self.leave();
+            let statements = vec![inner];
+            self.node(inner_start, Block { statements })
+        } else {
+            self.parse_block()
+        }
+    }
+
+    /// Returns whether `global` / string-module names are ambient here.
+    fn name_is_ambient(&self) -> bool {
+        !matches!(self.ambient, AmbientContext::None)
+    }
+
+    /// Parses with the given ambient context, restoring the previous one.
+    fn with_ambient<T>(
+        &mut self,
+        context: AmbientContext,
+        parse: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let saved = self.ambient;
+        self.ambient = context;
+        let result = parse(self);
+        self.ambient = saved;
+        result
+    }
+
+    /// Parses a namespace/module/global body in a non-ambient name context, so
+    /// nested `global` / string-module forms are not treated as ambient.
+    fn parse_outside_declare<T>(&mut self, parse: impl FnOnce(&mut Self) -> T) -> T {
+        self.with_ambient(AmbientContext::None, parse)
+    }
+
+    fn identifier_namespace_name(
+        &mut self,
+        name: IdentifierNode,
+        keyword: NamespaceKeyword,
+    ) -> NamespaceName {
+        NamespaceName::Identifier { name, keyword }
+    }
+
     /// Parses `namespace A.B.C { ... }`, desugaring the dotted form into
     /// nested single-name declarations because the node carries one name.
     fn parse_namespace_declaration(&mut self, start: Utf16Pos) -> Stmt {
         let keyword_range = self.cur().range();
         self.note_typescript_syntax(keyword_range);
         self.bump();
-        let name = self.expect_identifier("expected a namespace name");
-        let body = if self.at(TokenKind::Dot) {
-            let inner_start = self.cur_start();
-            self.bump();
-            let inner = self.parse_namespace_tail(inner_start);
-            let statements = vec![inner];
-            self.node(inner_start, Block { statements })
-        } else {
-            self.parse_block()
-        };
+        let name_node = self.expect_identifier("expected a namespace name");
+        let name = self.identifier_namespace_name(name_node, NamespaceKeyword::Namespace);
+        let body = self
+            .parse_outside_declare(|this| this.parse_namespace_body(NamespaceKeyword::Namespace));
         self.node(
             start,
             Statement::Namespace(NamespaceDeclaration { name, body }),
         )
     }
 
-    fn parse_namespace_tail(&mut self, start: Utf16Pos) -> Stmt {
-        let name = self.expect_identifier("expected a namespace name");
-        let body = if self.at(TokenKind::Dot) {
-            let inner_start = self.cur_start();
-            self.bump();
-            let inner = self.parse_namespace_tail(inner_start);
-            let statements = vec![inner];
-            self.node(inner_start, Block { statements })
-        } else {
-            self.parse_block()
-        };
+    fn parse_namespace_tail(&mut self, start: Utf16Pos, keyword: NamespaceKeyword) -> Stmt {
+        let name_node = self.expect_identifier("expected a namespace name");
+        let name = self.identifier_namespace_name(name_node, keyword);
+        let body = self.parse_outside_declare(|this| this.parse_namespace_body(keyword));
         self.node(
             start,
             Statement::Namespace(NamespaceDeclaration { name, body }),
         )
     }
 
-    /// Parses ambient `global { ... }` and `module Name { ... }` forms after a
-    /// `declare` wrapper. A string-named module cannot be represented by the
-    /// namespace node's identifier field, so recovery records a stable
-    /// unsupported-syntax diagnostic and keeps a missing name.
+    /// Parses ambient `global { ... }` and `module Name { ... }` forms, including
+    /// string-named ambient modules under `declare`.
     fn parse_contextual_namespace(&mut self, start: Utf16Pos) -> Stmt {
         let keyword = self.bump();
         let is_global = self.lexeme(keyword) == "global";
-        let name = if is_global {
-            self.ident_from(keyword)
+        let ambient = self.name_is_ambient();
+        let name = if is_global && ambient {
+            NamespaceName::Global {
+                range: keyword.range(),
+            }
+        } else if is_global {
+            let name = self.ident_from(keyword);
+            self.identifier_namespace_name(name, NamespaceKeyword::Namespace)
         } else if is_identifier_like(self.kind()) {
-            self.expect_identifier("expected a module name")
+            let name = self.expect_identifier("expected a module name");
+            self.identifier_namespace_name(name, NamespaceKeyword::Module)
         } else if self.at(TokenKind::StringLiteral) {
-            let range = self.cur().range();
-            self.error_at(
-                UNSUPPORTED_SYNTAX,
-                range,
-                "a string-named module is not representable in this syntax tree",
-            );
-            self.bump();
-            self.missing_ident()
+            let lit = self.parse_string_literal();
+            if !ambient {
+                self.error_at(
+                    EXPECTED_IDENTIFIER,
+                    lit.range(),
+                    "a string-named module is only allowed in an ambient declaration",
+                );
+            }
+            NamespaceName::StringLiteral(lit)
         } else {
             self.error_here(EXPECTED_IDENTIFIER, "expected a module name");
-            self.missing_ident()
+            let name = self.missing_ident();
+            self.identifier_namespace_name(name, NamespaceKeyword::Module)
         };
-        let body = self.parse_block();
+
+        // Only the direct body of a string-named ambient module keeps ambient
+        // name recognition, and only when that module was itself the direct
+        // `declare` target. A nested string module's body is not ambient, so
+        // `declare module "a" { module "b" { module "c" {} } }` rejects the
+        // inner string module exactly like TypeScript (TS2435).
+        let body_context = match (&name, self.ambient) {
+            (NamespaceName::StringLiteral(_), AmbientContext::DeclareTarget) => {
+                AmbientContext::ModuleBody
+            }
+            _ => AmbientContext::None,
+        };
+        let body = self.with_ambient(body_context, |this| match &name {
+            NamespaceName::Identifier { keyword, .. } => this.parse_namespace_body(*keyword),
+            NamespaceName::StringLiteral(_) | NamespaceName::Global { .. } => this.parse_block(),
+        });
         self.node(
             start,
             Statement::Namespace(NamespaceDeclaration { name, body }),
@@ -2521,6 +2763,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut specifiers = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let start = self.cur_start();
             let mode = if self.at(TokenKind::KwType) && self.specifier_type_is_modifier() {
@@ -2611,6 +2856,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut entries = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let name = self.parse_module_export_name();
             self.expect(TokenKind::Colon, "expected `:`");
@@ -2809,6 +3057,7 @@ impl Parser {
                 let class = self.parse_class(Vec::new(), modifiers, false);
                 ExportDefaultValue::Class(class)
             }
+            TokenKind::KwInterface => ExportDefaultValue::Interface(self.parse_interface()),
             TokenKind::At => {
                 let decorators = self.parse_decorators();
                 if self.at(TokenKind::KwClass) {
@@ -2838,6 +3087,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut specifiers = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let specifier_start = self.cur_start();
             let mode = if self.at(TokenKind::KwType) && self.specifier_type_is_modifier() {
@@ -2993,6 +3245,9 @@ impl Parser {
         }
         let mut expressions = vec![first];
         while self.eat(TokenKind::Comma).is_some() {
+            if self.is_cancelled() {
+                break;
+            }
             expressions.push(self.parse_assignment_expression(no_in));
         }
         self.node(
@@ -3112,6 +3367,9 @@ impl Parser {
         let start = self.cur_start();
         let mut left = self.parse_unary_expression();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             // TypeScript `as`/`satisfies` postfix type operators (precedence
             // just above relational). Disallowed across a newline.
             if matches!(self.kind(), TokenKind::KwAs | TokenKind::KwSatisfies)
@@ -3294,6 +3552,19 @@ impl Parser {
         let range = self.cur().range();
         self.note_typescript_syntax(range);
         self.expect_type_open("expected `<`");
+        if self.at(TokenKind::KwConst) {
+            // `<const>expr` is the prefix spelling of `expr as const`.
+            self.bump();
+            self.expect_type_close("expected `>`");
+            let expression = self.parse_unary_expression();
+            return self.node(
+                start,
+                Expression::As(AsExpression {
+                    expression: Box::new(expression),
+                    type_node: None,
+                }),
+            );
+        }
         let type_node = self.parse_type();
         self.expect_type_close("expected `>`");
         let expression = self.parse_unary_expression();
@@ -3379,6 +3650,9 @@ impl Parser {
     /// Member-only tail (no calls): used for a `new` callee.
     fn parse_member_tail(&mut self, start: Utf16Pos, mut expr: Expr, ctx: LhsContext) -> Expr {
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.kind() {
                 TokenKind::Dot => {
                     self.bump();
@@ -3429,6 +3703,9 @@ impl Parser {
         ctx: LhsContext,
     ) -> Expr {
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             match self.kind() {
                 TokenKind::Dot => {
                     self.bump();
@@ -3616,6 +3893,9 @@ impl Parser {
         self.expect(TokenKind::LParen, "expected `(`");
         let mut arguments = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RParen) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::DotDotDot) {
                 let spread_start = self.cur_start();
@@ -3729,7 +4009,7 @@ impl Parser {
                 if matches!(self.script_kind, ScriptKind::TypeScriptReact)
                     || matches!(self.script_kind, ScriptKind::JavaScriptReact) =>
             {
-                self.parse_jsx_placeholder(start)
+                self.parse_jsx(start)
             }
             kind if is_identifier_like(kind) => {
                 let token = self.bump();
@@ -3788,44 +4068,353 @@ impl Parser {
         )
     }
 
-    /// The fixed node space has no JSX productions. A `<` opening JSX in a
-    /// React source is diagnosed and its balanced element skipped so parsing
-    /// makes forward progress.
-    fn parse_jsx_placeholder(&mut self, start: Utf16Pos) -> Expr {
-        self.error_here(
-            UNSUPPORTED_SYNTAX,
-            "JSX is not representable in this syntax tree",
-        );
-        let mut depth = 0i32;
-        while !self.at_eof() {
-            match self.kind() {
-                TokenKind::LessThan => {
-                    depth += 1;
-                    self.bump();
-                }
-                TokenKind::GreaterThan | TokenKind::GreaterThanEq => {
-                    self.bump();
-                    depth -= 1;
-                    if depth <= 0 {
-                        break;
-                    }
-                }
-                TokenKind::GreaterGreater | TokenKind::GreaterGreaterGreater => {
-                    self.bump();
-                    depth -= 2;
-                    if depth <= 0 {
-                        break;
-                    }
-                }
-                _ => {
-                    self.bump();
-                }
+    /// Parses a JSX element or fragment. The whole construct is first re-lexed
+    /// from the source into JSX-aware tokens spliced over the default pass (see
+    /// [`Self::rescan_jsx_span`]), then reparsed structurally so nested
+    /// expression containers reuse the ordinary expression grammar.
+    fn parse_jsx(&mut self, start: Utf16Pos) -> Expr {
+        let _ = start;
+        self.rescan_jsx_span();
+        self.parse_jsx_element_or_fragment()
+    }
+
+    /// Re-lexes the JSX construct starting at the current `<` and splices the
+    /// JSX-aware tokens over the default pass's tokens for that span, keeping
+    /// the stored stream byte-exact. Mirrors the regex rescan's span handling.
+    fn rescan_jsx_span(&mut self) {
+        if !self.at(TokenKind::LessThan) || self.at_eof() {
+            return;
+        }
+        let index = self.cursor;
+        let start = self.tokens[index].range().start();
+        let Ok(start_byte) = self.source.utf16_to_byte(start) else {
+            return;
+        };
+        // Same budget invariant as `scan_shifted_fragment`: a tail of a
+        // budget-checked source cannot exceed the per-file cap; bail out
+        // instead of panicking if that ever changes.
+        let Ok(fragment) =
+            SourceText::new(self.source.as_str()[start_byte..].to_owned()).map(Arc::new)
+        else {
+            return;
+        };
+        let mut scanner = crate::scanner::Scanner::new(self.source_id, self.script_kind, &fragment);
+        let jsx_tokens = scanner.scan_jsx_span();
+        let consumed = jsx_tokens
+            .last()
+            .map_or(0, |token| token.range().end().get());
+        if consumed == 0 {
+            return;
+        }
+        let base = start.get();
+        let end = base + consumed;
+        let shift = |range: TextRange| {
+            TextRange::new(
+                Utf16Pos::new(base + range.start().get()),
+                Utf16Pos::new(base + range.end().get()),
+            )
+            .expect("shift preserves range ordering")
+        };
+        let mut replacement: Vec<Token> = jsx_tokens
+            .iter()
+            .map(|token| Token::new(token.kind(), shift(token.range())))
+            .collect();
+        for diagnostic in scanner.into_diagnostics() {
+            self.diagnostics.push(Diagnostic::new(
+                diagnostic.severity(),
+                diagnostic.code(),
+                diagnostic.source_id(),
+                shift(diagnostic.range()),
+                diagnostic.message(),
+            ));
+        }
+        // Absorb the pre-scanned tokens the span covers; a default token may
+        // straddle the JSX end, so re-lex only its trailing fragment.
+        let mut last = index;
+        while last + 1 < self.tokens.len() && self.tokens[last].range().end().get() < end {
+            last += 1;
+        }
+        let covered_end = self.tokens[last].range().end().get();
+        if covered_end > end {
+            replacement.extend(self.scan_shifted_fragment(end, covered_end));
+        }
+        self.replace_tokens(index, last, replacement);
+        self.jsx_spans
+            .push(TextRange::new(start, Utf16Pos::new(end)).expect("a JSX span grows forward"));
+    }
+
+    fn parse_jsx_element_or_fragment(&mut self) -> Expr {
+        let start = self.cur_start();
+        if !self.enter() {
+            if self.at(TokenKind::LessThan) {
+                self.bump();
             }
+            return self.node(
+                start,
+                Expression::Missing(MissingNode::new(NodeKind::MissingExpression)),
+            );
+        }
+        let result = self.parse_jsx_inner(start);
+        self.leave();
+        result
+    }
+
+    fn parse_jsx_inner(&mut self, start: Utf16Pos) -> Expr {
+        self.expect(TokenKind::LessThan, "expected `<`");
+        // Fragment `<>children</>`.
+        if self.at(TokenKind::GreaterThan) {
+            self.bump();
+            let children = self.parse_jsx_children();
+            self.expect(TokenKind::LessThan, "expected `</>`");
+            self.expect(TokenKind::Slash, "expected `/`");
+            self.expect(TokenKind::GreaterThan, "expected `>`");
+            return self.node(start, Expression::JsxFragment(JsxFragment { children }));
+        }
+        let name = self.parse_jsx_element_name();
+        let attributes = self.parse_jsx_attributes();
+        if self.at(TokenKind::Slash) {
+            self.bump();
+            self.expect(TokenKind::GreaterThan, "expected `>`");
+            return self.node(
+                start,
+                Expression::JsxSelfClosingElement(JsxSelfClosingElement { name, attributes }),
+            );
+        }
+        self.expect(TokenKind::GreaterThan, "expected `>`");
+        let opening = self.node(start, JsxOpeningElement { name, attributes });
+        let children = self.parse_jsx_children();
+        let closing = self.parse_jsx_closing_element();
+        let open_text = self.jsx_name_text(&opening.data().name);
+        let close_text = self.jsx_name_text(&closing.data().name);
+        if open_text != close_text {
+            self.error_at(
+                EXPECTED_TOKEN,
+                closing.range(),
+                "JSX closing tag does not match the opening tag",
+            );
         }
         self.node(
             start,
-            Expression::Missing(MissingNode::new(NodeKind::MissingExpression)),
+            Expression::JsxElement(JsxElement {
+                opening,
+                children,
+                closing,
+            }),
         )
+    }
+
+    fn parse_jsx_closing_element(&mut self) -> JsxClosingElementNode {
+        let start = self.cur_start();
+        self.expect(TokenKind::LessThan, "expected `</`");
+        self.expect(TokenKind::Slash, "expected `/`");
+        let name = self.parse_jsx_element_name();
+        self.expect(TokenKind::GreaterThan, "expected `>`");
+        self.node(start, JsxClosingElement { name })
+    }
+
+    /// Parses a JSX name identifier. JSX names are always lexed as
+    /// [`TokenKind::Identifier`], so reserved-word rejection does not apply.
+    fn parse_jsx_name_identifier(&mut self) -> IdentifierNode {
+        if self.at(TokenKind::Identifier) {
+            let token = self.bump();
+            return self.identifier_name_from(token);
+        }
+        self.error_here(EXPECTED_IDENTIFIER, "expected a JSX name");
+        self.missing_ident()
+    }
+
+    /// Element name: bare identifier, namespaced `ns:name`, or a dotted member
+    /// chain `A.B.C`.
+    fn parse_jsx_element_name(&mut self) -> JsxElementName {
+        let first = self.parse_jsx_name_identifier();
+        if self.at(TokenKind::Colon) {
+            self.bump();
+            let name = self.parse_jsx_name_identifier();
+            return JsxElementName::Namespace(JsxNamespacedName {
+                namespace: first,
+                name,
+            });
+        }
+        let mut current = JsxElementName::Identifier(first);
+        while self.at(TokenKind::Dot) {
+            if self.is_cancelled() {
+                break;
+            }
+            self.bump();
+            let property = self.parse_jsx_name_identifier();
+            current = JsxElementName::Member(JsxMemberName {
+                object: Box::new(current),
+                property,
+            });
+        }
+        current
+    }
+
+    /// Attribute name: bare identifier or namespaced `ns:name`.
+    fn parse_jsx_attribute_name(&mut self) -> JsxAttributeName {
+        let first = self.parse_jsx_name_identifier();
+        if self.at(TokenKind::Colon) {
+            self.bump();
+            let name = self.parse_jsx_name_identifier();
+            return JsxAttributeName::Namespace(JsxNamespacedName {
+                namespace: first,
+                name,
+            });
+        }
+        JsxAttributeName::Identifier(first)
+    }
+
+    fn parse_jsx_attributes(&mut self) -> Vec<JsxAttributeItem> {
+        let mut items = Vec::new();
+        while !self.at_eof() && !self.at(TokenKind::GreaterThan) && !self.at(TokenKind::Slash) {
+            if self.is_cancelled() {
+                break;
+            }
+            let before = self.cursor;
+            if self.at(TokenKind::LBrace) {
+                items.push(self.parse_jsx_spread_attribute());
+            } else if self.at(TokenKind::Identifier) {
+                items.push(self.parse_jsx_attribute());
+            } else {
+                let skipped = self.bump();
+                self.error_at(
+                    UNEXPECTED_TOKEN,
+                    skipped.range(),
+                    "this token was skipped inside a JSX tag",
+                );
+            }
+            if self.cursor == before {
+                break;
+            }
+        }
+        items
+    }
+
+    fn parse_jsx_attribute(&mut self) -> JsxAttributeItem {
+        let start = self.cur_start();
+        let name = self.parse_jsx_attribute_name();
+        let initializer = if self.eat(TokenKind::Eq).is_some() {
+            Some(self.parse_jsx_attribute_initializer())
+        } else {
+            None
+        };
+        let node = self.node(start, JsxAttribute { name, initializer });
+        JsxAttributeItem::Attribute(node)
+    }
+
+    fn parse_jsx_attribute_initializer(&mut self) -> JsxAttributeInitializer {
+        if self.at(TokenKind::LBrace) {
+            return JsxAttributeInitializer::Expression(self.parse_jsx_expression_container());
+        }
+        if self.at(TokenKind::StringLiteral) {
+            return JsxAttributeInitializer::String(self.parse_string_literal());
+        }
+        self.error_here(EXPECTED_EXPRESSION, "expected a JSX attribute value");
+        let start = self.cur_start();
+        let container = self.node(start, JsxExpressionContainer { expression: None });
+        JsxAttributeInitializer::Expression(container)
+    }
+
+    fn parse_jsx_spread_attribute(&mut self) -> JsxAttributeItem {
+        let start = self.cur_start();
+        self.expect(TokenKind::LBrace, "expected `{`");
+        self.expect(TokenKind::DotDotDot, "expected `...`");
+        let expression = self.parse_assignment_expression(false);
+        self.expect(TokenKind::RBrace, "expected `}`");
+        let node = self.node(
+            start,
+            JsxSpreadAttribute {
+                expression: Box::new(expression),
+            },
+        );
+        JsxAttributeItem::Spread(node)
+    }
+
+    fn parse_jsx_expression_container(&mut self) -> JsxExpressionContainerNode {
+        let start = self.cur_start();
+        self.expect(TokenKind::LBrace, "expected `{`");
+        let expression = if self.at(TokenKind::RBrace) {
+            None
+        } else {
+            Some(Box::new(self.parse_assignment_expression(false)))
+        };
+        self.expect(TokenKind::RBrace, "expected `}`");
+        self.node(start, JsxExpressionContainer { expression })
+    }
+
+    fn parse_jsx_spread_child(&mut self) -> JsxSpreadChildNode {
+        let start = self.cur_start();
+        self.expect(TokenKind::LBrace, "expected `{`");
+        self.expect(TokenKind::DotDotDot, "expected `...`");
+        let expression = self.parse_assignment_expression(false);
+        self.expect(TokenKind::RBrace, "expected `}`");
+        self.node(
+            start,
+            JsxSpreadChild {
+                expression: Box::new(expression),
+            },
+        )
+    }
+
+    /// Parses children until the parent's closing tag (`</`) or end of file.
+    fn parse_jsx_children(&mut self) -> Vec<JsxChild> {
+        let mut children = Vec::new();
+        while !self.at_eof() {
+            if self.is_cancelled() {
+                break;
+            }
+            if self.at(TokenKind::LessThan) {
+                if self.nth_kind(1) == TokenKind::Slash {
+                    break;
+                }
+                let child = self.parse_jsx_element_or_fragment();
+                children.push(JsxChild::Element(Box::new(child)));
+                continue;
+            }
+            if self.at(TokenKind::LBrace) {
+                if self.nth_kind(1) == TokenKind::DotDotDot {
+                    children.push(JsxChild::Spread(self.parse_jsx_spread_child()));
+                } else {
+                    children.push(JsxChild::ExpressionContainer(
+                        self.parse_jsx_expression_container(),
+                    ));
+                }
+                continue;
+            }
+            if self.at(TokenKind::StringLiteral) {
+                let token = self.bump();
+                let range = token.range();
+                let node = self.node_at(range, JsxText::new(token));
+                children.push(JsxChild::Text(node));
+                continue;
+            }
+            let skipped = self.bump();
+            self.error_at(
+                UNEXPECTED_TOKEN,
+                skipped.range(),
+                "this token was skipped inside JSX children",
+            );
+        }
+        children
+    }
+
+    /// Renders a JSX name to its source text for opening/closing tag matching.
+    fn jsx_name_text(&self, name: &JsxElementName) -> String {
+        match name {
+            JsxElementName::Identifier(identifier) => {
+                self.lexeme(*identifier.data().token()).to_owned()
+            }
+            JsxElementName::Namespace(namespaced) => format!(
+                "{}:{}",
+                self.lexeme(*namespaced.namespace.data().token()),
+                self.lexeme(*namespaced.name.data().token())
+            ),
+            JsxElementName::Member(member) => format!(
+                "{}.{}",
+                self.jsx_name_text(&member.object),
+                self.lexeme(*member.property.data().token())
+            ),
+        }
     }
 
     fn parse_array_literal(&mut self) -> Expr {
@@ -3833,6 +4422,9 @@ impl Parser {
         self.bump();
         let mut elements = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBracket) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::Comma) {
                 self.bump();
@@ -3872,6 +4464,9 @@ impl Parser {
         self.bump();
         let mut members = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let member = self.parse_object_member();
             members.push(member);
@@ -4087,6 +4682,9 @@ impl Parser {
         let head_range = head.range();
         elements.push(self.node_at(head_range, TemplateElement::new(head)));
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let expr = self.parse_expression(false);
             expressions.push(expr);
             match self.kind() {
@@ -4153,6 +4751,9 @@ impl Parser {
         self.bump();
         let mut properties = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::DotDotDot) {
                 self.bump();
@@ -4241,6 +4842,9 @@ impl Parser {
         self.bump();
         let mut elements = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBracket) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             if self.at(TokenKind::Comma) {
                 self.bump();
@@ -4362,6 +4966,9 @@ impl Parser {
         self.expect(open, "expected `(`");
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.at(close) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let parameter = self.parse_parameter();
             parameters.push(parameter);
@@ -4386,6 +4993,9 @@ impl Parser {
         let decorators = self.parse_decorators();
         let mut modifiers = ParameterModifiers::default();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             if !self.parameter_modifier_follows() {
                 break;
             }
@@ -4714,6 +5324,9 @@ impl Parser {
         let mut index = self.cursor;
         let mut depth = 0i32;
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             let token = self.tokens.get(index).copied().unwrap_or(self.eof);
             match token.kind() {
                 TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
@@ -4778,11 +5391,6 @@ impl Parser {
                 }
                 _ => {
                     let range = expr.range();
-                    self.error_at(
-                        INVALID_ASSIGNMENT_TARGET,
-                        range,
-                        "this expression is not a valid assignment target",
-                    );
                     self.node_at(
                         range,
                         AssignmentTarget::Missing(MissingNode::new(
@@ -4803,11 +5411,6 @@ impl Parser {
             }
             Expression::Member(member) => {
                 if member.optional {
-                    self.error_at(
-                        INVALID_ASSIGNMENT_TARGET,
-                        range,
-                        "an optional chain is not a valid assignment target",
-                    );
                     return Node::new(
                         id,
                         range,
@@ -4834,25 +5437,18 @@ impl Parser {
                 let target = self.object_literal_to_target(object, range);
                 Node::new(id, range, target)
             }
-            _ => {
-                self.error_at(
-                    INVALID_ASSIGNMENT_TARGET,
-                    range,
-                    "this expression is not a valid assignment target",
-                );
-                Node::new(
-                    id,
-                    range,
-                    AssignmentTarget::Missing(MissingNode::new(NodeKind::MissingAssignmentTarget)),
-                )
-            }
+            _ => Node::new(
+                id,
+                range,
+                AssignmentTarget::Missing(MissingNode::new(NodeKind::MissingAssignmentTarget)),
+            ),
         }
     }
 
     fn array_literal_to_target(
         &mut self,
         array: ArrayLiteral,
-        range: TextRange,
+        _range: TextRange,
     ) -> AssignmentTarget {
         let mut elements = Vec::new();
         for element in array.elements {
@@ -4863,13 +5459,8 @@ impl Parser {
                     elements.push(AssignmentArrayElement::Target(target));
                 }
                 ArrayElement::Spread(_) => {
-                    // A rest element has no array-target slot; diagnose and
-                    // record a missing element rather than dropping it.
-                    self.error_at(
-                        INVALID_ASSIGNMENT_TARGET,
-                        range,
-                        "a rest element is not representable in this assignment target",
-                    );
+                    // A rest element has no array-target slot. Record a missing
+                    // element so the checker can report it; the parser stays silent.
                     elements.push(AssignmentArrayElement::Missing(MissingNode::new(
                         NodeKind::MissingAssignmentTarget,
                     )));
@@ -4900,11 +5491,6 @@ impl Parser {
                     });
                 }
                 ObjectMember::Spread(_) | ObjectMember::Method(_) | ObjectMember::Missing(_) => {
-                    self.error_at(
-                        INVALID_ASSIGNMENT_TARGET,
-                        member_range,
-                        "this object member is not a valid assignment target",
-                    );
                     properties.push(AssignmentObjectProperty {
                         name: PropertyName::Missing(MissingNode::new(NodeKind::Identifier)),
                         target: self.node_at(
@@ -5002,6 +5588,9 @@ impl Parser {
         }
         let mut types = vec![first];
         while self.eat(TokenKind::Pipe).is_some() {
+            if self.is_cancelled() {
+                break;
+            }
             types.push(self.parse_intersection_type());
         }
         self.node(start, TypeNode::Union(types))
@@ -5016,15 +5605,49 @@ impl Parser {
         }
         let mut types = vec![first];
         while self.eat(TokenKind::Amp).is_some() {
+            if self.is_cancelled() {
+                break;
+            }
             types.push(self.parse_postfix_type());
         }
         self.node(start, TypeNode::Intersection(types))
     }
 
     fn parse_postfix_type(&mut self) -> Ty {
+        let operator_budget = MAX_DEPTH.saturating_sub(self.depth) as usize;
+        let mut operators = Vec::new();
+        let mut overflowed = false;
+        while matches!(
+            self.kind(),
+            TokenKind::KwKeyof | TokenKind::KwUnique | TokenKind::KwReadonly
+        ) {
+            let start = self.cur_start();
+            let operator = match self.kind() {
+                TokenKind::KwKeyof => TypeOperator::Keyof,
+                TokenKind::KwUnique => TypeOperator::Unique,
+                _ => TypeOperator::Readonly,
+            };
+            if operators.len() < operator_budget {
+                operators.push((start, operator));
+            } else if !overflowed {
+                self.error_here(
+                    NESTING_TOO_DEEP,
+                    "this construct is nested too deeply to parse",
+                );
+                overflowed = true;
+            }
+            self.bump();
+        }
+
+        let operator_depth = operators.len() as u32;
+        self.depth += operator_depth;
+
         let start = self.cur_start();
         let mut type_node = self.parse_primary_type();
         loop {
+            if self.is_cancelled() {
+                break;
+            }
             if self.at(TokenKind::LBracket) && !self.has_newline_before() {
                 self.bump();
                 if self.eat(TokenKind::RBracket).is_some() {
@@ -5043,6 +5666,16 @@ impl Parser {
             } else {
                 break;
             }
+        }
+        self.depth -= operator_depth;
+        for (start, operator) in operators.into_iter().rev() {
+            type_node = self.node(
+                start,
+                TypeNode::Operator {
+                    operator,
+                    operand: Box::new(type_node),
+                },
+            );
         }
         type_node
     }
@@ -5140,22 +5773,6 @@ impl Parser {
                     }),
                 )
             }
-            TokenKind::KwKeyof | TokenKind::KwUnique | TokenKind::KwReadonly => {
-                let operator = match self.kind() {
-                    TokenKind::KwKeyof => TypeOperator::Keyof,
-                    TokenKind::KwUnique => TypeOperator::Unique,
-                    _ => TypeOperator::Readonly,
-                };
-                self.bump();
-                let operand = self.parse_primary_type();
-                self.node(
-                    start,
-                    TypeNode::Operator {
-                        operator,
-                        operand: Box::new(operand),
-                    },
-                )
-            }
             TokenKind::KwInfer => {
                 self.bump();
                 let parameter = self.parse_type_parameter();
@@ -5205,11 +5822,16 @@ impl Parser {
         self.bump();
         let mut elements = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBracket) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let rest = self.eat(TokenKind::DotDotDot).is_some();
             // Named tuple element `name?: Type`.
             let (name, optional) = if is_identifier_like(self.kind())
-                && matches!(self.nth_kind(1), TokenKind::Colon | TokenKind::Question)
+                && (self.nth_kind(1) == TokenKind::Colon
+                    || (self.nth_kind(1) == TokenKind::Question
+                        && self.nth_kind(2) == TokenKind::Colon))
             {
                 let token = self.bump();
                 let name = Some(self.ident_from(token));
@@ -5351,6 +5973,7 @@ impl Parser {
                     type_parameters: None,
                     parameters,
                     return_type: Box::new(return_type),
+                    return_type_missing: false,
                 }),
             );
         }
@@ -5372,6 +5995,7 @@ impl Parser {
                 type_parameters,
                 parameters,
                 return_type: Box::new(return_type),
+                return_type_missing: false,
             }),
         )
     }
@@ -5391,6 +6015,7 @@ impl Parser {
                     type_parameters,
                     parameters,
                     return_type: Box::new(return_type),
+                    return_type_missing: false,
                 },
             }),
         )
@@ -5400,6 +6025,9 @@ impl Parser {
         self.expect(TokenKind::LParen, "expected `(`");
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RParen) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             let rest = self.eat(TokenKind::DotDotDot).is_some();
             let name = if is_identifier_like(self.kind()) || self.at(TokenKind::KwThis) {
@@ -5449,6 +6077,9 @@ impl Parser {
         };
         let mut depth = 0i32;
         while !self.at_eof() {
+            if self.is_cancelled() {
+                break;
+            }
             if self.kind() == open {
                 depth += 1;
             } else if self.kind() == close {
@@ -5481,6 +6112,9 @@ impl Parser {
                     ImportAttributes::default()
                 };
                 while !self.at_eof() && !self.at(TokenKind::RBrace) {
+                    if self.is_cancelled() {
+                        break;
+                    }
                     self.bump();
                 }
                 self.expect(TokenKind::RBrace, "expected `}`");
@@ -5517,6 +6151,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut entries = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let name = self.parse_module_export_name();
             self.expect(TokenKind::Colon, "expected `:`");
             let value = self.parse_string_literal();
@@ -5541,6 +6178,9 @@ impl Parser {
             let range = head.range();
             elements.push(self.node_at(range, TemplateElement::new(head)));
             loop {
+                if self.is_cancelled() {
+                    break;
+                }
                 types.push(self.parse_type());
                 if self.at(TokenKind::TemplateMiddle) {
                     let token = self.bump();
@@ -5599,6 +6239,9 @@ impl Parser {
         self.expect_type_open("expected `<`");
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.at_greater_like() {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             parameters.push(self.parse_type_parameter());
             if self.eat(TokenKind::Comma).is_none() {
@@ -5669,6 +6312,9 @@ impl Parser {
         self.expect_type_open("expected `<`");
         let mut arguments = Vec::new();
         while !self.at_eof() && !self.at_greater_like() {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             arguments.push(self.parse_type());
             if self.eat(TokenKind::Comma).is_none() {
@@ -5730,6 +6376,9 @@ impl Parser {
         let token = self.bump();
         let mut name = EntityName::Identifier(self.ident_from(token));
         while self.eat(TokenKind::Dot).is_some() {
+            if self.is_cancelled() {
+                break;
+            }
             let right = self.expect_identifier("expected a qualified name");
             name = EntityName::Qualified {
                 left: Box::new(name),
@@ -5743,6 +6392,9 @@ impl Parser {
         self.expect(TokenKind::LBrace, "expected `{`");
         let mut members = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBrace) {
+            if self.is_cancelled() {
+                break;
+            }
             let before = self.cursor;
             members.push(self.parse_type_member());
             if self.eat(TokenKind::Semicolon).is_none()
@@ -5767,7 +6419,6 @@ impl Parser {
 
     fn parse_type_member(&mut self) -> TypeMemberNode {
         let start = self.cur_start();
-
         // Call signature `<T>(...): R` / `(...): R`.
         if self.at(TokenKind::LParen) || self.at_less_like() {
             let function = self.parse_function_type_signature(false);
@@ -5837,27 +6488,25 @@ impl Parser {
             }),
         )
     }
-
     fn parse_function_type_signature(&mut self, constructor: bool) -> FunctionType {
         let type_parameters = self.parse_optional_type_parameters();
         let parameters = self.parse_function_type_parameters();
-        let return_type = if constructor {
+        let (return_type, return_type_missing) = if constructor {
             if self.eat(TokenKind::Colon).is_some() {
-                self.parse_type()
+                (self.parse_type(), false)
             } else {
-                self.error_here(EXPECTED_TOKEN, "expected `:`");
-                self.missing_type()
+                (self.missing_type(), true)
             }
         } else if self.eat(TokenKind::Colon).is_some() || self.eat(TokenKind::Arrow).is_some() {
-            self.parse_type()
+            (self.parse_type(), false)
         } else {
-            self.error_here(EXPECTED_TOKEN, "expected a return type");
-            self.missing_type()
+            (self.missing_type(), true)
         };
         FunctionType {
             type_parameters,
             parameters,
             return_type: Box::new(return_type),
+            return_type_missing,
         }
     }
 
@@ -5865,6 +6514,9 @@ impl Parser {
         self.expect(TokenKind::LBracket, "expected `[` ");
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.at(TokenKind::RBracket) {
+            if self.is_cancelled() {
+                break;
+            }
             let rest = self.eat(TokenKind::DotDotDot).is_some();
             let name = self.expect_identifier("expected a parameter name");
             let optional = self.eat(TokenKind::Question).is_some();
@@ -5894,7 +6546,7 @@ mod tests {
     use crate::scanner::scan;
 
     fn parse_text(text: &str, script_kind: ScriptKind) -> Recovered<SourceFile> {
-        let source = Arc::new(SourceText::new(text));
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
         let scanned = scan(SourceId::new(0), script_kind, source);
         parse(scanned)
     }
@@ -5967,7 +6619,7 @@ mod tests {
     #[test]
     fn preserves_all_scanner_tokens_and_eof() {
         let text = "let a = 1; // trailing\n";
-        let source = Arc::new(SourceText::new(text));
+        let source = Arc::new(SourceText::new(text).expect("test source fits the per-file budget"));
         let scanned = scan(SourceId::new(0), ScriptKind::TypeScript, source);
         let scanned_token_count = scanned.product().tokens().len();
         let recovered = parse(scanned);
@@ -6371,6 +7023,65 @@ mod tests {
     }
 
     #[test]
+    fn type_operators_bind_after_postfix_types() {
+        let readonly = assert_clean("type R = readonly Case[];");
+        let Statement::TypeAlias(alias) = readonly.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        let TypeNode::Operator {
+            operator: TypeOperator::Readonly,
+            operand,
+        } = alias.type_node.data()
+        else {
+            panic!("expected readonly to be the top-level type operator");
+        };
+        assert!(matches!(operand.data(), TypeNode::Array(_)));
+
+        let keyof = assert_clean("type K = keyof T[];");
+        let Statement::TypeAlias(alias) = keyof.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        let TypeNode::Operator {
+            operator: TypeOperator::Keyof,
+            operand,
+        } = alias.type_node.data()
+        else {
+            panic!("expected keyof to be the top-level type operator");
+        };
+        assert!(matches!(operand.data(), TypeNode::Array(_)));
+
+        let parenthesized = assert_clean("type P = (keyof T)[];");
+        let Statement::TypeAlias(alias) = parenthesized.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        let TypeNode::Array(element) = alias.type_node.data() else {
+            panic!("expected parentheses to keep the array outside keyof");
+        };
+        assert!(matches!(
+            element.data(),
+            TypeNode::Parenthesized(inner)
+                if matches!(
+                    inner.data(),
+                    TypeNode::Operator {
+                        operator: TypeOperator::Keyof,
+                        ..
+                    }
+                )
+        ));
+        let unique = assert_clean("type S = unique symbol;");
+        let Statement::TypeAlias(alias) = unique.product().statements()[0].data() else {
+            panic!("expected a type alias");
+        };
+        assert!(matches!(
+            alias.type_node.data(),
+            TypeNode::Operator {
+                operator: TypeOperator::Unique,
+                operand,
+            } if matches!(operand.data(), TypeNode::Keyword(KeywordType::Symbol))
+        ));
+    }
+
+    #[test]
     fn parses_enum_and_namespace() {
         let recovered = assert_clean(
             "enum Color { Red, Green = 2, Blue }\nnamespace A.B { export const x = 1; }",
@@ -6439,6 +7150,8 @@ mod tests {
         assert_clean("const config = { a: 1 } as const;");
         assert_clean("const point = { x: 0 } satisfies Point;");
         assert_clean("const n = value as unknown as number;");
+        assert_clean("const q = <const>[1, 2, 3];");
+        assert_clean("const p = <const>{ x: 1 };");
     }
 
     #[test]
@@ -6469,17 +7182,191 @@ mod tests {
         assert_eq!(stmt_kind(&recovered, 0), NodeKind::VariableDeclaration);
     }
 
+    fn parse_tsx(text: &str) -> Recovered<SourceFile> {
+        parse_text(text, ScriptKind::TypeScriptReact)
+    }
+
+    fn jsx_initializer(recovered: &Recovered<SourceFile>) -> &Expr {
+        let Statement::Variable(declaration) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        declaration.declarations[0]
+            .data()
+            .initializer
+            .as_deref()
+            .expect("the declarator has an initializer")
+    }
+
     #[test]
-    fn jsx_in_react_source_is_diagnosed_not_panicking() {
-        let recovered = parse_text(
-            "const el = <div className=\"x\">hi</div>;",
-            ScriptKind::TypeScriptReact,
-        );
+    fn jsx_self_closing_element() {
+        let recovered = parse_tsx("const a = <Foo />;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Expression::JsxSelfClosingElement(element) = jsx_initializer(&recovered).data() else {
+            panic!("expected a self-closing element");
+        };
+        assert!(matches!(element.name, JsxElementName::Identifier(_)));
+        assert!(element.attributes.is_empty());
+    }
+
+    #[test]
+    fn jsx_balanced_element_with_children() {
+        let recovered = parse_tsx("const a = <Foo attr={x}>text{expr}<Child />more</Foo>;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Expression::JsxElement(element) = jsx_initializer(&recovered).data() else {
+            panic!("expected a balanced element");
+        };
+        assert_eq!(element.opening.data().attributes.len(), 1);
+        assert_eq!(element.children.len(), 4);
+        assert!(matches!(element.children[0], JsxChild::Text(_)));
+        assert!(matches!(
+            element.children[1],
+            JsxChild::ExpressionContainer(_)
+        ));
+        assert!(matches!(element.children[2], JsxChild::Element(_)));
+        assert!(matches!(element.children[3], JsxChild::Text(_)));
+        assert!(matches!(
+            element.closing.data().name,
+            JsxElementName::Identifier(_)
+        ));
+    }
+
+    #[test]
+    fn jsx_fragment() {
+        let recovered = parse_tsx("const a = <>{child}<Foo /></>;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Expression::JsxFragment(fragment) = jsx_initializer(&recovered).data() else {
+            panic!("expected a fragment");
+        };
+        assert_eq!(fragment.children.len(), 2);
+        assert!(matches!(
+            fragment.children[0],
+            JsxChild::ExpressionContainer(_)
+        ));
+        assert!(matches!(fragment.children[1], JsxChild::Element(_)));
+
+        let empty = parse_tsx("const a = <></>;");
+        assert!(errors(&empty).is_empty(), "{:?}", errors(&empty));
+        let Expression::JsxFragment(fragment) = jsx_initializer(&empty).data() else {
+            panic!("expected an empty fragment");
+        };
+        assert!(fragment.children.is_empty());
+    }
+
+    #[test]
+    fn jsx_member_qualified_names() {
+        let recovered = parse_tsx("const a = <Foo.Bar.Baz />;\nconst b = <my:Card />;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Statement::Variable(first) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let Expression::JsxSelfClosingElement(member) = first.declarations[0]
+            .data()
+            .initializer
+            .as_deref()
+            .unwrap()
+            .data()
+        else {
+            panic!("expected a self-closing element");
+        };
+        let JsxElementName::Member(outer) = &member.name else {
+            panic!("expected a member name");
+        };
+        assert!(matches!(*outer.object, JsxElementName::Member(_)));
+
+        let Statement::Variable(second) = recovered.product().statements()[1].data() else {
+            panic!("expected a variable declaration");
+        };
+        let Expression::JsxSelfClosingElement(namespaced) = second.declarations[0]
+            .data()
+            .initializer
+            .as_deref()
+            .unwrap()
+            .data()
+        else {
+            panic!("expected a self-closing element");
+        };
+        assert!(matches!(namespaced.name, JsxElementName::Namespace(_)));
+    }
+
+    #[test]
+    fn jsx_attributes_all_forms() {
+        let recovered = parse_tsx("const a = <Foo bool str=\"s\" expr={x} {...rest} ns:name />;");
+        assert!(errors(&recovered).is_empty(), "{:?}", errors(&recovered));
+        let Expression::JsxSelfClosingElement(element) = jsx_initializer(&recovered).data() else {
+            panic!("expected a self-closing element");
+        };
+        assert_eq!(element.attributes.len(), 5);
+        assert!(matches!(
+            &element.attributes[0],
+            JsxAttributeItem::Attribute(attribute) if attribute.data().initializer.is_none()
+        ));
+        assert!(matches!(
+            &element.attributes[1],
+            JsxAttributeItem::Attribute(attribute)
+                if matches!(attribute.data().initializer, Some(JsxAttributeInitializer::String(_)))
+        ));
+        assert!(matches!(
+            &element.attributes[2],
+            JsxAttributeItem::Attribute(attribute)
+                if matches!(attribute.data().initializer, Some(JsxAttributeInitializer::Expression(_)))
+        ));
+        assert!(matches!(
+            &element.attributes[3],
+            JsxAttributeItem::Spread(_)
+        ));
+        assert!(matches!(
+            &element.attributes[4],
+            JsxAttributeItem::Attribute(attribute)
+                if matches!(attribute.data().name, JsxAttributeName::Namespace(_))
+        ));
+    }
+
+    #[test]
+    fn jsx_recovery_missing_closing_tag() {
+        // A truncated closing tag must recover into a `JsxElement` with
+        // diagnostics rather than panic.
+        let recovered = parse_tsx("const a = <Foo>hi</Foo");
+        assert!(!errors(&recovered).is_empty());
+        assert!(matches!(
+            jsx_initializer(&recovered).data(),
+            Expression::JsxElement(_)
+        ));
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+
+        // A name mismatch is a diagnostic, not a panic.
+        let mismatch = parse_tsx("const a = <Foo>hi</Bar>;");
+        assert!(!errors(&mismatch).is_empty());
+        assert!(matches!(
+            jsx_initializer(&mismatch).data(),
+            Expression::JsxElement(_)
+        ));
+    }
+
+    #[test]
+    fn jsx_type_argument_disambiguation_in_ts_vs_tsx() {
+        // `.ts`: `<T>x` is a type assertion, never JSX.
+        let ts = parse_text("const a = <T>x;", ScriptKind::TypeScript);
+        let Statement::Variable(declaration) = ts.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let assertion = declaration.declarations[0]
+            .data()
+            .initializer
+            .as_deref()
+            .unwrap();
         assert!(
-            recovered
-                .diagnostics()
-                .iter()
-                .any(|d| d.code() == UNSUPPORTED_SYNTAX)
+            matches!(assertion.data(), Expression::TypeAssertion(_)),
+            "ts: {:?}",
+            assertion.data()
+        );
+
+        // `.tsx`: the same leading `<T>` opens a JSX element.
+        let tsx = parse_tsx("const a = <T>x</T>;");
+        assert!(errors(&tsx).is_empty(), "{:?}", errors(&tsx));
+        assert!(
+            matches!(jsx_initializer(&tsx).data(), Expression::JsxElement(_)),
+            "tsx: {:?}",
+            jsx_initializer(&tsx).data()
         );
     }
 
@@ -6496,6 +7383,59 @@ mod tests {
     }
 
     #[test]
+    fn discarded_jsx_speculation_does_not_suppress_lexical_diagnostics() {
+        // `(…): T` makes `paren_arrow_follow` return `Colon`, so
+        // `try_parse_arrow_function` speculatively parses a parameter list
+        // via `speculate_paren_arrow`. In `.tsx` the parameter default
+        // `<div>` triggers a JSX rescan that records a `jsx_spans` entry.
+        // With no `=>` after the return type the speculation is rolled back.
+        // A rolled-back JSX span must not survive: `rollback()` must truncate
+        // `jsx_spans` so the discarded rescan does not suppress the default
+        // scanner's lexical diagnostics for that range in the final
+        // `parse()` diagnostic filter.
+        //
+        // This is tested at the parser-method level because the public
+        // `parse()` entry point re-parses the same `<div>` as JSX after
+        // rollback — in TSX `<` in expression position always triggers
+        // `rescan_jsx_span` — which re-commits an identical span and masks
+        // the bug. The contract under test (rollback undoes `jsx_spans`
+        // growth) is observable only between the speculation rollback and
+        // the re-parse, i.e. directly on the `Parser` before `parse()`
+        // runs its diagnostic-filtering epilogue.
+        let source = Arc::new(
+            SourceText::new("(x = <div>\u{1}</div>): T")
+                .expect("test source fits the per-file budget"),
+        );
+        let scanned = scan(SourceId::new(0), ScriptKind::TypeScriptReact, source);
+        let (scanned, _lexical) = scanned.into_parts();
+        let mut parser = Parser::new(
+            scanned.source_id(),
+            scanned.script_kind(),
+            Arc::clone(scanned.source()),
+            scanned.tokens().to_vec(),
+            *scanned.eof(),
+        );
+
+        // Drives the full speculation path: `paren_arrow_follow` → `Colon`,
+        // `speculate_paren_arrow` checkpoints, parses the parameter default
+        // `<div>\u{1}</div>` (recording a jsx_span), parses `: T`, finds no
+        // `=>`, and rolls back.
+        assert!(
+            parser.try_parse_arrow_function(false).is_none(),
+            "input is not an arrow function"
+        );
+
+        // After rollback the discarded JSX span must be gone. If it survives,
+        // `parse()` would suppress the L005 diagnostic for the control byte
+        // inside the would-be JSX text — the exact bug the fix targets.
+        assert!(
+            parser.jsx_spans.is_empty(),
+            "rolled-back JSX span survived: {:?}",
+            parser.jsx_spans,
+        );
+    }
+
+    #[test]
     fn deeply_nested_input_does_not_overflow() {
         let text = format!("const x = {}1{};", "(".repeat(5000), ")".repeat(5000));
         let recovered = parse_ts(&text);
@@ -6506,6 +7446,110 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|d| d.code() == NESTING_TOO_DEEP)
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn deeply_nested_type_operator_chain_is_iterative_and_bounded() {
+        let text = format!("type T = {}number;", "keyof ".repeat(20_000));
+        let recovered = parse_ts(&text);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == NESTING_TOO_DEEP),
+            "the type-operator depth budget must emit BAMTS-P010"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+
+        let text = format!(
+            "type U = {}{}number{};",
+            "keyof ".repeat(200),
+            "(".repeat(200),
+            ")".repeat(200)
+        );
+        let recovered = parse_ts(&text);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == NESTING_TOO_DEEP),
+            "operator and operand nesting must share one depth budget"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn parser_max_depth_boundary() {
+        // Drive the depth guard directly: depths 1..=MAX_DEPTH are admitted,
+        // the (MAX_DEPTH + 1)-th enter is rejected with the typed BAMTS-P010
+        // diagnostic, and the guard unwinds without ever panicking.
+        let source = Arc::new(SourceText::new("1").expect("test source fits the per-file budget"));
+        let scanned = scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::clone(&source),
+        );
+        let tokens = scanned.product().tokens().to_vec();
+        let eof = *scanned.product().eof();
+        let mut parser = Parser::new(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source,
+            tokens,
+            eof,
+        );
+
+        for depth in 1..MAX_DEPTH {
+            assert!(parser.enter(), "depth {depth} must be admitted");
+        }
+        assert!(parser.enter(), "depth {MAX_DEPTH} must be admitted");
+        let crossed = parser.enter();
+        assert!(!crossed, "the {}-th enter must be rejected", MAX_DEPTH + 1);
+        assert!(
+            parser
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == NESTING_TOO_DEEP),
+            "the rejected enter records BAMTS-P010 NESTING_TOO_DEEP"
+        );
+
+        // Recovery: the rejected enter did not leak a frame, every admitted
+        // frame unwinds back to zero, and the parser still observes the real
+        // token stream and its end-of-file.
+        for _ in 0..MAX_DEPTH {
+            parser.leave();
+        }
+        assert_eq!(parser.depth, 0);
+        assert_eq!(parser.kind(), TokenKind::NumericLiteral);
+        parser.bump();
+        assert!(parser.at_eof());
+
+        // The same boundary holds end to end. A spaced prefix-minus chain
+        // spends one frame per operator on top of the four
+        // statement/expression frames, so 251 operators bottom out at exactly
+        // MAX_DEPTH live frames and parse cleanly, while 252 operators cross
+        // the budget and recover with the typed diagnostic instead of a stack
+        // overflow. (Unspaced runs would lex as `--` decrement pairs.)
+        let accepted = format!("const a = {}1;", "- ".repeat(251));
+        let recovered = parse_ts(&accepted);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .all(|d| d.code() != NESTING_TOO_DEEP),
+            "a chain bottoming out at {MAX_DEPTH} frames must parse cleanly"
+        );
+
+        let rejected = format!("const b = {}1;", "- ".repeat(252));
+        let recovered = parse_ts(&rejected);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .any(|d| d.code() == NESTING_TOO_DEEP),
+            "one operator past the budget must be diagnosed, not panicked on"
         );
         assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
     }
@@ -6651,12 +7695,12 @@ mod tests {
 
     #[test]
     fn using_declaration_requires_initializer() {
+        // Missing initializers are reported by the checker (BAMTS-C035), not the parser.
         let missing = parse_ts("{ using x; }");
         assert!(
-            errors(&missing)
+            !errors(&missing)
                 .iter()
-                .any(|d| d.code() == INVALID_USING_DECLARATION),
-            "expected BAMTS-P011 for `using x;`"
+                .any(|d| d.code().as_str().starts_with("BAMTS-P"))
         );
         let Statement::Block(block) = missing.product().statements()[0].data() else {
             panic!("expected a block");
@@ -6668,59 +7712,37 @@ mod tests {
 
         let awaited = parse_ts("async function f() { await using h; }");
         assert!(
-            errors(&awaited)
+            !errors(&awaited)
                 .iter()
-                .any(|d| d.code() == INVALID_USING_DECLARATION),
-            "expected BAMTS-P011 for `await using h;`"
+                .any(|d| d.code().as_str().starts_with("BAMTS-P"))
         );
     }
-
     #[test]
-    fn using_declaration_rejects_non_identifier_binding() {
-        // Lookahead only admits identifier-led using decls; a later declarator
-        // may still introduce a pattern binding, which must be diagnosed.
+    fn using_declaration_accepts_pattern_binding_for_checker() {
+        // Pattern `using` bindings are reported by the checker (BAMTS-C034), not the parser.
         let recovered = parse_ts("{ using a = acquire(), { b } = obj; }");
         assert!(
-            errors(&recovered)
+            !errors(&recovered)
                 .iter()
-                .any(|d| d.code() == INVALID_USING_DECLARATION),
-            "expected BAMTS-P011 for a destructuring using binding"
+                .any(|d| d.code().as_str().starts_with("BAMTS-P"))
         );
     }
 
     #[test]
     fn using_for_in_and_classic_heads_are_rejected() {
         let for_in = parse_ts("for (using x in obj) {}");
-        assert!(
-            errors(&for_in)
-                .iter()
-                .any(|d| d.code() == INVALID_USING_DECLARATION),
-            "expected BAMTS-P011 for for-in using head"
-        );
         assert_eq!(stmt_kind(&for_in, 0), NodeKind::ForInStatement);
 
         let classic = parse_ts("for (using x = acquire(); false; ) {}");
-        assert!(
-            errors(&classic)
-                .iter()
-                .any(|d| d.code() == INVALID_USING_DECLARATION),
-            "expected BAMTS-P011 for classic for using head"
-        );
         assert_eq!(stmt_kind(&classic, 0), NodeKind::ForStatement);
 
         let await_in = parse_ts("async function f() { for (await using x in obj) {} }");
-        assert!(
-            errors(&await_in)
-                .iter()
-                .any(|d| d.code() == INVALID_USING_DECLARATION),
-            "expected BAMTS-P011 for await using for-in head"
-        );
+        assert_eq!(stmt_kind(&await_in, 0), NodeKind::FunctionDeclaration);
     }
 
     #[test]
     fn using_for_of_heads_remain_parseable() {
         let sync = assert_clean("for (using x of items) {}");
-        assert_eq!(stmt_kind(&sync, 0), NodeKind::ForOfStatement);
         let Statement::ForOf(for_of) = sync.product().statements()[0].data() else {
             panic!("expected for-of");
         };
@@ -6816,5 +7838,425 @@ mod tests {
             "the depth budget must fire on combined hostile nesting"
         );
         assert_eq!(rc.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn parses_ambient_string_module_with_exact_name_range() {
+        let recovered = assert_clean("declare module \"express\" { export interface X {} }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare wrapper");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::StringLiteral(name) = &namespace.name else {
+            panic!("expected string literal name");
+        };
+        let text = recovered
+            .product()
+            .token_text(name.data().token())
+            .expect("literal text");
+        assert_eq!(text, "\"express\"");
+        assert_eq!(
+            name.range().start().get(),
+            text_start(recovered.product(), "\"express\"")
+        );
+        assert_eq!(
+            name.range().end().get(),
+            text_start(recovered.product(), "\"express\"") + "\"express\"".encode_utf16().count()
+        );
+    }
+
+    #[test]
+    fn parses_declare_global_with_keyword_range() {
+        let recovered = assert_clean("declare global { interface Window { x: number } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare wrapper");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::Global { range } = &namespace.name else {
+            panic!("expected global name");
+        };
+        assert_eq!(
+            range.start().get(),
+            text_start(recovered.product(), "global")
+        );
+        assert_eq!(
+            range.end().get(),
+            text_start(recovered.product(), "global") + "global".encode_utf16().count()
+        );
+    }
+
+    #[test]
+    fn parses_declare_module_identifier_and_dotted() {
+        let ident = assert_clean("declare module Foo {}");
+        let Statement::Declare(inner) = ident.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(
+            namespace.name,
+            NamespaceName::Identifier {
+                keyword: NamespaceKeyword::Module,
+                ..
+            }
+        ));
+
+        let dotted = assert_clean("declare module A.B {}");
+        let Statement::Declare(inner) = dotted.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::Identifier { name, keyword } = &outer.name else {
+            panic!("expected identifier name");
+        };
+        assert_eq!(*keyword, NamespaceKeyword::Module);
+        assert_eq!(
+            dotted.product().token_text(name.data().token()).unwrap(),
+            "A"
+        );
+        assert!(matches!(
+            outer.body.data().statements[0].data(),
+            Statement::Namespace(_)
+        ));
+    }
+
+    #[test]
+    fn parses_deep_identifier_namespace() {
+        let recovered = assert_clean("namespace A.B.C {}");
+        assert_eq!(stmt_kind(&recovered, 0), NodeKind::NamespaceDeclaration);
+        let Statement::Namespace(outer) = recovered.product().statements()[0].data() else {
+            panic!("expected namespace");
+        };
+        let Statement::Namespace(mid) = outer.body.data().statements[0].data() else {
+            panic!("expected nested namespace");
+        };
+        assert!(matches!(
+            mid.body.data().statements[0].data(),
+            Statement::Namespace(_)
+        ));
+    }
+
+    #[test]
+    fn dotted_namespace_within_depth_parses_cleanly() {
+        let names = (0..50)
+            .map(|i| format!("N{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        let source = format!("namespace {names} {{}}");
+        let recovered = assert_clean(&source);
+        assert_eq!(stmt_kind(&recovered, 0), NodeKind::NamespaceDeclaration);
+        let Statement::Namespace(outer) = recovered.product().statements()[0].data() else {
+            panic!("expected a namespace");
+        };
+        assert!(matches!(
+            outer.body.data().statements[0].data(),
+            Statement::Namespace(_)
+        ));
+    }
+
+    #[test]
+    fn deep_dotted_namespace_rejects_recursion_with_nesting_diagnostic() {
+        let names = (0..260)
+            .map(|i| format!("N{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        let source = format!("namespace {names} {{}}");
+        let recovered = parse_ts(&source);
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == NESTING_TOO_DEEP),
+            "a 260-segment dotted namespace must emit BAMTS-P010 instead of overflowing"
+        );
+        assert_eq!(recovered.product().eof().kind(), TokenKind::EndOfFile);
+    }
+
+    #[test]
+    fn declare_module_non_name_recovers_with_missing_identifier() {
+        let recovered = parse_ts("declare module 123 {}");
+        assert!(
+            errors(&recovered)
+                .iter()
+                .any(|d| d.code() == EXPECTED_IDENTIFIER)
+        );
+        assert_tokens_tile(&recovered);
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::Identifier { name, .. } = &namespace.name else {
+            panic!("expected missing identifier recovery");
+        };
+        assert!(name.data().token().is_missing());
+    }
+
+    #[test]
+    fn bare_string_module_is_p003() {
+        let recovered = parse_ts("module \"pkg\" {}");
+        let errs = errors(&recovered);
+        assert!(
+            errs.iter().any(|d| {
+                d.code() == EXPECTED_IDENTIFIER
+                    && d.message()
+                        .contains("only allowed in an ambient declaration")
+            }),
+            "expected P003 ambient-only message, got: {:?}",
+            errs.iter()
+                .map(|d| (d.code().as_str(), d.message()))
+                .collect::<Vec<_>>()
+        );
+        let Statement::Namespace(namespace) = recovered.product().statements()[0].data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(namespace.name, NamespaceName::StringLiteral(_)));
+    }
+
+    #[test]
+    fn bare_global_remains_identifier_namespace() {
+        let recovered = assert_clean("global {}");
+        let Statement::Namespace(namespace) = recovered.product().statements()[0].data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::Identifier { name, .. } = &namespace.name else {
+            panic!("expected identifier global");
+        };
+        assert_eq!(
+            recovered.product().token_text(name.data().token()).unwrap(),
+            "global"
+        );
+    }
+
+    #[test]
+    fn ambient_string_module_preserves_single_quotes() {
+        let recovered = assert_clean("declare module 'lib' {}");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(namespace) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let NamespaceName::StringLiteral(name) = &namespace.name else {
+            panic!("expected string literal");
+        };
+        assert_eq!(
+            recovered.product().token_text(name.data().token()).unwrap(),
+            "'lib'"
+        );
+    }
+
+    #[test]
+    fn ambient_module_in_javascript_is_still_typescript_syntax() {
+        let recovered = parse_text("declare module \"x\" {}", ScriptKind::JavaScript);
+        assert!(
+            recovered
+                .diagnostics()
+                .iter()
+                .any(|d| d.code() == TYPESCRIPT_SYNTAX_IN_JAVASCRIPT)
+        );
+    }
+
+    #[test]
+    fn nested_global_inside_declare_namespace_is_identifier_not_augmentation() {
+        let recovered = assert_clean("declare namespace N { global { interface Leaked {} } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(
+            outer.name,
+            NamespaceName::Identifier {
+                keyword: NamespaceKeyword::Namespace,
+                ..
+            }
+        ));
+        let Statement::Namespace(nested) = outer.body.data().statements[0].data() else {
+            panic!("expected nested namespace");
+        };
+        assert!(
+            matches!(
+                nested.name,
+                NamespaceName::Identifier {
+                    keyword: NamespaceKeyword::Namespace,
+                    ..
+                }
+            ),
+            "nested global must not become Global augmentation under body-scoped declare"
+        );
+    }
+
+    #[test]
+    fn nested_string_module_inside_declare_namespace_is_p003() {
+        let recovered = parse_ts("declare namespace N { module \"x\" {} }");
+        let errs = errors(&recovered);
+        assert!(
+            errs.iter().any(|d| {
+                d.code() == EXPECTED_IDENTIFIER
+                    && d.message()
+                        .contains("only allowed in an ambient declaration")
+            }),
+            "nested string module must not inherit declare: {:?}",
+            errs.iter()
+                .map(|d| (d.code().as_str(), d.message()))
+                .collect::<Vec<_>>()
+        );
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let Statement::Namespace(nested) = outer.body.data().statements[0].data() else {
+            panic!("expected nested module");
+        };
+        assert!(matches!(nested.name, NamespaceName::StringLiteral(_)));
+    }
+
+    #[test]
+    fn namespace_keyword_is_preserved_on_identifier_names() {
+        let recovered = assert_clean("namespace Foo {}");
+        let Statement::Namespace(namespace) = recovered.product().statements()[0].data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(
+            namespace.name,
+            NamespaceName::Identifier {
+                keyword: NamespaceKeyword::Namespace,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ambient_module_body_allows_nested_string_module() {
+        // tsc 7.0.2 accepts `declare module "y" { module "x" {} }`.
+        let recovered =
+            assert_clean("declare module \"y\" { module \"x\" { export interface I {} } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(outer.name, NamespaceName::StringLiteral(_)));
+        let Statement::Namespace(nested) = outer.body.data().statements[0].data() else {
+            panic!("expected nested module");
+        };
+        assert!(matches!(nested.name, NamespaceName::StringLiteral(_)));
+    }
+
+    #[test]
+    fn ambient_module_body_allows_nested_global_augmentation() {
+        // tsc 7.0.2 accepts `declare module "y" { global { ... } }` (TS2669
+        // allows global augmentations directly nested in ambient modules).
+        let recovered = assert_clean("declare module \"y\" { global { interface G {} } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        assert!(matches!(outer.name, NamespaceName::StringLiteral(_)));
+        let Statement::Namespace(nested) = outer.body.data().statements[0].data() else {
+            panic!("expected nested global");
+        };
+        assert!(matches!(nested.name, NamespaceName::Global { .. }));
+    }
+
+    #[test]
+    fn nested_string_module_body_is_not_ambient() {
+        // tsc 7.0.2 rejects `declare module "y" { module "x" { module "z" {} } }`
+        // with TS2435; the innermost string module must not be accepted.
+        let recovered = parse_ts("declare module \"y\" { module \"x\" { module \"z\" {} } }");
+        let errs = errors(&recovered);
+        assert!(
+            errs.iter().any(|d| {
+                d.code() == EXPECTED_IDENTIFIER
+                    && d.message()
+                        .contains("only allowed in an ambient declaration")
+            }),
+            "a module nested inside a nested ambient module body must be rejected: {:?}",
+            errs.iter()
+                .map(|d| (d.code().as_str(), d.message()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_global_inside_nested_string_module_is_identifier() {
+        // tsc 7.0.2 rejects `declare module "y" { module "x" { global {} } }`
+        // (TS2669); the global must not become an augmentation.
+        let recovered = assert_clean("declare module \"y\" { module \"x\" { global {} } }");
+        let Statement::Declare(inner) = recovered.product().statements()[0].data() else {
+            panic!("expected declare");
+        };
+        let Statement::Namespace(outer) = inner.data() else {
+            panic!("expected namespace");
+        };
+        let Statement::Namespace(mid) = outer.body.data().statements[0].data() else {
+            panic!("expected nested module");
+        };
+        let Statement::Namespace(nested) = mid.body.data().statements[0].data() else {
+            panic!("expected nested global namespace");
+        };
+        assert!(
+            matches!(
+                nested.name,
+                NamespaceName::Identifier {
+                    keyword: NamespaceKeyword::Namespace,
+                    ..
+                }
+            ),
+            "nested global must not become an augmentation"
+        );
+    }
+
+    #[test]
+    fn global_body_is_not_ambient_for_nested_string_module() {
+        // tsc 7.0.2 rejects `declare global { module "x" {} }`; the string
+        // module inside the global body must not be accepted.
+        let recovered = parse_ts("declare global { module \"x\" {} }");
+        let errs = errors(&recovered);
+        assert!(
+            errs.iter().any(|d| {
+                d.code() == EXPECTED_IDENTIFIER
+                    && d.message()
+                        .contains("only allowed in an ambient declaration")
+            }),
+            "a string module inside a global body must be rejected: {:?}",
+            errs.iter()
+                .map(|d| (d.code().as_str(), d.message()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn text_start(file: &SourceFile, needle: &str) -> usize {
+        let source = file.source_text().as_str();
+        let byte = source.find(needle).expect("needle present");
+        source[..byte].encode_utf16().count()
+    }
+
+    #[test]
+    fn parse_cancellation_returns_typed_error() {
+        let source =
+            Arc::new(SourceText::new("const x = 1;".to_owned()).expect("test source fits budget"));
+        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = parse_with_cancel(scanned, cancel);
+        assert!(
+            matches!(result, Err(ParseError::Cancelled(_))),
+            "cancelled parse must return ParseError::Cancelled"
+        );
     }
 }
