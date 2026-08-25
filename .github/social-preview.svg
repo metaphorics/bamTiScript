@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">bamTiScript pre-release social preview</title>
+  <desc id="description">A compiler pipeline from TypeScript source through an abstract syntax tree and bytecode to native output.</desc>
+  <style>
+    .background { fill: #181a1b; }
+    .panel { fill: #232728; stroke: #3b4343; stroke-width: 2; }
+    .brand { fill: #d94f28; font: 700 72px "IBM Plex Sans", Inter, sans-serif; }
+    .subtitle { fill: #f4f1e8; font: 400 30px "IBM Plex Mono", "JetBrains Mono", monospace; letter-spacing: 1px; }
+    .status { fill: #f4f1e8; font: 700 16px "IBM Plex Sans", Inter, sans-serif; letter-spacing: 2px; }
+    .code { fill: #f4f1e8; font: 500 16px "IBM Plex Mono", "JetBrains Mono", monospace; }
+    .muted { fill: #a9b1aa; font: 500 14px "IBM Plex Mono", "JetBrains Mono", monospace; }
+    .accent-fill { fill: #0f8a83; }
+    .accent-stroke { fill: none; stroke: #0f8a83; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+    .node { fill: #f4f1e8; stroke: #0f8a83; stroke-width: 3; }
+    .machine { fill: #f4f1e8; stroke: #d94f28; stroke-width: 1.5; }
+  </style>
+  <rect class="background" width="1280" height="640"/>
+
+  <text class="brand" x="80" y="116">bamTiScript</text>
+  <text class="subtitle" x="82" y="164">TypeScript 7.0.2 in Rust</text>
+  <rect class="accent-fill" x="82" y="190" width="140" height="34" rx="17"/>
+  <text class="status" x="105" y="213">PRE-RELEASE</text>
+
+  <rect class="panel" x="80" y="286" width="250" height="220" rx="12"/>
+  <text class="muted" x="104" y="318">TYPESCRIPT SOURCE</text>
+  <text class="code" x="104" y="362">interface Node {</text>
+  <text class="code" x="124" y="390">kind: string</text>
+  <text class="code" x="104" y="418">}</text>
+  <text class="code" x="104" y="454">const answer = 42</text>
+  <text class="code" x="104" y="482">compile(answer)</text>
+
+  <path class="accent-stroke" d="M348 396h62m-16-12 16 12-16 12"/>
+
+  <rect class="panel" x="430" y="286" width="180" height="220" rx="12"/>
+  <text class="muted" x="454" y="318">SYNTAX TREE</text>
+  <path class="accent-stroke" d="M520 350v36m0 0-42 48m42-48 42 48m-84 0-22 36m22-36 22 36m62-36-22 36m22-36 22 36"/>
+  <circle class="node" cx="520" cy="350" r="8"/>
+  <circle class="node" cx="520" cy="386" r="8"/>
+  <circle class="node" cx="478" cy="434" r="8"/>
+  <circle class="node" cx="562" cy="434" r="8"/>
+  <circle class="node" cx="456" cy="470" r="7"/>
+  <circle class="node" cx="500" cy="470" r="7"/>
+  <circle class="node" cx="540" cy="470" r="7"/>
+  <circle class="node" cx="584" cy="470" r="7"/>
+
+  <path class="accent-stroke" d="M628 396h62m-16-12 16 12-16 12"/>
+
+  <rect class="panel" x="710" y="286" width="210" height="220" rx="12"/>
+  <text class="muted" x="734" y="318">VERIFIED BYTECODE</text>
+  <g class="code" text-anchor="middle">
+    <rect class="accent-fill" x="734" y="344" width="74" height="34" rx="4"/><text x="771" y="367">OP_PUSH</text>
+    <rect class="panel" x="822" y="344" width="74" height="34" rx="4"/><text x="859" y="367">OP_CALL</text>
+    <rect class="panel" x="734" y="390" width="74" height="34" rx="4"/><text x="771" y="413">OP_LOAD</text>
+    <rect class="accent-fill" x="822" y="390" width="74" height="34" rx="4"/><text x="859" y="413">OP_ADD</text>
+    <rect class="panel" x="734" y="436" width="74" height="34" rx="4"/><text x="771" y="459">OP_STORE</text>
+    <rect class="accent-fill" x="822" y="436" width="74" height="34" rx="4"/><text x="859" y="459">OP_RET</text>
+  </g>
+
+  <path class="accent-stroke" d="M938 396h62m-16-12 16 12-16 12"/>
+
+  <rect class="panel" x="1020" y="286" width="180" height="220" rx="12"/>
+  <text class="muted" x="1044" y="318">NATIVE OUTPUT</text>
+  <g>
+    <rect class="machine" x="1046" y="348" width="24" height="24"/><rect class="machine" x="1080" y="348" width="24" height="24"/><rect class="machine" x="1114" y="348" width="24" height="24"/><rect class="machine" x="1148" y="348" width="24" height="24"/>
+    <rect class="machine" x="1046" y="382" width="24" height="24"/><rect class="accent-fill" x="1080" y="382" width="24" height="24"/><rect class="machine" x="1114" y="382" width="24" height="24"/><rect class="machine" x="1148" y="382" width="24" height="24"/>
+    <rect class="machine" x="1046" y="416" width="24" height="24"/><rect class="machine" x="1080" y="416" width="24" height="24"/><rect class="accent-fill" x="1114" y="416" width="24" height="24"/><rect class="machine" x="1148" y="416" width="24" height="24"/>
+    <rect class="machine" x="1046" y="450" width="24" height="24"/><rect class="machine" x="1080" y="450" width="24" height="24"/><rect class="machine" x="1114" y="450" width="24" height="24"/><rect class="accent-fill" x="1148" y="450" width="24" height="24"/>
+  </g>
+</svg>
