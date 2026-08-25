@@ -1,0 +1,216 @@
+name: Weekly audit
+
+on:
+  schedule:
+    - cron: "42 4 * * 0"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-audit
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  preflight:
+    name: Preflight sync and ledger audit
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.label.name == 's0-weekly-dry-run')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Assert source commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Install Node dependencies
+        shell: bash
+        run: npm ci
+      - name: Assert Node version
+        shell: bash
+        run: '[[ "$(node --version)" == "v24.18.0" ]]'
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy --component rust-src
+          rustup default "$channel"
+      - name: Sync pinned conformance suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+      - name: Audit ledger completeness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked -p bamts-verification --bin ts_conformance -- audit-ledger --require-complete
+
+  audit:
+    name: Audit shard ${{ matrix.shard }}/32
+    needs: preflight
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+          - 17
+          - 18
+          - 19
+          - 20
+          - 21
+          - 22
+          - 23
+          - 24
+          - 25
+          - 26
+          - 27
+          - 28
+          - 29
+          - 30
+          - 31
+          - 32
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Assert source commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Install Node dependencies
+        shell: bash
+        run: npm ci
+      - name: Assert Node version
+        shell: bash
+        run: '[[ "$(node --version)" == "v24.18.0" ]]'
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy --component rust-src
+          rustup default "$channel"
+      - name: Resync pinned conformance suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+      - name: Run weekly-audit shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/weekly
+          cargo run --locked -p bamts-verification --bin ts_conformance -- ci --mode weekly-audit --status all --backend all --shards ${{ matrix.shard }}/32 2>&1 | tee target/weekly/shard-${{ matrix.shard }}.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: weekly-shard-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: target/weekly/shard-${{ matrix.shard }}.log
+          if-no-files-found: error
+          retention-days: 30
+
+  accounting:
+    name: Weekly audit accounting
+    needs: audit
+    if: always() && needs.audit.result != 'skipped'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Assert source commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Install Node dependencies
+        shell: bash
+        run: npm ci
+      - name: Assert Node version
+        shell: bash
+        run: '[[ "$(node --version)" == "v24.18.0" ]]'
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy --component rust-src
+          rustup default "$channel"
+      - name: Download shard logs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: weekly-shard-*
+          path: target/weekly
+          merge-multiple: true
+      - name: Verify and summarize shard logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          shards=(target/weekly/shard-*.log)
+          if [[ "${#shards[@]}" -ne 32 ]]; then
+            echo "Expected 32 shard-*.log files, found ${#shards[@]}" >&2
+            exit 1
+          fi
+          {
+            echo "## Weekly audit shard evidence"
+            echo
+            echo "Collected ${#shards[@]} shard logs."
+            echo
+            echo "### Rollups"
+            for file in "${shards[@]}"; do
+              echo "#### $(basename "$file")"
+              sed -n '/^rollup /p' "$file"
+            done
+          } | tee target/weekly/weekly-audit-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Resync suite for authoritative ledger audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+      - name: Rerun authoritative ledger audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked -p bamts-verification --bin ts_conformance -- audit-ledger --require-complete
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: weekly-audit-accounting-${{ github.run_attempt }}
+          path: target/weekly
+          if-no-files-found: error
+          retention-days: 30

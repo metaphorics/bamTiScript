@@ -480,6 +480,18 @@
       "evidence": "Unused @ts-expect-error directive -> TS2578 via tsc --noEmit when the following statement has no diagnostic.",
       "status": "mapped",
       "tsCode": 2578
+    },
+    {
+      "bamtsCode": "BAMTS-C071",
+      "evidence": "Circular type-parameter default -> TS2716 via tsc --noEmit on \"interface SelfReference<T = SelfReference> {}\".",
+      "status": "mapped",
+      "tsCode": 2716
+    },
+    {
+      "bamtsCode": "BAMTS-C072",
+      "evidence": "Circular type alias -> TS2456 via tsc --noEmit on \"type A = A;\".",
+      "status": "mapped",
+      "tsCode": 2456
     }
   ]
 }

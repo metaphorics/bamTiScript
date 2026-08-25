@@ -40,7 +40,8 @@ use super::{
     PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
     SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-    SUPER_REFERENCE_NON_DERIVED, TYPE_NOT_ASSIGNABLE, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
+    SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE,
+    TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
     USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
     USING_DECLARATION_MISSING_INITIALIZER, WITH_STATEMENT_NOT_ALLOWED,
 };
@@ -65,9 +66,11 @@ use super::{
     PROPERTY_NOT_INITIALIZED_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
     SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
-    SUPER_REFERENCE_NON_DERIVED_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
-    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
-    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    SUPER_REFERENCE_NON_DERIVED_MESSAGE, TYPE_ALIAS_CIRCULAR_MESSAGE,
+    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
+    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
+    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
+    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -1158,11 +1161,19 @@ pub enum Type {
     Intersection(Vec<TypeId>),
     ObjectType(ObjectType),
     Function(FunctionSignature),
-    /// A nominal type-parameter or interface head compared by identity.
+    /// A nominal type-parameter or interface head compared by identity. During
+    /// alias resolution it also serves as the inert head before application.
     Named(SymbolId),
     /// The canonical semantic identity of a class instance or generic interface
     /// application. The argument vector is complete, including defaults.
     AppliedClass {
+        symbol: SymbolId,
+        arguments: Vec<TypeId>,
+    },
+    /// The canonical identity of a recursive generic type-alias application.
+    /// Only occurrences resolved while the declaration is in progress are
+    /// interned; its finite structural view is stored separately.
+    AppliedAlias {
         symbol: SymbolId,
         arguments: Vec<TypeId>,
     },
@@ -1226,6 +1237,15 @@ struct ClassMetadata {
     template: Option<ClassTemplate>,
 }
 
+#[derive(Clone, Debug)]
+struct AliasMetadata {
+    parameters: Vec<SymbolId>,
+    bounds: Vec<TypeParameterBounds>,
+    bounds_resolving: bool,
+    bounds_ready: bool,
+    template: Option<TypeId>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AppliedClassView {
     revision: u32,
@@ -1236,6 +1256,7 @@ struct AppliedClassView {
 struct ImportedTypeMap {
     types: HashMap<TypeId, TypeId>,
     symbols: HashMap<SymbolId, SymbolId>,
+    synthesized: Vec<(SymbolId, SymbolId)>,
 }
 
 /// An interning table for structural types plus the assignability relation.
@@ -1276,9 +1297,16 @@ pub struct TypeTable {
     /// Class heads whose shallow views are being materialized. Per-head
     /// recursion permits finite A-to-B expansion without unrolling A<T[]> forever.
     materializing_class_views: HashSet<SymbolId>,
-    /// Applied heads skipped by the per-symbol recursion guard. A bounded
-    /// outer drain gives each skipped head one later materialization attempt.
+    /// Same-symbol heads deferred by the current top-level materialization.
+    /// One snapshot retries; descendants created by that retry are discarded.
     deferred_class_views: VecDeque<TypeId>,
+    aliases: HashMap<SymbolId, AliasMetadata>,
+    applied_alias_views: HashMap<TypeId, TypeId>,
+    materializing_alias_views: HashSet<SymbolId>,
+    deferred_alias_views: VecDeque<TypeId>,
+    circular_aliases: HashSet<SymbolId>,
+    substituted_alias_heads: Vec<TypeId>,
+    preparing_substituted_aliases: HashSet<SymbolId>,
     /// Completed structural body for an interface symbol. Recursive member
     /// references use `Type::Named(symbol)` as an inert head and expand through
     /// this single view after the body has been interned.
@@ -1323,6 +1351,13 @@ impl TypeTable {
             applied_class_views: HashMap::new(),
             materializing_class_views: HashSet::new(),
             deferred_class_views: VecDeque::new(),
+            aliases: HashMap::new(),
+            applied_alias_views: HashMap::new(),
+            materializing_alias_views: HashSet::new(),
+            deferred_alias_views: VecDeque::new(),
+            circular_aliases: HashSet::new(),
+            substituted_alias_heads: Vec::new(),
+            preparing_substituted_aliases: HashSet::new(),
             interface_structures: HashMap::new(),
             iterable_views: HashMap::new(),
         };
@@ -1432,6 +1467,9 @@ impl TypeTable {
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
                 .and_then(|view| self.property_type(view, name)),
+            Type::AppliedAlias { .. } => self
+                .prepare_applied_alias_view(ty)
+                .and_then(|view| self.property_type(view, name)),
             _ => None,
         }
     }
@@ -1469,6 +1507,9 @@ impl TypeTable {
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
                 .and_then(|view| self.generator_return_type(view)),
+            Type::AppliedAlias { .. } => self
+                .prepare_applied_alias_view(ty)
+                .and_then(|view| self.generator_return_type(view)),
             _ => None,
         }
     }
@@ -1494,6 +1535,9 @@ impl TypeTable {
             },
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
+                .and_then(|view| self.iterator_property_of(view, protocol)),
+            Type::AppliedAlias { .. } => self
+                .prepare_applied_alias_view(ty)
                 .and_then(|view| self.iterator_property_of(view, protocol)),
             Type::Intersection(members) => {
                 let mut properties = Vec::with_capacity(members.len());
@@ -1599,6 +1643,9 @@ impl TypeTable {
             }
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
+                .and_then(|view| self.read_property_type(view, name)),
+            Type::AppliedAlias { .. } => self
+                .prepare_applied_alias_view(ty)
                 .and_then(|view| self.read_property_type(view, name)),
             _ => None,
         }
@@ -1711,6 +1758,14 @@ impl TypeTable {
             .map_or(&[], |metadata| metadata.parameters.as_slice())
     }
 
+    pub(crate) fn class_template_raw(&self, symbol: SymbolId) -> Option<TypeId> {
+        self.classes
+            .get(&symbol)?
+            .template
+            .as_ref()
+            .map(|template| template.raw)
+    }
+
     #[must_use]
     pub fn class_type_parameter_bounds(&self, symbol: SymbolId) -> &[TypeParameterBounds] {
         self.classes
@@ -1751,6 +1806,247 @@ impl TypeTable {
     /// Sets resolved type-parameter bounds for a class in one step.
     pub fn set_class_bounds(&mut self, symbol: SymbolId, bounds: Vec<TypeParameterBounds>) {
         self.finish_class_bounds(symbol, bounds);
+    }
+
+    pub fn declare_alias(&mut self, symbol: SymbolId, parameters: Vec<SymbolId>) {
+        self.aliases.entry(symbol).or_insert_with(|| AliasMetadata {
+            bounds: vec![TypeParameterBounds::NONE; parameters.len()],
+            parameters,
+            bounds_resolving: false,
+            bounds_ready: false,
+            template: None,
+        });
+    }
+
+    #[must_use]
+    pub fn has_alias(&self, symbol: SymbolId) -> bool {
+        self.aliases.contains_key(&symbol)
+    }
+
+    #[must_use]
+    pub fn alias_type_parameters(&self, symbol: SymbolId) -> &[SymbolId] {
+        self.aliases
+            .get(&symbol)
+            .map_or(&[], |metadata| metadata.parameters.as_slice())
+    }
+
+    pub(crate) fn alias_template_raw(&self, symbol: SymbolId) -> Option<TypeId> {
+        self.aliases.get(&symbol)?.template
+    }
+
+    #[must_use]
+    pub fn alias_type_parameter_bounds(&self, symbol: SymbolId) -> &[TypeParameterBounds] {
+        self.aliases
+            .get(&symbol)
+            .map_or(&[], |metadata| metadata.bounds.as_slice())
+    }
+
+    #[must_use]
+    pub fn alias_bounds_ready(&self, symbol: SymbolId) -> bool {
+        self.aliases
+            .get(&symbol)
+            .is_some_and(|metadata| metadata.bounds_ready)
+    }
+
+    pub fn begin_alias_bounds(&mut self, symbol: SymbolId) -> bool {
+        let Some(metadata) = self.aliases.get_mut(&symbol) else {
+            return false;
+        };
+        if metadata.bounds_ready || metadata.bounds_resolving {
+            return false;
+        }
+        metadata.bounds_resolving = true;
+        true
+    }
+
+    pub fn finish_alias_bounds(&mut self, symbol: SymbolId, bounds: Vec<TypeParameterBounds>) {
+        let Some(metadata) = self.aliases.get_mut(&symbol) else {
+            return;
+        };
+        debug_assert_eq!(metadata.parameters.len(), bounds.len());
+        metadata.bounds = bounds;
+        metadata.bounds_resolving = false;
+        metadata.bounds_ready = true;
+    }
+
+    pub(crate) fn intern_applied_alias(
+        &mut self,
+        symbol: SymbolId,
+        arguments: Vec<TypeId>,
+    ) -> TypeId {
+        debug_assert!(
+            self.aliases
+                .get(&symbol)
+                .is_none_or(|metadata| metadata.parameters.len() == arguments.len())
+        );
+        self.intern(Type::AppliedAlias { symbol, arguments })
+    }
+
+    pub fn applied_alias(&mut self, symbol: SymbolId, arguments: Vec<TypeId>) -> TypeId {
+        let type_id = self.intern_applied_alias(symbol, arguments);
+        self.materialize_applied_alias_view(type_id);
+        type_id
+    }
+
+    pub fn publish_alias_template(&mut self, symbol: SymbolId, raw: TypeId) {
+        let Some(metadata) = self.aliases.get_mut(&symbol) else {
+            return;
+        };
+        debug_assert!(metadata.template.is_none());
+        metadata.template = Some(raw);
+        let heads: Vec<TypeId> = self
+            .types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ty)| {
+                matches!(ty, Type::AppliedAlias { symbol: head, .. } if *head == symbol).then_some(
+                    TypeId(u32::try_from(index).expect("type count fits in u32")),
+                )
+            })
+            .collect();
+        for head in heads {
+            self.materialize_applied_alias_view(head);
+        }
+    }
+
+    pub fn prepare_applied_alias_view(&mut self, type_id: TypeId) -> Option<TypeId> {
+        self.materialize_applied_alias_view(type_id);
+        self.applied_alias_view(type_id)
+    }
+
+    pub(crate) fn substituted_alias_marker(&self) -> usize {
+        self.substituted_alias_heads.len()
+    }
+
+    pub(crate) fn intern_substituted_alias(
+        &mut self,
+        symbol: SymbolId,
+        arguments: Vec<TypeId>,
+    ) -> TypeId {
+        let type_id = self.intern_applied_alias(symbol, arguments);
+        if !self.applied_alias_views.contains_key(&type_id) {
+            self.substituted_alias_heads.push(type_id);
+        }
+        type_id
+    }
+
+    pub(crate) fn prepare_substituted_aliases(&mut self, marker: usize) {
+        let heads = self.substituted_alias_heads.split_off(marker);
+        for type_id in heads {
+            let Type::AppliedAlias { symbol, .. } = self.get(type_id) else {
+                continue;
+            };
+            let symbol = *symbol;
+            if !self.preparing_substituted_aliases.insert(symbol) {
+                continue;
+            }
+            self.materialize_applied_alias_view(type_id);
+            self.preparing_substituted_aliases.remove(&symbol);
+        }
+    }
+
+    #[must_use]
+    pub fn applied_alias_view(&self, type_id: TypeId) -> Option<TypeId> {
+        if !matches!(self.get(type_id), Type::AppliedAlias { .. }) {
+            return None;
+        }
+        self.applied_alias_views.get(&type_id).copied()
+    }
+
+    fn materialize_applied_alias_view(&mut self, type_id: TypeId) {
+        self.materialize_one_applied_alias_view(type_id);
+        if !self.materializing_alias_views.is_empty() {
+            return;
+        }
+        let deferred = self.deferred_alias_views.len();
+        for _ in 0..deferred {
+            let Some(type_id) = self.deferred_alias_views.pop_front() else {
+                break;
+            };
+            self.materialize_one_applied_alias_view(type_id);
+        }
+    }
+
+    fn materialize_one_applied_alias_view(&mut self, type_id: TypeId) {
+        let Type::AppliedAlias { symbol, arguments } = self.get(type_id).clone() else {
+            return;
+        };
+        let Some(metadata) = self.aliases.get(&symbol).cloned() else {
+            return;
+        };
+        let Some(template) = metadata.template else {
+            return;
+        };
+        if self.applied_alias_views.contains_key(&type_id)
+            || arguments.len() != metadata.parameters.len()
+        {
+            return;
+        }
+        if !self.materializing_alias_views.insert(symbol) {
+            if !self.deferred_alias_views.contains(&type_id) {
+                self.deferred_alias_views.push_back(type_id);
+            }
+            return;
+        }
+        let substitutions = metadata
+            .parameters
+            .into_iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| {
+                InferredTypeArgument::new(parameter, argument, InferenceProvenance::Explicit)
+            })
+            .collect();
+        let view = InferredTypeArguments::new(substitutions).instantiate(self, template);
+        let removed = self.materializing_alias_views.remove(&symbol);
+        debug_assert!(removed);
+        if view == type_id {
+            self.circular_aliases.insert(symbol);
+        }
+        self.applied_alias_views.insert(type_id, view);
+    }
+
+    pub fn is_circular_alias(&mut self, symbol: SymbolId) -> bool {
+        if self.circular_aliases.contains(&symbol) {
+            return true;
+        }
+        let parameters = self.alias_type_parameters(symbol).to_vec();
+        let arguments = parameters
+            .into_iter()
+            .map(|parameter| self.named(parameter))
+            .collect();
+        let mut current = self.applied_alias(symbol, arguments);
+        let mut path = Vec::new();
+        let mut positions = HashMap::new();
+        loop {
+            let Type::AppliedAlias {
+                symbol: current_symbol,
+                ..
+            } = self.get(current)
+            else {
+                return false;
+            };
+            let current_symbol = *current_symbol;
+            if self.circular_aliases.contains(&current_symbol) {
+                return self.circular_aliases.contains(&symbol);
+            }
+            if let Some(start) = positions.get(&current_symbol).copied() {
+                self.circular_aliases.extend(path[start..].iter().copied());
+                return self.circular_aliases.contains(&symbol);
+            }
+            positions.insert(current_symbol, path.len());
+            path.push(current_symbol);
+            let Some(view) = self.prepare_applied_alias_view(current) else {
+                return false;
+            };
+            if view == current {
+                self.circular_aliases.insert(current_symbol);
+                return current_symbol == symbol;
+            }
+            if !matches!(self.get(view), Type::AppliedAlias { .. }) {
+                return false;
+            }
+            current = view;
+        }
     }
 
     /// Returns the `(symbol, arguments)` identity of an applied class type,
@@ -1860,8 +2156,12 @@ impl TypeTable {
     }
 
     fn materialize_applied_class_view(&mut self, type_id: TypeId) {
+        let top_level = self.materializing_class_views.is_empty();
+        if top_level {
+            debug_assert!(self.deferred_class_views.is_empty());
+        }
         self.materialize_one_applied_class_view(type_id);
-        if !self.materializing_class_views.is_empty() {
+        if !top_level {
             return;
         }
 
@@ -1872,6 +2172,7 @@ impl TypeTable {
             };
             self.materialize_one_applied_class_view(type_id);
         }
+        self.deferred_class_views.clear();
     }
 
     fn materialize_one_applied_class_view(&mut self, type_id: TypeId) {
@@ -1895,7 +2196,9 @@ impl TypeTable {
             return;
         }
         if !self.materializing_class_views.insert(symbol) {
-            self.deferred_class_views.push_back(type_id);
+            if !self.deferred_class_views.contains(&type_id) {
+                self.deferred_class_views.push_back(type_id);
+            }
             return;
         }
         let substitutions = metadata
@@ -1948,6 +2251,9 @@ impl TypeTable {
         }
         if let Type::This { constraint, .. } = self.get(type_id) {
             return self.indexed_access_view(*constraint);
+        }
+        if let Some(view) = self.prepare_applied_alias_view(type_id) {
+            return view;
         }
         self.prepare_applied_class_view(type_id).unwrap_or(type_id)
     }
@@ -2283,6 +2589,7 @@ impl TypeTable {
         }
         match self.get(type_id) {
             Type::AppliedClass { .. } => self.applied_class_view(type_id).unwrap_or(type_id),
+            Type::AppliedAlias { .. } => self.applied_alias_view(type_id).unwrap_or(type_id),
             _ => type_id,
         }
     }
@@ -2392,7 +2699,7 @@ impl TypeTable {
             Type::Never => {
                 IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.never()))
             }
-            Type::Named(_) | Type::AppliedClass { .. } => {
+            Type::Named(_) | Type::AppliedClass { .. } | Type::AppliedAlias { .. } => {
                 IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque)
             }
             _ => IndexedAccessConstraint::Invalid,
@@ -2424,7 +2731,7 @@ impl TypeTable {
             Type::Never => {
                 IndexedAccessConstraint::Reduced(self.constraint_type_expr(self.never()))
             }
-            Type::Named(_) | Type::AppliedClass { .. } => {
+            Type::Named(_) | Type::AppliedClass { .. } | Type::AppliedAlias { .. } => {
                 IndexedAccessConstraint::Reduced(ConstraintTypeExpr::Opaque)
             }
             _ => IndexedAccessConstraint::Invalid,
@@ -2647,6 +2954,9 @@ impl TypeTable {
             Type::Union(members) | Type::Intersection(members) => {
                 members.iter().any(|member| self.contains_error(*member))
             }
+            Type::AppliedAlias { .. } => self
+                .applied_alias_view(type_id)
+                .is_some_and(|view| view != type_id && self.contains_error(view)),
             _ => false,
         }
     }
@@ -3148,6 +3458,15 @@ impl TypeTable {
     /// other values of the same primitive type. Composite types keep their
     /// declared element and property types.
     pub fn widen(&mut self, type_id: TypeId, keep_primitive_literals: bool) -> TypeId {
+        self.widen_with_aliases(type_id, keep_primitive_literals, &mut HashSet::new())
+    }
+
+    fn widen_with_aliases(
+        &mut self,
+        type_id: TypeId,
+        keep_primitive_literals: bool,
+        active_aliases: &mut HashSet<SymbolId>,
+    ) -> TypeId {
         match self.get(type_id).clone() {
             Type::StringLiteral(_) if !keep_primitive_literals => self.string(),
             Type::NumberLiteral(_) if !keep_primitive_literals => self.number(),
@@ -3156,9 +3475,22 @@ impl TypeTable {
             Type::Union(members) if !keep_primitive_literals => {
                 let widened = members
                     .into_iter()
-                    .map(|member| self.widen(member, false))
+                    .map(|member| self.widen_with_aliases(member, false, active_aliases))
                     .collect::<Vec<_>>();
                 self.union(&widened)
+            }
+            Type::AppliedAlias { symbol, .. } => {
+                if !active_aliases.insert(symbol) {
+                    return type_id;
+                }
+                let widened = match self.prepare_applied_alias_view(type_id) {
+                    Some(view) if view != type_id => {
+                        self.widen_with_aliases(view, keep_primitive_literals, active_aliases)
+                    }
+                    _ => type_id,
+                };
+                active_aliases.remove(&symbol);
+                widened
             }
             _ => type_id,
         }
@@ -3433,6 +3765,14 @@ impl TypeTable {
                         .collect();
                     target.applied_class(symbol, arguments)
                 }
+                Type::AppliedAlias { symbol, arguments } => {
+                    let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|argument| copy(target, source, argument, imported, next_symbol))
+                        .collect();
+                    target.applied_alias(symbol, arguments)
+                }
                 Type::NumericEnum(symbol) => {
                     let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
                     target.numeric_enum(symbol)
@@ -3489,6 +3829,7 @@ impl TypeTable {
                 .checked_add(1)
                 .expect("imported symbol count fits in u32");
             imported.symbols.insert(source_symbol, symbol);
+            imported.synthesized.push((source_symbol, symbol));
 
             if let Some(metadata) = source.classes.get(&source_symbol).cloned() {
                 let parameters = metadata
@@ -3508,6 +3849,26 @@ impl TypeTable {
                 if let Some(template) = metadata.template {
                     let raw = copy(target, source, template.raw, imported, next_symbol);
                     target.publish_class_template(symbol, raw, template.state);
+                }
+            }
+            if let Some(metadata) = source.aliases.get(&source_symbol).cloned() {
+                let parameters = metadata
+                    .parameters
+                    .into_iter()
+                    .map(|parameter| remap_symbol(target, source, parameter, imported, next_symbol))
+                    .collect();
+                target.declare_alias(symbol, parameters);
+                if metadata.bounds_ready {
+                    let bounds = metadata
+                        .bounds
+                        .into_iter()
+                        .map(|bounds| copy_bounds(target, source, bounds, imported, next_symbol))
+                        .collect();
+                    target.finish_alias_bounds(symbol, bounds);
+                }
+                if let Some(raw) = metadata.template {
+                    let raw = copy(target, source, raw, imported, next_symbol);
+                    target.publish_alias_template(symbol, raw);
                 }
             }
             if let Some(structure) = source.interface_structures.get(&source_symbol).copied() {
@@ -3633,12 +3994,12 @@ struct ImportEqualsTarget {
 }
 
 /// One imported binding's resolved value and type facts, carried across module
-/// boundaries so a target binder can install both source-table identities
-/// before it resolves statements.
+/// boundaries so a target binder can install both source-table identities and
+/// materialize every synthetic symbol before it resolves statements.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImportedSymbolType<'a> {
     pub symbol: SymbolId,
-    pub source_types: &'a TypeTable,
+    pub source_model: &'a SemanticModel,
     pub value_type_id: TypeId,
     pub type_parameters: &'a [SymbolId],
     pub type_plane_id: Option<TypeId>,
@@ -4105,11 +4466,25 @@ struct ReturnContext {
     generator_protocol: Option<ForOfMode>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingConstraintCheck {
     argument: TypeId,
-    constraint: TypeId,
+    parameter: SymbolId,
+    substitution: InferredTypeArguments,
     range: TextRange,
+}
+
+#[derive(Clone, Copy)]
+enum TypeParameterDefaultState<'src> {
+    Unresolved {
+        node: &'src crate::syntax::Ty,
+        scope: ScopeId,
+    },
+    Resolving {
+        range: TextRange,
+    },
+    Circular(TypeId),
+    Resolved(TypeId),
 }
 
 pub(crate) struct Binder<'src> {
@@ -4133,6 +4508,9 @@ pub(crate) struct Binder<'src> {
     pub(crate) diagnostics: Vec<Diagnostic>,
     probing_contextual_type: bool,
     pending_constraint_checks: Vec<PendingConstraintCheck>,
+    type_parameter_defaults: HashMap<SymbolId, TypeParameterDefaultState<'src>>,
+    alias_resolution_stack: Vec<SymbolId>,
+    alias_resolution_dependencies: HashSet<SymbolId>,
     pub(crate) types: TypeTable,
     module_scope: ScopeId,
     global_scope: ScopeId,
@@ -4177,6 +4555,9 @@ pub(crate) struct Binder<'src> {
     class_method_signature_scopes: HashMap<NodeId, ScopeId>,
     /// Predeclared scope for each named class declaration.
     class_header_scopes: HashMap<NodeId, ScopeId>,
+    /// Declaration symbol for each named class syntax node. Duplicate names keep
+    /// distinct recovery symbols while scope lookup keeps the first binding.
+    class_declaration_symbols: HashMap<NodeId, SymbolId>,
     /// Enclosing class symbol for member-access authorization, innermost last.
     class_owner_stack: Vec<SymbolId>,
     /// Direct base class symbol for each class symbol, used for protected access.
@@ -4293,6 +4674,9 @@ impl<'src> Binder<'src> {
             diagnostics: Vec::new(),
             probing_contextual_type: false,
             pending_constraint_checks: Vec::new(),
+            type_parameter_defaults: HashMap::new(),
+            alias_resolution_stack: Vec::new(),
+            alias_resolution_dependencies: HashSet::new(),
             types: TypeTable::new(),
             module_scope: ScopeId(0),
             global_scope: ScopeId(0),
@@ -4323,6 +4707,7 @@ impl<'src> Binder<'src> {
             reg_exp_instance_type: None,
             class_method_signature_scopes: HashMap::new(),
             class_header_scopes: HashMap::new(),
+            class_declaration_symbols: HashMap::new(),
             class_owner_stack: Vec::new(),
             class_base_symbols: HashMap::new(),
             jsx_element_types: HashMap::new(),
@@ -4955,15 +5340,19 @@ impl<'src> Binder<'src> {
         self.check_cancel()?;
         self.build_import_equals_targets(statements, scope);
         let mut imported_by_source = HashMap::<*const TypeTable, ImportedTypeMap>::new();
+        let mut models_by_source = HashMap::<*const TypeTable, &SemanticModel>::new();
         let mut next_imported_symbol =
             u32::try_from(self.symbols.len()).expect("symbol count fits in u32");
         for imported in imported_types {
             self.check_cancel()?;
-            let identities = imported_by_source
-                .entry(std::ptr::from_ref(imported.source_types))
-                .or_default();
+            let source_types = imported.source_model.types();
+            let source_key = std::ptr::from_ref(source_types);
+            models_by_source
+                .entry(source_key)
+                .or_insert(imported.source_model);
+            let identities = imported_by_source.entry(source_key).or_default();
             let (value_type_id, type_parameters) = self.types.import_type(
-                imported.source_types,
+                source_types,
                 imported.value_type_id,
                 imported.type_parameters,
                 identities,
@@ -4975,7 +5364,7 @@ impl<'src> Binder<'src> {
             }
             if let Some(source_type_id) = imported.type_plane_id {
                 let (type_id, _) = self.types.import_type(
-                    imported.source_types,
+                    source_types,
                     source_type_id,
                     imported.type_parameters,
                     identities,
@@ -4986,35 +5375,124 @@ impl<'src> Binder<'src> {
             self.symbol_types[imported.symbol.get() as usize] = value_type_id;
             self.type_state[imported.symbol.get() as usize] = TypeState::Done(value_type_id);
         }
+        self.materialize_imported_symbols(
+            &mut imported_by_source,
+            &models_by_source,
+            &mut next_imported_symbol,
+        )?;
         self.resolve_statement_class_bounds(statements);
         self.check_cancel()?;
         self.resolve_statements(statements, scope);
         self.check_cancel()?;
         self.validate_pending_constraints();
+        self.validate_alias_cycles();
         self.check_export_assignment_conflicts();
         Ok(())
     }
 
+    fn materialize_imported_symbols(
+        &mut self,
+        imported_by_source: &mut HashMap<*const TypeTable, ImportedTypeMap>,
+        models_by_source: &HashMap<*const TypeTable, &SemanticModel>,
+        next_imported_symbol: &mut u32,
+    ) -> Result<(), super::CheckCancelled> {
+        let mut cursors = HashMap::<*const TypeTable, usize>::new();
+        loop {
+            self.check_cancel()?;
+            let target = u32::try_from(self.symbols.len()).expect("symbol count fits in u32");
+            if target == *next_imported_symbol {
+                break;
+            }
+
+            let mut located = None;
+            for (&source_key, identities) in imported_by_source.iter() {
+                let cursor = cursors.get(&source_key).copied().unwrap_or(0);
+                if let Some(&(source_symbol, synthesized)) = identities.synthesized.get(cursor)
+                    && synthesized.get() == target
+                {
+                    located = Some((source_key, source_symbol));
+                    cursors.insert(source_key, cursor + 1);
+                    break;
+                }
+            }
+            let (source_key, source_symbol) =
+                located.expect("every synthesized import SymbolId records its source");
+            let source_model = models_by_source[&source_key];
+            let source_symbol_data = source_model.symbol(source_symbol).clone();
+            let source_type = source_model.symbol_type(source_symbol);
+            let identities = imported_by_source
+                .get_mut(&source_key)
+                .expect("located source has an identity map");
+            let (copied_type, _) = self.types.import_type(
+                source_model.types(),
+                source_type,
+                &[],
+                identities,
+                next_imported_symbol,
+            );
+            let parent = source_symbol_data
+                .parent()
+                .and_then(|parent| identities.symbols.get(&parent).copied());
+
+            self.symbols.push(Symbol {
+                name: source_symbol_data.name().to_owned(),
+                kind: source_symbol_data.kind(),
+                scope: self.module_scope,
+                declaration: NodeId::default(),
+                range: NodeId::default_range(),
+                parent,
+            });
+            self.symbol_types.push(copied_type);
+            self.overload_signatures.push(Vec::new());
+            self.type_state.push(TypeState::Done(copied_type));
+        }
+        Ok(())
+    }
+
+    fn validate_alias_cycles(&mut self) {
+        let aliases: Vec<SymbolId> = self
+            .type_defs
+            .iter()
+            .filter_map(|(&symbol, definition)| {
+                matches!(definition, TypeDef::Alias { .. }).then_some(symbol)
+            })
+            .collect();
+        for symbol in aliases {
+            if self.types.is_circular_alias(symbol) {
+                let range = self.symbols[symbol.get() as usize].range();
+                self.emit(TYPE_ALIAS_CIRCULAR, range, TYPE_ALIAS_CIRCULAR_MESSAGE);
+            }
+        }
+    }
+
     fn validate_pending_constraints(&mut self) {
         let pending = std::mem::take(&mut self.pending_constraint_checks);
+        let pending: Vec<_> = pending
+            .into_iter()
+            .filter_map(|check| {
+                let constraint = self.types.type_parameter_constraint(check.parameter)?;
+                let constraint = check.substitution.instantiate(&mut self.types, constraint);
+                Some((check.argument, constraint, check.range))
+            })
+            .collect();
         let relations = TypeRelations::new_with_cancel(&self.types, self.cancel.clone());
         let failed: Vec<_> = pending
             .into_iter()
-            .filter(|check| {
+            .filter(|(argument, constraint, _)| {
                 let compatible = if self.strict_null_checks {
-                    relations.assignable_with_strict_null(check.argument, check.constraint)
+                    relations.assignable_with_strict_null(*argument, *constraint)
                 } else {
-                    relations.assignable(check.argument, check.constraint)
+                    relations.assignable(*argument, *constraint)
                 };
                 !compatible
             })
             .collect();
         drop(relations);
 
-        for check in failed {
+        for (_, _, range) in failed {
             self.emit(
                 ARGUMENT_NOT_ASSIGNABLE,
-                check.range,
+                range,
                 ARGUMENT_NOT_ASSIGNABLE_MESSAGE,
             );
         }
@@ -5079,6 +5557,9 @@ impl<'src> Binder<'src> {
             })
             .collect();
         let qualified_import_paths = std::mem::take(&mut self.qualified_import_paths);
+        debug_assert_eq!(self.symbols.len(), self.symbol_types.len());
+        debug_assert_eq!(self.symbols.len(), self.type_state.len());
+        debug_assert_eq!(self.symbols.len(), self.overload_signatures.len());
         let mut model = SemanticModel {
             scopes: self.scopes,
             symbols: self.symbols,
@@ -5933,17 +6414,15 @@ impl<'src> Binder<'src> {
         let Some(name) = &class.name else {
             return;
         };
-        let Some(owner) = self.scopes[parent.0 as usize]
-            .values
-            .get(self.identifier_text(name).as_ref())
+        let owner = self
+            .class_declaration_symbols
+            .get(&name.id())
             .copied()
-        else {
-            return;
-        };
+            .expect("named class declaration has a symbol");
         let scope = self.new_scope(ScopeKind::Class, Some(parent));
         self.scopes[scope.0 as usize].strict = true;
         self.bind_type_parameter_names(class.type_parameters.as_ref(), scope);
-        let parameters = self.class_type_parameter_symbols(class, scope);
+        let parameters = self.bound_type_parameter_symbols(class.type_parameters.as_ref(), scope);
         self.types.declare_class(owner, parameters);
         self.set_scope_owner(scope, owner);
         let replaced = self.class_header_scopes.insert(name.id(), scope);
@@ -5969,27 +6448,24 @@ impl<'src> Binder<'src> {
         self.types.finish_class_bounds(owner, bounds);
     }
 
-    fn class_type_parameter_symbols(
+    fn bound_type_parameter_symbols(
         &self,
-        class: &'src ClassDeclaration,
+        list: Option<&'src crate::syntax::TypeParameterList>,
         scope: ScopeId,
     ) -> Vec<SymbolId> {
-        class
-            .type_parameters
-            .as_ref()
-            .map(|list| {
-                list.parameters
-                    .iter()
-                    .filter_map(|parameter| {
-                        let name = self.identifier_text(&parameter.data().name);
-                        self.scopes[scope.0 as usize]
-                            .types
-                            .get(name.as_ref())
-                            .copied()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        list.map(|list| {
+            list.parameters
+                .iter()
+                .filter_map(|parameter| {
+                    let name = self.identifier_text(&parameter.data().name);
+                    self.scopes[scope.0 as usize]
+                        .types
+                        .get(name.as_ref())
+                        .copied()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     /// Pre-binds `var` and function names that occur beneath lexical child
@@ -6120,13 +6596,15 @@ impl<'src> Binder<'src> {
             }
             Statement::Class(class) => {
                 if let Some(name) = &class.name {
-                    self.declare(
+                    let symbol = self.declare(
                         &self.identifier_text(name),
                         SymbolKind::Class,
                         scope,
                         declaration,
                         name.range(),
                     );
+                    let replaced = self.class_declaration_symbols.insert(name.id(), symbol);
+                    debug_assert!(replaced.is_none());
                 }
             }
             Statement::Interface(interface) => self.bind_interface(interface, scope, declaration),
@@ -6186,13 +6664,15 @@ impl<'src> Binder<'src> {
                     crate::syntax::ExportDefaultValue::Class(class)
                         if let Some(name) = &class.name =>
                     {
-                        self.declare(
+                        let symbol = self.declare(
                             &self.identifier_text(name),
                             SymbolKind::Class,
                             scope,
                             declaration,
                             name.range(),
                         );
+                        let replaced = self.class_declaration_symbols.insert(name.id(), symbol);
+                        debug_assert!(replaced.is_none());
                     }
                     crate::syntax::ExportDefaultValue::Interface(interface) => {
                         self.bind_interface(interface, scope, declaration);
@@ -6522,12 +7002,53 @@ impl<'src> Binder<'src> {
         );
         let type_scope = self.new_scope(ScopeKind::Block, Some(scope));
         self.bind_type_parameter_names(interface.type_parameters.as_ref(), type_scope);
+        let parameters =
+            self.bound_type_parameter_symbols(interface.type_parameters.as_ref(), type_scope);
+        match self.type_defs.get(&id).copied() {
+            Some(TypeDef::Interface {
+                scope: canonical_scope,
+                ..
+            }) => {
+                let canonical_parameters = self.types.class_type_parameters(id).to_vec();
+                if canonical_parameters.len() == parameters.len() {
+                    self.merge_interface_type_parameter_defaults(
+                        interface.type_parameters.as_ref(),
+                        canonical_scope,
+                        &canonical_parameters,
+                    );
+                }
+            }
+            None if !parameters.is_empty() => self.types.declare_class(id, parameters),
+            None | Some(_) => {}
+        }
         self.set_scope_this_owner(type_scope, id);
         self.interface_merges.entry(id).or_default().push(interface);
         self.type_defs.entry(id).or_insert(TypeDef::Interface {
             scope: type_scope,
             type_parameters: interface.type_parameters.as_ref(),
         });
+    }
+
+    fn merge_interface_type_parameter_defaults(
+        &mut self,
+        list: Option<&'src crate::syntax::TypeParameterList>,
+        canonical_scope: ScopeId,
+        canonical_parameters: &[SymbolId],
+    ) {
+        let Some(list) = list else {
+            return;
+        };
+        for (&symbol, parameter) in canonical_parameters.iter().zip(&list.parameters) {
+            let Some(node) = parameter.data().default.as_deref() else {
+                continue;
+            };
+            self.type_parameter_defaults.entry(symbol).or_insert(
+                TypeParameterDefaultState::Unresolved {
+                    node,
+                    scope: canonical_scope,
+                },
+            );
+        }
     }
 
     fn bind_type_alias(
@@ -6545,6 +7066,9 @@ impl<'src> Binder<'src> {
         );
         let type_scope = self.new_scope(ScopeKind::Block, Some(scope));
         self.bind_type_parameter_names(alias.type_parameters.as_ref(), type_scope);
+        let parameters =
+            self.bound_type_parameter_symbols(alias.type_parameters.as_ref(), type_scope);
+        self.types.declare_alias(id, parameters);
         self.type_defs.insert(
             id,
             TypeDef::Alias {
@@ -8279,13 +8803,58 @@ impl<'src> Binder<'src> {
         };
         for parameter in &list.parameters {
             let data = parameter.data();
-            self.declare(
+            let symbol = self.declare(
                 &self.identifier_text(&data.name),
                 SymbolKind::TypeParameter,
                 scope,
                 parameter.id(),
                 data.name.range(),
             );
+            if let Some(node) = data.default.as_deref() {
+                let replaced = self.type_parameter_defaults.insert(
+                    symbol,
+                    TypeParameterDefaultState::Unresolved { node, scope },
+                );
+                debug_assert!(replaced.is_none());
+            }
+        }
+    }
+
+    fn resolve_type_parameter_default(&mut self, symbol: SymbolId) -> Option<TypeId> {
+        let state = self.type_parameter_defaults.get(&symbol).copied()?;
+        match state {
+            TypeParameterDefaultState::Unresolved { node, scope } => {
+                self.type_parameter_defaults.insert(
+                    symbol,
+                    TypeParameterDefaultState::Resolving {
+                        range: node.range(),
+                    },
+                );
+                let resolved = self.resolve_type(node, scope);
+                if let Some(TypeParameterDefaultState::Circular(error)) =
+                    self.type_parameter_defaults.get(&symbol).copied()
+                {
+                    return Some(error);
+                }
+                self.type_parameter_defaults
+                    .insert(symbol, TypeParameterDefaultState::Resolved(resolved));
+                self.types.set_type_parameter_default(symbol, resolved);
+                Some(resolved)
+            }
+            TypeParameterDefaultState::Resolving { range } => {
+                let error = self.types.error_type();
+                self.emit(
+                    TYPE_PARAMETER_CIRCULAR_DEFAULT,
+                    range,
+                    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
+                );
+                self.type_parameter_defaults
+                    .insert(symbol, TypeParameterDefaultState::Circular(error));
+                self.types.set_type_parameter_default(symbol, error);
+                Some(error)
+            }
+            TypeParameterDefaultState::Circular(error)
+            | TypeParameterDefaultState::Resolved(error) => Some(error),
         }
     }
 
@@ -8320,10 +8889,7 @@ impl<'src> Binder<'src> {
             if let Some(constraint) = constraint {
                 self.types.set_type_parameter_constraint(symbol, constraint);
             }
-            let default = data
-                .default
-                .as_ref()
-                .map(|default| self.resolve_type(default, scope));
+            let default = self.resolve_type_parameter_default(symbol);
             if let Some(default) = default {
                 self.types.set_type_parameter_default(symbol, default);
             }
@@ -8716,22 +9282,25 @@ impl<'src> Binder<'src> {
         }
         self.constructor_writable_readonly_properties
             .push(constructor_writable_readonly);
-        let predeclared = !bind_internal_name && class.name.is_some();
-        let scope = if predeclared {
-            let name = class.name.as_ref().expect("predeclared class has a name");
-            self.class_header_scopes
-                .remove(&name.id())
-                .expect("named class header was predeclared")
+        let predeclared_scope = if bind_internal_name {
+            None
         } else {
+            class
+                .name
+                .as_ref()
+                .and_then(|name| self.class_header_scopes.remove(&name.id()))
+        };
+        let predeclared = predeclared_scope.is_some();
+        let bind_local_name = bind_internal_name || (class.name.is_some() && !predeclared);
+        let scope = predeclared_scope.unwrap_or_else(|| {
             let scope = self.new_scope(ScopeKind::Class, Some(parent));
             self.scopes[scope.0 as usize].strict = true;
             self.bind_type_parameter_names(class.type_parameters.as_ref(), scope);
             scope
-        };
-        // Named class expressions bind their internal name into the class scope
-        // only (mirroring named function expressions). Declarations keep their
-        // existing outer-scope binding from `bind_statement` unchanged.
-        if bind_internal_name && let Some(name) = &class.name {
+        });
+        // Recovery-only class declarations outside a statement list have no
+        // outer binding, so keep their name local like a named class expression.
+        if bind_local_name && let Some(name) = &class.name {
             self.declare(
                 &self.identifier_text(name),
                 SymbolKind::Class,
@@ -8743,7 +9312,7 @@ impl<'src> Binder<'src> {
         let owner = if predeclared {
             self.scopes[scope.0 as usize].owner
         } else {
-            let owner_scope = if bind_internal_name { scope } else { parent };
+            let owner_scope = if bind_local_name { scope } else { parent };
             class.name.as_ref().and_then(|name| {
                 self.scopes[owner_scope.0 as usize]
                     .values
@@ -8753,7 +9322,8 @@ impl<'src> Binder<'src> {
         };
         if let Some(owner) = owner {
             if !predeclared {
-                let class_parameters = self.class_type_parameter_symbols(class, scope);
+                let class_parameters =
+                    self.bound_type_parameter_symbols(class.type_parameters.as_ref(), scope);
                 self.types.declare_class(owner, class_parameters);
                 let class_bounds = self
                     .signature_type_parameters(class.type_parameters.as_ref(), scope)
@@ -10996,6 +11566,9 @@ impl<'src> Binder<'src> {
         type_id: TypeId,
         receiver: TypeId,
     ) -> Vec<Vec<FunctionSignature>> {
+        if let Some(view) = self.types.prepare_applied_alias_view(type_id) {
+            return self.call_signature_groups_for_type_raw(view, receiver);
+        }
         if let Some(view) = self.types.prepare_applied_class_view(type_id) {
             return self.call_signature_groups_for_type_raw(view, receiver);
         }
@@ -11060,6 +11633,9 @@ impl<'src> Binder<'src> {
         type_id: TypeId,
         receiver: TypeId,
     ) -> Vec<Vec<ConstructEntry>> {
+        if let Some(view) = self.types.prepare_applied_alias_view(type_id) {
+            return self.construct_signature_groups_for_type_raw(view, receiver);
+        }
         if let Some(view) = self.types.prepare_applied_class_view(type_id) {
             return self.construct_signature_groups_for_type_raw(view, receiver);
         }
@@ -11233,8 +11809,9 @@ impl<'src> Binder<'src> {
                     Some(self.types.union(&elements))
                 }
             }
-            Type::Named(_) | Type::AppliedClass { .. } => {
+            Type::Named(_) | Type::AppliedClass { .. } | Type::AppliedAlias { .. } => {
                 let view = self.types.named_structural_view(iterator);
+                let view = self.types.prepare_applied_alias_view(view).unwrap_or(view);
                 let view = self.types.prepare_applied_class_view(view).unwrap_or(view);
                 (view != iterator)
                     .then(|| self.iterator_object_element_type(view, protocol))
@@ -11314,8 +11891,9 @@ impl<'src> Binder<'src> {
                     value
                 })
             }
-            Type::Named(_) | Type::AppliedClass { .. } => {
+            Type::Named(_) | Type::AppliedClass { .. } | Type::AppliedAlias { .. } => {
                 let view = self.types.named_structural_view(result);
+                let view = self.types.prepare_applied_alias_view(view).unwrap_or(view);
                 let view = self.types.prepare_applied_class_view(view).unwrap_or(view);
                 (view != result)
                     .then(|| self.iterator_result_yield_type(view))
@@ -11472,6 +12050,12 @@ impl<'src> Binder<'src> {
             }
             Type::AppliedClass { .. } => {
                 let view = self.types.prepare_applied_class_view(iterable)?;
+                (view != iterable)
+                    .then(|| self.iteration_element_type_inner(view, mode, receiver))
+                    .flatten()
+            }
+            Type::AppliedAlias { .. } => {
+                let view = self.types.prepare_applied_alias_view(iterable)?;
                 (view != iterable)
                     .then(|| self.iteration_element_type_inner(view, mode, receiver))
                     .flatten()
@@ -11775,6 +12359,10 @@ impl<'src> Binder<'src> {
         receiver: TypeId,
         owner_hint: Option<SymbolId>,
     ) -> Option<TypeId> {
+        if let Some(view) = self.types.prepare_applied_alias_view(object_type) {
+            return self
+                .property_type_for_member_raw(view, name, range, read, receiver, owner_hint);
+        }
         match self.types.get(object_type).clone() {
             Type::Record { key, value } => {
                 let property = self.deferred_record_property_type(key, value, name);
@@ -11884,6 +12472,10 @@ impl<'src> Binder<'src> {
             Type::Intersection(members) => {
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
+                    let member = self
+                        .types
+                        .prepare_applied_alias_view(member)
+                        .unwrap_or(member);
                     let (resolved, member_owner) = match self.types.get(member).clone() {
                         Type::Named(symbol) => {
                             (self.resolve_named_type_symbol(symbol), Some(symbol))
@@ -11996,6 +12588,7 @@ impl<'src> Binder<'src> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Function(_)
+            | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
             | Type::Keyof(_)
             | Type::IndexedAccess { .. } => None,
@@ -12032,6 +12625,12 @@ impl<'src> Binder<'src> {
                 .any(|member| self.property_is_readonly(member, name)),
             Type::AppliedClass { .. } => {
                 if let Some(view) = self.types.prepare_applied_class_view(object_type) {
+                    return self.property_is_readonly(view, name);
+                }
+                false
+            }
+            Type::AppliedAlias { .. } => {
+                if let Some(view) = self.types.prepare_applied_alias_view(object_type) {
                     return self.property_is_readonly(view, name);
                 }
                 false
@@ -12833,6 +13432,25 @@ impl<'src> Binder<'src> {
         }
     }
 
+    fn ensure_alias_bounds(&mut self, symbol: SymbolId) {
+        if self.types.alias_bounds_ready(symbol) {
+            return;
+        }
+        let Some(TypeDef::Alias {
+            scope,
+            type_parameters,
+            ..
+        }) = self.type_defs.get(&symbol).copied()
+        else {
+            return;
+        };
+        if !self.types.begin_alias_bounds(symbol) {
+            return;
+        }
+        let bounds = self.signature_type_parameters(type_parameters, scope).1;
+        self.types.finish_alias_bounds(symbol, bounds);
+    }
+
     fn instantiate_explicit_type_arguments(
         &mut self,
         symbol: SymbolId,
@@ -12842,7 +13460,18 @@ impl<'src> Binder<'src> {
     ) -> TypeId {
         let definition = self.type_defs.get(&symbol).copied();
         let imported_parameters = self.imported_type_parameters.get(&symbol).cloned();
-        let (parameters, bounds) = if let Some(definition) = definition {
+        let (parameters, bounds) = if self.types.has_class(symbol) {
+            (
+                self.types.class_type_parameters(symbol).to_vec(),
+                self.types.class_type_parameter_bounds(symbol).to_vec(),
+            )
+        } else if self.types.has_alias(symbol) {
+            self.ensure_alias_bounds(symbol);
+            (
+                self.types.alias_type_parameters(symbol).to_vec(),
+                self.types.alias_type_parameter_bounds(symbol).to_vec(),
+            )
+        } else if let Some(definition) = definition {
             match definition {
                 TypeDef::Alias {
                     scope,
@@ -12879,6 +13508,18 @@ impl<'src> Binder<'src> {
         };
         let inferred =
             self.resolve_explicit_type_arguments(&parameters, &bounds, arguments, diagnostic_range);
+        if self.types.has_alias(symbol)
+            && (matches!(
+                self.type_state[symbol.get() as usize],
+                TypeState::InProgress
+            ) || self.alias_resolution_dependencies.contains(&symbol))
+        {
+            let arguments = inferred
+                .into_iter()
+                .map(|argument| argument.type_id())
+                .collect();
+            return self.types.applied_alias(symbol, arguments);
+        }
         if inferred.is_empty() {
             return base;
         }
@@ -12904,9 +13545,12 @@ impl<'src> Binder<'src> {
         diagnostic_range: TextRange,
     ) -> Vec<InferredTypeArgument> {
         let provided = arguments.map_or(0, <[TypeId]>::len);
-        let required = bounds
+        let required = parameters
             .iter()
-            .filter(|bound| bound.default().is_none())
+            .zip(bounds)
+            .filter(|(parameter, bound)| {
+                bound.default().is_none() && !self.type_parameter_defaults.contains_key(*parameter)
+            })
             .count();
         if provided < required || provided > parameters.len() {
             self.emit(
@@ -12918,18 +13562,13 @@ impl<'src> Binder<'src> {
 
         let inferred = self.complete_explicit_type_arguments(parameters, bounds, arguments);
         let substitution = InferredTypeArguments::new(inferred.clone());
-        for (index, argument) in inferred.iter().enumerate() {
-            if let Some(constraint) = bounds
-                .get(index)
-                .and_then(|bound| bound.constraint())
-                .map(|constraint| substitution.instantiate(&mut self.types, constraint))
-            {
-                self.pending_constraint_checks.push(PendingConstraintCheck {
-                    argument: argument.type_id(),
-                    constraint,
-                    range: diagnostic_range,
-                });
-            }
+        for argument in &inferred {
+            self.pending_constraint_checks.push(PendingConstraintCheck {
+                argument: argument.type_id(),
+                parameter: argument.symbol(),
+                substitution: substitution.clone(),
+                range: diagnostic_range,
+            });
         }
         inferred
     }
@@ -12940,59 +13579,29 @@ impl<'src> Binder<'src> {
         bounds: &[TypeParameterBounds],
         arguments: Option<&[TypeId]>,
     ) -> Vec<InferredTypeArgument> {
-        let mut resolved: Vec<TypeId> = (0..parameters.len())
-            .map(|index| {
-                arguments
-                    .and_then(|arguments| arguments.get(index))
-                    .copied()
-                    .unwrap_or_else(|| self.types.any())
-            })
-            .collect();
-        for index in 0..parameters.len() {
-            if arguments
+        let mut inferred = Vec::with_capacity(parameters.len());
+        for (index, &parameter) in parameters.iter().enumerate() {
+            let explicit = arguments
                 .and_then(|arguments| arguments.get(index))
-                .is_some()
-            {
-                continue;
-            }
-            let substitution = InferredTypeArguments::new(
-                parameters
-                    .iter()
-                    .copied()
-                    .zip(resolved.iter().copied())
-                    .map(|(symbol, type_id)| {
-                        InferredTypeArgument::new(symbol, type_id, InferenceProvenance::Default)
-                    })
-                    .collect(),
-            );
-            if let Some(default) = bounds
-                .get(index)
-                .and_then(|bound| bound.default())
-                .map(|default| substitution.instantiate(&mut self.types, default))
-            {
-                resolved[index] = default;
-            }
+                .copied();
+            let (type_id, provenance) = if let Some(type_id) = explicit {
+                (type_id, InferenceProvenance::Explicit)
+            } else {
+                let default = bounds
+                    .get(index)
+                    .and_then(|bound| bound.default())
+                    .or_else(|| self.resolve_type_parameter_default(parameter));
+                let type_id = if let Some(default) = default {
+                    InferredTypeArguments::new(inferred.clone())
+                        .instantiate(&mut self.types, default)
+                } else {
+                    self.types.any()
+                };
+                (type_id, InferenceProvenance::Default)
+            };
+            inferred.push(InferredTypeArgument::new(parameter, type_id, provenance));
         }
-        parameters
-            .iter()
-            .copied()
-            .zip(resolved)
-            .enumerate()
-            .map(|(index, (parameter, type_id))| {
-                let explicit = arguments
-                    .and_then(|arguments| arguments.get(index))
-                    .is_some();
-                InferredTypeArgument::new(
-                    parameter,
-                    type_id,
-                    if explicit {
-                        InferenceProvenance::Explicit
-                    } else {
-                        InferenceProvenance::Default
-                    },
-                )
-            })
-            .collect()
+        inferred
     }
 
     fn resolve_named_type_symbol(&mut self, symbol: SymbolId) -> TypeId {
@@ -13385,7 +13994,8 @@ impl<'src> Binder<'src> {
         match self.type_state[symbol.get() as usize] {
             TypeState::Done(id) => return id,
             TypeState::InProgress
-                if self.symbols[symbol.get() as usize].kind == SymbolKind::Interface =>
+                if self.symbols[symbol.get() as usize].kind == SymbolKind::Interface
+                    || self.types.has_alias(symbol) =>
             {
                 return self.types.named(symbol);
             }
@@ -13404,21 +14014,35 @@ impl<'src> Binder<'src> {
                 type_parameters,
                 node,
             } => {
-                self.resolve_type_parameter_bounds(type_parameters, scope);
-                self.resolve_type(node, scope)
+                let root_resolution = self.alias_resolution_stack.is_empty();
+                if root_resolution {
+                    self.alias_resolution_dependencies.clear();
+                } else {
+                    self.alias_resolution_dependencies.insert(symbol);
+                }
+                self.alias_resolution_stack.push(symbol);
+                if self.types.begin_alias_bounds(symbol) {
+                    let bounds = self.signature_type_parameters(type_parameters, scope).1;
+                    self.types.finish_alias_bounds(symbol, bounds);
+                }
+                let raw = self.resolve_type(node, scope);
+                self.types.publish_alias_template(symbol, raw);
+                let popped = self.alias_resolution_stack.pop();
+                debug_assert_eq!(popped, Some(symbol));
+                if self.alias_resolution_stack.is_empty() {
+                    self.alias_resolution_dependencies.clear();
+                }
+                raw
             }
             TypeDef::Interface {
                 scope,
                 type_parameters,
             } => {
                 let head = self.types.named(symbol);
-                let (parameters, bounds) = self.signature_type_parameters(type_parameters, scope);
-                let is_generic = !parameters.is_empty();
-                // Generic interfaces share the applied-head machinery with
-                // classes so recursive references retain their arguments.
-                if is_generic {
-                    self.types.declare_class(symbol, parameters);
-                    self.types.set_class_bounds(symbol, bounds);
+                let is_generic = self.types.has_class(symbol);
+                if is_generic && self.types.begin_class_bounds(symbol) {
+                    let bounds = self.signature_type_parameters(type_parameters, scope).1;
+                    self.types.finish_class_bounds(symbol, bounds);
                 }
                 let declarations = self
                     .interface_merges
@@ -13437,6 +14061,7 @@ impl<'src> Binder<'src> {
                 for interface in declarations {
                     let base =
                         self.resolve_interface_type(scope, &interface.extends, &interface.members);
+                    let base = self.types.indexed_access_view(base);
                     if let Type::ObjectType(object) = self.types.get(base).clone() {
                         merged.generator_return =
                             match (merged.generator_return, object.generator_return) {
@@ -13918,6 +14543,10 @@ impl<'src> Binder<'src> {
         let target = self.types.non_nullable(target);
         let target = self
             .types
+            .prepare_applied_alias_view(target)
+            .unwrap_or(target);
+        let target = self
+            .types
             .prepare_applied_class_view(target)
             .unwrap_or(target);
         let target = self.types.named_structural_view(target);
@@ -13931,6 +14560,10 @@ impl<'src> Binder<'src> {
     }
 
     fn fresh_object_candidate(&mut self, target: TypeId) -> Option<ObjectType> {
+        let target = self
+            .types
+            .prepare_applied_alias_view(target)
+            .unwrap_or(target);
         let target = self
             .types
             .prepare_applied_class_view(target)
@@ -15629,7 +16262,7 @@ mod tests {
         FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
         PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
         STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, ScopeId, ScopeKind, SymbolId, SymbolKind,
-        TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeTable, bind_source,
+        TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeParameterBounds, TypeTable, bind_source,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -15673,6 +16306,64 @@ mod tests {
             source(text),
         ));
         bind_source(parsed.product())
+    }
+
+    #[test]
+    fn transforming_recursive_class_view_is_demand_bounded() {
+        let mut table = TypeTable::new();
+        let class = SymbolId::new(1);
+        let parameter = SymbolId::new(2);
+        table.declare_class(class, vec![parameter]);
+        table.finish_class_bounds(class, vec![TypeParameterBounds::NONE]);
+
+        let named_parameter = table.named(parameter);
+        let nested_argument = table.array(named_parameter);
+        let nested = table.intern(Type::AppliedClass {
+            symbol: class,
+            arguments: vec![nested_argument],
+        });
+        let raw = table.object_type(vec![PropertyType::new("next", false, nested)]);
+        table.publish_final_class_template(class, raw);
+
+        let number = table.number();
+        let root = table.applied_class(class, vec![number]);
+        let root_view = table
+            .applied_class_view(root)
+            .expect("root view is prepared");
+        let type_count = table.types.len();
+        for _ in 0..64 {
+            assert_eq!(table.prepare_applied_class_view(root), Some(root_view));
+        }
+        assert_eq!(table.types.len(), type_count);
+
+        let Type::ObjectType(root_object) = table.get(root_view) else {
+            panic!("class view must be structural");
+        };
+        let next = root_object
+            .properties
+            .iter()
+            .find(|property| property.name() == "next")
+            .expect("next property")
+            .type_id();
+        let next_view = table
+            .applied_class_view(next)
+            .expect("first recursive layer is prepared");
+        let Type::ObjectType(next_object) = table.get(next_view) else {
+            panic!("nested class view must be structural");
+        };
+        let second = next_object
+            .properties
+            .iter()
+            .find(|property| property.name() == "next")
+            .expect("second next property")
+            .type_id();
+        assert!(table.applied_class_view(second).is_none());
+        let second_view = table
+            .prepare_applied_class_view(second)
+            .expect("second recursive layer prepares on demand");
+        let type_count = table.types.len();
+        assert_eq!(table.prepare_applied_class_view(second), Some(second_view));
+        assert_eq!(table.types.len(), type_count);
     }
 
     #[test]

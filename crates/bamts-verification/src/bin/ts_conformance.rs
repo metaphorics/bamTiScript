@@ -38,6 +38,7 @@ enum Command {
     AuditLedger {
         require_complete: bool,
         ledger: Option<PathBuf>,
+        workspace_root: PathBuf,
         snapshot_root: PathBuf,
     },
     Run {
@@ -158,9 +159,17 @@ fn run() -> Result<()> {
         Command::AuditLedger {
             require_complete,
             ledger,
+            workspace_root,
             snapshot_root,
         } => {
-            let ledger_path = ledger.unwrap_or_else(|| snapshot_root.join("ledger.json"));
+            let committed_ledger = workspace_root.join("verification/ts-suite-ledger.json");
+            let ledger_path = ledger.unwrap_or_else(|| {
+                if committed_ledger.is_file() {
+                    committed_ledger
+                } else {
+                    snapshot_root.join("ledger.json")
+                }
+            });
             let index_path = snapshot_root.join("index.json");
             let discovered = discovered_inputs_from_index(&index_path)?;
             let audited = audit_ledger(&ledger_path, require_complete, &discovered)?;
@@ -427,6 +436,7 @@ fn parse_audit_ledger(
     Ok(Command::AuditLedger {
         require_complete,
         ledger,
+        workspace_root: cwd,
         snapshot_root,
     })
 }

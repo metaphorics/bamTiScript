@@ -6,7 +6,7 @@
 # The release comparator gates candidate against official `typescript@7.0.2`.
 # Sources: `.outline/wayfinder/decisions/performance-resource-budgets.md` §4,
 # `.outline/sdd/briefs/U0.8.md` contract §3.
-schema = 1
+schema = 2
 
 # Wall time / latency ratio thresholds (candidate/base).
 [wall_ratio]

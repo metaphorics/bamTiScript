@@ -411,10 +411,26 @@ pub fn run_suite(
 
     // LedgerAudit
     let discovered = case_inputs_from_index(&verified.snapshot.index);
-    audit_ledger(&snapshot_root.join("ledger.json"), true, &discovered)?;
+    let committed_ledger = workspace_root.join("verification/ts-suite-ledger.json");
+    let ledger_path = if committed_ledger.is_file() {
+        committed_ledger
+    } else {
+        snapshot_root.join("ledger.json")
+    };
+    let ledger = audit_ledger(&ledger_path, true, &discovered)?;
+    let expected_digest = index_content_digest(&verified.snapshot.index);
+    if ledger.snapshot.digest != expected_digest {
+        return Err(VerificationError::new(
+            ErrorCode::Digest,
+            format!(
+                "classified ledger digest `{}` does not match suite index `{expected_digest}`",
+                ledger.snapshot.digest
+            ),
+        ));
+    }
 
     // ShardPlan
-    let planned = plan_cells(&verified.snapshot.ledger, filters)?;
+    let planned = plan_cells(&ledger, filters)?;
 
     // S2 check-cell context: the diagnostic code map and baseline groups are
     // loaded once per run (U2.8), and only when an included check cell is
@@ -2061,7 +2077,7 @@ fn write_then_verify(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn fetch_archive(url: &str, expected_digest: &str, cache_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn fetch_archive(url: &str, expected_digest: &str, cache_dir: &Path) -> Result<PathBuf> {
     let cache_path = cache_dir.join(format!("{expected_digest}.tar.gz"));
     if cache_path.exists() {
         let bytes = fs::read(&cache_path).map_err(|e| io_err(&cache_path, &e))?;
@@ -2108,7 +2124,7 @@ fn fetch_archive(url: &str, expected_digest: &str, cache_dir: &Path) -> Result<P
     Ok(cache_path)
 }
 
-fn extract_archive(archive: &Path) -> Result<TempDir> {
+pub(crate) fn extract_archive(archive: &Path) -> Result<TempDir> {
     // Each archive extracts into its own temp dir. Without a per-archive
     // discriminator the suite and compiler extractions collide on the same
     // path (same prefix + pid), and the second extraction wipes the first.
@@ -2152,11 +2168,18 @@ fn extract_archive(archive: &Path) -> Result<TempDir> {
                 format!("failed to spawn tar verbose list: {error}"),
             )
         })?;
-    if verbose.status.success() {
-        let verbose_listing = String::from_utf8_lossy(&verbose.stdout);
-        for line in verbose_listing.lines() {
-            reject_tar_verbose_line(line)?;
-        }
+    if !verbose.status.success() {
+        return Err(VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!(
+                "tar -tvzf failed: {}",
+                String::from_utf8_lossy(&verbose.stderr)
+            ),
+        ));
+    }
+    let verbose_listing = String::from_utf8_lossy(&verbose.stdout);
+    for line in verbose_listing.lines() {
+        reject_tar_verbose_line(line)?;
     }
 
     let status = Command::new("tar")
@@ -2213,30 +2236,13 @@ fn reject_tar_verbose_line(line: &str) -> Result<()> {
     if trimmed.is_empty() {
         return Ok(());
     }
-    let type_char = trimmed.chars().next();
-    if !matches!(
-        type_char,
-        Some('l') | Some('c') | Some('b') | Some('p') | Some('s')
-    ) {
+    if matches!(trimmed.chars().next(), Some('-') | Some('d')) {
         return Ok(());
     }
-    // Only reject link/device members that would otherwise be imported.
-    let member = extract_tar_member_name(trimmed);
-    if member_looks_allowlisted(member) {
-        return Err(VerificationError::new(
-            ErrorCode::ProvenanceMismatch,
-            format!("archive member link/device rejected: `{line}`"),
-        ));
-    }
-    Ok(())
-}
-
-fn extract_tar_member_name(verbose_line: &str) -> &str {
-    // GNU/BSD `tar -tv` puts the member path after the timestamp fields.
-    // Take the last space-separated token as a conservative fallback; if the
-    // path contains spaces we still err on the side of rejecting when the
-    // basename looks like LICENSE/NOTICE or the path contains tests/.
-    verbose_line.rsplit(' ').next().unwrap_or(verbose_line)
+    Err(VerificationError::new(
+        ErrorCode::ProvenanceMismatch,
+        format!("archive member link/special type rejected: `{line}`"),
+    ))
 }
 
 fn member_looks_allowlisted(member: &str) -> bool {
@@ -2268,17 +2274,10 @@ fn reject_extracted_symlinks(root: &Path) -> Result<()> {
             let path = entry.path();
             let meta = fs::symlink_metadata(&path).map_err(|e| io_err(&path, &e))?;
             if meta.file_type().is_symlink() {
-                let rel = path
-                    .strip_prefix(root)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_default();
-                if member_looks_allowlisted(&rel) {
-                    return Err(VerificationError::new(
-                        ErrorCode::ProvenanceMismatch,
-                        format!("extracted symlink rejected: `{}`", path.display()),
-                    ));
-                }
-                continue;
+                return Err(VerificationError::new(
+                    ErrorCode::ProvenanceMismatch,
+                    format!("extracted symlink rejected: `{}`", path.display()),
+                ));
             }
             if meta.is_dir() {
                 stack.push(path);
@@ -2288,7 +2287,7 @@ fn reject_extracted_symlinks(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn single_archive_root(extract_root: &Path) -> Result<PathBuf> {
+pub(crate) fn single_archive_root(extract_root: &Path) -> Result<PathBuf> {
     let mut dirs = Vec::new();
     for entry in fs::read_dir(extract_root).map_err(|e| io_err(extract_root, &e))? {
         let entry = entry.map_err(|e| io_err(extract_root, &e))?;
@@ -2371,7 +2370,7 @@ fn sort_json_keys(value: &mut serde_json::Value) {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(Sha256::digest(bytes))
 }
 
@@ -2746,6 +2745,63 @@ mod tests {
     }
 
     #[test]
+    fn fresh_sync_keeps_the_committed_classified_ledger_authoritative() {
+        let suite = TestDir::new("classified-sync-suite");
+        write_fixture_tree(suite.path());
+        let snapshot = TestDir::new("classified-sync-snapshot");
+        materialize_from_extracted(snapshot.path(), suite.path()).unwrap();
+        let workspace = TestDir::new("classified-sync-workspace");
+        let ledger_path = workspace.path().join("verification/ts-suite-ledger.json");
+        write_suite_ledger(snapshot.path(), &ledger_path).unwrap();
+
+        // A later pin/snapshot refresh recreates the provisional embedded ledger.
+        materialize_from_extracted(snapshot.path(), suite.path()).unwrap();
+
+        let report = run_suite(
+            workspace.path(),
+            snapshot.path(),
+            &RunFilterOptions {
+                status: StatusFilter::Included,
+                slice: Some("s1".to_owned()),
+                backends: BackendFilter::One(Backend::Check),
+                shards: Some((1, 1)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].facet, Facet::Parse);
+        assert!(matches!(report.results[0].class, FailureClass::Pass));
+    }
+    #[test]
+    fn committed_ledger_must_match_the_materialized_index() {
+        let suite = TestDir::new("classified-digest-suite");
+        write_fixture_tree(suite.path());
+        let snapshot = TestDir::new("classified-digest-snapshot");
+        materialize_from_extracted(snapshot.path(), suite.path()).unwrap();
+        let workspace = TestDir::new("classified-digest-workspace");
+        let ledger_path = workspace.path().join("verification/ts-suite-ledger.json");
+        let mut ledger = write_suite_ledger(snapshot.path(), &ledger_path).unwrap();
+        ledger.snapshot.digest = "0".repeat(64);
+        fs::write(&ledger_path, TsLedgerWriter::to_vec(&ledger).unwrap()).unwrap();
+        materialize_from_extracted(snapshot.path(), suite.path()).unwrap();
+
+        let error = run_suite(
+            workspace.path(),
+            snapshot.path(),
+            &RunFilterOptions {
+                status: StatusFilter::Included,
+                slice: Some("s1".to_owned()),
+                backends: BackendFilter::One(Backend::Check),
+                shards: Some((1, 1)),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::Digest);
+    }
+
+    #[test]
     fn included_s1_parse_rows_are_selected_by_slice_and_pass_check() {
         let suite = TestDir::new("s1parse-suite");
         write_fixture_tree(suite.path());
@@ -3117,6 +3173,32 @@ mod tests {
                     assert!(!entry.blocked_by.is_empty());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tar_preflight_rejects_non_allowlisted_symlink_and_hard_link() {
+        let symlink = "lrwxrwxrwx owner/group 0 2026-08-20 00:00 package/docs/link -> target";
+        let hard_link =
+            "hrw-r--r-- owner/group 0 2026-08-20 00:00 package/docs/alias link to target";
+        assert_eq!(
+            reject_tar_verbose_line(symlink).unwrap_err().code,
+            ErrorCode::ProvenanceMismatch
+        );
+        assert_eq!(
+            reject_tar_verbose_line(hard_link).unwrap_err().code,
+            ErrorCode::ProvenanceMismatch
+        );
+    }
+
+    #[test]
+    fn tar_preflight_allows_only_regular_files_and_directories() {
+        reject_tar_verbose_line("-rw-r--r-- owner/group 1 2026-08-20 00:00 package/docs/file")
+            .unwrap();
+        reject_tar_verbose_line("drwxr-xr-x owner/group 0 2026-08-20 00:00 package/docs/").unwrap();
+        for special in ['c', 'b', 'p', 's'] {
+            let line = format!("{special}rw-r--r-- owner/group 0 date package/docs/special");
+            assert!(reject_tar_verbose_line(&line).is_err());
         }
     }
 }

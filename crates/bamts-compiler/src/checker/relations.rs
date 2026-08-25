@@ -23,8 +23,9 @@ use std::collections::{HashMap, HashSet};
 use bamts_bytecode::MAX_BIGINT_BYTES;
 
 use super::binder::{
-    ConstraintTypeExpr, ConstructEntry, FunctionSignature, IndexedAccessConstraint,
-    IteratorProperty, ObjectType, PropertyType, SymbolId, TupleShape, Type, TypeId, TypeTable,
+    ConstraintTypeExpr, ConstructEntry, FunctionParameter, FunctionSignature,
+    IndexedAccessConstraint, IteratorProperty, ObjectType, PropertyType, SymbolId, TupleShape,
+    Type, TypeId, TypeTable,
 };
 use crate::literal::{MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, number_value};
 use crate::syntax::Accessibility;
@@ -107,7 +108,35 @@ struct RelationKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RelationContext {
     parameter_aliases: Box<[(SymbolId, SymbolId)]>,
+    alpha_aliases: usize,
     erasure_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RelationEndpoint {
+    Alias(SymbolId),
+    Class(SymbolId),
+    Type(TypeId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TemplateHead {
+    Class(SymbolId),
+    Alias(SymbolId),
+}
+
+#[derive(Default)]
+struct FreeSymbolSearch {
+    types: HashSet<TypeId>,
+    templates: HashSet<TemplateHead>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct AliasRelationKey {
+    source: RelationEndpoint,
+    target: RelationEndpoint,
+    strictness: Strictness,
+    context: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -121,6 +150,7 @@ struct DependencyFrame {
     assumptions: HashSet<RelationKey>,
     erasure_requirements: HashMap<SymbolId, bool>,
     erased_base: usize,
+    approximate_alias: bool,
 }
 
 impl DependencyFrame {
@@ -129,6 +159,7 @@ impl DependencyFrame {
             assumptions: HashSet::new(),
             erasure_requirements: HashMap::new(),
             erased_base,
+            approximate_alias: false,
         }
     }
 }
@@ -150,17 +181,25 @@ pub struct TypeRelations<'table> {
     cache: RefCell<HashMap<RelationKey, Vec<CachedRelation>>>,
     /// Pairs currently being compared, to break recursive structural types.
     visiting: RefCell<HashSet<RelationKey>>,
+    /// Semantic alias pairs active on the current structural path.
+    active_alias_relations: RefCell<HashSet<AliasRelationKey>>,
     /// Coinductive assumptions and erased-membership predicates consumed by
     /// each active relation frame.
     dependency_stack: RefCell<Vec<DependencyFrame>>,
     /// Interned identities for effective alias/erasure environments. Identity
     /// zero is the empty environment.
     contexts: RefCell<HashMap<RelationContext, usize>>,
+    /// Proven capture reachability in immutable class and alias templates.
+    template_capture_reachability: RefCell<HashMap<(TemplateHead, SymbolId), bool>>,
+    /// Proven free-symbol reachability from concrete relation endpoints.
+    free_symbol_reachability: RefCell<HashMap<(TypeId, SymbolId), bool>>,
     active_context: Cell<usize>,
     /// Type parameters paired positionally by the generic signatures currently
     /// being compared, so `<T>(x: T) => T` relates to `<U>(x: U) => U`.
     /// Non-empty only inside such a comparison.
     parameter_aliases: RefCell<Vec<(SymbolId, SymbolId)>>,
+    /// Number of directed pairs introduced by each active signature frame.
+    parameter_alias_frames: RefCell<Vec<usize>>,
     /// Signature type parameters erased to `any` for the comparable relation.
     /// Non-empty only while one signature comparison is active.
     erased_parameters: RefCell<Vec<SymbolId>>,
@@ -186,10 +225,14 @@ impl<'table> TypeRelations<'table> {
             table,
             cache: RefCell::new(HashMap::new()),
             visiting: RefCell::new(HashSet::new()),
+            active_alias_relations: RefCell::new(HashSet::new()),
             dependency_stack: RefCell::new(Vec::new()),
             contexts: RefCell::new(HashMap::new()),
+            template_capture_reachability: RefCell::new(HashMap::new()),
+            free_symbol_reachability: RefCell::new(HashMap::new()),
             active_context: Cell::new(0),
             parameter_aliases: RefCell::new(Vec::new()),
+            parameter_alias_frames: RefCell::new(Vec::new()),
             erased_parameters: RefCell::new(Vec::new()),
             cancel,
             #[cfg(test)]
@@ -260,6 +303,15 @@ impl<'table> TypeRelations<'table> {
                 hazards: Box::new([]),
             };
         }
+        let (Some(source), Some(target)) = (
+            self.relation_alias_view(source),
+            self.relation_alias_view(target),
+        ) else {
+            return TypeRelation {
+                compatible,
+                hazards: Box::new([]),
+            };
+        };
 
         let mut hazards = Vec::new();
         if let (Type::Function(from), Type::Function(to)) =
@@ -384,8 +436,12 @@ impl<'table> TypeRelations<'table> {
         // The in-progress key above uses the applied TypeIds themselves, so a
         // recursive Box<1>/Box<number> comparison terminates without conflating
         // either application with a different argument pair.
-        let source_applied = matches!(self.table.get(source), Type::AppliedClass { .. });
-        let target_applied = matches!(self.table.get(target), Type::AppliedClass { .. });
+        let source_class = matches!(self.table.get(source), Type::AppliedClass { .. });
+        let target_class = matches!(self.table.get(target), Type::AppliedClass { .. });
+        let source_alias = matches!(self.table.get(source), Type::AppliedAlias { .. });
+        let target_alias = matches!(self.table.get(target), Type::AppliedAlias { .. });
+        let source_applied = source_class || source_alias;
+        let target_applied = target_class || target_alias;
         let identical_application = matches!(
             (self.table.get(source), self.table.get(target)),
             (
@@ -399,16 +455,49 @@ impl<'table> TypeRelations<'table> {
                 },
             ) if source_symbol == target_symbol && source_arguments == target_arguments
         );
-        let result = if identical_application {
+        let alias_relation = (source_applied || target_applied).then(|| AliasRelationKey {
+            source: match self.table.get(source) {
+                Type::AppliedAlias { symbol, .. } => RelationEndpoint::Alias(*symbol),
+                Type::AppliedClass { symbol, .. } => RelationEndpoint::Class(*symbol),
+                _ => RelationEndpoint::Type(source),
+            },
+            target: match self.table.get(target) {
+                Type::AppliedAlias { symbol, .. } => RelationEndpoint::Alias(*symbol),
+                Type::AppliedClass { symbol, .. } => RelationEndpoint::Class(*symbol),
+                _ => RelationEndpoint::Type(target),
+            },
+            strictness,
+            context: self.alias_relation_context(source, target),
+        });
+        let alias_relation_inserted =
+            alias_relation.is_none_or(|key| self.active_alias_relations.borrow_mut().insert(key));
+        if !alias_relation_inserted {
+            self.dependency_stack
+                .borrow_mut()
+                .last_mut()
+                .expect("active relation owns a dependency frame")
+                .approximate_alias = true;
+        }
+        let result = if !alias_relation_inserted || identical_application {
             true
         } else if source_applied || target_applied {
-            let source_view = source_applied
-                .then(|| self.table.applied_class_view(source))
-                .flatten();
-            let target_view = target_applied
-                .then(|| self.table.applied_class_view(target))
-                .flatten();
-            if source_view.is_some() || target_view.is_some() {
+            let source_view = if source_class {
+                self.table.applied_class_view(source)
+            } else if source_alias {
+                self.relation_alias_view(source)
+            } else {
+                None
+            };
+            let target_view = if target_class {
+                self.table.applied_class_view(target)
+            } else if target_alias {
+                self.relation_alias_view(target)
+            } else {
+                None
+            };
+            if (source_alias && source_view.is_none()) || (target_alias && target_view.is_none()) {
+                false
+            } else if source_view.is_some() || target_view.is_some() {
                 self.relates(
                     source_view.unwrap_or(source),
                     target_view.unwrap_or(target),
@@ -420,6 +509,9 @@ impl<'table> TypeRelations<'table> {
         } else {
             self.relates_uncached(source, target, strictness)
         };
+        if alias_relation_inserted && let Some(key) = alias_relation {
+            self.active_alias_relations.borrow_mut().remove(&key);
+        }
 
         let mut frame = self
             .dependency_stack
@@ -431,11 +523,12 @@ impl<'table> TypeRelations<'table> {
             frame.assumptions.clear();
         } else if let Some(parent) = self.dependency_stack.borrow_mut().last_mut() {
             parent.assumptions.extend(frame.assumptions.iter().copied());
+            parent.approximate_alias |= frame.approximate_alias;
             for (&symbol, &erased) in &frame.erasure_requirements {
                 self.record_erasure_requirement(parent, ErasureRequirement { symbol, erased });
             }
         }
-        if cacheable && (result || frame.assumptions.is_empty()) {
+        if cacheable && !frame.approximate_alias && (result || frame.assumptions.is_empty()) {
             let mut assumptions: Vec<_> = frame.assumptions.into_iter().collect();
             assumptions.sort_unstable();
             let mut erasure_requirements: Vec<_> = frame
@@ -476,24 +569,397 @@ impl<'table> TypeRelations<'table> {
         result
     }
 
-    fn refresh_context(&self) {
-        let mut parameter_aliases = self.parameter_aliases.borrow().clone();
+    fn intern_context(
+        &self,
+        mut parameter_aliases: Vec<(SymbolId, SymbolId)>,
+        alpha_aliases: usize,
+        erasure_active: bool,
+    ) -> usize {
         parameter_aliases.sort_unstable();
         parameter_aliases.dedup();
-        let erasure_active = !self.erased_parameters.borrow().is_empty();
-        if parameter_aliases.is_empty() && !erasure_active {
-            self.active_context.set(0);
-            return;
+        if parameter_aliases.is_empty() && alpha_aliases == 0 && !erasure_active {
+            return 0;
         }
 
         let context = RelationContext {
             parameter_aliases: parameter_aliases.into_boxed_slice(),
+            alpha_aliases,
             erasure_active,
         };
         let mut contexts = self.contexts.borrow_mut();
         let next = contexts.len() + 1;
+        *contexts.entry(context).or_insert(next)
+    }
+
+    fn refresh_context(&self) {
+        let parameter_aliases = self.parameter_aliases.borrow().clone();
+        let erasure_active = !self.erased_parameters.borrow().is_empty();
         self.active_context
-            .set(*contexts.entry(context).or_insert(next));
+            .set(self.intern_context(parameter_aliases, 0, erasure_active));
+    }
+
+    fn alias_relation_context(&self, source: TypeId, target: TypeId) -> usize {
+        let current_frame = self
+            .parameter_alias_frames
+            .borrow()
+            .last()
+            .copied()
+            .unwrap_or(0);
+        debug_assert_eq!(current_frame % 2, 0);
+        let alpha_aliases = current_frame / 2;
+        let mut aliases = {
+            let aliases = self.parameter_aliases.borrow();
+            debug_assert!(current_frame <= aliases.len());
+            aliases[..aliases.len() - current_frame].to_vec()
+        };
+        aliases.sort_unstable();
+        aliases.dedup();
+        let erasure_active = !self.erased_parameters.borrow().is_empty();
+        if aliases.is_empty() {
+            return self.intern_context(Vec::new(), alpha_aliases, erasure_active);
+        }
+        let mut projected = Vec::with_capacity(aliases.len());
+
+        for alias in aliases {
+            let forward = Self::both_reachable(
+                self.reaches_free_symbol(source, alias.0),
+                self.reaches_free_symbol(target, alias.1),
+            );
+            let reverse = Self::both_reachable(
+                self.reaches_free_symbol(source, alias.1),
+                self.reaches_free_symbol(target, alias.0),
+            );
+            if forward == Some(true) || reverse == Some(true) {
+                projected.push(alias);
+            } else if forward.is_none() || reverse.is_none() {
+                return self.active_context.get();
+            }
+        }
+
+        self.intern_context(projected, alpha_aliases, erasure_active)
+    }
+
+    fn both_reachable(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+        match (left, right) {
+            (Some(true), Some(true)) => Some(true),
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            _ => None,
+        }
+    }
+
+    fn reaches_free_symbol(&self, type_id: TypeId, symbol: SymbolId) -> Option<bool> {
+        if let Some(found) = self
+            .free_symbol_reachability
+            .borrow()
+            .get(&(type_id, symbol))
+            .copied()
+        {
+            return Some(found);
+        }
+
+        let mut search = FreeSymbolSearch::default();
+        let found = self.type_reaches_free_symbol(type_id, symbol, &mut search);
+        if let Some(found) = found {
+            self.free_symbol_reachability
+                .borrow_mut()
+                .insert((type_id, symbol), found);
+        }
+        found
+    }
+
+    fn type_reaches_free_symbol(
+        &self,
+        type_id: TypeId,
+        symbol: SymbolId,
+        search: &mut FreeSymbolSearch,
+    ) -> Option<bool> {
+        if !search.types.insert(type_id) {
+            return Some(false);
+        }
+
+        match self.table.get(type_id) {
+            Type::Array(element) | Type::Keyof(element) => {
+                self.type_reaches_free_symbol(*element, symbol, search)
+            }
+            Type::Tuple(shape) => self.any_types_reach_free_symbol(
+                shape
+                    .prefix
+                    .iter()
+                    .copied()
+                    .chain(shape.rest)
+                    .chain(shape.suffix.iter().copied()),
+                symbol,
+                search,
+            ),
+            Type::Union(members) | Type::Intersection(members) => {
+                self.any_types_reach_free_symbol(members.iter().copied(), symbol, search)
+            }
+            Type::ObjectType(object) => self.object_reaches_free_symbol(object, symbol, search),
+            Type::Function(signature) => {
+                self.signature_reaches_free_symbol(signature, symbol, search)
+            }
+            Type::Named(named) => {
+                if *named == symbol {
+                    return Some(true);
+                }
+                self.any_types_reach_free_symbol(
+                    [
+                        self.table.type_parameter_constraint(*named),
+                        self.table.interface_structure(*named),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                    symbol,
+                    search,
+                )
+            }
+            Type::AppliedClass {
+                symbol: head,
+                arguments,
+            } => {
+                let arguments_reach =
+                    self.any_types_reach_free_symbol(arguments.iter().copied(), symbol, search);
+                if arguments_reach == Some(true) {
+                    return Some(true);
+                }
+                Self::combine_reachability(
+                    arguments_reach,
+                    self.template_reaches_free_symbol(TemplateHead::Class(*head), symbol, search),
+                )
+            }
+            Type::AppliedAlias {
+                symbol: head,
+                arguments,
+            } => {
+                let arguments_reach =
+                    self.any_types_reach_free_symbol(arguments.iter().copied(), symbol, search);
+                if arguments_reach == Some(true) {
+                    return Some(true);
+                }
+                Self::combine_reachability(
+                    arguments_reach,
+                    self.template_reaches_free_symbol(TemplateHead::Alias(*head), symbol, search),
+                )
+            }
+            Type::IndexedAccess { object, index } => {
+                self.any_types_reach_free_symbol([*object, *index], symbol, search)
+            }
+            Type::Record { key, value } => {
+                self.any_types_reach_free_symbol([*key, *value], symbol, search)
+            }
+            Type::This { constraint, .. } => {
+                self.type_reaches_free_symbol(*constraint, symbol, search)
+            }
+            Type::Error
+            | Type::Any
+            | Type::Unknown
+            | Type::Never
+            | Type::Void
+            | Type::Null
+            | Type::Undefined
+            | Type::Boolean
+            | Type::Number
+            | Type::BigInt
+            | Type::String
+            | Type::Symbol
+            | Type::Object
+            | Type::BooleanLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::StringLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::NumericEnum(_) => Some(false),
+        }
+    }
+
+    fn template_reaches_free_symbol(
+        &self,
+        head: TemplateHead,
+        symbol: SymbolId,
+        search: &mut FreeSymbolSearch,
+    ) -> Option<bool> {
+        if !search.templates.is_empty() {
+            return self.template_reaches_free_symbol_inner(head, symbol, search);
+        }
+        if let Some(found) = self
+            .template_capture_reachability
+            .borrow()
+            .get(&(head, symbol))
+            .copied()
+        {
+            return Some(found);
+        }
+
+        let mut template_search = FreeSymbolSearch::default();
+        let found = self.template_reaches_free_symbol_inner(head, symbol, &mut template_search);
+        if let Some(found) = found {
+            self.template_capture_reachability
+                .borrow_mut()
+                .insert((head, symbol), found);
+        }
+        found
+    }
+
+    fn template_reaches_free_symbol_inner(
+        &self,
+        head: TemplateHead,
+        symbol: SymbolId,
+        search: &mut FreeSymbolSearch,
+    ) -> Option<bool> {
+        if !search.templates.insert(head) {
+            return Some(false);
+        }
+
+        let (parameters, raw) = match head {
+            TemplateHead::Class(head) => (
+                self.table.class_type_parameters(head),
+                self.table.class_template_raw(head),
+            ),
+            TemplateHead::Alias(head) => (
+                self.table.alias_type_parameters(head),
+                self.table.alias_template_raw(head),
+            ),
+        };
+        let found = if parameters.contains(&symbol) {
+            Some(false)
+        } else {
+            raw.and_then(|raw| self.type_reaches_free_symbol(raw, symbol, search))
+        };
+        search.templates.remove(&head);
+        found
+    }
+
+    fn object_reaches_free_symbol(
+        &self,
+        object: &ObjectType,
+        symbol: SymbolId,
+        search: &mut FreeSymbolSearch,
+    ) -> Option<bool> {
+        let mut complete = true;
+        for property in &object.properties {
+            if Self::found_or_mark_incomplete(
+                self.type_reaches_free_symbol(property.type_id(), symbol, search),
+                &mut complete,
+            ) {
+                return Some(true);
+            }
+        }
+        for signature in &object.call_signatures {
+            if Self::found_or_mark_incomplete(
+                self.signature_reaches_free_symbol(signature, symbol, search),
+                &mut complete,
+            ) {
+                return Some(true);
+            }
+        }
+        for entry in &object.construct_signatures {
+            if Self::found_or_mark_incomplete(
+                self.signature_reaches_free_symbol(&entry.signature, symbol, search),
+                &mut complete,
+            ) {
+                return Some(true);
+            }
+        }
+        for signature in &object.index_signatures {
+            for parameter in &signature.parameters {
+                if Self::found_or_mark_incomplete(
+                    self.type_reaches_free_symbol(parameter.type_id(), symbol, search),
+                    &mut complete,
+                ) {
+                    return Some(true);
+                }
+            }
+            if Self::found_or_mark_incomplete(
+                self.type_reaches_free_symbol(signature.value_type, symbol, search),
+                &mut complete,
+            ) {
+                return Some(true);
+            }
+        }
+        for type_id in [
+            object.generator_return,
+            object
+                .iterator_property
+                .as_ref()
+                .map(|property| property.type_id()),
+            object
+                .async_iterator_property
+                .as_ref()
+                .map(|property| property.type_id()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if Self::found_or_mark_incomplete(
+                self.type_reaches_free_symbol(type_id, symbol, search),
+                &mut complete,
+            ) {
+                return Some(true);
+            }
+        }
+        complete.then_some(false)
+    }
+
+    fn signature_reaches_free_symbol(
+        &self,
+        signature: &FunctionSignature,
+        symbol: SymbolId,
+        search: &mut FreeSymbolSearch,
+    ) -> Option<bool> {
+        if signature.type_parameters().contains(&symbol) {
+            return Some(false);
+        }
+
+        let bounds = signature
+            .type_parameter_bounds()
+            .iter()
+            .flat_map(|bound| [bound.constraint(), bound.default()].into_iter().flatten());
+        let parameters = signature
+            .parameters()
+            .iter()
+            .map(FunctionParameter::type_id);
+        self.any_types_reach_free_symbol(
+            bounds
+                .chain(parameters)
+                .chain(std::iter::once(signature.return_type())),
+            symbol,
+            search,
+        )
+    }
+
+    fn any_types_reach_free_symbol(
+        &self,
+        types: impl IntoIterator<Item = TypeId>,
+        symbol: SymbolId,
+        search: &mut FreeSymbolSearch,
+    ) -> Option<bool> {
+        let mut complete = true;
+        for type_id in types {
+            if Self::found_or_mark_incomplete(
+                self.type_reaches_free_symbol(type_id, symbol, search),
+                &mut complete,
+            ) {
+                return Some(true);
+            }
+        }
+        complete.then_some(false)
+    }
+
+    fn found_or_mark_incomplete(found: Option<bool>, complete: &mut bool) -> bool {
+        match found {
+            Some(found) => found,
+            None => {
+                *complete = false;
+                false
+            }
+        }
+    }
+
+    fn combine_reachability(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+        match (left, right) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        }
     }
 
     fn relates_uncached(&self, source: TypeId, target: TypeId, strictness: Strictness) -> bool {
@@ -770,6 +1236,7 @@ impl<'table> TypeRelations<'table> {
                 | Type::Function(_)
                 | Type::Named(_)
                 | Type::AppliedClass { .. }
+                | Type::AppliedAlias { .. }
                 | Type::NumericEnum(_)
                 | Type::Keyof(_),
                 _,
@@ -813,6 +1280,7 @@ impl<'table> TypeRelations<'table> {
             aliases.push((target_parameter, source_parameter));
         }
         drop(aliases);
+        self.parameter_alias_frames.borrow_mut().push(added);
         self.refresh_context();
         let constraints_relate = source
             .type_parameter_bounds()
@@ -831,6 +1299,12 @@ impl<'table> TypeRelations<'table> {
                         && self.relates(source_constraint, target_constraint, strictness))
             });
         let result = constraints_relate && compare();
+        let removed = self
+            .parameter_alias_frames
+            .borrow_mut()
+            .pop()
+            .expect("active generic signature owns one alias frame");
+        debug_assert_eq!(removed, added);
         let mut aliases = self.parameter_aliases.borrow_mut();
         let kept = aliases.len() - added;
         aliases.truncate(kept);
@@ -903,21 +1377,53 @@ impl<'table> TypeRelations<'table> {
                 | Type::Function(_)
                 | Type::Named(_)
                 | Type::AppliedClass { .. }
+                | Type::AppliedAlias { .. }
                 | Type::This { .. }
                 | Type::Record { .. }
         )
     }
+
+    /// Follows transparent alias heads without classifying a missing or cyclic
+    /// view as the alias's nominal identity.
+    fn relation_alias_view(&self, mut type_id: TypeId) -> Option<TypeId> {
+        let mut visiting = HashSet::new();
+        while matches!(self.table.get(type_id), Type::AppliedAlias { .. }) {
+            if !visiting.insert(type_id) {
+                return None;
+            }
+            type_id = self.table.applied_alias_view(type_id)?;
+        }
+        Some(type_id)
+    }
+
     fn contains_undefined(&self, type_id: TypeId) -> bool {
+        self.contains_undefined_inner(type_id, &mut HashSet::new())
+    }
+
+    fn contains_undefined_inner(
+        &self,
+        type_id: TypeId,
+        visiting_aliases: &mut HashSet<TypeId>,
+    ) -> bool {
         match self.table.get(type_id) {
             Type::Any | Type::Unknown | Type::Undefined => true,
             Type::Union(members) => members
                 .iter()
-                .any(|member| self.contains_undefined(*member)),
+                .any(|member| self.contains_undefined_inner(*member, visiting_aliases)),
             Type::AppliedClass { .. } => self
                 .table
                 .applied_class_view(type_id)
-                .map(|view| self.contains_undefined(view))
+                .map(|view| self.contains_undefined_inner(view, visiting_aliases))
                 .unwrap_or(false),
+            Type::AppliedAlias { .. } => {
+                if !visiting_aliases.insert(type_id) {
+                    return false;
+                }
+                self.table
+                    .applied_alias_view(type_id)
+                    .map(|view| self.contains_undefined_inner(view, visiting_aliases))
+                    .unwrap_or(false)
+            }
             Type::Error
             | Type::Intersection(_)
             | Type::Never
@@ -1313,6 +1819,9 @@ impl<'table> TypeRelations<'table> {
         if self.constraint_clause_is_never(known) {
             return true;
         }
+        let Some(target) = self.relation_alias_view(target) else {
+            return false;
+        };
         match self.table.get(target) {
             Type::Union(targets) => {
                 return targets
@@ -1350,6 +1859,12 @@ impl<'table> TypeRelations<'table> {
     }
 
     fn constraint_ids_disjoint(&self, left: TypeId, right: TypeId) -> bool {
+        let Some(left) = self.relation_alias_view(left) else {
+            return false;
+        };
+        let Some(right) = self.relation_alias_view(right) else {
+            return false;
+        };
         let left = self.table.get(left);
         let right = self.table.get(right);
         if matches!(left, Type::Never) || matches!(right, Type::Never) {
@@ -1408,6 +1923,7 @@ impl<'table> TypeRelations<'table> {
         }
     }
     fn relation_object_view(&self, type_id: TypeId) -> Option<&ObjectType> {
+        let type_id = self.relation_alias_view(type_id)?;
         let type_id = match self.table.get(type_id) {
             Type::AppliedClass { .. } => self.table.applied_class_view(type_id).unwrap_or(type_id),
             Type::Named(symbol) => self
@@ -1416,7 +1932,9 @@ impl<'table> TypeRelations<'table> {
                 .unwrap_or(type_id),
             _ => type_id,
         };
+        let type_id = self.relation_alias_view(type_id)?;
         let type_id = self.table.named_structural_view(type_id);
+        let type_id = self.relation_alias_view(type_id)?;
         match self.table.get(type_id) {
             Type::ObjectType(object) => Some(object),
             _ => None,
@@ -2340,7 +2858,7 @@ mod tests {
 
     /// Nested applications relate through their own substituted views.
     #[test]
-    fn nested_applied_class_heads_relate_structurally() {
+    fn nested_applied_class_heads_relate_without_precreated_concrete_views() {
         let mut table = TypeTable::new();
         let string = table.string();
         let animal = table.object_type(vec![PropertyType::new("name", false, string)]);
@@ -2353,8 +2871,6 @@ mod tests {
         let named_inner = table.named(t_inner);
         let inner_raw = table.object_type(vec![PropertyType::new("value", false, named_inner)]);
         declare_generic_class(&mut table, inner, t_inner, inner_raw);
-        let inner_animal = table.applied_class(inner, vec![animal]);
-        let inner_dog = table.applied_class(inner, vec![dog]);
         let outer = SymbolId::new(470);
         let t_outer = SymbolId::new(471);
         let named_outer = table.named(t_outer);
@@ -2367,7 +2883,6 @@ mod tests {
 
         assert!(relations.subtype(outer_dog, outer_animal));
         assert!(!relations.subtype(outer_animal, outer_dog));
-        assert_ne!(inner_animal, inner_dog);
     }
 
     #[test]
@@ -2689,6 +3204,154 @@ mod tests {
         let relations = TypeRelations::new(&table);
 
         assert!(!relations.assignable(source, target));
+    }
+
+    #[test]
+    fn alias_guard_context_normalizes_local_binders_and_retains_captures() {
+        let mut table = TypeTable::new();
+        let source_class = SymbolId::new(800);
+        let source_parameter = SymbolId::new(801);
+        let source_parameter_type = table.named(source_parameter);
+        let source_raw = table.object_type(vec![PropertyType::new(
+            "value",
+            false,
+            source_parameter_type,
+        )]);
+        declare_generic_class(&mut table, source_class, source_parameter, source_raw);
+        let target_class = SymbolId::new(802);
+        let target_parameter = SymbolId::new(803);
+        let target_parameter_type = table.named(target_parameter);
+        let target_raw = table.object_type(vec![PropertyType::new(
+            "value",
+            false,
+            target_parameter_type,
+        )]);
+        declare_generic_class(&mut table, target_class, target_parameter, target_raw);
+
+        let outer_source = SymbolId::new(804);
+        let outer_target = SymbolId::new(805);
+        let inner_source = SymbolId::new(806);
+        let inner_target = SymbolId::new(807);
+        let outer_source_type = table.named(outer_source);
+        let outer_target_type = table.named(outer_target);
+        let inner_source_type = table.named(inner_source);
+        let inner_target_type = table.named(inner_target);
+        let outer_source_head = table.applied_class(source_class, vec![outer_source_type]);
+        let outer_target_head = table.applied_class(target_class, vec![outer_target_type]);
+        let inner_source_head = table.applied_class(source_class, vec![inner_source_type]);
+        let inner_target_head = table.applied_class(target_class, vec![inner_target_type]);
+
+        let captured_source_class = SymbolId::new(808);
+        table.declare_class(captured_source_class, Vec::new());
+        let captured_source_raw = table.object_type(vec![PropertyType::new(
+            "captured",
+            false,
+            outer_source_type,
+        )]);
+        table.publish_final_class_template(captured_source_class, captured_source_raw);
+        let captured_source_head = table.applied_class(captured_source_class, Vec::new());
+        let captured_target_class = SymbolId::new(809);
+        table.declare_class(captured_target_class, Vec::new());
+        let captured_target_raw = table.object_type(vec![PropertyType::new(
+            "captured",
+            false,
+            outer_target_type,
+        )]);
+        table.publish_final_class_template(captured_target_class, captured_target_raw);
+        let captured_target_head = table.applied_class(captured_target_class, Vec::new());
+
+        let constrained_source = SymbolId::new(810);
+        let constrained_target = SymbolId::new(811);
+        table.set_type_parameter_constraint(constrained_source, outer_source_type);
+        table.set_type_parameter_constraint(constrained_target, outer_target_type);
+        let constrained_source_type = table.named(constrained_source);
+        let constrained_target_type = table.named(constrained_target);
+        let constrained_source_head =
+            table.applied_class(source_class, vec![constrained_source_type]);
+        let constrained_target_head =
+            table.applied_class(target_class, vec![constrained_target_type]);
+
+        let outer_source_signature =
+            table.function_with_parameters(vec![outer_source], Vec::new(), table.void());
+        let outer_target_signature =
+            table.function_with_parameters(vec![outer_target], Vec::new(), table.void());
+        let inner_source_signature =
+            table.function_with_parameters(vec![inner_source], Vec::new(), table.void());
+        let inner_target_signature =
+            table.function_with_parameters(vec![inner_target], Vec::new(), table.void());
+        let signature = |type_id| match table.get(type_id) {
+            Type::Function(signature) => signature.clone(),
+            _ => panic!("test fixture must be a function"),
+        };
+        let outer_source_signature = signature(outer_source_signature);
+        let outer_target_signature = signature(outer_target_signature);
+        let inner_source_signature = signature(inner_source_signature);
+        let inner_target_signature = signature(inner_target_signature);
+        let relations = TypeRelations::new(&table);
+
+        let local = Cell::new(0);
+        assert!(relations.with_parameter_aliases(
+            &inner_source_signature,
+            &inner_target_signature,
+            Strictness::Assignable,
+            ParameterVariance::Bivariant,
+            || {
+                local.set(relations.alias_relation_context(inner_source_head, inner_target_head));
+                true
+            },
+        ));
+
+        let nested_local = Cell::new(0);
+        let captured_argument = Cell::new(0);
+        let captured_template = Cell::new(0);
+        let captured_constraint = Cell::new(0);
+        assert!(relations.with_parameter_aliases(
+            &outer_source_signature,
+            &outer_target_signature,
+            Strictness::Assignable,
+            ParameterVariance::Bivariant,
+            || relations.with_parameter_aliases(
+                &inner_source_signature,
+                &inner_target_signature,
+                Strictness::Assignable,
+                ParameterVariance::Bivariant,
+                || {
+                    nested_local.set(
+                        relations.alias_relation_context(inner_source_head, inner_target_head),
+                    );
+                    captured_argument.set(
+                        relations.alias_relation_context(outer_source_head, outer_target_head),
+                    );
+                    captured_template.set(
+                        relations
+                            .alias_relation_context(captured_source_head, captured_target_head),
+                    );
+                    captured_constraint.set(
+                        relations.alias_relation_context(
+                            constrained_source_head,
+                            constrained_target_head,
+                        ),
+                    );
+                    true
+                },
+            ),
+        ));
+
+        assert_eq!(nested_local.get(), local.get());
+        for context_id in [
+            captured_argument.get(),
+            captured_template.get(),
+            captured_constraint.get(),
+        ] {
+            assert_ne!(context_id, local.get());
+            let contexts = relations.contexts.borrow();
+            let context = contexts
+                .iter()
+                .find_map(|(context, &id)| (id == context_id).then_some(context))
+                .expect("projected context is interned");
+            assert_eq!(context.alpha_aliases, 1);
+            assert_eq!(context.parameter_aliases.len(), 2);
+        }
     }
 
     #[test]

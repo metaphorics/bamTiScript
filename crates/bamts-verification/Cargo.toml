@@ -35,8 +35,12 @@ path = "src/bin/ts_conformance.rs"
 name = "perf_budget"
 path = "src/bin/perf_budget.rs"
 
+[[bin]]
+name = "bh1_jit"
+path = "src/bin/bh1_jit.rs"
+
 [lints.rust]
-# `unsafe_code` is downgraded from the workspace `forbid` to `deny` so a
-# single `#[allow(unsafe_code)]` may cover the `libc::killpg` call in
-# `terminate_process_group`.
+# `unsafe_code` is downgraded from the workspace `forbid` to `deny` so narrow
+# `#[allow(unsafe_code)]` blocks may call `killpg` for namespace teardown and
+# `prctl(PR_SET_DUMPABLE)` before the JIT secret enters the launcher argv.
 unsafe_code = "deny"

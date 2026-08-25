@@ -1,0 +1,339 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup default "$TOOLCHAIN"
+          rustc --version
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Assert Node version
+        run: test "$(node --version)" = "v24.18.0"
+
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup default "$TOOLCHAIN"
+
+      - name: Sync snapshot
+        run: |
+          cargo run --locked -p bamts-verification --bin ts_conformance -- \
+            sync --verify-pin --write-snapshot
+
+      - name: Audit ledger
+        run: |
+          cargo run --locked -p bamts-verification --bin ts_conformance -- \
+            audit-ledger --require-complete
+
+  corpus:
+    name: Corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TZ: UTC
+      LANG: C
+      LC_ALL: C
+      NO_COLOR: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Assert Node version
+        run: test "$(node --version)" = "v24.18.0"
+
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup default "$TOOLCHAIN"
+
+      - name: Corpus differential
+        run: |
+          cargo test -p bamts-verification --test corpus_differential --locked -- --nocapture
+
+  formal:
+    name: Formal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Install Quint
+        run: npm ci --prefix formal/quint
+
+      - name: Assert Node version
+        run: test "$(node --version)" = "v24.18.0"
+
+      - name: Setup Racket
+        uses: Bogdanp/setup-racket@2466913449df77df2bad149d1f2fc4e1ea4795dd # v1.15
+        with:
+          architecture: x64
+          distribution: full
+          variant: CS
+          version: "9.2"
+
+      - name: Setup and build Lean proofs
+        uses: leanprover/lean-action@38fbc41a8c28c4cbaec22d7f7de508ec2e7c0dd9 # v1
+        with:
+          # `build: true` runs Lake; Elan resolves formal/lean/lean-toolchain.
+          auto-config: false
+          build: true
+          lake-package-directory: formal/lean
+          use-github-cache: false
+
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup default "$TOOLCHAIN"
+
+      - name: G0 ledger
+        run: cargo run --locked -p bamts-verification --bin bamts-verification -- ledger verify --gate G0
+
+      - name: Formal gates G1,G2,G5,G3,G4
+        run: cargo run --locked -p bamts-verification --bin bamts-verification -- formal audit --gates G1,G2,G5,G3,G4
+
+  conformance:
+    name: Conformance shard ${{ matrix.shard }}/4
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Assert Node version
+        run: test "$(node --version)" = "v24.18.0"
+
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup default "$TOOLCHAIN"
+
+      - name: Sync snapshot
+        run: |
+          cargo run --locked -p bamts-verification --bin ts_conformance -- \
+            sync --verify-pin --write-snapshot
+
+      - name: Run conformance shard
+        run: |
+          cargo run --locked -p bamts-verification --bin ts_conformance -- \
+            ci --mode pr --status included --shards ${{ matrix.shard }}/4 \
+            | tee "conformance-${{ matrix.shard }}.log"
+
+      - name: Upload conformance log
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: conformance-shard-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: conformance-${{ matrix.shard }}.log
+          if-no-files-found: error
+          retention-days: 14
+
+  perf-bh1:
+    name: Performance (BH1)
+    needs: [quality, preflight, corpus, formal, conformance]
+    # Fork pull-request code never reaches BH1. After the upstream jobs succeed, run on BH1:
+    # cargo run --locked -p bamts-verification --bin bh1_jit -- provision --repo metaphorics/bamTiScript --pr PR --run RUN_ID --attempt RUN_ATTEMPT --head-sha HEAD_SHA --runner-group-id GROUP_ID
+    # The host tool provisions the unique run-attempt label and a one-job JIT runner.
+    # Its generated job-start hook revalidates the exact run, workflow, same-repository PR,
+    # PR number, and head SHA before GitHub permits any workflow step to execute.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, bh1, "bh1-perf-${{ github.run_id }}-${{ github.run_attempt }}"]
+    timeout-minutes: 120
+    env:
+      NO_COLOR: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Assert Node version
+        run: test "$(node --version)" = "v24.18.0"
+
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup default "$TOOLCHAIN"
+
+      - name: Build perf_budget release
+        run: |
+          cargo build --release --locked -p bamts-verification --bin perf_budget
+
+      - name: Verify fixtures
+        run: |
+          numactl --physcpubind=0-19 --membind=0 \
+            target/release/perf_budget verify-fixtures --manifest perf/benchmarks.toml
+
+      - name: Check s0 baseline
+        run: |
+          numactl --physcpubind=0-19 --membind=0 \
+            target/release/perf_budget check-baseline \
+            --host perf/hosts/bh1.toml \
+            --baseline perf/baselines/s0.json
+
+      - name: Measure s0
+        run: |
+          mkdir -p target/perf
+          numactl --physcpubind=0-19 --membind=0 \
+            target/release/perf_budget measure \
+            --host perf/hosts/bh1.toml \
+            --manifest perf/benchmarks.toml \
+            --slice s0 \
+            --out target/perf/pr-s0.json \
+            --baseline perf/baselines/s0.json
+
+      - name: Compare s0
+        run: |
+          numactl --physcpubind=0-19 --membind=0 \
+            target/release/perf_budget compare \
+            --host perf/hosts/bh1.toml \
+            --policy perf/budgets.toml \
+            --result target/perf/pr-s0.json
+
+      - name: Check scorecard
+        run: |
+          numactl --physcpubind=0-19 --membind=0 \
+            target/release/perf_budget check-scorecard \
+            --host perf/hosts/bh1.toml \
+            --scorecard perf/scorecard/typescript-7.0.2.json \
+            --policy perf/budgets.toml
+
+      - name: Upload s0 result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: perf-pr-s0-${{ github.run_attempt }}
+          path: target/perf/pr-s0.json
+          if-no-files-found: error
+          retention-days: 14

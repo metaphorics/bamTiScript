@@ -8,11 +8,9 @@
 //!
 //! Host identity is matched strictly: the immutable hardware/OS fields in
 //! [`HostFingerprint`] must equal the live machine or the run is
-//! [`PerfErrorCode::InvalidHost`]. CPU governor and swap are runtime-tunable
-//! measurement preconditions (BH1 "Execution Environment Rules"): they are
-//! read, recorded, and surfaced via [`MeasureResult::conditions_match`], but
-//! they do not gate host identity, so a BH1-hardware host that has not yet been
-//! tuned still measures (the operator gates on `conditions_match`).
+//! [`PerfErrorCode::InvalidHost`]. Runtime conditions are read from the live
+//! process, matched exactly before work starts, and serialized into every
+//! measurement or scorecard. Drift yields [`PerfErrorCode::InvalidConditions`].
 //!
 //! For S0 the measurement drives [`crate::suite::run_suite_with_telemetry`] for
 //! the requested slice. `total` is the measured seam wall; the `parse`, `bind`,
@@ -25,16 +23,19 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Path, PathBuf},
-    time::Instant,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use bamts_compiler::telemetry::Phase;
 use serde::{Deserialize, Serialize};
 
+use crate::fixtures::checked_root_path;
 use crate::suite::{BackendFilter, RunFilterOptions, StatusFilter, run_suite_with_telemetry};
 
 /// Schema version accepted by every perf schema loader.
-pub const PERF_SCHEMA_VERSION: u32 = 1;
+pub const PERF_SCHEMA_VERSION: u32 = 2;
 /// Default repeats when a benchmark omits the field.
 pub const DEFAULT_REPEATS: u32 = 3;
 /// Phase keys every measured result must carry (U0.9 fills real telemetry).
@@ -49,6 +50,10 @@ pub enum PerfErrorCode {
     NoBaseline,
     /// A budget threshold was exceeded.
     BudgetBreach,
+    /// The fixture tree differs from the pinned manifest.
+    FixtureMismatch,
+    /// Runtime tuning does not satisfy the baseline-capture contract.
+    InvalidConditions,
     /// The harness could not complete measurement.
     HarnessError,
     /// Command-line usage error.
@@ -63,6 +68,8 @@ impl PerfErrorCode {
             Self::InvalidHost => "INVALID_HOST",
             Self::NoBaseline => "NO_BASELINE",
             Self::BudgetBreach => "BUDGET_BREACH",
+            Self::FixtureMismatch => "FIXTURE_MISMATCH",
+            Self::InvalidConditions => "INVALID_CONDITIONS",
             Self::HarnessError => "HARNESS_ERROR",
             Self::Usage => "USAGE",
         }
@@ -77,6 +84,8 @@ impl PerfErrorCode {
             Self::NoBaseline => 4,
             Self::BudgetBreach => 5,
             Self::HarnessError => 6,
+            Self::FixtureMismatch => 7,
+            Self::InvalidConditions => 8,
         }
     }
 }
@@ -147,8 +156,8 @@ pub struct HostManifest {
 impl HostManifest {
     /// Confirms the immutable hardware/OS identity matches the machine.
     ///
-    /// Runtime conditions (governor/swap) are advisory and reported separately
-    /// via [`MeasureResult::conditions_match`]; they never yield `INVALID_HOST`.
+    /// Runtime conditions are validated separately and yield
+    /// [`PerfErrorCode::InvalidConditions`] when they drift.
     ///
     /// # Errors
     /// Returns [`PerfErrorCode::InvalidHost`] naming every mismatched identity field.
@@ -230,32 +239,47 @@ fn require_no_host_mismatches(diffs: Vec<String>) -> Result<()> {
     }
 }
 
-/// Runtime measurement conditions BH1 must be tuned to.
+/// Runtime measurement conditions required by the pinned host manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConditions {
-    /// Required CPU frequency governor, for example `performance`.
+    /// Required CPU frequency governor string, matched exactly.
     pub governor: String,
-    /// Required total swap in KiB (BH1 mandates `0`).
+    /// Required total swap in KiB, matched exactly.
     pub swap_total_kib: u64,
-    /// NUMA node 0 CPU pinning range.
-    pub numa_node0_cpus: String,
+    /// Required calling-thread CPU affinity list, matched exactly.
+    pub cpu_affinity: String,
+    /// Required calling-thread NUMA policy, matched exactly.
+    pub memory_policy: String,
+    /// Required calling-thread NUMA node list, matched exactly.
+    pub memory_nodes: String,
 }
 
-/// Conditions observed on the live machine at measurement time.
+/// Conditions observed on the live process at measurement time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedConditions {
     /// Live CPU governor.
     pub governor: String,
     /// Live total swap in KiB.
     pub swap_total_kib: u64,
+    /// Calling-thread CPU affinity list.
+    pub cpu_affinity: String,
+    /// Calling-thread NUMA policy.
+    pub memory_policy: String,
+    /// Calling-thread NUMA node list.
+    pub memory_nodes: String,
 }
 
 impl ObservedConditions {
-    /// Whether observed conditions satisfy the manifest preconditions.
+    /// Whether observed conditions satisfy every manifest precondition exactly.
     #[must_use]
     pub fn satisfies(&self, expected: &HostConditions) -> bool {
-        self.governor == expected.governor && self.swap_total_kib == expected.swap_total_kib
+        self.governor == expected.governor
+            && self.swap_total_kib == expected.swap_total_kib
+            && self.cpu_affinity == expected.cpu_affinity
+            && self.memory_policy == expected.memory_policy
+            && self.memory_nodes == expected.memory_nodes
     }
 }
 
@@ -347,6 +371,140 @@ fn parse_proc_meminfo_swap(content: &str) -> Result<u64> {
     Err(PerfError::harness("/proc/meminfo missing SwapTotal"))
 }
 
+fn parse_cpu_affinity(status: &str) -> Result<String> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| PerfError::harness("/proc/thread-self/status missing Cpus_allowed_list"))
+}
+
+#[cfg(target_os = "linux")]
+const NUMA_MASK_BITS: usize = 1024;
+#[cfg(target_os = "linux")]
+const NUMA_MASK_WORDS: usize = NUMA_MASK_BITS.div_ceil(libc::c_ulong::BITS as usize);
+
+#[cfg(target_os = "linux")]
+fn format_memory_nodes(mask: &[libc::c_ulong]) -> String {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for node in 0..NUMA_MASK_BITS {
+        let word = node / libc::c_ulong::BITS as usize;
+        let bit = node % libc::c_ulong::BITS as usize;
+        let is_set = mask[word] & (1 as libc::c_ulong) << bit != 0;
+        if is_set && start.is_none() {
+            start = Some(node);
+        } else if !is_set && start.is_some() {
+            let first = start.take().expect("checked above");
+            let last = node - 1;
+            ranges.push(if first == last {
+                first.to_string()
+            } else {
+                format!("{first}-{last}")
+            });
+        }
+    }
+    if let Some(first) = start {
+        let last = NUMA_MASK_BITS - 1;
+        ranges.push(if first == last {
+            first.to_string()
+        } else {
+            format!("{first}-{last}")
+        });
+    }
+    ranges.join(",")
+}
+
+#[cfg(target_os = "linux")]
+fn decode_memory_policy(mode: libc::c_int, mask: &[libc::c_ulong]) -> Result<(String, String)> {
+    let mode_flags = libc::MPOL_F_STATIC_NODES | libc::MPOL_F_RELATIVE_NODES;
+    let base_mode = mode & !mode_flags;
+    let mut policy = match base_mode {
+        libc::MPOL_DEFAULT => "default".to_owned(),
+        libc::MPOL_PREFERRED => "preferred".to_owned(),
+        libc::MPOL_BIND => "bind".to_owned(),
+        libc::MPOL_INTERLEAVE => "interleave".to_owned(),
+        libc::MPOL_LOCAL => "local".to_owned(),
+        _ => {
+            return Err(PerfError::harness(format!(
+                "get_mempolicy(2) returned unsupported mode {mode}"
+            )));
+        }
+    };
+    if mode & libc::MPOL_F_STATIC_NODES != 0 {
+        policy.push_str("|static");
+    }
+    if mode & libc::MPOL_F_RELATIVE_NODES != 0 {
+        policy.push_str("|relative");
+    }
+    Ok((policy, format_memory_nodes(mask)))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn read_memory_policy() -> Result<(String, String)> {
+    let mut mode = 0 as libc::c_int;
+    let mut mask = [0 as libc::c_ulong; NUMA_MASK_WORDS];
+    // SAFETY: get_mempolicy writes one c_int and at most NUMA_MASK_BITS into
+    // the two live buffers. flags=0 and addr=NULL request this thread's
+    // default policy, as required by get_mempolicy(2).
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_get_mempolicy,
+            std::ptr::addr_of_mut!(mode),
+            mask.as_mut_ptr(),
+            NUMA_MASK_BITS as libc::c_ulong,
+            std::ptr::null::<libc::c_void>(),
+            0 as libc::c_ulong,
+        )
+    };
+    if status != 0 {
+        return Err(PerfError::harness(format!(
+            "get_mempolicy(2): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    decode_memory_policy(mode, &mask)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_memory_policy() -> Result<(String, String)> {
+    Err(PerfError::harness(
+        "NUMA memory policy evidence requires Linux",
+    ))
+}
+
+fn read_observed_conditions(machine: &MachineFingerprint) -> Result<ObservedConditions> {
+    let status = read_evidence("/proc/thread-self/status")?;
+    let cpu_affinity = parse_cpu_affinity(&status)?;
+    let (memory_policy, memory_nodes) = read_memory_policy()?;
+    Ok(ObservedConditions {
+        governor: machine.governor.clone(),
+        swap_total_kib: machine.swap_total_kib,
+        cpu_affinity,
+        memory_policy,
+        memory_nodes,
+    })
+}
+
+fn require_conditions(observed: &ObservedConditions, expected: &HostConditions) -> Result<()> {
+    if observed.satisfies(expected) {
+        Ok(())
+    } else {
+        Err(invalid_conditions(observed, expected))
+    }
+}
+
+fn read_validated_host(host: &HostManifest) -> Result<(MachineFingerprint, ObservedConditions)> {
+    let machine = read_machine_fingerprint()?;
+    host.require_match(&machine)?;
+    let observed = read_observed_conditions(&machine)?;
+    require_conditions(&observed, &host.conditions)?;
+    Ok((machine, observed))
+}
+
 /// Reads the live machine fingerprint from `/proc` and `/sys`.
 ///
 /// # Errors
@@ -394,6 +552,61 @@ pub struct BenchmarkManifest {
     /// Benchmarks, one or more per slice.
     #[serde(rename = "benchmark")]
     pub benchmarks: Vec<Benchmark>,
+    /// Pinned workload inputs and generated boundaries.
+    #[serde(default, rename = "fixture")]
+    pub fixtures: Vec<Fixture>,
+}
+
+/// A workload fixture pinned by the performance manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fixture {
+    pub id: String,
+    pub group: FixtureGroup,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    pub origin: FixtureOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_fixture: Option<String>,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<String>,
+    #[serde(default)]
+    pub params: BTreeMap<String, u64>,
+}
+
+/// Closed workload role for a fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FixtureGroup {
+    Bench,
+    CliStartup,
+    Corpus,
+    Boundary,
+}
+
+/// Provenance class for a workload fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FixtureOrigin {
+    Generated,
+    TypescriptSuite,
+    Corpus,
 }
 
 impl BenchmarkManifest {
@@ -587,6 +800,7 @@ pub struct ReleaseBaseline {
 
 /// The measurement result written by `measure` and read by `compare`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeasureResult {
     /// Schema version.
     pub schema: u32,
@@ -618,6 +832,76 @@ pub struct MeasureResult {
     pub selected: bool,
 }
 
+/// Official TypeScript comparator measurements captured under a pinned host contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scorecard {
+    pub schema: u32,
+    pub comparator: String,
+    pub node_version: String,
+    pub host: String,
+    pub fingerprint: HostFingerprint,
+    pub conditions_expected: HostConditions,
+    pub conditions_observed: ObservedConditions,
+    pub conditions_match: bool,
+    pub repeats: u32,
+    pub fixtures: BTreeMap<String, FixtureScore>,
+}
+
+/// Comparator measurements for one pinned fixture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureScore {
+    pub wall_ms: Quantiles,
+    pub rss_bytes: Quantiles,
+    pub argv: Vec<String>,
+    pub exit_code: i32,
+}
+
+/// Inputs to [`capture_scorecard`].
+#[derive(Debug, Clone)]
+pub struct ScorecardOptions {
+    pub host_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub out_path: PathBuf,
+    pub workspace_root: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct ScorecardFixture {
+    id: &'static str,
+    path: &'static str,
+    exit_code: i32,
+}
+
+const SCORECARD_FIXTURES: [ScorecardFixture; 5] = [
+    ScorecardFixture {
+        id: "bench-checker-ts",
+        path: "perf/fixtures/upstream/checker.ts",
+        exit_code: 1,
+    },
+    ScorecardFixture {
+        id: "bench-dom-dts",
+        path: "perf/fixtures/upstream/dom.generated.d.ts",
+        exit_code: 2,
+    },
+    ScorecardFixture {
+        id: "bench-empty-ts",
+        path: "perf/fixtures/upstream/empty.ts",
+        exit_code: 0,
+    },
+    ScorecardFixture {
+        id: "bench-herebyfile",
+        path: "perf/fixtures/upstream/Herebyfile.mjs",
+        exit_code: 1,
+    },
+    ScorecardFixture {
+        id: "bench-jsx-complexity",
+        path: "perf/fixtures/upstream/jsxComplexSignatureHasApplicabilityError.tsx",
+        exit_code: 1,
+    },
+];
+
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
@@ -639,6 +923,16 @@ pub fn load_host(path: &Path) -> Result<HostManifest> {
 pub fn load_manifest(path: &Path) -> Result<BenchmarkManifest> {
     let manifest: BenchmarkManifest = load_toml(path)?;
     require_schema(path, manifest.schema)?;
+    let mut ids = BTreeSet::new();
+    for fixture in &manifest.fixtures {
+        if !ids.insert(fixture.id.as_str()) {
+            return Err(PerfError::harness(format!(
+                "{}: duplicate fixture id `{}`",
+                path.display(),
+                fixture.id
+            )));
+        }
+    }
     Ok(manifest)
 }
 
@@ -701,15 +995,14 @@ pub struct MeasureOptions {
 /// - [`PerfErrorCode::HarnessError`] on load/seam/serialization failure.
 pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
     let host = load_host(&options.host_path)?;
-    let machine = read_machine_fingerprint()?;
-    host.require_match(&machine)?;
+    let _ = read_validated_host(&host)?;
 
     let manifest = load_manifest(&options.manifest_path)?;
     let benchmark = manifest
         .find_slice(&options.slice)
         .ok_or_else(|| PerfError::harness(format!("no benchmark for slice `{}`", options.slice)))?;
 
-    let baseline = load_baseline(options.baseline_path.as_deref())?;
+    let baseline = load_baseline(options.baseline_path.as_deref(), &host)?;
 
     // S0 seam: drive the suite for the slice `repeats` times, timing the whole
     // seam wall as `total` and aggregating real frontend phase telemetry from
@@ -761,12 +1054,7 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
     require_phase_keys(&phases)?;
 
     let rss_bytes = Quantiles::from_samples(&rss_samples);
-
-    let conditions_observed = ObservedConditions {
-        governor: machine.governor.clone(),
-        swap_total_kib: machine.swap_total_kib,
-    };
-    let conditions_match = conditions_observed.satisfies(&host.conditions);
+    let (_machine, conditions_observed) = read_validated_host(&host)?;
 
     let result = MeasureResult {
         schema: PERF_SCHEMA_VERSION,
@@ -776,7 +1064,7 @@ pub fn measure(options: &MeasureOptions) -> Result<MeasureResult> {
         fingerprint: host.fingerprint,
         conditions_expected: host.conditions,
         conditions_observed,
-        conditions_match,
+        conditions_match: true,
         repeats,
         phases,
         rss_bytes,
@@ -804,7 +1092,7 @@ fn require_phase_keys(phases: &BTreeMap<String, Quantiles>) -> Result<()> {
     Ok(())
 }
 
-fn load_baseline(path: Option<&Path>) -> Result<Option<Baseline>> {
+fn load_baseline(path: Option<&Path>, host: &HostManifest) -> Result<Option<Baseline>> {
     let Some(path) = path else {
         return Ok(None);
     };
@@ -818,6 +1106,36 @@ fn load_baseline(path: Option<&Path>) -> Result<Option<Baseline>> {
         .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))?;
     let base: MeasureResult = serde_json::from_str(&text)
         .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))?;
+    if base.schema != PERF_SCHEMA_VERSION {
+        return Err(PerfError::new(
+            PerfErrorCode::NoBaseline,
+            format!(
+                "baseline schema must be {PERF_SCHEMA_VERSION}, found {}",
+                base.schema
+            ),
+        ));
+    }
+    if base.host != host.host {
+        return Err(PerfError::new(
+            PerfErrorCode::NoBaseline,
+            format!(
+                "baseline host `{}` does not match `{}`",
+                base.host, host.host
+            ),
+        ));
+    }
+    if !base.conditions_match || !base.conditions_observed.satisfies(&host.conditions) {
+        return Err(PerfError::new(
+            PerfErrorCode::NoBaseline,
+            "baseline captured under unmatched runtime conditions",
+        ));
+    }
+    if base.fingerprint != host.fingerprint || base.conditions_expected != host.conditions {
+        return Err(PerfError::new(
+            PerfErrorCode::NoBaseline,
+            "baseline host fingerprint or expected conditions mismatch",
+        ));
+    }
     let wall_ms = base.phases.get("total").copied().ok_or_else(|| {
         PerfError::new(
             PerfErrorCode::NoBaseline,
@@ -903,6 +1221,408 @@ fn write_result(path: &Path, result: &MeasureResult) -> Result<()> {
         .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))
 }
 
+/// Writes a measured result as a blessed baseline only after strict live validation.
+pub fn bless_baseline(host_path: &Path, result_path: &Path, out_path: &Path) -> Result<()> {
+    let host = load_host(host_path)?;
+    let _ = read_validated_host(&host)?;
+    let result = load_result(result_path)?;
+    if result.schema != PERF_SCHEMA_VERSION
+        || result.host != host.host
+        || result.fingerprint != host.fingerprint
+    {
+        return Err(PerfError::new(
+            PerfErrorCode::InvalidHost,
+            "result schema or immutable host identity does not match the host manifest",
+        ));
+    }
+    if result.conditions_expected != host.conditions {
+        return Err(PerfError::new(
+            PerfErrorCode::InvalidConditions,
+            "result expected conditions do not match the host manifest",
+        ));
+    }
+    if !result.conditions_match || !result.conditions_observed.satisfies(&host.conditions) {
+        return Err(invalid_conditions(
+            &result.conditions_observed,
+            &host.conditions,
+        ));
+    }
+    let json = serde_json::to_string_pretty(&result)
+        .map_err(|error| PerfError::harness(format!("serialize baseline: {error}")))?;
+    write_text(out_path, &json)
+}
+
+/// Validates a committed baseline against the pinned host and live identity.
+pub fn check_baseline(host_path: &Path, baseline_path: &Path) -> Result<()> {
+    let host = load_host(host_path)?;
+    let _ = read_validated_host(&host)?;
+    load_baseline(Some(baseline_path), &host).map(|_| ())
+}
+
+/// Loads a scorecard JSON.
+pub fn load_scorecard(path: &Path) -> Result<Scorecard> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))?;
+    serde_json::from_str(&text)
+        .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))
+}
+
+/// Validates a scorecard against its host and comparator contracts.
+pub fn validate_scorecard(card: &Scorecard, host: &HostManifest, comparator: &str) -> Result<()> {
+    if card.schema != PERF_SCHEMA_VERSION {
+        return Err(PerfError::harness(format!(
+            "scorecard schema must be {PERF_SCHEMA_VERSION}, found {}",
+            card.schema
+        )));
+    }
+    if card.comparator != comparator {
+        return Err(PerfError::harness(format!(
+            "scorecard comparator `{}` does not match `{comparator}`",
+            card.comparator
+        )));
+    }
+    if card.node_version != crate::corpus::NODE_VERSION_OUTPUT {
+        return Err(PerfError::harness(format!(
+            "scorecard Node version must be `{}`, found `{}`",
+            crate::corpus::NODE_VERSION_OUTPUT,
+            card.node_version
+        )));
+    }
+    if card.host != host.host || card.fingerprint != host.fingerprint {
+        return Err(PerfError::new(
+            PerfErrorCode::InvalidHost,
+            "scorecard immutable host identity does not match the host manifest",
+        ));
+    }
+    if card.conditions_expected != host.conditions {
+        return Err(PerfError::new(
+            PerfErrorCode::InvalidConditions,
+            "scorecard expected conditions do not match the host manifest",
+        ));
+    }
+    if !card.conditions_match || !card.conditions_observed.satisfies(&host.conditions) {
+        return Err(invalid_conditions(
+            &card.conditions_observed,
+            &host.conditions,
+        ));
+    }
+    if card.repeats != 30 {
+        return Err(PerfError::harness(format!(
+            "scorecard repeats must be 30, found {}",
+            card.repeats
+        )));
+    }
+    let actual_ids: Vec<_> = card.fixtures.keys().map(String::as_str).collect();
+    let expected_ids: Vec<_> = SCORECARD_FIXTURES
+        .iter()
+        .map(|fixture| fixture.id)
+        .collect();
+    if actual_ids != expected_ids {
+        return Err(PerfError::harness(format!(
+            "scorecard fixture IDs must be [{}], found [{}]",
+            expected_ids.join(", "),
+            actual_ids.join(", ")
+        )));
+    }
+    for fixture in SCORECARD_FIXTURES {
+        let score = &card.fixtures[fixture.id];
+        let expected_argv = canonical_scorecard_argv(fixture.path);
+        if score.argv != expected_argv {
+            return Err(PerfError::harness(format!(
+                "scorecard fixture `{}` argv must be {:?}, found {:?}",
+                fixture.id, expected_argv, score.argv
+            )));
+        }
+        if score.exit_code != fixture.exit_code {
+            return Err(PerfError::harness(format!(
+                "scorecard fixture `{}` exit code must be {}, found {}",
+                fixture.id, fixture.exit_code, score.exit_code
+            )));
+        }
+        validate_positive_quantiles(fixture.id, "wall_ms", score.wall_ms)?;
+        validate_positive_quantiles(fixture.id, "rss_bytes", score.rss_bytes)?;
+    }
+    Ok(())
+}
+
+fn canonical_scorecard_argv(path: &str) -> Vec<String> {
+    vec![
+        "--noEmit".to_owned(),
+        "--pretty".to_owned(),
+        "false".to_owned(),
+        "--allowJs".to_owned(),
+        "--jsx".to_owned(),
+        "preserve".to_owned(),
+        path.to_owned(),
+    ]
+}
+
+fn validate_positive_quantiles(id: &str, name: &str, values: Quantiles) -> Result<()> {
+    for (quantile, value) in [
+        ("p50", values.p50),
+        ("p95", values.p95),
+        ("p99", values.p99),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(PerfError::harness(format!(
+                "scorecard fixture `{id}` {name}.{quantile} must be finite and positive, found {value}"
+            )));
+        }
+    }
+    if values.p50 > values.p95 || values.p95 > values.p99 {
+        return Err(PerfError::harness(format!(
+            "scorecard fixture `{id}` {name} quantiles must satisfy p50 <= p95 <= p99, found {}, {}, {}",
+            values.p50, values.p95, values.p99
+        )));
+    }
+    Ok(())
+}
+
+/// Validates a scorecard against the supplied live machine identity and conditions.
+///
+/// # Errors
+/// Returns an invalid-host or invalid-conditions error when the live machine
+/// differs from the pinned contract, or a harness error for an invalid scorecard.
+pub fn validate_scorecard_on_machine(
+    card: &Scorecard,
+    host: &HostManifest,
+    comparator: &str,
+    machine: &MachineFingerprint,
+) -> Result<()> {
+    let observed = read_observed_conditions(machine)?;
+    validate_scorecard_with_conditions(card, host, comparator, machine, &observed)
+}
+
+fn validate_scorecard_with_conditions(
+    card: &Scorecard,
+    host: &HostManifest,
+    comparator: &str,
+    machine: &MachineFingerprint,
+    observed: &ObservedConditions,
+) -> Result<()> {
+    host.require_match(machine)?;
+    require_conditions(observed, &host.conditions)?;
+    validate_scorecard(card, host, comparator)
+}
+
+fn require_positive_peak_rss(id: &str, peak: u64) -> Result<u64> {
+    if peak == 0 {
+        Err(PerfError::harness(format!(
+            "RSS sampler captured zero bytes for fixture `{id}`"
+        )))
+    } else {
+        Ok(peak)
+    }
+}
+
+/// Captures the pinned official TypeScript scorecard under valid BH1 conditions.
+pub fn capture_scorecard(options: &ScorecardOptions) -> Result<Scorecard> {
+    crate::oracle_pins::verify_oracle_pins(&options.workspace_root)
+        .map_err(|error| PerfError::harness(error.to_string()))?;
+    let host = load_host(&options.host_path)?;
+    let _ = read_validated_host(&host)?;
+
+    let version = Command::new("node")
+        .arg("--version")
+        .output()
+        .map_err(|error| PerfError::harness(format!("node --version: {error}")))?;
+    let node_version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    if !version.status.success() || node_version != crate::corpus::NODE_VERSION_OUTPUT {
+        return Err(PerfError::harness(format!(
+            "node version must be `{}`, found `{node_version}`",
+            crate::corpus::NODE_VERSION_OUTPUT
+        )));
+    }
+
+    let manifest = load_manifest(&options.manifest_path)?;
+    verify_bench_fixture_hashes(&options.workspace_root, &manifest)?;
+    let repeats = 30;
+    let mut fixtures = BTreeMap::new();
+    for fixture in manifest
+        .fixtures
+        .iter()
+        .filter(|fixture| fixture.group == FixtureGroup::Bench)
+    {
+        let relative = fixture.path.as_deref().ok_or_else(|| {
+            PerfError::harness(format!("bench fixture `{}` is missing path", fixture.id))
+        })?;
+        let fixture_path = checked_root_path(&options.workspace_root, relative)?;
+        let contract = SCORECARD_FIXTURES
+            .iter()
+            .find(|contract| contract.id == fixture.id)
+            .ok_or_else(|| {
+                PerfError::harness(format!(
+                    "bench fixture `{}` has no scorecard contract",
+                    fixture.id
+                ))
+            })?;
+        if contract.path != relative {
+            return Err(PerfError::harness(format!(
+                "bench fixture `{}` path must be `{}`, found `{relative}`",
+                fixture.id, contract.path
+            )));
+        }
+        let argv = canonical_scorecard_argv(relative);
+        let command_argv = canonical_scorecard_argv(&fixture_path.to_string_lossy());
+        let mut wall = Vec::with_capacity(repeats as usize);
+        let mut rss = Vec::with_capacity(repeats as usize);
+        for _ in 0..repeats {
+            let started = Instant::now();
+            let mut child = Command::new("node_modules/typescript/bin/tsc")
+                .args(&command_argv)
+                .current_dir(&options.workspace_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| PerfError::harness(format!("spawn tsc: {error}")))?;
+            let pid = child.id();
+            let sampler = thread::spawn(move || poll_child_peak_rss(pid));
+            let status = child
+                .wait()
+                .map_err(|error| PerfError::harness(format!("wait for tsc: {error}")))?;
+            let peak = sampler
+                .join()
+                .map_err(|_| PerfError::harness("RSS sampler panicked"))?;
+            let exit_code = status.code().ok_or_else(|| {
+                PerfError::harness(format!(
+                    "tsc terminated by signal for fixture `{}`",
+                    fixture.id
+                ))
+            })?;
+            if exit_code != contract.exit_code {
+                return Err(PerfError::harness(format!(
+                    "tsc exit drift for fixture `{}`: expected {}, found {exit_code}",
+                    fixture.id, contract.exit_code
+                )));
+            }
+            wall.push(started.elapsed().as_secs_f64() * 1_000.0);
+            rss.push(require_positive_peak_rss(&fixture.id, peak)? as f64);
+        }
+        fixtures.insert(
+            fixture.id.clone(),
+            FixtureScore {
+                wall_ms: Quantiles::from_samples(&wall),
+                rss_bytes: Quantiles::from_samples(&rss),
+                argv,
+                exit_code: contract.exit_code,
+            },
+        );
+    }
+
+    let (_machine, observed) = read_validated_host(&host)?;
+    let card = Scorecard {
+        schema: PERF_SCHEMA_VERSION,
+        comparator: crate::oracle_pins::NPM_SPECIFIER.to_owned(),
+        node_version,
+        host: host.host.clone(),
+        fingerprint: host.fingerprint.clone(),
+        conditions_expected: host.conditions.clone(),
+        conditions_observed: observed,
+        conditions_match: true,
+        repeats,
+        fixtures,
+    };
+    validate_scorecard(&card, &host, crate::oracle_pins::NPM_SPECIFIER)?;
+    let json = serde_json::to_string_pretty(&card)
+        .map_err(|error| PerfError::harness(format!("serialize scorecard: {error}")))?;
+    write_text(&options.out_path, &json)?;
+    Ok(card)
+}
+
+fn verify_bench_fixture_hashes(root: &Path, manifest: &BenchmarkManifest) -> Result<()> {
+    let mut mismatches = Vec::new();
+    for fixture in manifest
+        .fixtures
+        .iter()
+        .filter(|fixture| fixture.group == FixtureGroup::Bench)
+    {
+        let Some(relative) = fixture.path.as_deref() else {
+            mismatches.push(format!("{}: missing path", fixture.id));
+            continue;
+        };
+        let path = match checked_root_path(root, relative) {
+            Ok(path) => path,
+            Err(error) => {
+                mismatches.push(format!("{}: {}", fixture.id, error.detail));
+                continue;
+            }
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                mismatches.push(format!("{}: {error}", fixture.id));
+                continue;
+            }
+        };
+        let actual = crate::suite::sha256_hex(&bytes);
+        if fixture.sha256.as_deref() != Some(actual.as_str())
+            || fixture.bytes != Some(bytes.len() as u64)
+        {
+            mismatches.push(format!("{}: hash or byte count mismatch", fixture.id));
+        }
+    }
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(PerfError::new(
+            PerfErrorCode::FixtureMismatch,
+            mismatches.join("; "),
+        ))
+    }
+}
+
+fn invalid_conditions(observed: &ObservedConditions, expected: &HostConditions) -> PerfError {
+    PerfError::new(
+        PerfErrorCode::InvalidConditions,
+        format!(
+            "observed governor=`{}`, swap_total_kib={}, cpu_affinity=`{}`, memory_policy=`{}`, memory_nodes=`{}`; expected governor=`{}`, swap_total_kib={}, cpu_affinity=`{}`, memory_policy=`{}`, memory_nodes=`{}`",
+            observed.governor,
+            observed.swap_total_kib,
+            observed.cpu_affinity,
+            observed.memory_policy,
+            observed.memory_nodes,
+            expected.governor,
+            expected.swap_total_kib,
+            expected.cpu_affinity,
+            expected.memory_policy,
+            expected.memory_nodes,
+        ),
+    )
+}
+
+fn poll_child_peak_rss(pid: u32) -> u64 {
+    let status_path = format!("/proc/{pid}/status");
+    let mut peak = 0_u64;
+    loop {
+        let Ok(status) = fs::read_to_string(&status_path) else {
+            return peak;
+        };
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("VmHWM:") {
+                if let Some(kib) = value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    peak = peak.max(kib.saturating_mul(1024));
+                }
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn write_text(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| PerfError::harness(format!("{}: {error}", parent.display())))?;
+    }
+    fs::write(path, text)
+        .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))
+}
+
 // ---------------------------------------------------------------------------
 // Comparison
 // ---------------------------------------------------------------------------
@@ -930,9 +1650,43 @@ pub fn load_result(path: &Path) -> Result<MeasureResult> {
 pub fn compare(
     result: &MeasureResult,
     policy: &BudgetPolicy,
+    host: &HostManifest,
     machine: &MachineFingerprint,
 ) -> Result<()> {
-    require_no_host_mismatches(result.fingerprint.identity_mismatches(machine))?;
+    let observed = read_observed_conditions(machine)?;
+    compare_with_conditions(result, policy, host, machine, &observed)
+}
+
+fn compare_with_conditions(
+    result: &MeasureResult,
+    policy: &BudgetPolicy,
+    host: &HostManifest,
+    machine: &MachineFingerprint,
+    observed: &ObservedConditions,
+) -> Result<()> {
+    host.require_match(machine)?;
+    if result.schema != PERF_SCHEMA_VERSION
+        || result.host != host.host
+        || result.fingerprint != host.fingerprint
+    {
+        return Err(PerfError::new(
+            PerfErrorCode::InvalidHost,
+            "result schema or immutable host identity does not match the host manifest",
+        ));
+    }
+    if result.conditions_expected != host.conditions {
+        return Err(PerfError::new(
+            PerfErrorCode::InvalidConditions,
+            "result expected conditions do not match the host manifest",
+        ));
+    }
+    if !result.conditions_match || !result.conditions_observed.satisfies(&host.conditions) {
+        return Err(invalid_conditions(
+            &result.conditions_observed,
+            &host.conditions,
+        ));
+    }
+    require_conditions(observed, &host.conditions)?;
     evaluate_budgets(result, policy)
 }
 
@@ -1114,6 +1868,26 @@ mod tests {
         }
     }
 
+    fn sample_conditions() -> HostConditions {
+        HostConditions {
+            governor: "performance".to_owned(),
+            swap_total_kib: 0,
+            cpu_affinity: "0-19".to_owned(),
+            memory_policy: "bind".to_owned(),
+            memory_nodes: "0".to_owned(),
+        }
+    }
+
+    fn sample_observed_conditions() -> ObservedConditions {
+        ObservedConditions {
+            governor: "performance".to_owned(),
+            swap_total_kib: 0,
+            cpu_affinity: "0-19".to_owned(),
+            memory_policy: "bind".to_owned(),
+            memory_nodes: "0".to_owned(),
+        }
+    }
+
     fn budget_policy() -> BudgetPolicy {
         BudgetPolicy {
             schema: PERF_SCHEMA_VERSION,
@@ -1152,15 +1926,8 @@ mod tests {
             slice: "s0".to_owned(),
             benchmark_id: "s0-conformance-foundation".to_owned(),
             fingerprint: host_fingerprint_from_machine(&sample_machine()),
-            conditions_expected: HostConditions {
-                governor: "performance".to_owned(),
-                swap_total_kib: 0,
-                numa_node0_cpus: "0-19".to_owned(),
-            },
-            conditions_observed: ObservedConditions {
-                governor: "performance".to_owned(),
-                swap_total_kib: 0,
-            },
+            conditions_expected: sample_conditions(),
+            conditions_observed: sample_observed_conditions(),
             conditions_match: true,
             repeats: 3,
             phases,
@@ -1195,12 +1962,298 @@ mod tests {
         }
     }
 
+    fn sample_host() -> HostManifest {
+        HostManifest {
+            schema: PERF_SCHEMA_VERSION,
+            host: "BH1".to_owned(),
+            fingerprint: host_fingerprint_from_machine(&sample_machine()),
+            conditions: sample_conditions(),
+            source: BTreeMap::new(),
+        }
+    }
+
+    fn sample_scorecard(host: &HostManifest) -> Scorecard {
+        let quantiles = Quantiles {
+            p50: 1.0,
+            p95: 2.0,
+            p99: 3.0,
+        };
+        let fixtures = SCORECARD_FIXTURES
+            .iter()
+            .map(|fixture| {
+                (
+                    fixture.id.to_owned(),
+                    FixtureScore {
+                        wall_ms: quantiles,
+                        rss_bytes: quantiles,
+                        argv: canonical_scorecard_argv(fixture.path),
+                        exit_code: fixture.exit_code,
+                    },
+                )
+            })
+            .collect();
+        Scorecard {
+            schema: PERF_SCHEMA_VERSION,
+            comparator: "typescript@7.0.2".to_owned(),
+            node_version: "v24.18.0".to_owned(),
+            host: host.host.clone(),
+            fingerprint: host.fingerprint.clone(),
+            conditions_expected: host.conditions.clone(),
+            conditions_observed: sample_observed_conditions(),
+            conditions_match: true,
+            repeats: 30,
+            fixtures,
+        }
+    }
+
+    #[test]
+    fn benchmark_manifest_without_fixtures_still_parses() {
+        let manifest: BenchmarkManifest = toml::from_str(
+            "schema = 2\n[[benchmark]]\nid = 'b'\nslice = 's0'\ninput = 'index.json'\nfacets = []\nbackends = []\nexpected = 'out.json'\ntimeout_ms = 1\n",
+        )
+        .unwrap();
+        assert!(manifest.fixtures.is_empty());
+    }
+
+    #[test]
+    fn load_baseline_rejects_unmatched_conditions_and_host() {
+        let temp = crate::suite::TempDir::new("perf-baseline-validation").unwrap();
+        let path = temp.path().join("baseline.json");
+        let host = sample_host();
+        let mut result = result_with_baseline(Quantiles::zero(), Quantiles::zero());
+        result.conditions_match = false;
+        fs::write(&path, serde_json::to_vec(&result).unwrap()).unwrap();
+        assert_eq!(
+            load_baseline(Some(&path), &host).unwrap_err().code,
+            PerfErrorCode::NoBaseline
+        );
+        result.conditions_match = true;
+        result.conditions_observed.cpu_affinity = "0-18".to_owned();
+        fs::write(&path, serde_json::to_vec(&result).unwrap()).unwrap();
+        assert_eq!(
+            load_baseline(Some(&path), &host).unwrap_err().code,
+            PerfErrorCode::NoBaseline
+        );
+        result.conditions_observed = sample_observed_conditions();
+        result.host = "other".to_owned();
+        fs::write(&path, serde_json::to_vec(&result).unwrap()).unwrap();
+        assert_eq!(
+            load_baseline(Some(&path), &host).unwrap_err().code,
+            PerfErrorCode::NoBaseline
+        );
+    }
+
+    #[test]
+    fn validate_scorecard_rejects_conditions_and_fingerprint_drift() {
+        let host = sample_host();
+        let mut card = sample_scorecard(&host);
+        card.conditions_observed = ObservedConditions {
+            governor: "powersave".to_owned(),
+            ..sample_observed_conditions()
+        };
+        card.conditions_match = false;
+        assert_eq!(
+            validate_scorecard(&card, &host, "typescript@7.0.2")
+                .unwrap_err()
+                .code,
+            PerfErrorCode::InvalidConditions
+        );
+        card.conditions_match = true;
+        card.conditions_observed = sample_observed_conditions();
+        card.conditions_observed.cpu_affinity = "0-18".to_owned();
+        assert_eq!(
+            validate_scorecard(&card, &host, "typescript@7.0.2")
+                .unwrap_err()
+                .code,
+            PerfErrorCode::InvalidConditions
+        );
+        card.conditions_observed = sample_observed_conditions();
+        card.conditions_observed.memory_nodes = "0-1".to_owned();
+        assert_eq!(
+            validate_scorecard(&card, &host, "typescript@7.0.2")
+                .unwrap_err()
+                .code,
+            PerfErrorCode::InvalidConditions
+        );
+        card.conditions_observed = sample_observed_conditions();
+        card.fingerprint.cpu_model = "different".to_owned();
+        assert_eq!(
+            validate_scorecard(&card, &host, "typescript@7.0.2")
+                .unwrap_err()
+                .code,
+            PerfErrorCode::InvalidHost
+        );
+    }
+
+    #[test]
+    fn validate_scorecard_rejects_incomplete_and_degenerate_measurements() {
+        let host = sample_host();
+        let mut card = sample_scorecard(&host);
+        validate_scorecard(&card, &host, "typescript@7.0.2").unwrap();
+
+        card.fixtures.remove("bench-checker-ts");
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+        card = sample_scorecard(&host);
+        card.repeats = 0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+        card = sample_scorecard(&host);
+        card.fixtures.get_mut("bench-dom-dts").unwrap().argv.clear();
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+        card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-empty-ts")
+            .unwrap()
+            .rss_bytes
+            .p95 = 0.0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+        card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-herebyfile")
+            .unwrap()
+            .wall_ms
+            .p99 = f64::NAN;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+    }
+
+    #[test]
+    fn validate_scorecard_rejects_node_and_quantile_order_drift() {
+        let host = sample_host();
+        let mut card = sample_scorecard(&host);
+        card.node_version = "v24.17.0".to_owned();
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        let wall = &mut card.fixtures.get_mut("bench-checker-ts").unwrap().wall_ms;
+        wall.p50 = wall.p95 + 1.0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        let rss = &mut card.fixtures.get_mut("bench-dom-dts").unwrap().rss_bytes;
+        rss.p95 = rss.p99 + 1.0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+    }
+
+    #[test]
+    fn scorecard_rejects_fixture_exit_drift() {
+        let host = sample_host();
+        let mut card = sample_scorecard(&host);
+        card.fixtures.get_mut("bench-checker-ts").unwrap().exit_code = 0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+    }
+
+    #[test]
+    fn zero_peak_rss_is_rejected_before_scorecard_capture() {
+        assert!(require_positive_peak_rss("bench-empty-ts", 0).is_err());
+        assert_eq!(require_positive_peak_rss("bench-empty-ts", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn live_scorecard_validation_rejects_identity_and_condition_drift() {
+        let host = sample_host();
+        let card = sample_scorecard(&host);
+        validate_scorecard_with_conditions(
+            &card,
+            &host,
+            "typescript@7.0.2",
+            &sample_machine(),
+            &sample_observed_conditions(),
+        )
+        .unwrap();
+
+        let mut machine = sample_machine();
+        machine.cpu_model = "different".to_owned();
+        assert_eq!(
+            validate_scorecard_with_conditions(
+                &card,
+                &host,
+                "typescript@7.0.2",
+                &machine,
+                &sample_observed_conditions(),
+            )
+            .unwrap_err()
+            .code,
+            PerfErrorCode::InvalidHost
+        );
+        let mut observed = sample_observed_conditions();
+        observed.memory_policy = "default".to_owned();
+        assert_eq!(
+            validate_scorecard_with_conditions(
+                &card,
+                &host,
+                "typescript@7.0.2",
+                &sample_machine(),
+                &observed,
+            )
+            .unwrap_err()
+            .code,
+            PerfErrorCode::InvalidConditions
+        );
+    }
+
+    #[test]
+    fn bless_baseline_refuses_unmatched_conditions_before_writing() {
+        let machine = read_machine_fingerprint().unwrap();
+        let live_conditions = read_observed_conditions(&machine).unwrap();
+        let temp = crate::suite::TempDir::new("perf-bless-conditions").unwrap();
+        let host = HostManifest {
+            schema: PERF_SCHEMA_VERSION,
+            host: "live".to_owned(),
+            fingerprint: HostFingerprint {
+                kernel_release: machine.kernel_release.clone(),
+                kernel_version: machine.kernel_version.clone(),
+                arch: machine.arch.clone(),
+                cpu_model: machine.cpu_model.clone(),
+                sockets: machine.sockets,
+                cores_per_socket: machine.cores_per_socket,
+                microcode: machine.microcode.clone(),
+            },
+            conditions: HostConditions {
+                governor: live_conditions.governor.clone(),
+                swap_total_kib: live_conditions.swap_total_kib,
+                cpu_affinity: live_conditions.cpu_affinity.clone(),
+                memory_policy: live_conditions.memory_policy.clone(),
+                memory_nodes: live_conditions.memory_nodes.clone(),
+            },
+            source: BTreeMap::new(),
+        };
+        let mut result = result_with_baseline(Quantiles::zero(), Quantiles::zero());
+        result.host = host.host.clone();
+        result.fingerprint = host.fingerprint.clone();
+        result.conditions_expected = host.conditions.clone();
+        result.conditions_observed = live_conditions;
+        result.conditions_match = false;
+        let host_path = temp.path().join("host.toml");
+        let result_path = temp.path().join("result.json");
+        let out_path = temp.path().join("baseline.json");
+        fs::write(&host_path, toml::to_string(&host).unwrap()).unwrap();
+        fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+        let error = bless_baseline(&host_path, &result_path, &out_path).unwrap_err();
+        assert_eq!(error.code, PerfErrorCode::InvalidConditions);
+        assert!(!out_path.exists());
+
+        result.conditions_match = true;
+        result.conditions_expected.cpu_affinity = "0-18".to_owned();
+        fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+        assert_eq!(
+            bless_baseline(&host_path, &result_path, &out_path)
+                .unwrap_err()
+                .code,
+            PerfErrorCode::InvalidConditions
+        );
+        assert!(!out_path.exists());
+
+        result.conditions_expected = host.conditions.clone();
+        fs::write(&result_path, serde_json::to_vec(&result).unwrap()).unwrap();
+        bless_baseline(&host_path, &result_path, &out_path).unwrap();
+        assert_eq!(load_result(&out_path).unwrap(), result);
+    }
+
     #[test]
     fn host_read_parses_committed_manifest() {
         let host = toml::from_str::<HostManifest>(bh1_toml()).expect("parse bh1.toml");
         assert_eq!(host.schema, PERF_SCHEMA_VERSION);
         assert_eq!(host.host, "BH1");
-        assert_eq!(host.fingerprint.kernel_release, "7.0.0-28-generic");
+        assert_eq!(host.fingerprint.kernel_release, "7.0.0-30-generic");
         assert_eq!(host.fingerprint.arch, "x86_64");
         assert_eq!(
             host.fingerprint.cpu_model,
@@ -1208,12 +2261,15 @@ mod tests {
         );
         assert_eq!(host.fingerprint.sockets, 2);
         assert_eq!(host.fingerprint.cores_per_socket, 20);
-        assert_eq!(host.conditions.governor, "performance");
-        assert_eq!(host.conditions.swap_total_kib, 0);
+        assert_eq!(host.conditions.governor, "powersave");
+        assert_eq!(host.conditions.swap_total_kib, 403_979_000);
         assert_eq!(
             host.source.get("governor").map(String::as_str),
             Some("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
         );
+        assert_eq!(host.conditions.cpu_affinity, "0-19");
+        assert_eq!(host.conditions.memory_policy, "bind");
+        assert_eq!(host.conditions.memory_nodes, "0");
     }
 
     #[cfg(target_os = "linux")]
@@ -1255,20 +2311,13 @@ mod tests {
         let untuned = HostConditions {
             governor: "powersave".to_owned(),
             swap_total_kib: 4096,
-            numa_node0_cpus: "0-19".to_owned(),
+            ..sample_conditions()
         };
-        let observed = ObservedConditions {
-            governor: machine.governor.clone(),
-            swap_total_kib: machine.swap_total_kib,
-        };
+        let observed = sample_observed_conditions();
         // Observed (performance/0) does not satisfy an untuned expectation.
         assert!(!observed.satisfies(&untuned));
         // But a matching expectation is satisfied.
-        let tuned = HostConditions {
-            governor: "performance".to_owned(),
-            swap_total_kib: 0,
-            numa_node0_cpus: "0-19".to_owned(),
-        };
+        let tuned = sample_conditions();
         assert!(observed.satisfies(&tuned));
     }
 
@@ -1286,7 +2335,16 @@ mod tests {
         };
         let result = result_with_baseline(base, candidate);
         assert!(evaluate_budgets(&result, &budget_policy()).is_ok());
-        assert!(compare(&result, &budget_policy(), &sample_machine()).is_ok());
+        assert!(
+            compare_with_conditions(
+                &result,
+                &budget_policy(),
+                &sample_host(),
+                &sample_machine(),
+                &sample_observed_conditions(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1340,15 +2398,8 @@ mod tests {
             slice: s11.slice.clone(),
             benchmark_id: s11.id.clone(),
             fingerprint: host_fingerprint_from_machine(&sample_machine()),
-            conditions_expected: HostConditions {
-                governor: "performance".to_owned(),
-                swap_total_kib: 0,
-                numa_node0_cpus: "0-19".to_owned(),
-            },
-            conditions_observed: ObservedConditions {
-                governor: "performance".to_owned(),
-                swap_total_kib: 0,
-            },
+            conditions_expected: sample_conditions(),
+            conditions_observed: sample_observed_conditions(),
             conditions_match: true,
             repeats: 3,
             phases,
@@ -1357,8 +2408,14 @@ mod tests {
             selected: true,
         };
 
-        let error = compare(&result, &budget_policy(), &sample_machine())
-            .expect_err("selected slice without baseline must fail the budget gate");
+        let error = compare_with_conditions(
+            &result,
+            &budget_policy(),
+            &sample_host(),
+            &sample_machine(),
+            &sample_observed_conditions(),
+        )
+        .expect_err("selected slice without baseline must fail the budget gate");
         assert_eq!(error.code, PerfErrorCode::NoBaseline);
         assert_eq!(error.code.exit_code(), 4);
         assert!(error.detail.contains("s11"), "error must name the slice");
@@ -1378,7 +2435,14 @@ mod tests {
         let result = result_with_baseline(base, base);
         let mut machine = sample_machine();
         machine.cpu_model = "Different CPU".to_owned();
-        let error = compare(&result, &budget_policy(), &machine).unwrap_err();
+        let error = compare_with_conditions(
+            &result,
+            &budget_policy(),
+            &sample_host(),
+            &machine,
+            &sample_observed_conditions(),
+        )
+        .unwrap_err();
         assert_eq!(error.code, PerfErrorCode::InvalidHost);
     }
 
@@ -1456,9 +2520,26 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("bamts_perf_baseline_no_total.json");
         std::fs::write(&path, &json).expect("write temp baseline");
-        let error = load_baseline(Some(&path))
-            .expect_err("baseline missing `total` must be rejected")
-            .code;
+        let error = load_baseline(
+            Some(&path),
+            &HostManifest {
+                schema: PERF_SCHEMA_VERSION,
+                host: "BH1".to_owned(),
+                fingerprint: HostFingerprint {
+                    kernel_release: "7.0.0-28-generic".to_owned(),
+                    kernel_version: "#28-Ubuntu SMP PREEMPT_DYNAMIC".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    cpu_model: "Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz".to_owned(),
+                    sockets: 2,
+                    cores_per_socket: 20,
+                    microcode: "0x2007006".to_owned(),
+                },
+                conditions: sample_conditions(),
+                source: BTreeMap::new(),
+            },
+        )
+        .expect_err("baseline missing `total` must be rejected")
+        .code;
         assert_eq!(error, PerfErrorCode::NoBaseline);
         assert_eq!(error.exit_code(), 4);
         let _ = std::fs::remove_file(&path);
@@ -1754,5 +2835,116 @@ mod tests {
             evaluate_budgets(&result, &budget_policy()).is_ok(),
             "valid selected baseline must pass the budget gate"
         );
+    }
+
+    #[test]
+    fn schema_v2_pins_process_placement() {
+        assert_eq!(PERF_SCHEMA_VERSION, 2);
+        assert!(require_schema(Path::new("v1.toml"), 1).is_err());
+
+        let host = sample_host();
+        let mut result = result_with_baseline(Quantiles::zero(), Quantiles::zero());
+        result.schema = 1;
+        assert_eq!(
+            compare_with_conditions(
+                &result,
+                &budget_policy(),
+                &host,
+                &sample_machine(),
+                &sample_observed_conditions(),
+            )
+            .unwrap_err()
+            .code,
+            PerfErrorCode::InvalidHost
+        );
+        let mut card = sample_scorecard(&host);
+        card.schema = 1;
+        assert_eq!(
+            validate_scorecard(&card, &host, "typescript@7.0.2")
+                .unwrap_err()
+                .code,
+            PerfErrorCode::HarnessError
+        );
+    }
+
+    #[test]
+    fn recorded_expected_condition_drift_is_invalid_conditions() {
+        let host = sample_host();
+        let mut result = result_with_baseline(Quantiles::zero(), Quantiles::zero());
+        result.conditions_expected.memory_policy = "default".to_owned();
+        assert_eq!(
+            compare_with_conditions(
+                &result,
+                &budget_policy(),
+                &host,
+                &sample_machine(),
+                &sample_observed_conditions(),
+            )
+            .unwrap_err()
+            .code,
+            PerfErrorCode::InvalidConditions
+        );
+
+        let mut card = sample_scorecard(&host);
+        card.conditions_expected.memory_nodes = "0-1".to_owned();
+        assert_eq!(
+            validate_scorecard(&card, &host, "typescript@7.0.2")
+                .unwrap_err()
+                .code,
+            PerfErrorCode::InvalidConditions
+        );
+    }
+
+    #[test]
+    fn observed_conditions_match_every_field_exactly() {
+        let expected = sample_conditions();
+        let observed = sample_observed_conditions();
+        assert!(observed.satisfies(&expected));
+
+        let mismatches = [
+            ObservedConditions {
+                governor: "powersave".to_owned(),
+                ..observed.clone()
+            },
+            ObservedConditions {
+                swap_total_kib: 1,
+                ..observed.clone()
+            },
+            ObservedConditions {
+                cpu_affinity: "0-18".to_owned(),
+                ..observed.clone()
+            },
+            ObservedConditions {
+                memory_policy: "default".to_owned(),
+                ..observed.clone()
+            },
+            ObservedConditions {
+                memory_nodes: "0-1".to_owned(),
+                ..observed
+            },
+        ];
+        for mismatch in mismatches {
+            assert!(!mismatch.satisfies(&expected));
+        }
+    }
+
+    #[test]
+    fn parses_thread_cpu_affinity() {
+        let status =
+            "Name:\tperf_budget\nCpus_allowed:\t00000000,000fffff\nCpus_allowed_list:\t0-19\n";
+        assert_eq!(parse_cpu_affinity(status).unwrap(), "0-19");
+        assert!(parse_cpu_affinity("Name:\tperf_budget\n").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn decodes_memory_policy_and_node_ranges() {
+        let mut mask = [0 as libc::c_ulong; NUMA_MASK_WORDS];
+        mask[0] = 0b1_1111;
+        assert_eq!(
+            decode_memory_policy(libc::MPOL_BIND, &mask).unwrap(),
+            ("bind".to_owned(), "0-4".to_owned())
+        );
+        assert!(decode_memory_policy(-1, &mask).is_err());
     }
 }
