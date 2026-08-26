@@ -1,44 +1,35 @@
+pub mod authority;
+pub mod catalog;
 pub mod check_cells;
+pub mod classification;
+pub mod completion;
 pub mod corpus;
+pub mod diagnostic_catalog;
+pub mod evidence;
 pub mod facets;
 pub mod fixtures;
 pub mod formal_bridge;
 pub mod formal_gates;
 pub mod jit_runner;
+pub mod lane;
 pub mod ledger;
+#[path = "../../../formal/ledger_wiring.rs"]
+pub mod ledger_wiring;
 pub mod oracle_pins;
+pub mod oracles;
 pub mod perf;
+pub mod perf_guard;
+pub mod perf_jit;
+pub mod perf_stage0;
+pub mod rebuild;
+pub(crate) mod schema;
+pub mod shard;
+pub mod source_fetch;
 pub mod suite;
+pub mod toolchain_schema;
 pub mod ts_ledger;
+pub mod unicode;
 pub mod workspace_guard;
-
-pub use facets::{
-    DiagnosticCodeMap, FacetDiagnostic, FacetVerdict, VerifiedJsOutcome, compare_diagnostics,
-    compare_dts, compare_js, compare_js_cases, compare_symbols, compare_types,
-    load_diagnostic_code_map, parse_diagnostic_code_map,
-};
-pub use fixtures::{
-    FixtureVerification, MaterializedFixture, TreeHash, generate_boundary, hash_file, hash_tree,
-    materialize_fixtures, verify_fixtures,
-};
-pub use jit_runner::{JitError, JitErrorCode, ProvisionArgs, ProvisionOutcome, provision};
-pub use oracle_pins::{OraclePins, verify_oracle_pins};
-pub use perf::{
-    ArtifactPolicy, Baseline, Benchmark, BenchmarkManifest, BudgetPolicy, Fixture, FixtureGroup,
-    FixtureOrigin, FixtureScore, HostConditions, HostFingerprint, HostManifest, MachineFingerprint,
-    MeasureOptions, MeasureResult, ObservedConditions, PerfError, PerfErrorCode, Quantiles,
-    ReleaseBaseline, ReleasePolicy, RssPolicy, Scorecard, ScorecardOptions, WallRatioPolicy,
-    bless_baseline, capture_scorecard, check_baseline, compare as compare_perf, evaluate_budgets,
-    load_host, load_manifest as load_perf_manifest, load_policy, load_result, load_scorecard,
-    measure, nearest_rank, read_machine_fingerprint, validate_scorecard,
-};
-pub use suite::{
-    AssetKind, BackendFilter, CellResult, CiMode, CiOptions, FailureClass, IndexEntry,
-    RunFilterOptions, RunState, StatusFilter, SuiteIndex, SuiteRunReport, SuiteSnapshot,
-    SyncOptions, VerifiedSuite, audit_ledger, run_ci, run_suite, run_suite_with_telemetry,
-    sync_suite, write_suite_ledger,
-};
-pub use ts_ledger::{TsLedger, TsLedgerReader, TsLedgerWriter};
 
 use std::fmt;
 
@@ -154,3 +145,33 @@ impl fmt::Display for VerificationError {
 }
 
 impl std::error::Error for VerificationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorCode;
+
+    #[test]
+    fn error_codes_have_stable_strings() {
+        let cases = [
+            (ErrorCode::Usage, "E_USAGE"),
+            (ErrorCode::Io, "E_IO"),
+            (ErrorCode::Json, "E_JSON"),
+            (ErrorCode::Toml, "E_TOML"),
+            (ErrorCode::Schema, "E_SCHEMA"),
+            (ErrorCode::Digest, "E_DIGEST"),
+            (ErrorCode::Duplicate, "E_DUPLICATE"),
+            (ErrorCode::SetMismatch, "E_SET_MISMATCH"),
+            (ErrorCode::Transition, "E_TRANSITION"),
+            (ErrorCode::Workspace, "E_WORKSPACE"),
+            (ErrorCode::GateDependency, "E_GATE_DEPENDENCY"),
+            (ErrorCode::ToolMissing, "E_TOOL_MISSING"),
+            (ErrorCode::ToolFailed, "E_TOOL_FAILED"),
+            (ErrorCode::Replay, "E_REPLAY"),
+            (ErrorCode::ProvenanceMismatch, "PROVENANCE_MISMATCH"),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(code.as_str(), expected);
+        }
+    }
+}

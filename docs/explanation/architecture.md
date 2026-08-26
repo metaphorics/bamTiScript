@@ -9,7 +9,7 @@ For technical contributors seeking to locate specific functionality, the followi
 | Responsibility | Owning crate | Relative path | Key source files |
 | :--- | :--- | :--- | :--- |
 | **Facade & Public API** | `bamts` | [`../../crates/bamts`](../../crates/bamts) | [`src/lib.rs`](../../crates/bamts/src/lib.rs) |
-| **CLI & Process Driver** | `bamts-cli` | [`../../crates/bamts-cli`](../../crates/bamts-cli) | [`src/main.rs`](../../crates/bamts-cli/src/main.rs), [`src/driver.rs`](../../crates/bamts-cli/src/driver.rs), [`src/args.rs`](../../crates/bamts-cli/src/args.rs) |
+| **CLI & Process Driver** | `bamts-cli` | [`../../crates/bamts-cli`](../../crates/bamts-cli) | [`src/main.rs`](../../crates/bamts-cli/src/main.rs), [`src/cli/tsc_args.rs`](../../crates/bamts-cli/src/cli/tsc_args.rs), [`src/driver.rs`](../../crates/bamts-cli/src/driver.rs), [`src/args.rs`](../../crates/bamts-cli/src/args.rs) |
 | **Parsing & Scanning** | `bamts-compiler` | [`../../crates/bamts-compiler`](../../crates/bamts-compiler) | [`src/parser.rs`](../../crates/bamts-compiler/src/parser.rs), [`src/scanner.rs`](../../crates/bamts-compiler/src/scanner.rs), [`src/syntax.rs`](../../crates/bamts-compiler/src/syntax.rs) |
 | **Type Checking & Binding** | `bamts-compiler` | [`../../crates/bamts-compiler`](../../crates/bamts-compiler) | [`src/checker.rs`](../../crates/bamts-compiler/src/checker.rs), [`src/checker/binder.rs`](../../crates/bamts-compiler/src/checker/binder.rs), [`src/checker/inference.rs`](../../crates/bamts-compiler/src/checker/inference.rs) |
 | **Semantic Rules & Lints** | `bamts-compiler` | [`../../crates/bamts-compiler`](../../crates/bamts-compiler) | [`src/rules/`](../../crates/bamts-compiler/src/rules/), [`src/lint.rs`](../../crates/bamts-compiler/src/lint.rs), [`RULES.md`](../../crates/bamts-compiler/RULES.md) |
@@ -47,7 +47,7 @@ flowchart TD
 ```
 
 ### 1. Invocation and orchestration
-- CLI (`crates/bamts-cli`): Accepts `check`, `run`, `compile`, and `explain` commands. [`src/driver.rs`](../../crates/bamts-cli/src/driver.rs) loads configuration, compiles the module graph, renders diagnostics, and selects the execution target.
+- CLI (`crates/bamts-cli`): Accepts the TypeScript 7.0.2 `tsc` argument model. [`src/main.rs`](../../crates/bamts-cli/src/main.rs) parses through [`src/cli/tsc_args.rs`](../../crates/bamts-cli/src/cli/tsc_args.rs). [`src/driver.rs`](../../crates/bamts-cli/src/driver.rs) loads configuration, compiles the module graph, and renders diagnostics. The legacy `check`, `run`, `compile`, `explain`, and `--target aot|jit` forms are not public commands; they remain only in the internal `--api` parser (`src/args.rs`).
 - Facade (`crates/bamts`): Exposes Rust functions for compiling and running source entrypoints and, with the `aot` feature, producing native object files. It translates subsystem errors into [`bamts::Error`](../../crates/bamts/src/lib.rs).
 
 ### 2. Frontend compilation

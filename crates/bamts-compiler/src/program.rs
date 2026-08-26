@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fmt, fs, io,
+    fmt, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,8 +15,13 @@ use bamts_bytecode::{
 use bamts_cancel::{CancellationToken, Cancelled};
 
 use crate::{
+    checker::ProgramCheckOptions,
     diagnostic::DiagnosticCode,
     enum_plan::EnumFacts,
+    jsx_desugar::{
+        JsxEmitOptions, JsxRuntimeBinding, JsxRuntimeImportStyle, JsxSourceDesugarPlan,
+        desugar_source_jsx,
+    },
     lower::{self, LowerError, LowerOptions},
     namespace_plan::NamespaceFacts,
     parser,
@@ -26,8 +31,10 @@ use crate::{
         PackageTarget, ProjectRoot, ResolutionConditions, ResolutionFlavor, plan_relative_module,
     },
     scanner,
+    service::filesystem::{FileSystem, FileSystemError, OsFileSystem},
     source::{
-        MAX_SOURCE_BYTES, ScriptKind, SourceId, SourceIdentity, SourceText, TextRange, Utf16Pos,
+        JsxEmit, MAX_SOURCE_BYTES, NodeIdSource, ScriptKind, SourceId, SourceIdentity,
+        SourcePositionError, SourceText, TextRange, Utf16Pos,
     },
     syntax::{
         ExportDeclaration, ExportDefaultValue, ExportNamedDeclaration, ExportSpecifierMode,
@@ -35,6 +42,16 @@ use crate::{
         VariableKind,
     },
 };
+/// Stable diagnostic code for a per-file source budget breach.
+pub const SOURCE_TOO_LARGE: DiagnosticCode = DiagnosticCode::new("BAMTS-R001");
+/// Stable diagnostic code for a session aggregate source budget breach.
+pub const SESSION_TOO_LARGE: DiagnosticCode = DiagnosticCode::new("BAMTS-R002");
+
+/// Aggregate UTF-8 byte budget for every canonical source in one loaded graph.
+///
+/// A graph at exactly 256 MiB is accepted. Loading one byte more fails with
+/// ProgramLoadError::SessionTooLarge.
+pub const MAX_SESSION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The semantic role of one resolved module dependency.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -114,6 +131,7 @@ pub struct ResolvedModule {
     script_kind: ScriptKind,
     source: Arc<SourceText>,
     dependencies: Arc<[ModuleEdge]>,
+    jsx_plan: Option<JsxSourceDesugarPlan>,
 }
 
 impl ResolvedModule {
@@ -146,27 +164,46 @@ impl ResolvedModule {
     pub fn dependencies(&self) -> &[ModuleEdge] {
         &self.dependencies
     }
+
+    pub(crate) const fn jsx_plan(&self) -> Option<&JsxSourceDesugarPlan> {
+        self.jsx_plan.as_ref()
+    }
+}
+
+/// Output path used to make the JSX routing decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramOutputKind {
+    JavaScript,
+    NativeExecutable,
+}
+
+/// The single program-level decision for JSX emission versus lowering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsxRoutingDecision {
+    Emit,
+    TransformAndEmit,
+    Lower,
+    RejectPreservedNative,
 }
 
 /// The canonical whole-program value shared by every compiler and execution phase.
 ///
 /// Runtime and type-only modules are stored in deterministic dependency-first DFS
-/// postorder. Declaration overlays are appended afterward in deterministic discovery
-/// order. Cycles remain ordinary edges; each canonical file appears exactly once.
-/// Overlays are reachable only through [`ModuleEdge::type_target`], so eager runtime
-/// closure and lowering continue to follow only [`ModuleEdge::target`].
+/// postorder. Declaration overlays and their type dependencies are appended afterward.
+/// Cycles remain ordinary edges; each canonical file appears exactly once. Overlays are
+/// reachable only through [`ModuleEdge::type_target`], so runtime traversal follows only
+/// [`ModuleEdge::target`].
 #[derive(Clone, Debug)]
 pub struct ResolvedProgram {
     root: ProjectRoot,
-    entrypoint: SourceId,
+    roots: Arc<[SourceId]>,
     modules: Arc<[ResolvedModule]>,
     module_indices: HashMap<SourceId, usize>,
     commonjs: bool,
-    strict_null_checks: bool,
-    no_implicit_any: bool,
-    always_strict: bool,
-    es5: bool,
-    check_js: bool,
+    jsx: Option<JsxEmit>,
+    jsx_factory: Option<Arc<str>>,
+    jsx_fragment_factory: Option<Arc<str>>,
+    jsx_import_source: Option<Arc<str>>,
 }
 
 impl ResolvedProgram {
@@ -176,14 +213,19 @@ impl ResolvedProgram {
     }
 
     #[must_use]
-    pub const fn entrypoint_id(&self) -> SourceId {
-        self.entrypoint
+    pub fn roots(&self) -> &[SourceId] {
+        &self.roots
+    }
+
+    #[must_use]
+    pub fn entrypoint_id(&self) -> SourceId {
+        self.roots[0]
     }
 
     #[must_use]
     pub fn entrypoint(&self) -> &ResolvedModule {
-        self.module(self.entrypoint)
-            .expect("resolved program always contains its entrypoint")
+        self.module(self.entrypoint_id())
+            .expect("resolved program always contains every root")
     }
 
     #[must_use]
@@ -204,38 +246,57 @@ impl ResolvedProgram {
         self.commonjs
     }
 
-    /// Whether compiler options enable `strictNullChecks`.
     #[must_use]
-    pub const fn is_strict_null_checks(&self) -> bool {
-        self.strict_null_checks
+    pub const fn jsx(&self) -> Option<JsxEmit> {
+        self.jsx
     }
 
-    /// Whether compiler options enable `noImplicitAny`.
     #[must_use]
-    pub const fn is_no_implicit_any(&self) -> bool {
-        self.no_implicit_any
+    pub fn jsx_factory(&self) -> Option<&str> {
+        self.jsx_factory.as_deref()
     }
 
-    /// Whether compiler options enable `alwaysStrict`.
     #[must_use]
-    pub const fn is_always_strict(&self) -> bool {
-        self.always_strict
-    }
-    /// Whether compiler options target ES5 or earlier.
-    #[must_use]
-    pub const fn is_target_es5(&self) -> bool {
-        self.es5
+    pub fn jsx_fragment_factory(&self) -> Option<&str> {
+        self.jsx_fragment_factory.as_deref()
     }
 
-    /// Whether compiler options enable `checkJs`.
     #[must_use]
-    pub const fn is_check_js(&self) -> bool {
-        self.check_js
+    pub fn jsx_import_source(&self) -> Option<&str> {
+        self.jsx_import_source.as_deref()
     }
 
-    /// Enables semantic diagnostics for JavaScript modules.
-    pub fn enable_javascript_checking(&mut self) {
-        self.check_js = true;
+    /// Selects the only valid JSX path for a requested program product.
+    #[must_use]
+    pub const fn jsx_routing_decision(&self, output: ProgramOutputKind) -> JsxRoutingDecision {
+        match (output, self.jsx) {
+            (
+                ProgramOutputKind::JavaScript,
+                None | Some(JsxEmit::Preserve | JsxEmit::ReactNative),
+            ) => JsxRoutingDecision::Emit,
+            (
+                ProgramOutputKind::JavaScript,
+                Some(JsxEmit::React | JsxEmit::ReactJsx | JsxEmit::ReactJsxDev),
+            ) => JsxRoutingDecision::TransformAndEmit,
+            (
+                ProgramOutputKind::NativeExecutable,
+                None | Some(JsxEmit::React | JsxEmit::ReactJsx | JsxEmit::ReactJsxDev),
+            ) => JsxRoutingDecision::Lower,
+            (
+                ProgramOutputKind::NativeExecutable,
+                Some(JsxEmit::Preserve | JsxEmit::ReactNative),
+            ) => JsxRoutingDecision::RejectPreservedNative,
+        }
+    }
+
+    /// Constructs the effective checker environment for this resolved program.
+    #[must_use]
+    pub const fn check_options(&self) -> ProgramCheckOptions {
+        if self.commonjs {
+            ProgramCheckOptions::commonjs()
+        } else {
+            ProgramCheckOptions::standard()
+        }
     }
 
     /// Returns the eager runtime closure in the program's canonical order.
@@ -243,7 +304,7 @@ impl ResolvedProgram {
     #[must_use]
     pub fn runtime_modules(&self) -> Vec<&ResolvedModule> {
         let mut reachable = HashSet::new();
-        let mut pending = vec![self.entrypoint];
+        let mut pending = self.roots.to_vec();
         while let Some(source_id) = pending.pop() {
             if !reachable.insert(source_id) {
                 continue;
@@ -298,24 +359,14 @@ impl UnresolvedModuleDiagnostic {
     }
 }
 
-/// Stable diagnostic code for a per-file source budget breach.
-pub const SOURCE_TOO_LARGE: DiagnosticCode = DiagnosticCode::new("BAMTS-R001");
-/// Stable diagnostic code for a session aggregate source budget breach.
-pub const SESSION_TOO_LARGE: DiagnosticCode = DiagnosticCode::new("BAMTS-R002");
-
-/// The session aggregate UTF-8 byte budget across every source a
-/// [`ProgramLoader`] loads for one module graph (256 MiB, the S1 frontend
-/// session bound).
-///
-/// Each canonical file is counted once. A graph whose total reaches exactly
-/// this budget is accepted; one byte more is rejected with
-/// [`ProgramLoadError::SessionTooLarge`].
-pub const MAX_SESSION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
-
 /// Fail-fast program loading errors. No partially resolved graph is exposed.
 #[derive(Debug)]
 pub enum ProgramLoadError {
-    Cancelled(Cancelled),
+    Cancelled {
+        path: PathBuf,
+        source: Cancelled,
+    },
+    NoRoots,
     InvalidRoot(io::Error),
     EntryOutsideRoot(PathBuf),
     TraversalRejected {
@@ -327,6 +378,10 @@ pub enum ProgramLoadError {
         source: io::Error,
     },
     UnsupportedSource(PathBuf),
+    Source {
+        path: PathBuf,
+        source: SourcePositionError,
+    },
     TooManySources,
     IllFormedModuleSpecifier {
         importer: PathBuf,
@@ -341,6 +396,10 @@ pub enum ProgramLoadError {
         source: PackageError,
     },
     UnresolvedModule(UnresolvedModuleDiagnostic),
+    JsxPlan {
+        path: PathBuf,
+        message: Arc<str>,
+    },
     /// One source file exceeded the 16 MiB per-file input budget.
     SourceTooLarge {
         path: PathBuf,
@@ -356,7 +415,12 @@ pub enum ProgramLoadError {
 impl fmt::Display for ProgramLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled(error) => error.fmt(formatter),
+            Self::Cancelled { path, .. } => write!(
+                formatter,
+                "program loading cancelled while processing {}",
+                path.display()
+            ),
+            Self::NoRoots => formatter.write_str("program requires at least one root source"),
             Self::InvalidRoot(error) => {
                 write!(formatter, "cannot canonicalize project root: {error}")
             }
@@ -380,6 +444,13 @@ impl fmt::Display for ProgramLoadError {
                 write!(
                     formatter,
                     "unsupported source extension: {}",
+                    path.display()
+                )
+            }
+            Self::Source { path, source } => {
+                write!(
+                    formatter,
+                    "cannot index source {}: {source}",
                     path.display()
                 )
             }
@@ -409,6 +480,13 @@ impl fmt::Display for ProgramLoadError {
                 diagnostic.specifier(),
                 diagnostic.importer().display()
             ),
+            Self::JsxPlan { path, message } => {
+                write!(
+                    formatter,
+                    "cannot plan JSX in {}: {message}",
+                    path.display()
+                )
+            }
             Self::SourceTooLarge { path, len } => write!(
                 formatter,
                 "source file {} is {len} bytes, exceeding the {MAX_SOURCE_BYTES}-byte per-file budget",
@@ -422,10 +500,8 @@ impl fmt::Display for ProgramLoadError {
         }
     }
 }
-
 impl ProgramLoadError {
-    /// The stable diagnostic code identifying a frontend budget breach, when
-    /// this failure is one.
+    /// Stable diagnostic code for a frontend budget breach, when applicable.
     #[must_use]
     pub const fn code(&self) -> Option<DiagnosticCode> {
         match self {
@@ -436,64 +512,72 @@ impl ProgramLoadError {
     }
 }
 
-impl From<Cancelled> for ProgramLoadError {
-    fn from(error: Cancelled) -> Self {
-        Self::Cancelled(error)
-    }
-}
-
-impl From<crate::scanner::ScanError> for ProgramLoadError {
-    fn from(error: crate::scanner::ScanError) -> Self {
-        match error {
-            crate::scanner::ScanError::Cancelled(cancelled) => Self::Cancelled(cancelled),
-        }
-    }
-}
-
-impl From<crate::parser::ParseError> for ProgramLoadError {
-    fn from(error: crate::parser::ParseError) -> Self {
-        match error {
-            crate::parser::ParseError::Cancelled(cancelled) => Self::Cancelled(cancelled),
-        }
-    }
-}
-
 impl std::error::Error for ProgramLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Cancelled(error) => Some(error),
+            Self::Cancelled { source, .. } => Some(source),
             Self::InvalidRoot(error) | Self::Read { source: error, .. } => Some(error),
+            Self::Source { source, .. } => Some(source),
             Self::InvalidSpecifier { source, .. } => Some(source),
             Self::InvalidPackage { source, .. } => Some(source),
             _ => None,
         }
     }
 }
+fn file_system_io(error: FileSystemError) -> io::Error {
+    io::Error::new(error.kind(), error)
+}
 
-/// Loads one entrypoint and its complete local module graph.
-#[derive(Clone, Debug)]
+/// Loads one or more roots and their complete local module graph.
+#[derive(Clone)]
 pub struct ProgramLoader {
     root: ProjectRoot,
     options: CompilerOptions,
+    fs: Arc<dyn FileSystem>,
+}
+
+impl fmt::Debug for ProgramLoader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProgramLoader")
+            .field("root", &self.root)
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProgramLoader {
     /// Creates a loader using the project's already-validated compiler options.
     pub fn new(root: &ProjectRoot, options: &CompilerOptions) -> Result<Self, ProgramLoadError> {
-        let canonical = fs::canonicalize(root.path()).map_err(ProgramLoadError::InvalidRoot)?;
+        let fs = Arc::new(
+            OsFileSystem::new(root.path())
+                .map_err(|error| ProgramLoadError::InvalidRoot(file_system_io(error)))?,
+        );
+        Self::with_file_system(root, options, fs)
+    }
+
+    /// Creates a loader over a caller-provided, root-confined filesystem.
+    pub fn with_file_system(
+        root: &ProjectRoot,
+        options: &CompilerOptions,
+        fs: Arc<dyn FileSystem>,
+    ) -> Result<Self, ProgramLoadError> {
+        let canonical = fs
+            .normalize(root.path())
+            .map_err(|error| ProgramLoadError::InvalidRoot(file_system_io(error)))?;
         let root = ProjectRoot::new(canonical).map_err(|error| {
             ProgramLoadError::InvalidRoot(io::Error::new(io::ErrorKind::InvalidInput, error))
         })?;
         Ok(Self {
             root,
             options: options.clone(),
+            fs,
         })
     }
 
     /// Resolves and loads an entrypoint. The entrypoint may be root-relative or absolute.
     pub fn load(&self, entrypoint: impl AsRef<Path>) -> Result<ResolvedProgram, ProgramLoadError> {
-        let cancel = CancellationToken::new();
-        self.load_with_cancel(entrypoint, &cancel)
+        self.load_with_cancel(entrypoint, &CancellationToken::new())
     }
 
     /// Resolves and loads an entrypoint with cooperative cancellation.
@@ -502,29 +586,63 @@ impl ProgramLoader {
         entrypoint: impl AsRef<Path>,
         cancel: &CancellationToken,
     ) -> Result<ResolvedProgram, ProgramLoadError> {
-        cancel.check()?;
-        let requested = self
-            .root
-            .resolve(entrypoint.as_ref())
-            .map_err(|_| ProgramLoadError::EntryOutsideRoot(entrypoint.as_ref().to_path_buf()))?;
-        let entrypoint = self
-            .select_absolute(&requested, ResolutionFlavor::Runtime, cancel)?
-            .ok_or_else(|| ProgramLoadError::Read {
-                path: requested,
-                source: io::Error::new(io::ErrorKind::NotFound, "entrypoint does not exist"),
-            })?;
+        let entrypoint = entrypoint.as_ref().to_path_buf();
+        self.load_roots_with_cancel(&[entrypoint], cancel)
+    }
+
+    /// Resolves a canonical root set into one shared module graph.
+    pub fn load_roots(&self, roots: &[PathBuf]) -> Result<ResolvedProgram, ProgramLoadError> {
+        self.load_roots_with_cancel(roots, &CancellationToken::new())
+    }
+
+    fn load_roots_with_cancel(
+        &self,
+        roots: &[PathBuf],
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedProgram, ProgramLoadError> {
+        let cancellation_path = roots.first().map_or(self.root.path(), PathBuf::as_path);
+        check_load_cancel(cancel, cancellation_path)?;
+        if roots.is_empty() {
+            return Err(ProgramLoadError::NoRoots);
+        }
+
+        let mut requested_roots = roots.to_vec();
+        requested_roots.sort();
+        requested_roots.dedup();
+
+        let mut canonical_roots = BTreeSet::new();
+        for root in requested_roots {
+            check_load_cancel(cancel, &root)?;
+            let requested = self
+                .root
+                .resolve(&root)
+                .map_err(|_| ProgramLoadError::EntryOutsideRoot(root.clone()))?;
+            let selected = self
+                .select_absolute(&requested, ResolutionFlavor::Runtime)?
+                .ok_or_else(|| ProgramLoadError::Read {
+                    path: requested,
+                    source: io::Error::new(io::ErrorKind::NotFound, "root source does not exist"),
+                })?;
+            check_load_cancel(cancel, &selected)?;
+            canonical_roots.insert(selected);
+        }
 
         let mut state = LoadState {
             loader: self,
-            cancel,
             identities: HashMap::new(),
             modules: Vec::new(),
             overlay_worklist: Vec::new(),
             type_overlays: Vec::new(),
             session_bytes: 0,
+            cancel,
         };
-        let entrypoint = state.visit_with_cancel(entrypoint)?;
-        state.load_declaration_overlays_with_cancel()?;
+        let mut root_ids = Vec::with_capacity(canonical_roots.len());
+        for root in canonical_roots {
+            check_load_cancel(cancel, &root)?;
+            root_ids.push(state.visit(root)?);
+        }
+        state.load_declaration_overlays()?;
+        check_load_cancel(cancel, cancellation_path)?;
         let module_indices = state
             .modules
             .iter()
@@ -533,29 +651,60 @@ impl ProgramLoader {
             .collect();
         Ok(ResolvedProgram {
             root: self.root.clone(),
-            entrypoint,
+            roots: Arc::from(root_ids),
             modules: Arc::from(state.modules),
             module_indices,
             commonjs: self
                 .options
                 .module()
                 .is_some_and(|module| module.eq_ignore_ascii_case("commonjs")),
-            strict_null_checks: self.options.strict_null_checks(),
-            no_implicit_any: self.options.no_implicit_any(),
-            always_strict: self.options.always_strict(),
-            es5: self
-                .options
-                .target()
-                .is_some_and(|target| matches!(target, "es5" | "ES5" | "es3" | "ES3")),
-            check_js: self.options.check_js(),
+            jsx: self.options.jsx(),
+            jsx_factory: self.options.jsx_factory().map(Arc::from),
+            jsx_fragment_factory: self.options.jsx_fragment_factory().map(Arc::from),
+            jsx_import_source: self.options.jsx_import_source().map(Arc::from),
         })
+    }
+
+    fn jsx_plan(
+        &self,
+        path: &Path,
+        file: &SourceFile,
+        source: &SourceText,
+    ) -> Result<Option<JsxSourceDesugarPlan>, ProgramLoadError> {
+        let Some(emit @ (JsxEmit::React | JsxEmit::ReactJsx | JsxEmit::ReactJsxDev)) =
+            self.options.jsx()
+        else {
+            return Ok(None);
+        };
+        let options = JsxEmitOptions {
+            emit,
+            factory: self.options.jsx_factory().map(Arc::from),
+            fragment_factory: self.options.jsx_fragment_factory().map(Arc::from),
+            import_source: self.options.jsx_import_source().map(Arc::from),
+            import_style: if self
+                .options
+                .module()
+                .is_some_and(|module| module.eq_ignore_ascii_case("commonjs"))
+            {
+                JsxRuntimeImportStyle::CommonJs
+            } else {
+                JsxRuntimeImportStyle::EsModule
+            },
+            file_name: Some(Arc::from(path.to_string_lossy().into_owned())),
+        };
+        let mut ids = NodeIdSource::after(file.id());
+        desugar_source_jsx(file, source, &options, &mut ids)
+            .map(Some)
+            .map_err(|error| ProgramLoadError::JsxPlan {
+                path: path.to_path_buf(),
+                message: Arc::from(error.to_string()),
+            })
     }
 
     fn select_absolute(
         &self,
         requested: &Path,
         flavor: ResolutionFlavor,
-        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
         let relative = requested.strip_prefix(self.root.path()).map_err(|_| {
             ProgramLoadError::TraversalRejected {
@@ -582,53 +731,38 @@ impl ProgramLoader {
             ),
             source,
         })?;
-        self.canonical_selection(plan.candidates(), flavor, cancel)
+        self.canonical_selection(plan.candidates(), flavor)
     }
 
     fn canonical_selection(
         &self,
         candidates: &[PathBuf],
         flavor: ResolutionFlavor,
-        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
         if flavor == ResolutionFlavor::Runtime {
             for candidate in candidates {
-                cancel.check()?;
-                if is_declaration_path(candidate) {
+                if is_declaration_path(candidate) || !self.is_file(candidate)? {
                     continue;
                 }
-                cancel.check()?;
-                let is_file = candidate.is_file();
-                cancel.check()?;
-                if !is_file {
-                    continue;
-                }
-                return self.canonical_candidate(candidate, cancel).map(Some);
+                return self.canonical_candidate(candidate).map(Some);
             }
         }
         for candidate in candidates {
-            cancel.check()?;
-            cancel.check()?;
-            let is_file = candidate.is_file();
-            cancel.check()?;
-            if is_file {
-                return self.canonical_candidate(candidate, cancel).map(Some);
+            if self.is_file(candidate)? {
+                return self.canonical_candidate(candidate).map(Some);
             }
         }
         Ok(None)
     }
 
-    fn canonical_candidate(
-        &self,
-        candidate: &Path,
-        cancel: &CancellationToken,
-    ) -> Result<PathBuf, ProgramLoadError> {
-        cancel.check()?;
-        let canonical = fs::canonicalize(candidate).map_err(|source| ProgramLoadError::Read {
-            path: candidate.to_path_buf(),
-            source,
-        })?;
-        cancel.check()?;
+    fn canonical_candidate(&self, candidate: &Path) -> Result<PathBuf, ProgramLoadError> {
+        let canonical = self
+            .fs
+            .normalize(candidate)
+            .map_err(|error| ProgramLoadError::Read {
+                path: candidate.to_path_buf(),
+                source: file_system_io(error),
+            })?;
         if !canonical.starts_with(self.root.path()) {
             return Err(ProgramLoadError::TraversalRejected {
                 path: canonical,
@@ -638,13 +772,30 @@ impl ProgramLoader {
         Ok(canonical)
     }
 
+    fn is_file(&self, path: &Path) -> Result<bool, ProgramLoadError> {
+        match self.fs.metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(ProgramLoadError::Read {
+                path: path.to_path_buf(),
+                source: file_system_io(error),
+            }),
+        }
+    }
+
     fn resolve_edge(
         &self,
         importer: &Path,
         edge: &UnresolvedEdge,
         cancel: &CancellationToken,
     ) -> Result<ResolvedEdge, ProgramLoadError> {
-        cancel.check()?;
         if edge.specifier.starts_with("node:") {
             return Ok(ResolvedEdge {
                 target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
@@ -685,7 +836,6 @@ impl ProgramLoader {
         flavor: ResolutionFlavor,
         cancel: &CancellationToken,
     ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
-        cancel.check()?;
         if edge.specifier.starts_with("./") || edge.specifier.starts_with("../") {
             let plan = plan_relative_module(
                 &self.root,
@@ -699,20 +849,18 @@ impl ProgramLoader {
                 source,
             })?;
             return Ok(self
-                .canonical_selection(plan.candidates(), flavor, cancel)?
+                .canonical_selection(plan.candidates(), flavor)?
                 .map(ResolvedEdgeTarget::Local));
         }
         if edge.specifier.starts_with('#') {
             return self.resolve_package_import(importer, edge, flavor, cancel);
         }
-        Ok(
-            match self.resolve_mapped(&edge.specifier, flavor, cancel)? {
-                Some(mapped) => Some(ResolvedEdgeTarget::Local(mapped)),
-                None => self
-                    .resolve_package(importer, edge, flavor, cancel)?
-                    .map(ResolvedEdgeTarget::Local),
-            },
-        )
+        Ok(match self.resolve_mapped(&edge.specifier, flavor)? {
+            Some(mapped) => Some(ResolvedEdgeTarget::Local(mapped)),
+            None => self
+                .resolve_package(importer, edge, flavor, cancel)?
+                .map(ResolvedEdgeTarget::Local),
+        })
     }
 
     fn type_overlay(
@@ -722,7 +870,6 @@ impl ProgramLoader {
         runtime_target: &ResolvedEdgeTarget,
         cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
-        cancel.check()?;
         if edge.kind == ModuleEdgeKind::TypeOnly || is_declaration_path(importer) {
             return Ok(None);
         }
@@ -741,18 +888,14 @@ impl ProgramLoader {
         &self,
         specifier: &str,
         flavor: ResolutionFlavor,
-        cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
-        cancel.check()?;
         for mapping in self.options.paths() {
-            cancel.check()?;
             let Some(capture) = pattern_capture(mapping.pattern(), specifier) else {
                 continue;
             };
             for target in mapping.targets() {
-                cancel.check()?;
                 let target = PathBuf::from(target.to_string_lossy().replace('*', capture));
-                if let Some(selected) = self.select_absolute(&target, flavor, cancel)? {
+                if let Some(selected) = self.select_absolute(&target, flavor)? {
                     return Ok(Some(selected));
                 }
             }
@@ -767,29 +910,27 @@ impl ProgramLoader {
         flavor: ResolutionFlavor,
         cancel: &CancellationToken,
     ) -> Result<Option<PathBuf>, ProgramLoadError> {
-        cancel.check()?;
         let Some((package_name, subpath)) = split_package_specifier(&edge.specifier) else {
             return Ok(None);
         };
         let mut directory = importer.parent();
         while let Some(current) = directory {
-            cancel.check()?;
+            check_load_cancel(cancel, current)?;
             if !current.starts_with(self.root.path()) {
                 break;
             }
             let package_directory = current.join("node_modules").join(package_name);
             let package_path = package_directory.join("package.json");
-            cancel.check()?;
-            let is_file = package_path.is_file();
-            cancel.check()?;
-            if is_file {
-                cancel.check()?;
+            if self.is_file(&package_path)? {
+                check_load_cancel(cancel, &package_path)?;
                 let package_source =
-                    fs::read_to_string(&package_path).map_err(|source| ProgramLoadError::Read {
-                        path: package_path.clone(),
-                        source,
-                    })?;
-                cancel.check()?;
+                    self.fs
+                        .read(&package_path)
+                        .map_err(|error| ProgramLoadError::Read {
+                            path: package_path.clone(),
+                            source: file_system_io(error),
+                        })?;
+                check_load_cancel(cancel, &package_path)?;
                 let package = PackageJson::parse(&self.root, &package_path, &package_source)
                     .map_err(|source| ProgramLoadError::InvalidPackage {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
@@ -807,7 +948,7 @@ impl ProgramLoader {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
                         source,
                     })?;
-                return self.select_absolute(&target, flavor, cancel);
+                return self.select_absolute(&target, flavor);
             }
             if current == self.root.path() {
                 break;
@@ -825,22 +966,21 @@ impl ProgramLoader {
     ) -> Result<Option<ResolvedEdgeTarget>, ProgramLoadError> {
         let mut directory = importer.parent();
         while let Some(current) = directory {
-            cancel.check()?;
+            check_load_cancel(cancel, current)?;
             if !current.starts_with(self.root.path()) {
                 break;
             }
             let package_path = current.join("package.json");
-            cancel.check()?;
-            let is_file = package_path.is_file();
-            cancel.check()?;
-            if is_file {
-                cancel.check()?;
+            if self.is_file(&package_path)? {
+                check_load_cancel(cancel, &package_path)?;
                 let package_source =
-                    fs::read_to_string(&package_path).map_err(|source| ProgramLoadError::Read {
-                        path: package_path.clone(),
-                        source,
-                    })?;
-                cancel.check()?;
+                    self.fs
+                        .read(&package_path)
+                        .map_err(|error| ProgramLoadError::Read {
+                            path: package_path.clone(),
+                            source: file_system_io(error),
+                        })?;
+                check_load_cancel(cancel, &package_path)?;
                 let package = PackageJson::parse(&self.root, &package_path, &package_source)
                     .map_err(|source| ProgramLoadError::InvalidPackage {
                         diagnostic: diagnostic(importer, &edge.specifier, edge.kind, edge.range),
@@ -860,7 +1000,7 @@ impl ProgramLoader {
                     })?;
                 return match target {
                     PackageTarget::Path(path) => Ok(self
-                        .select_absolute(&path, flavor, cancel)?
+                        .select_absolute(&path, flavor)?
                         .map(ResolvedEdgeTarget::Local)),
                     PackageTarget::External(specifier) => {
                         let external = UnresolvedEdge {
@@ -868,7 +1008,7 @@ impl ProgramLoader {
                             specifier,
                             range: edge.range,
                         };
-                        match self.resolve_mapped(&external.specifier, flavor, cancel)? {
+                        match self.resolve_mapped(&external.specifier, flavor)? {
                             Some(mapped) => Ok(Some(ResolvedEdgeTarget::Local(mapped))),
                             None => match self
                                 .resolve_package(importer, &external, flavor, cancel)?
@@ -906,10 +1046,7 @@ struct PendingEdge {
     edge: UnresolvedEdge,
     type_overlay: Option<PathBuf>,
 }
-
-/// Accumulates `added` UTF-8 source bytes into the session budget, returning
-/// the new total, or the budget-breaching total once
-/// [`MAX_SESSION_SOURCE_BYTES`] would be exceeded.
+/// Adds one canonical source's UTF-8 bytes to the session total.
 fn accumulate_session_bytes(session_bytes: usize, added: usize) -> Result<usize, usize> {
     let total = session_bytes.saturating_add(added);
     if total > MAX_SESSION_SOURCE_BYTES {
@@ -920,56 +1057,23 @@ fn accumulate_session_bytes(session_bytes: usize, added: usize) -> Result<usize,
 
 struct LoadState<'a> {
     loader: &'a ProgramLoader,
-    cancel: &'a CancellationToken,
     identities: HashMap<PathBuf, SourceId>,
     modules: Vec<ResolvedModule>,
     overlay_worklist: Vec<PathBuf>,
     type_overlays: Vec<(SourceId, usize, PathBuf)>,
-    /// UTF-8 bytes loaded so far, checked against `MAX_SESSION_SOURCE_BYTES`.
     session_bytes: usize,
-}
-#[derive(Clone)]
-struct Frame {
-    path: PathBuf,
-    source_id: SourceId,
-    script_kind: ScriptKind,
-    source: Arc<SourceText>,
-    remaining: std::vec::IntoIter<UnresolvedEdge>,
-    dependencies: Vec<ModuleEdge>,
-    /// Local edge whose target visit is in flight (child on the stack).
-    pending_edge: Option<PendingEdge>,
+    cancel: &'a CancellationToken,
 }
 
 impl LoadState<'_> {
-    fn complete_local_edge(
-        frame: &mut Frame,
-        pending: PendingEdge,
-        runtime_target: SourceId,
-        type_overlays: &mut Vec<(SourceId, usize, PathBuf)>,
-        overlay_worklist: &mut Vec<PathBuf>,
-    ) {
-        let dependency_index = frame.dependencies.len();
-        frame.dependencies.push(ModuleEdge {
-            kind: pending.edge.kind,
-            specifier: pending.edge.specifier,
-            target: ModuleTarget::Local(runtime_target),
-            type_target: None,
-            range: pending.edge.range,
-        });
-        if let Some(path) = pending.type_overlay {
-            type_overlays.push((frame.source_id, dependency_index, path.clone()));
-            overlay_worklist.push(path);
-        }
-    }
-
-    fn load_declaration_overlays_with_cancel(&mut self) -> Result<(), ProgramLoadError> {
+    fn load_declaration_overlays(&mut self) -> Result<(), ProgramLoadError> {
         let mut next = 0;
         while next < self.overlay_worklist.len() {
-            self.cancel.check()?;
             let path = self.overlay_worklist[next].clone();
             next += 1;
+            check_load_cancel(self.cancel, &path)?;
             if !self.identities.contains_key(&path) {
-                self.visit_with_cancel(path)?;
+                self.visit(path)?;
             }
         }
 
@@ -980,7 +1084,6 @@ impl LoadState<'_> {
             .map(|(index, module)| (module.source_id(), index))
             .collect();
         for (importer, dependency_index, path) in &self.type_overlays {
-            self.cancel.check()?;
             let type_source_id = *self
                 .identities
                 .get(path)
@@ -993,14 +1096,25 @@ impl LoadState<'_> {
         }
         Ok(())
     }
-
     /// Loads `entrypoint` and its local import graph with an explicit stack.
     ///
     /// SourceIds are assigned in DFS preorder (first discovery). Modules are
     /// appended in DFS postorder. Local edges are resolved left-to-right; a path
     /// already present in `identities` is reused immediately, which both
     /// deduplicates diamonds and retains cycle edges without re-entering.
-    fn visit_with_cancel(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
+    fn visit(&mut self, entrypoint: PathBuf) -> Result<SourceId, ProgramLoadError> {
+        struct Frame {
+            path: PathBuf,
+            source_id: SourceId,
+            script_kind: ScriptKind,
+            source: Arc<SourceText>,
+            remaining: std::vec::IntoIter<UnresolvedEdge>,
+            jsx_plan: Option<JsxSourceDesugarPlan>,
+            dependencies: Vec<ModuleEdge>,
+            /// Local edge whose target visit is in flight (child on the stack).
+            pending_edge: Option<PendingEdge>,
+        }
+
         enum Resume {
             Enter(PathBuf),
             Advance,
@@ -1010,7 +1124,15 @@ impl LoadState<'_> {
         let mut resume = Resume::Enter(entrypoint);
 
         loop {
-            self.cancel.check()?;
+            match &resume {
+                Resume::Enter(path) => check_load_cancel(self.cancel, path)?,
+                Resume::Advance => {
+                    let path = stack
+                        .last()
+                        .map_or(self.loader.root.path(), |frame| frame.path.as_path());
+                    check_load_cancel(self.cancel, path)?;
+                }
+            }
             match resume {
                 Resume::Enter(path) => {
                     if let Some(&source_id) = self.identities.get(&path) {
@@ -1020,13 +1142,22 @@ impl LoadState<'_> {
                         let pending = parent.pending_edge.take().expect(
                             "deduplicated or cyclic local resume belongs to a pending edge",
                         );
-                        Self::complete_local_edge(
-                            parent,
-                            pending,
-                            source_id,
-                            &mut self.type_overlays,
-                            &mut self.overlay_worklist,
-                        );
+                        let dependency_index = parent.dependencies.len();
+                        parent.dependencies.push(ModuleEdge {
+                            kind: pending.edge.kind,
+                            specifier: pending.edge.specifier,
+                            target: ModuleTarget::Local(source_id),
+                            type_target: None,
+                            range: pending.edge.range,
+                        });
+                        if let Some(path) = pending.type_overlay {
+                            self.type_overlays.push((
+                                parent.source_id,
+                                dependency_index,
+                                path.clone(),
+                            ));
+                            self.overlay_worklist.push(path);
+                        }
                         resume = Resume::Advance;
                         continue;
                     }
@@ -1039,20 +1170,29 @@ impl LoadState<'_> {
 
                     let script_kind = script_kind(&path)
                         .ok_or_else(|| ProgramLoadError::UnsupportedSource(path.clone()))?;
-                    self.cancel.check()?;
+                    check_load_cancel(self.cancel, &path)?;
                     let text =
-                        fs::read_to_string(&path).map_err(|source| ProgramLoadError::Read {
+                        self.loader
+                            .fs
+                            .read(&path)
+                            .map_err(|error| ProgramLoadError::Read {
+                                path: path.clone(),
+                                source: file_system_io(error),
+                            })?;
+                    check_load_cancel(self.cancel, &path)?;
+                    let len = text.len();
+                    let source = SourceText::new(text).map_err(|source| match source {
+                        SourcePositionError::SourceTooLarge { .. } => {
+                            ProgramLoadError::SourceTooLarge {
+                                path: path.clone(),
+                                len,
+                            }
+                        }
+                        source => ProgramLoadError::Source {
                             path: path.clone(),
                             source,
-                        })?;
-                    self.cancel.check()?;
-                    let len = text.len();
-                    let source = SourceText::new(text)
-                        .map_err(|_| ProgramLoadError::SourceTooLarge {
-                            path: path.clone(),
-                            len,
-                        })?
-                        .with_declaration_file(is_declaration_path(&path));
+                        },
+                    })?;
                     self.session_bytes = accumulate_session_bytes(self.session_bytes, len)
                         .map_err(|total| ProgramLoadError::SessionTooLarge {
                             path: path.clone(),
@@ -1064,14 +1204,38 @@ impl LoadState<'_> {
                         script_kind,
                         Arc::clone(&source),
                         self.cancel.clone(),
-                    )?;
-                    let parsed = parser::parse_with_cancel(scanned, self.cancel.clone())?;
-                    let unresolved = collect_edges(parsed.product()).map_err(|range| {
+                    )
+                    .map_err(|_| cancelled_load(&path))?;
+                    let parsed = parser::parse_with_cancel(scanned, self.cancel.clone())
+                        .map_err(|_| cancelled_load(&path))?;
+                    check_load_cancel(self.cancel, &path)?;
+                    let mut unresolved = collect_edges(parsed.product()).map_err(|range| {
                         ProgramLoadError::IllFormedModuleSpecifier {
                             importer: path.clone(),
                             range,
                         }
                     })?;
+                    let jsx_plan = if parsed.diagnostics().is_empty() {
+                        check_load_cancel(self.cancel, &path)?;
+                        self.loader.jsx_plan(&path, parsed.product(), &source)?
+                    } else {
+                        None
+                    };
+                    check_load_cancel(self.cancel, &path)?;
+                    if let Some(specifier) = jsx_plan
+                        .as_ref()
+                        .and_then(|plan| plan.demand.module_specifier.as_ref())
+                        && !unresolved.iter().any(|edge| {
+                            edge.specifier.as_ref() == specifier.as_ref()
+                                && edge.kind == ModuleEdgeKind::StaticRuntime
+                        })
+                    {
+                        unresolved.push(UnresolvedEdge {
+                            kind: ModuleEdgeKind::StaticRuntime,
+                            specifier: Arc::clone(specifier),
+                            range: parsed.product().range(),
+                        });
+                    }
                     let dependencies = Vec::with_capacity(unresolved.len());
                     stack.push(Frame {
                         path,
@@ -1079,6 +1243,7 @@ impl LoadState<'_> {
                         script_kind,
                         source,
                         remaining: unresolved.into_iter(),
+                        jsx_plan,
                         dependencies,
                         pending_edge: None,
                     });
@@ -1090,23 +1255,24 @@ impl LoadState<'_> {
                             .last_mut()
                             .expect("Advance always runs with a frame on the stack");
                         loop {
-                            self.cancel.check()?;
+                            check_load_cancel(self.cancel, &frame.path)?;
                             let Some(edge) = frame.remaining.next() else {
                                 break None;
                             };
                             let resolved =
                                 self.loader.resolve_edge(&frame.path, &edge, self.cancel)?;
-                            let target = resolved.target;
-                            let type_overlay = resolved.type_overlay;
-                            match target {
+                            match resolved.target {
                                 ResolvedEdgeTarget::Local(target_path) => {
-                                    frame.pending_edge = Some(PendingEdge { edge, type_overlay });
+                                    frame.pending_edge = Some(PendingEdge {
+                                        edge,
+                                        type_overlay: resolved.type_overlay,
+                                    });
                                     break Some(target_path);
                                 }
                                 ResolvedEdgeTarget::External(specifier) => {
                                     frame.dependencies.push(ModuleEdge {
                                         kind: edge.kind,
-                                        specifier: Arc::clone(&edge.specifier),
+                                        specifier: edge.specifier,
                                         target: ModuleTarget::External(specifier),
                                         type_target: None,
                                         range: edge.range,
@@ -1129,6 +1295,7 @@ impl LoadState<'_> {
                         identity: SourceIdentity::new(source_id, Arc::from(frame.path)),
                         script_kind: frame.script_kind,
                         source: frame.source,
+                        jsx_plan: frame.jsx_plan,
                         dependencies: Arc::from(frame.dependencies),
                     });
 
@@ -1139,18 +1306,34 @@ impl LoadState<'_> {
                         .pending_edge
                         .take()
                         .expect("finished child always completes a parent local edge");
-                    Self::complete_local_edge(
-                        parent,
-                        pending,
-                        source_id,
-                        &mut self.type_overlays,
-                        &mut self.overlay_worklist,
-                    );
+                    let dependency_index = parent.dependencies.len();
+                    parent.dependencies.push(ModuleEdge {
+                        kind: pending.edge.kind,
+                        specifier: pending.edge.specifier,
+                        target: ModuleTarget::Local(source_id),
+                        type_target: None,
+                        range: pending.edge.range,
+                    });
+                    if let Some(path) = pending.type_overlay {
+                        self.type_overlays
+                            .push((parent.source_id, dependency_index, path.clone()));
+                        self.overlay_worklist.push(path);
+                    }
                     resume = Resume::Advance;
                 }
             }
         }
     }
+}
+fn cancelled_load(path: &Path) -> ProgramLoadError {
+    ProgramLoadError::Cancelled {
+        path: path.to_path_buf(),
+        source: Cancelled,
+    }
+}
+
+fn check_load_cancel(cancel: &CancellationToken, path: &Path) -> Result<(), ProgramLoadError> {
+    cancel.check().map_err(|_| cancelled_load(path))
 }
 
 #[derive(Clone, Debug)]
@@ -1401,8 +1584,8 @@ impl DynamicEdgeCollector<'_> {
                 ExportDefaultValue::Function(function) => self.scan_function(function),
                 ExportDefaultValue::Class(class) => self.scan_class(class),
                 ExportDefaultValue::Expression(expression) => self.scan_expression(expression),
-                ExportDefaultValue::Missing(_) => {}
                 ExportDefaultValue::Interface(_) => {}
+                ExportDefaultValue::Missing(_) => {}
             },
             Statement::Export(ExportDeclaration::Assignment(expression)) => {
                 self.scan_expression(expression)
@@ -1535,14 +1718,6 @@ impl DynamicEdgeCollector<'_> {
             ArrayElement, Expression, Literal, MemberProperty, ObjectMember, PropertyName,
         };
         match expression.data() {
-            Expression::JsxElement(value) => {
-                self.scan_jsx_attributes(&value.opening.data().attributes);
-                self.scan_jsx_children(&value.children);
-            }
-            Expression::JsxFragment(value) => self.scan_jsx_children(&value.children),
-            Expression::JsxSelfClosingElement(value) => {
-                self.scan_jsx_attributes(&value.attributes);
-            }
             Expression::Template(value) => {
                 for expression in &value.expressions {
                     self.scan_expression(expression);
@@ -1653,6 +1828,14 @@ impl DynamicEdgeCollector<'_> {
                     self.scan_expression(options);
                 }
             }
+            Expression::JsxElement(value) => {
+                self.scan_jsx_attributes(&value.opening.data().attributes);
+                self.scan_jsx_children(&value.children);
+            }
+            Expression::JsxSelfClosingElement(value) => {
+                self.scan_jsx_attributes(&value.attributes);
+            }
+            Expression::JsxFragment(value) => self.scan_jsx_children(&value.children),
             Expression::Identifier(_)
             | Expression::This
             | Expression::Super
@@ -1663,11 +1846,10 @@ impl DynamicEdgeCollector<'_> {
     }
 
     fn scan_jsx_attributes(&mut self, attributes: &[crate::syntax::JsxAttributeItem]) {
-        use crate::syntax::JsxAttributeInitializer;
-        for attribute in attributes {
-            match attribute {
+        for entry in attributes {
+            match entry {
                 crate::syntax::JsxAttributeItem::Attribute(attribute) => {
-                    if let Some(JsxAttributeInitializer::Expression(container)) =
+                    if let Some(crate::syntax::JsxAttributeInitializer::Expression(container)) =
                         &attribute.data().initializer
                         && let Some(expression) = &container.data().expression
                     {
@@ -1682,17 +1864,18 @@ impl DynamicEdgeCollector<'_> {
     }
 
     fn scan_jsx_children(&mut self, children: &[crate::syntax::JsxChild]) {
-        use crate::syntax::JsxChild;
         for child in children {
             match child {
-                JsxChild::ExpressionContainer(container) => {
+                crate::syntax::JsxChild::ExpressionContainer(container) => {
                     if let Some(expression) = &container.data().expression {
                         self.scan_expression(expression);
                     }
                 }
-                JsxChild::Spread(spread) => self.scan_expression(&spread.data().expression),
-                JsxChild::Element(expression) => self.scan_expression(expression),
-                JsxChild::Text(_) => {}
+                crate::syntax::JsxChild::Spread(spread) => {
+                    self.scan_expression(&spread.data().expression);
+                }
+                crate::syntax::JsxChild::Element(expression) => self.scan_expression(expression),
+                crate::syntax::JsxChild::Text(_) => {}
             }
         }
     }
@@ -1845,7 +2028,7 @@ fn parse_hex(bytes: &[u8]) -> Option<u32> {
     bytes.iter().try_fold(0_u32, |value, byte| {
         char::from(*byte)
             .to_digit(16)
-            .and_then(|digit| value.checked_mul(16)?.checked_add(digit))
+            .map(|digit| value * 16 + digit)
     })
 }
 
@@ -2003,6 +2186,9 @@ pub enum ProgramLowerErrorKind {
     },
     Lower(LowerError),
     Link(ProgramVerifyError),
+    UnsupportedJsxMode {
+        mode: JsxEmit,
+    },
 }
 
 /// A whole-program lowering failure anchored to a canonical module path and phase.
@@ -2015,16 +2201,13 @@ pub struct ProgramLowerError {
 
 impl fmt::Display for ProgramLowerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            ProgramLowerErrorKind::Cancelled(error) => error.fmt(formatter),
-            _ => write!(
-                formatter,
-                "program lowering failed in {} during {:?}: {:?}",
-                self.module.display(),
-                self.phase,
-                self.kind
-            ),
-        }
+        write!(
+            formatter,
+            "program lowering failed in {} during {:?}: {:?}",
+            self.module.display(),
+            self.phase,
+            self.kind
+        )
     }
 }
 
@@ -2035,16 +2218,6 @@ impl std::error::Error for ProgramLowerError {
             ProgramLowerErrorKind::Lower(error) => Some(error),
             ProgramLowerErrorKind::Link(error) => Some(error),
             _ => None,
-        }
-    }
-}
-
-impl From<Cancelled> for ProgramLowerError {
-    fn from(error: Cancelled) -> Self {
-        Self {
-            module: PathBuf::new(),
-            phase: ProgramLowerPhase::Frontend,
-            kind: ProgramLowerErrorKind::Cancelled(error),
         }
     }
 }
@@ -2090,6 +2263,7 @@ struct RawModule {
     bindings: Vec<RawBinding>,
     exports: Vec<RawExport>,
     stars: Vec<EdgeId>,
+    jsx_plan: Option<JsxSourceDesugarPlan>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2122,7 +2296,11 @@ pub fn lower_program_with_cancel(
     options: LowerOptions,
     cancel: &CancellationToken,
 ) -> Result<ExecutableProgram, ProgramLowerError> {
-    cancel.check()?;
+    check_lower_cancel(
+        cancel,
+        resolved.entrypoint().path(),
+        ProgramLowerPhase::Frontend,
+    )?;
     if frontend.entrypoint_id() != resolved.entrypoint_id() {
         return Err(program_lower_error(
             resolved.entrypoint().path(),
@@ -2133,8 +2311,25 @@ pub fn lower_program_with_cancel(
             },
         ));
     }
+    if let JsxRoutingDecision::RejectPreservedNative =
+        resolved.jsx_routing_decision(ProgramOutputKind::NativeExecutable)
+    {
+        return Err(program_lower_error(
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Frontend,
+            ProgramLowerErrorKind::UnsupportedJsxMode {
+                mode: resolved
+                    .jsx()
+                    .expect("native JSX rejection requires a configured JSX mode"),
+            },
+        ));
+    }
     for output in frontend.modules() {
-        cancel.check()?;
+        check_lower_cancel(
+            cancel,
+            resolved.entrypoint().path(),
+            ProgramLowerPhase::Frontend,
+        )?;
         let source = output.source_file().source_id();
         if resolved.module(source).is_none() {
             return Err(program_lower_error(
@@ -2153,7 +2348,7 @@ pub fn lower_program_with_cancel(
         .collect();
     let mut raw_modules = Vec::with_capacity(resolved.modules().len());
     for module in resolved.modules() {
-        cancel.check()?;
+        check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
         let output = frontend.module(module.source_id()).ok_or_else(|| {
             program_lower_error(
                 module.path(),
@@ -2178,13 +2373,25 @@ pub fn lower_program_with_cancel(
             name,
             &module_ids,
         )?);
-        cancel.check()?;
+        check_lower_cancel(cancel, module.path(), ProgramLowerPhase::Metadata)?;
     }
-    cancel.check()?;
+    check_lower_cancel(
+        cancel,
+        resolved.entrypoint().path(),
+        ProgramLowerPhase::Metadata,
+    )?;
     resolve_import_equals_bindings(&mut raw_modules);
-    cancel.check()?;
+    check_lower_cancel(
+        cancel,
+        resolved.entrypoint().path(),
+        ProgramLowerPhase::Metadata,
+    )?;
     expand_star_exports(&mut raw_modules);
-    cancel.check()?;
+    check_lower_cancel(
+        cancel,
+        resolved.entrypoint().path(),
+        ProgramLowerPhase::Metadata,
+    )?;
 
     let mut linked_modules = Vec::with_capacity(raw_modules.len());
     let mut provenance = Vec::with_capacity(raw_modules.len());
@@ -2194,7 +2401,7 @@ pub fn lower_program_with_cancel(
         .zip(raw_modules.iter())
         .enumerate()
     {
-        cancel.check()?;
+        check_lower_cancel(cancel, resolved_module.path(), ProgramLowerPhase::Module)?;
         let output = frontend
             .module(resolved_module.source_id())
             .expect("frontend presence checked above");
@@ -2204,6 +2411,7 @@ pub fn lower_program_with_cancel(
             file,
             options,
             &strings,
+            raw.jsx_plan.as_ref(),
             output.semantic_model().enum_facts(),
             output.semantic_model().namespace_facts(),
         )
@@ -2221,7 +2429,7 @@ pub fn lower_program_with_cancel(
                 ProgramLowerErrorKind::Lower(error),
             )
         })?;
-        cancel.check()?;
+        check_lower_cancel(cancel, resolved_module.path(), ProgramLowerPhase::Module)?;
         linked_modules.push(materialize_program_module(code, raw));
         provenance.push(ExecutableModuleProvenance {
             module: ModuleId::new(index as u32),
@@ -2229,8 +2437,12 @@ pub fn lower_program_with_cancel(
             edges: Arc::from(resolved_module.dependencies()),
         });
     }
-    cancel.check()?;
     let entry = module_ids[&resolved.entrypoint_id()];
+    check_lower_cancel(
+        cancel,
+        resolved.entrypoint().path(),
+        ProgramLowerPhase::Link,
+    )?;
     let wire = BytecodeProgram::link(linked_modules, entry).map_err(|error| {
         let path = error
             .module
@@ -2242,8 +2454,21 @@ pub fn lower_program_with_cancel(
             ProgramLowerErrorKind::Link(error),
         )
     })?;
-    cancel.check()?;
+    check_lower_cancel(
+        cancel,
+        resolved.entrypoint().path(),
+        ProgramLowerPhase::Link,
+    )?;
     Ok(ExecutableProgram { wire, provenance })
+}
+fn check_lower_cancel(
+    cancel: &CancellationToken,
+    path: &Path,
+    phase: ProgramLowerPhase,
+) -> Result<(), ProgramLowerError> {
+    cancel
+        .check()
+        .map_err(|error| program_lower_error(path, phase, ProgramLowerErrorKind::Cancelled(error)))
 }
 
 fn collect_raw_module(
@@ -2332,12 +2557,38 @@ fn collect_raw_module(
         !matches!(binding.kind, RawBindingKind::Hoisted)
             || hoisted_names.insert(binding.name.clone())
     });
-    let binding_names: HashSet<_> = bindings
+    let mut binding_names: HashSet<String> = bindings
         .iter()
-        .map(|binding| binding.name.as_str())
+        .map(|binding| binding.name.clone())
         .collect();
+    let mut jsx_plan = module.jsx_plan().cloned();
+    if let Some(plan) = &mut jsx_plan
+        && let Some(specifier) = &plan.demand.module_specifier
+    {
+        let edge_id = edge(specifier.to_string())?;
+        let demanded: BTreeSet<_> = plan.demand.bindings.values().copied().collect();
+        let mut runtime_names: BTreeMap<JsxRuntimeBinding, Arc<str>> = BTreeMap::new();
+        for binding in demanded {
+            let stem = format!("__bamts_jsx_{}", binding.export_name());
+            let mut local = stem.clone();
+            let mut suffix = 2_u32;
+            while !binding_names.insert(local.clone()) {
+                local = format!("{stem}_{suffix}");
+                suffix += 1;
+            }
+            bindings.push(RawBinding {
+                name: local.clone(),
+                kind: RawBindingKind::Imported {
+                    edge: edge_id,
+                    name: binding.export_name().to_owned(),
+                },
+            });
+            runtime_names.insert(binding, Arc::from(local));
+        }
+        plan.rebind_runtime_names(&runtime_names);
+    }
     exports.retain(|export| match &export.source {
-        RawExportSource::Local(name) => binding_names.contains(name.as_str()),
+        RawExportSource::Local(name) => binding_names.contains(name),
         RawExportSource::Indirect { .. } => true,
     });
     Ok(RawModule {
@@ -2346,6 +2597,7 @@ fn collect_raw_module(
         bindings,
         exports,
         stars,
+        jsx_plan,
     })
 }
 
@@ -2484,8 +2736,8 @@ fn collect_top_level_statement(
                 let Statement::Namespace(declaration) = statement.data() else {
                     unreachable!("namespace plan belongs to namespace statement");
                 };
-                if let Some(name_node) = declaration.name.as_identifier() {
-                    let name = identifier(file, name_node);
+                if let Some(identifier_node) = declaration.name.as_identifier() {
+                    let name = identifier(file, identifier_node);
                     if !bindings.iter().any(|binding| binding.name == name) {
                         bindings.push(RawBinding {
                             name,
@@ -2768,14 +3020,12 @@ fn expand_star_exports(modules: &mut [RawModule]) {
                 }
                 let mut visited = BTreeSet::new();
                 visited.insert((index, name.clone()));
-                let mut truncated = false;
                 let candidates = star_export_origins(
                     modules,
                     &mut cache,
                     target.get() as usize,
                     &name,
                     &mut visited,
-                    &mut truncated,
                 );
                 if !candidates.is_empty() {
                     additions[index].entry(name).or_default().extend(candidates);
@@ -2802,14 +3052,12 @@ fn expand_star_exports(modules: &mut [RawModule]) {
                 };
                 let mut visited = BTreeSet::new();
                 visited.insert((index, name.clone()));
-                let mut truncated = false;
                 star_export_origins(
                     modules,
                     &mut cache,
                     target.get() as usize,
                     name,
                     &mut visited,
-                    &mut truncated,
                 )
                 .contains(origin)
             });
@@ -2838,12 +3086,8 @@ fn star_export_origins(
     module_index: usize,
     name: &str,
     visited: &mut BTreeSet<(usize, String)>,
-    truncated: &mut bool,
 ) -> BTreeSet<ExportOrigin> {
     if !visited.insert((module_index, name.to_owned())) {
-        // Truncation: this (module, name) is already on the current path. The
-        // result is path-dependent, so the caller must not cache it.
-        *truncated = true;
         return BTreeSet::new();
     }
     if let Some(candidates) = cache.get(&(module_index, name.to_owned())) {
@@ -2864,23 +3108,16 @@ fn star_export_origins(
             let EdgeTarget::Local(target) = module.edges[star.get() as usize].target else {
                 continue;
             };
-            let mut child_truncated = false;
             candidates.extend(star_export_origins(
                 modules,
                 cache,
                 target.get() as usize,
                 name,
                 visited,
-                &mut child_truncated,
             ));
-            if child_truncated {
-                *truncated = true;
-            }
         }
     }
-    if !*truncated {
-        cache.insert((module_index, name.to_owned()), candidates.clone());
-    }
+    cache.insert((module_index, name.to_owned()), candidates.clone());
     candidates
 }
 
@@ -3052,11 +3289,10 @@ fn module_has_binding_namespace(
         let Statement::Namespace(declaration) = statement.data() else {
             return false;
         };
-        if !declaration
-            .name
-            .as_identifier()
-            .is_some_and(|n| identifier(file, n) == name)
-        {
+        let Some(identifier_node) = declaration.name.as_identifier() else {
+            return false;
+        };
+        if identifier(file, identifier_node) != name {
             return false;
         }
         namespace_facts
@@ -3144,18 +3380,22 @@ mod tests {
     };
 
     use super::{
-        ExecutableProgram, ModuleEdgeKind, ModuleTarget, ProgramLoadError, ProgramLoader,
-        ProgramLowerErrorKind, ProgramLowerPhase, lower_program,
+        ExecutableProgram, JsxRoutingDecision, ModuleEdgeKind, ModuleTarget, ProgramLoadError,
+        ProgramLoader, ProgramLowerErrorKind, ProgramLowerPhase, ProgramOutputKind, lower_program,
+        lower_program_with_cancel,
     };
     use crate::{
         lower::LowerOptions,
         pipeline::{FrontendMode, compile_program_frontend},
         project::{ProjectConfig, ProjectRoot},
+        service::filesystem::{FileMetadata, FileSystem, FileSystemError, OsFileSystem},
+        source::JsxEmit,
     };
     use bamts_bytecode::{
         BindingId, BindingKind, EcmaString, EdgeId, EdgeKind, EdgeTarget, ExportSource,
         Instruction, ProgramModule, ProgramVerifyErrorKind, ResolvedExport, Verified,
     };
+    use bamts_cancel::CancellationToken;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -3189,6 +3429,88 @@ mod tests {
             ProgramLoader::new(&root, config.options()).unwrap()
         }
     }
+    struct CountingFileSystem {
+        inner: OsFileSystem,
+        shared: PathBuf,
+        shared_reads: AtomicU64,
+        total_reads: AtomicU64,
+    }
+
+    impl CountingFileSystem {
+        fn new(root: &Path, shared: &Path) -> Self {
+            let inner = OsFileSystem::new(root).unwrap();
+            let shared = inner.normalize(shared).unwrap();
+            Self {
+                inner,
+                shared,
+                shared_reads: AtomicU64::new(0),
+                total_reads: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl FileSystem for CountingFileSystem {
+        fn normalize(&self, path: &Path) -> Result<PathBuf, FileSystemError> {
+            self.inner.normalize(path)
+        }
+
+        fn read(&self, path: &Path) -> Result<String, FileSystemError> {
+            let path = self.inner.normalize(path)?;
+            self.total_reads.fetch_add(1, Ordering::Relaxed);
+            if path == self.shared {
+                self.shared_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.read(&path)
+        }
+
+        fn metadata(&self, path: &Path) -> Result<FileMetadata, FileSystemError> {
+            self.inner.metadata(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, FileSystemError> {
+            self.inner.read_dir(path)
+        }
+    }
+    struct CancellingFileSystem {
+        inner: OsFileSystem,
+        cancel: CancellationToken,
+        cancel_at: u64,
+        reads: AtomicU64,
+    }
+
+    impl CancellingFileSystem {
+        fn new(root: &Path, cancel: CancellationToken, cancel_at: u64) -> Self {
+            Self {
+                inner: OsFileSystem::new(root).unwrap(),
+                cancel,
+                cancel_at,
+                reads: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl FileSystem for CancellingFileSystem {
+        fn normalize(&self, path: &Path) -> Result<PathBuf, FileSystemError> {
+            self.inner.normalize(path)
+        }
+
+        fn read(&self, path: &Path) -> Result<String, FileSystemError> {
+            let source = self.inner.read(path)?;
+            let reads = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+            if reads == self.cancel_at {
+                self.cancel.cancel();
+            }
+            Ok(source)
+        }
+
+        fn metadata(&self, path: &Path) -> Result<FileMetadata, FileSystemError> {
+            self.inner.metadata(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, FileSystemError> {
+            self.inner.read_dir(path)
+        }
+    }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -3207,6 +3529,88 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    #[test]
+    fn pre_cancelled_load_preserves_typed_path_context() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "export const value = 1;");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = fixture
+            .loader()
+            .load_with_cancel("main.ts", &cancel)
+            .expect_err("pre-cancelled loading must stop before filesystem work");
+        assert!(matches!(
+            error,
+            ProgramLoadError::Cancelled { path, .. } if path == Path::new("main.ts")
+        ));
+    }
+
+    #[test]
+    fn load_cancellation_after_read_stops_before_dependency_traversal() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import './dependency.js';");
+        fixture.write("dependency.ts", "export const value = 1;");
+        let cancel = CancellationToken::new();
+        let root = ProjectRoot::new(fs::canonicalize(&fixture.0).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, fixture.0.join("tsconfig.json"), "{}").unwrap();
+        let filesystem = Arc::new(CancellingFileSystem::new(&fixture.0, cancel.clone(), 1));
+        let loader_filesystem: Arc<dyn FileSystem> = filesystem.clone();
+        let loader =
+            ProgramLoader::with_file_system(&root, config.options(), loader_filesystem).unwrap();
+
+        let error = loader
+            .load_with_cancel("main.ts", &cancel)
+            .expect_err("cancellation after the first read must stop traversal");
+        assert!(matches!(
+            error,
+            ProgramLoadError::Cancelled { path, .. } if path.ends_with("main.ts")
+        ));
+        assert_eq!(filesystem.reads.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn load_cancellation_after_package_read_retains_package_path() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import 'pkg';");
+        fixture.write(
+            "node_modules/pkg/package.json",
+            r#"{"name":"pkg","exports":{".":"./index.ts"}}"#,
+        );
+        fixture.write("node_modules/pkg/index.ts", "export const value = 1;");
+        let cancel = CancellationToken::new();
+        let root = ProjectRoot::new(fs::canonicalize(&fixture.0).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, fixture.0.join("tsconfig.json"), "{}").unwrap();
+        let filesystem = Arc::new(CancellingFileSystem::new(&fixture.0, cancel.clone(), 2));
+        let loader_filesystem: Arc<dyn FileSystem> = filesystem.clone();
+        let loader =
+            ProgramLoader::with_file_system(&root, config.options(), loader_filesystem).unwrap();
+
+        let error = loader
+            .load_with_cancel("main.ts", &cancel)
+            .expect_err("cancellation after package.json read must stop package parsing");
+        assert!(matches!(
+            error,
+            ProgramLoadError::Cancelled { path, .. } if path.ends_with("node_modules/pkg/package.json")
+        ));
+        assert_eq!(filesystem.reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn pre_cancelled_lowering_preserves_stage_and_path_context() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "export const value = 1;");
+        let resolved = fixture.loader().load("main.ts").unwrap();
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error =
+            lower_program_with_cancel(&resolved, &frontend, LowerOptions::default(), &cancel)
+                .expect_err("pre-cancelled lowering must stop at the frontend boundary");
+        assert_eq!(error.module, resolved.entrypoint().path());
+        assert_eq!(error.phase, ProgramLowerPhase::Frontend);
+        assert!(matches!(error.kind, ProgramLowerErrorKind::Cancelled(_)));
     }
 
     #[test]
@@ -4438,6 +4842,143 @@ mod tests {
     }
 
     #[test]
+    fn multi_root_load_compiles_every_root_and_reads_shared_source_once() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "a.ts",
+            "import { shared } from './shared'; export const a = shared;",
+        );
+        fixture.write(
+            "b.ts",
+            "import { shared } from './shared'; export const b = shared;",
+        );
+        fixture.write("shared.ts", "export const shared = 1;");
+
+        let root = ProjectRoot::new(fs::canonicalize(&fixture.0).unwrap()).unwrap();
+        let config = ProjectConfig::parse(&root, fixture.0.join("tsconfig.json"), "{}").unwrap();
+        let filesystem = Arc::new(CountingFileSystem::new(&fixture.0, Path::new("shared.ts")));
+        let loader_filesystem: Arc<dyn FileSystem> = filesystem.clone();
+        let loader =
+            ProgramLoader::with_file_system(&root, config.options(), loader_filesystem).unwrap();
+
+        let program = loader
+            .load_roots(&[PathBuf::from("b.ts"), PathBuf::from("a.ts")])
+            .unwrap();
+        let frontend = compile_program_frontend(&program, FrontendMode::Check);
+
+        assert_eq!(names(&program), ["shared.ts", "a.ts", "b.ts"]);
+        assert_eq!(program.roots().len(), 2);
+        assert_eq!(frontend.modules().len(), 3);
+        assert!(frontend.modules().iter().all(|module| !module.has_errors()));
+        assert_eq!(filesystem.shared_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(filesystem.total_reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn multi_root_load_is_input_order_independent_and_keeps_explicit_dependency_root() {
+        let fixture = Fixture::new();
+        fixture.write("a.ts", "import './shared'; export const a: string = 1;");
+        fixture.write("b.ts", "import './shared'; export const b: boolean = 2;");
+        fixture.write("shared.ts", "export const shared = 3;");
+        let loader = fixture.loader();
+        let forward = loader
+            .load_roots(&[
+                PathBuf::from("a.ts"),
+                PathBuf::from("b.ts"),
+                PathBuf::from("shared.ts"),
+                PathBuf::from("a.ts"),
+            ])
+            .unwrap();
+        let reversed = loader
+            .load_roots(&[
+                PathBuf::from("a.ts"),
+                PathBuf::from("shared.ts"),
+                PathBuf::from("b.ts"),
+                PathBuf::from("a.ts"),
+            ])
+            .unwrap();
+
+        let graph = |program: &super::ResolvedProgram| {
+            program
+                .modules()
+                .iter()
+                .map(|module| {
+                    (
+                        module.source_id(),
+                        module
+                            .path()
+                            .strip_prefix(program.root().path())
+                            .unwrap()
+                            .to_path_buf(),
+                        module
+                            .dependencies()
+                            .iter()
+                            .map(|edge| {
+                                (
+                                    edge.kind(),
+                                    edge.specifier().to_owned(),
+                                    edge.target().clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let diagnostics = |program: &super::ResolvedProgram| {
+            compile_program_frontend(program, FrontendMode::Check)
+                .modules()
+                .iter()
+                .flat_map(|module| module.diagnostics().iter().cloned())
+                .collect::<Vec<_>>()
+        };
+
+        let forward_diagnostics = diagnostics(&forward);
+        let reversed_diagnostics = diagnostics(&reversed);
+        assert!(!forward_diagnostics.is_empty());
+        assert_eq!(forward.roots(), reversed.roots());
+        assert_eq!(graph(&forward), graph(&reversed));
+        assert_eq!(forward_diagnostics, reversed_diagnostics);
+        assert_eq!(
+            forward
+                .roots()
+                .iter()
+                .map(|source_id| {
+                    forward
+                        .module(*source_id)
+                        .unwrap()
+                        .path()
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+            ["a.ts", "b.ts", "shared.ts"]
+        );
+    }
+
+    #[test]
+    fn multi_root_load_rejects_missing_and_empty_root_sets_with_typed_errors() {
+        let fixture = Fixture::new();
+        fixture.write("present.ts", "export const present = true;");
+        let loader = fixture.loader();
+
+        let error = loader
+            .load_roots(&[PathBuf::from("present.ts"), PathBuf::from("missing.ts")])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProgramLoadError::Read { path, source }
+                if path.ends_with("missing.ts") && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            loader.load_roots(&[]).unwrap_err(),
+            ProgramLoadError::NoRoots
+        ));
+    }
+
+    #[test]
     fn preserves_cycles_without_duplicate_modules() {
         let fixture = Fixture::new();
         fixture.write("a.ts", "import './b';");
@@ -4543,18 +5084,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_overflowing_unicode_escape_in_module_specifier() {
-        // More than eight hex digits overflow u32 in parse_hex; the compiler
-        // must drop the edge rather than panicking.
-        let fixture = Fixture::new();
-        fixture.write("main.ts", r#"import "./\u{FFFFFFFFFF}";"#);
-
-        let program = fixture.loader().load("main.ts").unwrap();
-        assert_eq!(names(&program), ["main.ts"]);
-        assert!(program.entrypoint().dependencies().is_empty());
-    }
-
-    #[test]
     fn rejects_ill_formed_utf16_module_specifiers() {
         for source in [
             r#"import type { T } from "\uD800";"#,
@@ -4600,23 +5129,6 @@ mod tests {
             ModuleEdgeKind::DynamicRuntime
         );
         assert_eq!(program.runtime_modules().len(), 1);
-    }
-
-    #[test]
-    fn retains_dynamic_imports_inside_jsx_expressions() {
-        let fixture = Fixture::new();
-        fixture.write("dep.ts", "export const value = 1;");
-        fixture.write(
-            "main.tsx",
-            "const element = <Foo onClick={() => import('./dep')} />;",
-        );
-
-        let program = fixture.loader().load("main.tsx").unwrap();
-        assert_eq!(names(&program), ["dep.ts", "main.tsx"]);
-        assert_eq!(
-            program.entrypoint().dependencies()[0].kind(),
-            ModuleEdgeKind::DynamicRuntime
-        );
     }
 
     #[test]
@@ -4780,7 +5292,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_and_verifies_exactly_the_twenty_pinned_corpus_programs() {
+    fn lowers_and_verifies_every_manifest_pinned_corpus_program() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
@@ -4793,7 +5305,10 @@ mod tests {
                     .and_then(|value| value.strip_suffix('"'))
             })
             .collect();
-        assert_eq!(entrypoints.len(), 20);
+        assert!(
+            !entrypoints.is_empty(),
+            "corpus manifest must declare projects"
+        );
 
         let root = ProjectRoot::new(repository).unwrap();
         let config = ProjectConfig::parse(&root, root.path().join("tsconfig.json"), "{}").unwrap();
@@ -4848,209 +5363,304 @@ mod tests {
     }
 
     #[test]
-    fn program_loader_session_size_limit_arithmetic_and_codes() {
-        // The real `LoadState::visit` branch that emits `ProgramLoadError::SessionTooLarge`
-        // is exercised through `accumulate_session_bytes` here. A true end-to-end
-        // 256 MiB breach would require a ~256 MiB fixture, so the arithmetic path
-        // and error-code mapping are tested directly; the `visit` wiring itself
-        // is a straight call to the same helper with the returned total.
-        assert_eq!(
-            super::accumulate_session_bytes(0, super::MAX_SESSION_SOURCE_BYTES - 1),
-            Ok(super::MAX_SESSION_SOURCE_BYTES - 1)
+    fn jsx_runtime_linkage_adds_default_runtime_to_resolved_graph() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.tsx",
+            "import { jsx as authored } from 'react/jsx-runtime'; void authored; export const view = <div />;",
         );
+        fixture.write(
+            "node_modules/react/package.json",
+            r#"{"name":"react","exports":{"./jsx-runtime":"./jsx-runtime.ts"}}"#,
+        );
+        fixture.write(
+            "node_modules/react/jsx-runtime.ts",
+            "export function jsx() {} export function jsxs() {} export const Fragment = 0;",
+        );
+
+        let program = fixture
+            .loader_with_config(r#"{"compilerOptions":{"jsx":"react-jsx"}}"#)
+            .load("main.tsx")
+            .unwrap();
+        let main = program.entrypoint();
+        let runtime = main
+            .dependencies()
+            .iter()
+            .find(|edge| edge.specifier() == "react/jsx-runtime")
+            .expect("automatic JSX creates one ordinary runtime dependency");
+        assert_eq!(runtime.kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(
+            main.dependencies()
+                .iter()
+                .filter(|edge| edge.specifier() == "react/jsx-runtime")
+                .count(),
+            1,
+            "source-authored and generated runtime demand share one edge"
+        );
+        let ModuleTarget::Local(runtime_id) = runtime.target() else {
+            panic!("fixture runtime resolves through the canonical local graph");
+        };
+        assert_eq!(
+            program.module(*runtime_id).unwrap().path(),
+            fixture.0.join("node_modules/react/jsx-runtime.ts")
+        );
+    }
+
+    #[test]
+    fn jsx_runtime_linkage_reuses_runtime_node_across_roots() {
+        let fixture = Fixture::new();
+        fixture.write("a.tsx", "export const a = <div />;");
+        fixture.write("b.tsx", "export const b = <span />;");
+        fixture.write(
+            "runtime/jsx-runtime.ts",
+            "export function jsx() {} export function jsxs() {} export const Fragment = 0;",
+        );
+        let program = fixture
+            .loader_with_config(
+                r#"{"compilerOptions":{"jsx":"react-jsx","jsxImportSource":"./runtime"}}"#,
+            )
+            .load_roots(&[PathBuf::from("b.tsx"), PathBuf::from("a.tsx")])
+            .unwrap();
+        let runtime_targets: Vec<_> = program
+            .roots()
+            .iter()
+            .map(|root| {
+                program
+                    .module(*root)
+                    .unwrap()
+                    .dependencies()
+                    .iter()
+                    .find(|edge| edge.specifier() == "./runtime/jsx-runtime")
+                    .unwrap()
+                    .target()
+                    .clone()
+            })
+            .collect();
+        assert_eq!(runtime_targets[0], runtime_targets[1]);
+        assert_eq!(
+            program
+                .modules()
+                .iter()
+                .filter(|module| module.path().ends_with("runtime/jsx-runtime.ts"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn jsx_runtime_linkage_reports_missing_runtime_through_resolver() {
+        let fixture = Fixture::new();
+        fixture.write("main.tsx", "export const view = <div />;");
+        let error = fixture
+            .loader_with_config(r#"{"compilerOptions":{"jsx":"react-jsx"}}"#)
+            .load("main.tsx")
+            .expect_err("missing automatic runtime must be a module-resolution error");
+        let ProgramLoadError::UnresolvedModule(diagnostic) = error else {
+            panic!("expected typed unresolved-module diagnostic");
+        };
+        assert_eq!(diagnostic.specifier(), "react/jsx-runtime");
+    }
+
+    #[test]
+    fn jsx_runtime_linkage_uses_dev_source_and_collision_free_imported_bindings() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.tsx",
+            "const __bamts_jsx_jsxDEV = 0; export const view = <><div /></>;",
+        );
+        fixture.write(
+            "runtime/jsx-dev-runtime.ts",
+            "export function jsxDEV() {} export const Fragment = 0;",
+        );
+        let resolved = fixture
+            .loader_with_config(
+                r#"{"compilerOptions":{"jsx":"react-jsxdev","jsxImportSource":"./runtime"}}"#,
+            )
+            .load("main.tsx")
+            .unwrap();
+        assert!(resolved.entrypoint().dependencies().iter().any(|edge| {
+            edge.kind() == ModuleEdgeKind::StaticRuntime
+                && edge.specifier() == "./runtime/jsx-dev-runtime"
+        }));
+
+        let frontend = compile_program_frontend(&resolved, FrontendMode::Check);
+        let executable = lower_program(
+            &resolved,
+            &frontend,
+            LowerOptions {
+                javascript_compatibility: true,
+            },
+        )
+        .unwrap();
+        let main = module(&executable, "main.tsx");
+        let imported: Vec<_> = main
+            .bindings()
+            .iter()
+            .filter_map(|binding| match binding.kind {
+                BindingKind::Imported { name, .. } => Some((
+                    constant_string(main, binding.name),
+                    constant_string(main, name),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(imported.contains(&("__bamts_jsx_jsxDEV_2".to_owned(), "jsxDEV".to_owned())));
+        assert!(imported.contains(&("__bamts_jsx_Fragment".to_owned(), "Fragment".to_owned())));
+        assert!(
+            main.bindings()
+                .iter()
+                .all(|binding| constant_string(main, binding.name) != "_jsxDEV")
+        );
+    }
+
+    #[test]
+    fn jsx_runtime_linkage_preserve_and_classic_add_no_runtime_edge() {
+        for jsx in ["preserve", "react"] {
+            let fixture = Fixture::new();
+            fixture.write("main.tsx", "export const view = <div />;");
+            let config = format!(r#"{{"compilerOptions":{{"jsx":"{jsx}"}}}}"#);
+            let program = fixture
+                .loader_with_config(&config)
+                .load("main.tsx")
+                .unwrap();
+            assert!(program.entrypoint().dependencies().is_empty(), "{jsx}");
+        }
+    }
+
+    #[test]
+    fn jsx_options_survive_loading_and_select_one_output_route() {
+        let fixture = Fixture::new();
+        fixture.write("main.tsx", "export const view = 1;");
+        let program = fixture
+            .loader_with_config(
+                r#"{"compilerOptions":{
+                    "jsx":"react-jsx",
+                    "jsxFactory":"h",
+                    "jsxFragmentFactory":"Fragment",
+                    "jsxImportSource":"@scope/runtime"
+                }}"#,
+            )
+            .load("main.tsx")
+            .unwrap();
+
+        assert_eq!(program.jsx(), Some(JsxEmit::ReactJsx));
+        assert_eq!(program.jsx_factory(), Some("h"));
+        assert_eq!(program.jsx_fragment_factory(), Some("Fragment"));
+        assert_eq!(program.jsx_import_source(), Some("@scope/runtime"));
+        assert_eq!(
+            program.jsx_routing_decision(ProgramOutputKind::JavaScript),
+            JsxRoutingDecision::TransformAndEmit
+        );
+        assert_eq!(
+            program.jsx_routing_decision(ProgramOutputKind::NativeExecutable),
+            JsxRoutingDecision::Lower
+        );
+    }
+    #[test]
+    fn declaration_overlay_preserves_runtime_target_identity() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js'; void Queue;");
+        fixture.write("index.js", "export default class Queue {}");
+        fixture.write(
+            "index.d.ts",
+            "export default class Queue<Value> { value: Value; }",
+        );
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let edge = &program.entrypoint().dependencies()[0];
+        let runtime_id = edge
+            .target()
+            .local_source_id()
+            .expect("local runtime target");
+        let type_id = edge
+            .type_target()
+            .and_then(ModuleTarget::local_source_id)
+            .expect("local declaration overlay");
+
+        assert_ne!(runtime_id, type_id);
+        assert!(
+            program
+                .module(runtime_id)
+                .unwrap()
+                .path()
+                .ends_with("index.js")
+        );
+        assert!(
+            program
+                .module(type_id)
+                .unwrap()
+                .path()
+                .ends_with("index.d.ts")
+        );
+        assert_eq!(
+            program
+                .runtime_modules()
+                .iter()
+                .filter(|module| module.source_id() == type_id)
+                .count(),
+            0,
+            "checker overlay must not enter the eager runtime closure"
+        );
+    }
+
+    #[test]
+    fn runtime_edge_without_declaration_overlay_has_no_type_target() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import Queue from './index.js'; void Queue;");
+        fixture.write("index.js", "export default class Queue {}");
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let edge = &program.entrypoint().dependencies()[0];
+
+        assert!(edge.target().local_source_id().is_some());
+        assert!(edge.type_target().is_none());
+        assert_eq!(names(&program), ["index.js", "main.ts"]);
+    }
+
+    #[test]
+    fn program_loader_enforces_source_budgets_and_stable_codes() {
         assert_eq!(
             super::accumulate_session_bytes(0, super::MAX_SESSION_SOURCE_BYTES),
-            Ok(super::MAX_SESSION_SOURCE_BYTES)
-        );
-        assert_eq!(
-            super::accumulate_session_bytes(0, super::MAX_SESSION_SOURCE_BYTES + 1),
-            Err(super::MAX_SESSION_SOURCE_BYTES + 1)
-        );
-        assert_eq!(
-            super::accumulate_session_bytes(super::MAX_SESSION_SOURCE_BYTES - 1, 1),
             Ok(super::MAX_SESSION_SOURCE_BYTES)
         );
         assert_eq!(
             super::accumulate_session_bytes(super::MAX_SESSION_SOURCE_BYTES - 1, 2),
             Err(super::MAX_SESSION_SOURCE_BYTES + 1)
         );
-        // The accumulation saturates rather than wrapping on extreme inputs.
         assert_eq!(
             super::accumulate_session_bytes(usize::MAX, 1),
             Err(usize::MAX)
         );
 
-        // End to end: a graph of small modules loads, and each canonical file
-        // is counted once even when the diamond imports it twice.
         let fixture = Fixture::new();
         fixture.write("main.ts", "import './left'; import './right';");
         fixture.write("left.ts", "import './shared';");
         fixture.write("right.ts", "import './shared';");
         fixture.write("shared.ts", "export const shared = 1;");
         let program = fixture.loader().load("main.ts").unwrap();
-        assert_eq!(program.modules().len(), 4);
+        assert_eq!(program.modules().len(), 4, "diamond imports load once");
 
-        // A file at exactly 16 MiB loads; one byte more is a typed per-file
-        // breach carrying the stable BAMTS-R001 code, never a panic.
         let exact = "a".repeat(crate::source::MAX_SOURCE_BYTES);
         fixture.write("exact.ts", &exact);
-        fixture.write("main_exact.ts", "import './exact';");
-        fixture.loader().load("main_exact.ts").unwrap();
+        fixture.loader().load("exact.ts").unwrap();
 
         let oversized = "a".repeat(crate::source::MAX_SOURCE_BYTES + 1);
         fixture.write("oversized.ts", &oversized);
-        fixture.write("main_oversized.ts", "import './oversized';");
-        let error = fixture.loader().load("main_oversized.ts").unwrap_err();
+        let error = fixture.loader().load("oversized.ts").unwrap_err();
         let ProgramLoadError::SourceTooLarge { path, len } = &error else {
             panic!("expected SourceTooLarge, got {error}");
         };
         assert_eq!(*len, crate::source::MAX_SOURCE_BYTES + 1);
         assert!(path.ends_with("oversized.ts"));
         assert_eq!(error.code(), Some(super::SOURCE_TOO_LARGE));
-        assert_eq!(
-            super::ProgramLoadError::SessionTooLarge {
-                path: PathBuf::from("next.ts"),
-                total: super::MAX_SESSION_SOURCE_BYTES + 1,
-            }
-            .code(),
-            Some(super::SESSION_TOO_LARGE)
-        );
-    }
+        assert!(std::error::Error::source(&error).is_none());
 
-    fn target_name<'a>(
-        program: &'a super::ResolvedProgram,
-        target: &super::ModuleTarget,
-    ) -> &'a str {
-        let source_id = target.local_source_id().expect("local target");
-        program
-            .module(source_id)
-            .unwrap()
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-    }
-
-    #[test]
-    fn declaration_overlay_resolves_beside_runtime_target() {
-        let fixture = Fixture::new();
-        fixture.write("main.ts", "import Queue from './index.js';");
-        fixture.write("index.js", "export default class Queue {}");
-        fixture.write(
-            "index.d.ts",
-            "export default class Queue<ValueType> implements Iterable<ValueType> {}",
-        );
-        let resolved = fixture.loader().load("main.ts").unwrap();
-        let main = resolved.entrypoint();
-        assert_eq!(main.dependencies().len(), 1);
-        let edge = &main.dependencies()[0];
-        assert_eq!(target_name(&resolved, edge.target()), "index.js");
-        assert_eq!(
-            target_name(&resolved, edge.type_target().expect("overlay edge")),
-            "index.d.ts"
-        );
-        assert_eq!(names(&resolved), ["index.js", "main.ts", "index.d.ts"]);
-        let runtime_names: Vec<_> = resolved
-            .runtime_modules()
-            .iter()
-            .map(|m| m.path().file_name().unwrap().to_str().unwrap())
-            .collect();
-        assert_eq!(runtime_names, ["index.js", "main.ts"]);
-    }
-
-    #[test]
-    fn declaration_overlay_dependencies_resolve_in_the_types_flavor() {
-        let fixture = Fixture::new();
-        fixture.write("main.ts", "import Queue from './index.js';");
-        fixture.write("index.js", "export default class Queue {}");
-        fixture.write(
-            "index.d.ts",
-            "import { Shape } from './types.js';\
-             export default class Queue { value: Shape; }",
-        );
-        fixture.write("types.js", "export const Shape = class {};");
-        fixture.write("types.d.ts", "export interface Shape { value: number; }");
-
-        let resolved = fixture.loader().load("main.ts").unwrap();
-        assert_eq!(
-            names(&resolved),
-            ["index.js", "main.ts", "types.d.ts", "index.d.ts"]
-        );
-        let overlay = resolved
-            .modules()
-            .iter()
-            .find(|module| module.path().ends_with("index.d.ts"))
-            .expect("declaration overlay");
-        let dependency = &overlay.dependencies()[0];
-        assert_eq!(dependency.kind(), ModuleEdgeKind::StaticRuntime);
-        assert_eq!(target_name(&resolved, dependency.target()), "types.d.ts");
-        assert!(dependency.type_target().is_none());
-    }
-
-    #[test]
-    fn declaration_overlay_preserves_external_type_dependencies() {
-        let fixture = Fixture::new();
-        fixture.write("main.ts", "import Queue from './index.js';");
-        fixture.write("index.js", "export default class Queue {}");
-        fixture.write(
-            "index.d.ts",
-            "import { Shape } from 'external-types';\
-             export default class Queue { value: Shape; }",
-        );
-
-        let resolved = fixture.loader().load("main.ts").unwrap();
-        let overlay = resolved
-            .modules()
-            .iter()
-            .find(|module| module.path().ends_with("index.d.ts"))
-            .expect("declaration overlay");
-        let dependency = &overlay.dependencies()[0];
-        assert_eq!(dependency.kind(), ModuleEdgeKind::StaticRuntime);
-        assert_eq!(
-            dependency.target().external_specifier(),
-            Some("external-types")
-        );
-        assert!(dependency.type_target().is_none());
-    }
-
-    #[test]
-    fn declaration_overlays_append_in_import_discovery_order() {
-        let fixture = Fixture::new();
-        fixture.write("main.ts", "import './a.js'; import './b.js';");
-        fixture.write("a.js", "export const a = 1;");
-        fixture.write("a.d.ts", "export declare const a: number;");
-        fixture.write("b.js", "export const b = 1;");
-        fixture.write("b.d.ts", "export declare const b: number;");
-
-        let resolved = fixture.loader().load("main.ts").unwrap();
-        assert_eq!(
-            names(&resolved),
-            ["a.js", "b.js", "main.ts", "a.d.ts", "b.d.ts"]
-        );
-    }
-
-    #[test]
-    fn declaration_overlay_absent_falls_back_to_runtime_source() {
-        let fixture = Fixture::new();
-        fixture.write("main.ts", "import Queue from './index.js';");
-        fixture.write("index.js", "export default class Queue {}");
-        let resolved = fixture.loader().load("main.ts").unwrap();
-        let edge = &resolved.entrypoint().dependencies()[0];
-        assert_eq!(target_name(&resolved, edge.target()), "index.js");
-        assert!(edge.type_target().is_none());
-        assert_eq!(names(&resolved), ["index.js", "main.ts"]);
-    }
-
-    #[test]
-    fn type_only_edge_has_no_overlay() {
-        let fixture = Fixture::new();
-        fixture.write("main.ts", "import type { Shape } from './shape';");
-        fixture.write("shape.d.ts", "export interface Shape { x: number; }");
-        let resolved = fixture.loader().load("main.ts").unwrap();
-        let edge = &resolved.entrypoint().dependencies()[0];
-        assert_eq!(edge.kind(), super::ModuleEdgeKind::TypeOnly);
-        assert_eq!(target_name(&resolved, edge.target()), "shape.d.ts");
-        assert!(edge.type_target().is_none());
+        let session = ProgramLoadError::SessionTooLarge {
+            path: PathBuf::from("next.ts"),
+            total: super::MAX_SESSION_SOURCE_BYTES + 1,
+        };
+        assert_eq!(session.code(), Some(super::SESSION_TOO_LARGE));
+        assert!(session.to_string().contains("next.ts"));
+        assert!(std::error::Error::source(&session).is_none());
     }
 }

@@ -106,6 +106,7 @@ impl GcState {
         self.trace_roots(machine);
         self.drain(&machine.heap);
         self.ephemeron_fixed_point(&machine.heap);
+        machine.process_weak_targets_after_marking(&self.marks);
         self.purge_weak_entries(machine);
         self.sweep(machine);
         self.pending = false;
@@ -149,6 +150,7 @@ impl GcState {
             self.mark_value(&machine.heap, value);
         }
         self.mark_value(&machine.heap, machine.current_new_target);
+        self.mark_values(&machine.heap, &machine.kept_alive);
         if let Some(resume) = &machine.pending_generator_resume {
             trace_generator_resume(resume, &machine.heap, &mut self.marks, &mut self.work);
         }
@@ -158,6 +160,9 @@ impl GcState {
         }
         for job in &machine.microtasks {
             trace_microtask(&job.job, &machine.heap, &mut self.marks, &mut self.work);
+        }
+        for &registry in &machine.finalization_cleanup_queue {
+            self.mark_value(&machine.heap, registry);
         }
         for timer in machine.timers.values() {
             self.mark_value(&machine.heap, timer.callback);
@@ -516,6 +521,18 @@ fn trace_promise_reaction(
             mark_value(heap, marks, work, *derived);
             mark_value(heap, marks, work, *sync_iterator);
         }
+        PromiseReaction::AsyncDisposeStep {
+            stack,
+            pending_error,
+            capability,
+            ..
+        } => {
+            mark_value(heap, marks, work, *stack);
+            if let Some(error) = pending_error {
+                mark_value(heap, marks, work, *error);
+            }
+            mark_value(heap, marks, work, *capability);
+        }
         PromiseReaction::DynamicImportFulfill { promise, .. }
         | PromiseReaction::DynamicImportReject { promise, .. } => {
             mark_value(heap, marks, work, *promise);
@@ -574,6 +591,12 @@ fn trace_microtask(
         }
         MicrotaskJob::Callback { callback, context } => {
             mark_value(heap, marks, work, *callback);
+            if let Some(context) = context {
+                mark_value(heap, marks, work, *context);
+            }
+        }
+        MicrotaskJob::FinalizationCleanup { registry, context } => {
+            mark_value(heap, marks, work, *registry);
             if let Some(context) = context {
                 mark_value(heap, marks, work, *context);
             }
@@ -645,6 +668,11 @@ fn trace_entry(
         | HeapEntry::ExternalModuleNamespace { .. }
         | HeapEntry::Symbol { .. }
         | HeapEntry::PrivateName { .. } => {}
+        HeapEntry::WeakRef { .. } | HeapEntry::FinalizationRegistry { .. } => {
+            crate::intrinsics::builtins::weakref_finalization::trace_strong_edges(entry, |value| {
+                mark_value(heap, marks, work, value);
+            });
+        }
         HeapEntry::Object {
             properties,
             prototype,
@@ -706,11 +734,38 @@ fn trace_entry(
             prototype,
             ..
         }
-        | HeapEntry::Uint8Array {
+        | HeapEntry::SharedArrayBuffer {
             properties,
             prototype,
             ..
         } => trace_properties_and_prototype(properties, *prototype, heap, marks, work),
+        HeapEntry::TypedArray {
+            buffer,
+            properties,
+            prototype,
+            ..
+        } => {
+            mark_value(heap, marks, work, *buffer);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::DataView {
+            buffer,
+            properties,
+            prototype,
+            ..
+        } => {
+            mark_value(heap, marks, work, *buffer);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::ArrayBuffer {
+            data,
+            properties,
+            prototype,
+            ..
+        } => {
+            mark_value(heap, marks, work, data.detach_key());
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
         HeapEntry::Collection {
             kind,
             entries,
@@ -742,12 +797,22 @@ fn trace_entry(
         }
         HeapEntry::Iterator { state } => match state {
             IteratorState::Keys { .. } => {}
-            IteratorState::Protocol { iterator, next }
-            | IteratorState::AsyncFromSync { iterator, next } => {
+            IteratorState::Protocol { iterator, next } => {
                 mark_value(heap, marks, work, *iterator);
                 mark_value(heap, marks, work, *next);
             }
         },
+        HeapEntry::AsyncFromSync {
+            iterator,
+            next,
+            properties,
+            prototype,
+            ..
+        } => {
+            mark_value(heap, marks, work, *iterator);
+            mark_value(heap, marks, work, *next);
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
         HeapEntry::Generator {
             state,
             properties,
@@ -766,9 +831,20 @@ fn trace_entry(
         } => {
             trace_async_generator_state(state, heap, marks, work);
             for request in queue {
-                mark_value(heap, marks, work, request.completion.value());
+                request
+                    .completion
+                    .visit_roots(|value| mark_value(heap, marks, work, value));
                 mark_value(heap, marks, work, request.capability);
             }
+            trace_properties_and_prototype(properties, *prototype, heap, marks, work);
+        }
+        HeapEntry::DisposableStack {
+            state,
+            properties,
+            prototype,
+            ..
+        } => {
+            state.visit_roots(|value| mark_value(heap, marks, work, value));
             trace_properties_and_prototype(properties, *prototype, heap, marks, work);
         }
         HeapEntry::ProcessEnv { prototype, .. } => {
@@ -839,3 +915,5 @@ fn trace_entry(
         }
     }
 }
+#[cfg(test)]
+mod stress_hardening;

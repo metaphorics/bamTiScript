@@ -1084,13 +1084,15 @@ fn string_match<H: Host>(
     let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
     let (regex, object) = regexp_for_argument(machine, argument)?;
     if !regex.flags().global {
-        let matched = match object {
-            Some(regexp) => super::regexp::execute(machine, regexp, &input)?,
-            None => exec_regex(&regex, &input, 0)?,
-        };
+        if let Some(regexp) = object {
+            return Ok(BuiltinOutcome::Value(super::regexp::regexp_exec(
+                machine, regexp, &input,
+            )?));
+        }
+        let matched = exec_regex(&regex, &input, 0)?;
         return match matched {
-            Some(matched) => Ok(BuiltinOutcome::Value(super::regexp::match_array(
-                machine, &input, matched,
+            Some(matched) => Ok(BuiltinOutcome::Value(super::regexp::match_array_for(
+                machine, None, &input, matched,
             )?)),
             None => Ok(BuiltinOutcome::Value(Value::NULL)),
         };
@@ -1128,7 +1130,9 @@ fn match_all<H: Host>(
     }
     let mut values = Vec::new();
     for matched in collect_matches(&regex, &input)? {
-        values.push(super::regexp::match_array(machine, &input, matched)?);
+        values.push(super::regexp::match_array_for(
+            machine, object, &input, matched,
+        )?);
     }
     let source = allocate_array(machine, values)?;
     Ok(BuiltinOutcome::Value(super::collections::iterator(
@@ -2191,5 +2195,35 @@ mod split_replace_tests {
             .unwrap();
         let result = call_string_method(&mut machine, "replace", "a", &[regexp, replacement]);
         assert_eq!(machine.string_value(result).unwrap().to_utf8_lossy(), "[]");
+    }
+
+    fn match_exec_override(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.set_data_property(this, "matchOverrideSeen", Value::boolean(true))?;
+        Ok(BuiltinOutcome::Value(Value::NULL))
+    }
+
+    #[test]
+    fn string_match_honours_own_exec_override() {
+        let program = blank_program("<string match exec override>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "a", "");
+        let override_fn = native_replacer(&mut machine, match_exec_override);
+        machine
+            .set_data_property(regexp, "exec", override_fn)
+            .expect("override installed");
+        let result = call_string_method(&mut machine, "match", "xa", &[regexp]);
+        assert_eq!(result, Value::NULL);
+        assert_eq!(
+            machine
+                .get_named_property(regexp, "matchOverrideSeen")
+                .unwrap(),
+            Value::boolean(true)
+        );
     }
 }

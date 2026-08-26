@@ -82,9 +82,6 @@ fn map_script_compile_error(
         bamts_compiler::ScriptCompileError::Capacity { message } => {
             bamts_runtime::ScriptCompileError::Capacity { message }
         }
-        bamts_compiler::ScriptCompileError::Internal { message } => {
-            bamts_runtime::ScriptCompileError::Internal { message }
-        }
     }
 }
 

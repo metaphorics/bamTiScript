@@ -20,6 +20,14 @@
 
 #[path = "checker/binder.rs"]
 pub(crate) mod binder;
+#[path = "checker/conditional_types.rs"]
+pub mod conditional_types;
+#[path = "checker/decorators.rs"]
+pub mod decorators;
+#[path = "generated/diagnostic_messages.rs"]
+pub mod diagnostic_messages;
+#[path = "checker/enum_namespace.rs"]
+pub mod enum_namespace;
 #[path = "checker/inference.rs"]
 pub mod inference;
 #[path = "checker/intrinsic_environment.rs"]
@@ -28,6 +36,8 @@ pub(crate) mod intrinsic_environment;
 pub mod jsx;
 #[path = "checker/narrowing.rs"]
 pub mod narrowing;
+#[path = "checker/overloads.rs"]
+pub mod overloads;
 #[path = "checker/relations.rs"]
 pub mod relations;
 

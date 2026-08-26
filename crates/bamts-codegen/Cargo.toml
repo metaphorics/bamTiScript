@@ -18,6 +18,7 @@ cranelift-module = "=0.134.2"
 cranelift-object = { version = "=0.134.2", optional = true }
 cranelift-jit = { version = "=0.134.2", optional = true }
 region = { version = "=3.0.2", optional = true }
+sha2 = { version = "=0.10.9", optional = true }
 wasmtime-internal-jit-icache-coherence = { version = "=47.0.2", optional = true }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
@@ -28,7 +29,7 @@ bamts-runtime.workspace = true
 
 [features]
 default = []
-aot = ["dep:cranelift-object"]
+aot = ["dep:bamts-native", "dep:cranelift-object", "dep:sha2"]
 host-jit = ["dep:cranelift-jit", "dep:bamts-native", "dep:region", "dep:wasmtime-internal-jit-icache-coherence", "dep:libc"]
 
 [lints.rust]

@@ -1,59 +1,27 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::{self, File},
+    fs::File,
     io::BufReader,
-    path::{Component, Path},
+    path::Path,
 };
 
 use serde::{
     Deserialize,
-    de::{self, DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+    de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
-use sha2::{Digest, Sha256};
 
+use crate::schema::{
+    MANIFEST_PATH, SourcePin, VerificationManifest, io_error, is_lower_hex, is_nonempty,
+    json_error, load_sources, parse_json, parse_toml, read_bytes, require_nonempty, schema_error,
+    set_difference_detail, set_mismatch, sha256_hex, source_by_name, string_set, validate_digest,
+    validate_manifest, validate_sha256,
+};
 use crate::{ErrorCode, Gate, GateReport, Result, VerificationError};
 
-const SOURCES_PATH: &str = "vendor/sources.toml";
 const TOOLCHAINS_PATH: &str = "formal/toolchains.toml";
-const MANIFEST_PATH: &str = "verification/manifest.lock.json";
 const LEDGER_PATH: &str = "proof/completeness-ledger.json";
 const BLOCKER_PATH: &str = "verification/blockers/webassembly.json";
-const SET_PREVIEW_LIMIT: usize = 16;
-
-const SOURCE_NAMES: [&str; 19] = [
-    "rust",
-    "typescript-7-npm",
-    "typescript-7-compiler",
-    "typescript-7-suite",
-    "node-source",
-    "node-headers",
-    "libuv",
-    "cranelift-codegen",
-    "cranelift-frontend",
-    "cranelift-module",
-    "cranelift-jit",
-    "cranelift-object",
-    "wasmtime-reference",
-    "test262",
-    "quint",
-    "lean",
-    "racket",
-    "redex",
-    "quint-connect",
-];
-
-const CATALOG_NAMES: [&str; 9] = [
-    "typescript-7.0.2",
-    "test262",
-    "node-24.18.0",
-    "node-api-v1-v9",
-    "formal-quint",
-    "formal-lean",
-    "formal-redex",
-    "target-cells",
-    "benchmarks",
-];
 
 const P0_STATES: [&str; 7] = [
     "PASS",
@@ -64,27 +32,6 @@ const P0_STATES: [&str; 7] = [
     "INAPPLICABLE_CATALOG_ERROR",
     "EXTERNAL_BLOCKED",
 ];
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourcesDocument {
-    schema: String,
-    source: Vec<SourcePin>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourcePin {
-    name: String,
-    pin: String,
-    url: String,
-    digest_algorithm: String,
-    digest: String,
-    #[serde(default)]
-    commit: Option<String>,
-    #[serde(default)]
-    vendored_path: Option<String>,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,34 +83,6 @@ struct ToolSource<'a> {
     digest_algorithm: &'a str,
     digest: &'a str,
     commit: &'a str,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VerificationManifest {
-    schema: String,
-    source_ledger_sha256: String,
-    catalogs: Vec<Catalog>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Catalog {
-    extractor: serde_json::Value,
-    id: String,
-    identifier_count: usize,
-    identifiers: Vec<String>,
-    identifiers_sha256: String,
-    source: CatalogSource,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CatalogSource {
-    pin: String,
-    url: String,
-    digest_algorithm: String,
-    digest: String,
 }
 
 #[derive(Deserialize)]
@@ -358,116 +277,6 @@ pub fn verify_ledger_g0(root: &Path) -> Result<GateReport> {
     })
 }
 
-fn load_sources(root: &Path) -> Result<(BTreeMap<String, SourcePin>, String)> {
-    let path = root.join(SOURCES_PATH);
-    let bytes = read_bytes(&path)?;
-    let source_ledger_sha256 = sha256_hex(&bytes);
-    let document: SourcesDocument = parse_toml(&path, &bytes)?;
-
-    if document.schema != "bamti.sources/v1" {
-        return Err(schema_error(
-            &path,
-            format!(
-                "expected schema `bamti.sources/v1`, found `{}`",
-                document.schema
-            ),
-        ));
-    }
-
-    let mut sources = BTreeMap::new();
-    for source in document.source {
-        validate_source(root, &path, &source)?;
-        let source_name = source.name.clone();
-        if sources.insert(source_name.clone(), source).is_some() {
-            return Err(VerificationError::new(
-                ErrorCode::Duplicate,
-                format!("duplicate source `{source_name}`"),
-            ));
-        }
-    }
-
-    let expected_names = string_set(&SOURCE_NAMES);
-    let actual_names = sources.keys().cloned().collect();
-    if actual_names != expected_names {
-        return Err(set_mismatch("source names", &expected_names, &actual_names));
-    }
-
-    let libuv = match sources.get("libuv") {
-        Some(source) => source,
-        None => return Err(schema_error(&path, "missing required `libuv` source")),
-    };
-    if libuv.vendored_path.is_none() {
-        return Err(schema_error(
-            &path,
-            "source `libuv` must declare `vendored_path`",
-        ));
-    }
-
-    Ok((sources, source_ledger_sha256))
-}
-
-fn validate_source(root: &Path, path: &Path, source: &SourcePin) -> Result<()> {
-    for (field, value) in [
-        ("name", source.name.as_str()),
-        ("pin", source.pin.as_str()),
-        ("url", source.url.as_str()),
-    ] {
-        require_nonempty(path, &format!("source `{}` {field}", source.name), value)?;
-    }
-
-    validate_digest(
-        path,
-        &format!("source `{}`", source.name),
-        &source.digest_algorithm,
-        &source.digest,
-    )?;
-
-    if let Some(commit) = &source.commit
-        && !is_lower_hex(commit, 40)
-    {
-        return Err(schema_error(
-            path,
-            format!("source `{}` has malformed commit", source.name),
-        ));
-    }
-
-    if let Some(vendored_path) = &source.vendored_path {
-        validate_vendored_path(root, path, &source.name, vendored_path)?;
-    }
-
-    Ok(())
-}
-
-fn validate_vendored_path(root: &Path, path: &Path, source_name: &str, value: &str) -> Result<()> {
-    if !is_nonempty(value) {
-        return Err(schema_error(
-            path,
-            format!("source `{source_name}` has an empty `vendored_path`"),
-        ));
-    }
-
-    let relative_path = Path::new(value);
-    if relative_path.is_absolute()
-        || relative_path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(schema_error(
-            path,
-            format!("source `{source_name}` has a non-local `vendored_path`"),
-        ));
-    }
-
-    if !root.join(relative_path).is_dir() {
-        return Err(schema_error(
-            path,
-            format!("source `{source_name}` vendored path `{value}` does not exist"),
-        ));
-    }
-
-    Ok(())
-}
-
 fn validate_formal_toolchains(root: &Path, sources: &BTreeMap<String, SourcePin>) -> Result<()> {
     let path = root.join(TOOLCHAINS_PATH);
     let bytes = read_bytes(&path)?;
@@ -589,217 +398,6 @@ fn validate_tool_source(
     }
 
     Ok(())
-}
-
-fn source_by_name<'a>(
-    sources: &'a BTreeMap<String, SourcePin>,
-    name: &str,
-    path: &Path,
-) -> Result<&'a SourcePin> {
-    sources
-        .get(name)
-        .ok_or_else(|| schema_error(path, format!("missing source `{name}`")))
-}
-
-fn validate_manifest(
-    manifest: &VerificationManifest,
-    path: &Path,
-    source_ledger_sha256: &str,
-    sources: &BTreeMap<String, SourcePin>,
-) -> Result<BTreeSet<String>> {
-    if manifest.schema != "bamti.verification-manifest/v1" {
-        return Err(schema_error(
-            path,
-            format!(
-                "expected schema `bamti.verification-manifest/v1`, found `{}`",
-                manifest.schema
-            ),
-        ));
-    }
-
-    validate_sha256(path, "source_ledger_sha256", &manifest.source_ledger_sha256)?;
-    if manifest.source_ledger_sha256 != source_ledger_sha256 {
-        return Err(VerificationError::new(
-            ErrorCode::Digest,
-            format!(
-                "{}: source ledger SHA-256 does not match raw {SOURCES_PATH}",
-                path.display()
-            ),
-        ));
-    }
-
-    let mut catalog_names = BTreeSet::new();
-    let mut expected_ids = BTreeSet::new();
-    for catalog in &manifest.catalogs {
-        require_nonempty(path, "catalog id", &catalog.id)?;
-        if !catalog_names.insert(catalog.id.clone()) {
-            return Err(VerificationError::new(
-                ErrorCode::Duplicate,
-                format!("duplicate catalog `{}`", catalog.id),
-            ));
-        }
-        if !catalog.extractor.is_object() {
-            return Err(schema_error(
-                path,
-                format!("catalog `{}` extractor must be an object", catalog.id),
-            ));
-        }
-
-        validate_catalog_source(path, catalog)?;
-        if let Some(source_name) = upstream_source_name(&catalog.id) {
-            validate_catalog_cross_pin(path, catalog, source_by_name(sources, source_name, path)?)?;
-        }
-        validate_catalog_identifiers(path, catalog)?;
-
-        for identifier in &catalog.identifiers {
-            let row_id = format!("{}:{identifier}", catalog.id);
-            if !expected_ids.insert(row_id.clone()) {
-                return Err(VerificationError::new(
-                    ErrorCode::Duplicate,
-                    format!("duplicate catalog row `{row_id}`"),
-                ));
-            }
-        }
-    }
-
-    let expected_catalog_names = string_set(&CATALOG_NAMES);
-    if catalog_names != expected_catalog_names {
-        return Err(set_mismatch(
-            "catalog names",
-            &expected_catalog_names,
-            &catalog_names,
-        ));
-    }
-
-    Ok(expected_ids)
-}
-
-fn validate_catalog_source(path: &Path, catalog: &Catalog) -> Result<()> {
-    for (field, value) in [
-        ("pin", catalog.source.pin.as_str()),
-        ("url", catalog.source.url.as_str()),
-    ] {
-        require_nonempty(
-            path,
-            &format!("catalog `{}` source {field}", catalog.id),
-            value,
-        )?;
-    }
-    validate_digest(
-        path,
-        &format!("catalog `{}` source", catalog.id),
-        &catalog.source.digest_algorithm,
-        &catalog.source.digest,
-    )
-}
-
-fn validate_catalog_cross_pin(path: &Path, catalog: &Catalog, source: &SourcePin) -> Result<()> {
-    if catalog.source.pin != source.pin || catalog.source.url != source.url {
-        return Err(schema_error(
-            path,
-            format!(
-                "catalog `{}` source pin does not match vendor source",
-                catalog.id
-            ),
-        ));
-    }
-    if catalog.source.digest_algorithm != source.digest_algorithm
-        || catalog.source.digest != source.digest
-    {
-        return Err(VerificationError::new(
-            ErrorCode::Digest,
-            format!(
-                "{}: catalog `{}` source digest does not match vendor source",
-                path.display(),
-                catalog.id
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_catalog_identifiers(path: &Path, catalog: &Catalog) -> Result<()> {
-    if catalog.identifiers.is_empty() {
-        return Err(schema_error(
-            path,
-            format!("catalog `{}` has no identifiers", catalog.id),
-        ));
-    }
-    if catalog.identifier_count != catalog.identifiers.len() {
-        return Err(VerificationError::new(
-            ErrorCode::SetMismatch,
-            format!(
-                "{}: catalog `{}` declares {} identifiers but contains {}",
-                path.display(),
-                catalog.id,
-                catalog.identifier_count,
-                catalog.identifiers.len()
-            ),
-        ));
-    }
-
-    let mut previous: Option<&str> = None;
-    let mut hasher = Sha256::new();
-    for identifier in &catalog.identifiers {
-        if !is_nonempty(identifier) {
-            return Err(schema_error(
-                path,
-                format!("catalog `{}` has an empty identifier", catalog.id),
-            ));
-        }
-        if let Some(previous_identifier) = previous {
-            if identifier == previous_identifier {
-                return Err(VerificationError::new(
-                    ErrorCode::Duplicate,
-                    format!(
-                        "duplicate identifier `{identifier}` in catalog `{}`",
-                        catalog.id
-                    ),
-                ));
-            }
-            if identifier.as_str() < previous_identifier {
-                return Err(schema_error(
-                    path,
-                    format!(
-                        "catalog `{}` identifiers are not strictly ordered",
-                        catalog.id
-                    ),
-                ));
-            }
-        }
-        hasher.update(identifier.as_bytes());
-        hasher.update(b"\n");
-        previous = Some(identifier);
-    }
-
-    validate_sha256(
-        path,
-        &format!("catalog `{}` identifiers_sha256", catalog.id),
-        &catalog.identifiers_sha256,
-    )?;
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != catalog.identifiers_sha256 {
-        return Err(VerificationError::new(
-            ErrorCode::Digest,
-            format!(
-                "{}: catalog `{}` identifiers SHA-256 mismatch",
-                path.display(),
-                catalog.id
-            ),
-        ));
-    }
-
-    Ok(())
-}
-
-fn upstream_source_name(catalog_id: &str) -> Option<&'static str> {
-    match catalog_id {
-        "typescript-7.0.2" => Some("typescript-7-suite"),
-        "test262" => Some("test262"),
-        "node-24.18.0" => Some("node-source"),
-        "node-api-v1-v9" => Some("node-headers"),
-        _ => None,
-    }
 }
 
 fn load_blocker(root: &Path) -> Result<BTreeSet<String>> {
@@ -1267,282 +865,8 @@ where
     Ok(())
 }
 
-fn parse_toml<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
-    let input = std::str::from_utf8(bytes).map_err(|_| {
-        VerificationError::new(
-            ErrorCode::Toml,
-            format!("{}: TOML must be UTF-8", path.display()),
-        )
-    })?;
-    toml::from_str(input).map_err(|error| {
-        VerificationError::new(ErrorCode::Toml, format!("{}: {error}", path.display()))
-    })
-}
-
-fn parse_json<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
-    reject_duplicate_json_keys(path, bytes)?;
-    serde_json::from_slice(bytes).map_err(|error| json_error(path, error))
-}
-
-fn reject_duplicate_json_keys(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    NoDuplicateJson::deserialize(&mut deserializer).map_err(|error| json_error(path, error))?;
-    deserializer.end().map_err(|error| json_error(path, error))
-}
-
-struct NoDuplicateJson;
-
-impl<'de> Deserialize<'de> for NoDuplicateJson {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(NoDuplicateJsonVisitor)
-    }
-}
-
-struct NoDuplicateJsonVisitor;
-
-impl<'de> Visitor<'de> for NoDuplicateJsonVisitor {
-    type Value = NoDuplicateJson;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value")
-    }
-
-    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_str<E>(self, _: &str) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_borrowed_str<E>(self, _: &'de str) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_string<E>(self, _: String) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        NoDuplicateJson::deserialize(deserializer)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        while sequence.next_element::<NoDuplicateJson>()?.is_some() {}
-        Ok(NoDuplicateJson)
-    }
-
-    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut keys = BTreeSet::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if !keys.insert(key.clone()) {
-                return Err(de::Error::custom(format!("duplicate JSON key `{key}`")));
-            }
-            map.next_value::<NoDuplicateJson>()?;
-        }
-        Ok(NoDuplicateJson)
-    }
-}
-
-fn read_bytes(path: &Path) -> Result<Vec<u8>> {
-    fs::read(path).map_err(|error| io_error(path, error))
-}
-
-fn io_error(path: &Path, error: std::io::Error) -> VerificationError {
-    VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
-}
-
-fn json_error(path: &Path, error: serde_json::Error) -> VerificationError {
-    let code = match error.classify() {
-        serde_json::error::Category::Io => ErrorCode::Io,
-        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => ErrorCode::Json,
-        serde_json::error::Category::Data => ErrorCode::Schema,
-    };
-    VerificationError::new(code, format!("{}: {error}", path.display()))
-}
-
-fn schema_error(path: &Path, detail: impl Into<String>) -> VerificationError {
-    VerificationError::new(
-        ErrorCode::Schema,
-        format!("{}: {}", path.display(), detail.into()),
-    )
-}
-
-fn require_nonempty(path: &Path, field: &str, value: &str) -> Result<()> {
-    if is_nonempty(value) {
-        Ok(())
-    } else {
-        Err(schema_error(path, format!("{field} must be nonempty")))
-    }
-}
-
-fn validate_digest(path: &Path, field: &str, algorithm: &str, digest: &str) -> Result<()> {
-    let valid = match algorithm {
-        "sha256" => is_lower_hex(digest, 64),
-        "sha512" => is_sha512_base64(digest),
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(VerificationError::new(
-            ErrorCode::Digest,
-            format!(
-                "{}: {field} has malformed `{algorithm}` digest",
-                path.display()
-            ),
-        ))
-    }
-}
-
-fn validate_sha256(path: &Path, field: &str, digest: &str) -> Result<()> {
-    if is_lower_hex(digest, 64) {
-        Ok(())
-    } else {
-        Err(VerificationError::new(
-            ErrorCode::Digest,
-            format!(
-                "{}: {field} is not a lowercase SHA-256 digest",
-                path.display()
-            ),
-        ))
-    }
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
-
-fn is_sha512_base64(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() != 88 || bytes[86] != b'=' || bytes[87] != b'=' {
-        return false;
-    }
-    let Some(last_value) = base64_value(bytes[85]) else {
-        return false;
-    };
-    last_value & 0b0000_1111 == 0 && bytes[..86].iter().all(|byte| base64_value(*byte).is_some())
-}
-
-fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
-fn is_nonempty(value: &str) -> bool {
-    !value.trim().is_empty()
-}
-
 fn is_allowed_state(value: &str) -> bool {
     P0_STATES.contains(&value)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn string_set(values: &[&str]) -> BTreeSet<String> {
-    values.iter().map(|value| (*value).to_owned()).collect()
-}
-
-fn set_mismatch(
-    kind: &str,
-    expected: &BTreeSet<String>,
-    actual: &BTreeSet<String>,
-) -> VerificationError {
-    VerificationError::new(
-        ErrorCode::SetMismatch,
-        format!("{kind}: {}", set_difference_detail(expected, actual)),
-    )
-}
-
-fn set_difference_detail(expected: &BTreeSet<String>, actual: &BTreeSet<String>) -> String {
-    format!(
-        "missing {}; extra {}",
-        summarize_ids(expected.difference(actual)),
-        summarize_ids(actual.difference(expected))
-    )
-}
-
-fn summarize_ids<'a>(ids: impl Iterator<Item = &'a String>) -> String {
-    let mut count = 0;
-    let mut preview = Vec::new();
-    for id in ids {
-        count += 1;
-        if preview.len() < SET_PREVIEW_LIMIT {
-            preview.push(id.as_str());
-        }
-    }
-    let suffix = if count > preview.len() { ", ..." } else { "" };
-    format!("{count} [{}{suffix}]", preview.join(", "))
 }
 
 #[cfg(test)]
@@ -1557,6 +881,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::schema::{CATALOG_NAMES, SOURCE_NAMES, SOURCES_PATH, upstream_source_name};
 
     const TEST_SHA512: &str =
         "9Yoji7DU6moRm1ofDaN+ftdxNcEGciiGbm7eN4MjlcCbfv7/Y/zchadcXXRmMZmN9oTPXUk9GmhjQOhADJsiSQ==";
@@ -1694,7 +1019,7 @@ mod tests {
             .map(|catalog| {
                 let case = fixture_case(catalog);
                 let id = format!("{catalog}:{case}");
-                let state = if *catalog == "node-24.18.0" {
+                let state = if catalog == &"test262" {
                     "EXTERNAL_BLOCKED"
                 } else {
                     "BLOCKING_FAIL"
@@ -1777,7 +1102,7 @@ mod tests {
     }
 
     fn fixture_blocked_id() -> String {
-        let catalog = "node-24.18.0";
+        let catalog = "test262";
         format!("{catalog}:{}", fixture_case(catalog))
     }
 
@@ -1900,40 +1225,6 @@ mod tests {
             verify_ledger_g0(&fixture.root).unwrap_err().code(),
             ErrorCode::Transition
         );
-    }
-
-    #[test]
-    fn release_proof_rejects_stale_typescript_5_or_6_catalog() {
-        let fixture_6 = fixture();
-        let path = fixture_6.root.join(MANIFEST_PATH);
-        let mut manifest = read_json(&path);
-        let catalogs = manifest["catalogs"].as_array_mut().unwrap();
-        catalogs[0]["id"] = json!("typescript-6.0.2");
-        write_json(&path, &manifest);
-        assert_eq!(
-            verify_ledger_g0(&fixture_6.root).unwrap_err().code(),
-            ErrorCode::SetMismatch
-        );
-
-        let fixture_5 = fixture();
-        let path = fixture_5.root.join(MANIFEST_PATH);
-        let mut manifest = read_json(&path);
-        let catalogs = manifest["catalogs"].as_array_mut().unwrap();
-        catalogs[0]["id"] = json!("typescript-5.9.3");
-        write_json(&path, &manifest);
-        assert_eq!(
-            verify_ledger_g0(&fixture_5.root).unwrap_err().code(),
-            ErrorCode::SetMismatch
-        );
-    }
-
-    #[test]
-    #[ignore = "requires real workspace root with node_modules/typescript installed"]
-    fn verify_oracle_pins_succeeds_on_real_root() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let root = root.canonicalize().expect("workspace root");
-        let pins = crate::verify_oracle_pins(&root).expect("migrated real root pins");
-        assert_eq!(pins, crate::OraclePins::expected());
     }
 
     #[test]

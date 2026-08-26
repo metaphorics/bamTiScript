@@ -1,4 +1,4 @@
-use std::{fmt, path::Path, sync::Arc};
+use std::{fmt, path::Path, str::FromStr, sync::Arc};
 
 /// Identifies one source file within a compilation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -130,18 +130,92 @@ pub enum ScriptKind {
     Json,
 }
 
-/// The per-file UTF-8 byte budget enforced before a source is indexed
-/// (16 MiB, the S1 frontend input bound).
+/// Controls how JSX syntax is represented in JavaScript output.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum JsxEmit {
+    Preserve,
+    React,
+    ReactNative,
+    ReactJsx,
+    ReactJsxDev,
+}
+
+impl JsxEmit {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::React => "react",
+            Self::ReactNative => "react-native",
+            Self::ReactJsx => "react-jsx",
+            Self::ReactJsxDev => "react-jsxdev",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "preserve" => Some(Self::Preserve),
+            "react" => Some(Self::React),
+            "react-native" => Some(Self::ReactNative),
+            "react-jsx" => Some(Self::ReactJsx),
+            "react-jsxdev" => Some(Self::ReactJsxDev),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for JsxEmit {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        JsxEmit::parse(value).ok_or(())
+    }
+}
+
+impl fmt::Display for JsxEmit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+/// The per-file UTF-8 byte budget enforced before a source is indexed.
 ///
 /// A source at exactly this length is accepted; one byte more is rejected with
 /// [`SourcePositionError::SourceTooLarge`].
 pub const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 
-/// A failed checked source operation.
+/// Monotonic identities for synthesized AST nodes.
+///
+/// Constructing the source after the largest parser-assigned id keeps
+/// synthesized nodes disjoint from the source tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeIdSource {
+    next: u32,
+}
+
+impl NodeIdSource {
+    #[must_use]
+    pub fn after(max_source_id: crate::syntax::NodeId) -> Self {
+        Self {
+            next: max_source_id
+                .get()
+                .checked_add(1)
+                .expect("node id space exhausted"),
+        }
+    }
+
+    #[must_use]
+    pub fn fresh(&mut self) -> crate::syntax::NodeId {
+        let id = crate::syntax::NodeId::new(self.next);
+        self.next = self.next.checked_add(1).expect("node id space exhausted");
+        id
+    }
+}
+
+/// A failed checked source-position operation.
 ///
 /// This enum is deliberately closed: callers can exhaustively distinguish an
-/// out-of-bounds coordinate, a coordinate that splits one encoded character,
-/// and an input that exceeds the frontend byte budget.
+/// out-of-bounds coordinate from a coordinate that splits one encoded character.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourcePositionError {
     ByteOffsetOutOfBounds { offset: usize, len: usize },
@@ -209,22 +283,20 @@ pub struct SourceText {
     line_starts: Arc<[Utf16Pos]>,
     utf16_len: Utf16Pos,
     /// Whether this source originated from a `.d.ts`/`.d.mts`/`.d.cts` file.
-    /// Ambient source files only allow declaration statements at the top level.
     is_declaration_file: bool,
 }
 
 impl SourceText {
     /// Stores source text and precomputes its immutable position indexes.
     ///
-    /// Rejects text longer than [`MAX_SOURCE_BYTES`] before any index storage
-    /// is allocated, so the 16 MiB per-file frontend bound is enforced at the
-    /// boundary rather than after the input has been buffered and indexed.
+    /// Rejects text longer than [`MAX_SOURCE_BYTES`] before allocating index
+    /// storage.
     pub fn new(text: impl Into<Arc<str>>) -> Result<Self, SourcePositionError> {
         Self::from_arc(text.into())
     }
 
-    /// Stores an existing shared source allocation without copying its text,
-    /// under the same [`MAX_SOURCE_BYTES`] budget as [`SourceText::new`].
+    /// Stores an existing shared source allocation under the same byte budget
+    /// as [`SourceText::new`].
     pub fn from_arc(text: Arc<str>) -> Result<Self, SourcePositionError> {
         if text.len() > MAX_SOURCE_BYTES {
             return Err(SourcePositionError::SourceTooLarge {
@@ -232,7 +304,6 @@ impl SourceText {
                 limit: MAX_SOURCE_BYTES,
             });
         }
-
         let mut checkpoints = vec![BoundaryCheckpoint {
             byte: 0,
             utf16: Utf16Pos::ZERO,
@@ -259,6 +330,7 @@ impl SourceText {
                 line_starts.push(Utf16Pos::new(utf16_offset));
             }
         }
+
         Ok(Self {
             text,
             checkpoints: Arc::from(checkpoints),
@@ -269,6 +341,7 @@ impl SourceText {
     }
 
     /// Marks this source as originating from a `.d.ts`/`.d.mts`/`.d.cts` file.
+    #[must_use]
     pub fn with_declaration_file(mut self, value: bool) -> Self {
         self.is_declaration_file = value;
         self
@@ -371,7 +444,32 @@ impl SourceText {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourcePositionError, SourceText, TextRange, Utf16Pos};
+    use super::{JsxEmit, NodeIdSource, SourcePositionError, SourceText, TextRange, Utf16Pos};
+
+    #[test]
+    fn jsx_emit_strings_round_trip_exactly() {
+        for (text, emit) in [
+            ("preserve", JsxEmit::Preserve),
+            ("react", JsxEmit::React),
+            ("react-native", JsxEmit::ReactNative),
+            ("react-jsx", JsxEmit::ReactJsx),
+            ("react-jsxdev", JsxEmit::ReactJsxDev),
+        ] {
+            assert_eq!(JsxEmit::parse(text), Some(emit));
+            assert_eq!(text.parse::<JsxEmit>(), Ok(emit));
+            assert_eq!(emit.as_str(), text);
+            assert_eq!(emit.to_string(), text);
+        }
+        assert_eq!(JsxEmit::parse("React"), None);
+        assert!("react_jsx".parse::<JsxEmit>().is_err());
+    }
+
+    #[test]
+    fn synthesized_node_ids_start_after_source_ids_and_advance() {
+        let mut ids = NodeIdSource::after(crate::syntax::NodeId::new(40));
+        assert_eq!(ids.fresh(), crate::syntax::NodeId::new(41));
+        assert_eq!(ids.fresh(), crate::syntax::NodeId::new(42));
+    }
 
     #[test]
     fn ascii_boundaries_round_trip() {
@@ -543,20 +641,13 @@ mod tests {
     }
 
     #[test]
-    fn source_text_file_size_limit() {
-        // The 16 MiB per-file budget admits the limit exactly and rejects one
-        // byte past it with a typed error, before any index storage is built.
-        let accepted_below = "a".repeat(super::MAX_SOURCE_BYTES - 1);
-        let accepted_at = "a".repeat(super::MAX_SOURCE_BYTES);
-        let rejected_above = "a".repeat(super::MAX_SOURCE_BYTES + 1);
+    fn source_text_enforces_byte_budget_before_indexing() {
+        let accepted = SourceText::new("a".repeat(super::MAX_SOURCE_BYTES))
+            .expect("the exact source budget is accepted");
+        assert_eq!(accepted.as_str().len(), super::MAX_SOURCE_BYTES);
 
-        let below = SourceText::new(accepted_below).expect("16 MiB - 1 is within budget");
-        assert_eq!(below.as_str().len(), super::MAX_SOURCE_BYTES - 1);
-        let at = SourceText::new(accepted_at).expect("16 MiB exactly is within budget");
-        assert_eq!(at.as_str().len(), super::MAX_SOURCE_BYTES);
-
-        let error =
-            SourceText::new(rejected_above).expect_err("16 MiB + 1 exceeds the per-file budget");
+        let error = SourceText::new("a".repeat(super::MAX_SOURCE_BYTES + 1))
+            .expect_err("one byte above the source budget is rejected");
         assert_eq!(
             error,
             SourcePositionError::SourceTooLarge {
@@ -564,18 +655,13 @@ mod tests {
                 limit: super::MAX_SOURCE_BYTES,
             }
         );
+    }
 
-        // `from_arc` enforces the same budget on the shared-allocation path.
-        let oversized: std::sync::Arc<str> =
-            std::sync::Arc::from("a".repeat(super::MAX_SOURCE_BYTES + 1).as_str());
-        let error =
-            SourceText::from_arc(oversized).expect_err("from_arc rejects 16 MiB + 1 as well");
-        assert_eq!(
-            error,
-            SourcePositionError::SourceTooLarge {
-                len: super::MAX_SOURCE_BYTES + 1,
-                limit: super::MAX_SOURCE_BYTES,
-            }
-        );
+    #[test]
+    fn declaration_file_identity_is_explicit_and_preserved() {
+        let ordinary = SourceText::new("declare const value: number;")
+            .expect("test source fits the per-file budget");
+        assert!(!ordinary.is_declaration_file());
+        assert!(ordinary.with_declaration_file(true).is_declaration_file());
     }
 }

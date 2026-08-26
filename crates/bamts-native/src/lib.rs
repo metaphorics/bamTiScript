@@ -477,6 +477,8 @@ const _: () = {
 #[cfg(feature = "cache-guard")]
 pub mod cache_guard;
 pub mod native_bridge;
+pub mod tiering;
+
 pub use native_bridge::*;
 
 #[cfg(test)]

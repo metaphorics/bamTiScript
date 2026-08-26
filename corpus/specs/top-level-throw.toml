@@ -1,0 +1,17 @@
+schema = 1
+id = "top-level-throw"
+repository = "local"
+commit = "aacb3ab4d926dc73de601d12887dbc4a0da32efe"
+license = "UNLICENSED"
+source_dir = "corpus/cases"
+entrypoint = "corpus/cases/top-level-throw.ts"
+node_args = []
+expected_timeout_ms = 5000
+constructs = [
+  "top-level-throw",
+  "process-exit-code",
+  "empty-stdout-on-throw",
+]
+source_files = [
+  "corpus/cases/top-level-throw.ts",
+]

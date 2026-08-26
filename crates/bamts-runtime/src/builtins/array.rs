@@ -31,6 +31,7 @@ pub(super) fn install<H: Host>(
         define_static(heap, constructor, name, function);
     }
     for (name, length, handler) in [
+        ("toString", 0, to_string::<H> as BuiltinHandler<H>),
         ("push", 1, push::<H> as BuiltinHandler<H>),
         ("pop", 0, pop::<H>),
         ("shift", 0, shift::<H>),
@@ -126,6 +127,7 @@ pub(super) fn install<H: Host>(
             configurable: true,
         },
     );
+    super::array_es2023::install(heap, builtins, prototype, constructor);
 }
 
 fn define_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
@@ -478,6 +480,25 @@ fn join<H: Host>(
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
         output.finish(),
+    )?))
+}
+fn to_string<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    _args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let object = machine.value_to_object(this)?;
+    let join = machine.get_named_property(object, "join")?;
+    let function = if machine.is_callable(join)? {
+        join
+    } else {
+        machine.intrinsics.object_to_string()
+    };
+    Ok(BuiltinOutcome::Value(machine.call_value(
+        function,
+        object,
+        &[],
     )?))
 }
 fn from_index<H: Host>(
@@ -1918,6 +1939,18 @@ mod tests {
         assert!(done);
     }
 
+    fn custom_join<H: Host>(
+        machine: &mut Machine<'_, H>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("custom"),
+        )?))
+    }
+
     fn join_length_getter<H: Host>(
         machine: &mut Machine<'_, H>,
         this: Value,
@@ -1967,5 +2000,45 @@ mod tests {
         let result = call_proto(&mut machine, "join", array);
         let text = machine.string_value(result).expect("join returns a string");
         assert_eq!(text, EcmaString::encode("1,mutated,"));
+    }
+
+    #[test]
+    fn to_string_uses_dynamic_join_and_object_fallback() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let array = allocate_array(&mut machine, vec![Value::int32(1), Value::int32(2)]).unwrap();
+
+        let result = call_proto(&mut machine, "toString", array);
+        assert!(
+            machine
+                .string_value(result)
+                .is_some_and(|text| text.eq_ascii("1,2"))
+        );
+
+        let custom_id = machine.intrinsics.builtins.register(BuiltinDef {
+            name: "custom join",
+            length: 0,
+            handler: custom_join::<TestHost>,
+        });
+        let custom =
+            crate::intrinsics::native_function(&mut machine.heap, custom_id, "custom join", 0);
+        machine.set_data_property(array, "join", custom).unwrap();
+        let result = call_proto(&mut machine, "toString", array);
+        assert!(
+            machine
+                .string_value(result)
+                .is_some_and(|text| text.eq_ascii("custom"))
+        );
+
+        machine
+            .set_data_property(array, "join", Value::int32(0))
+            .unwrap();
+        let result = call_proto(&mut machine, "toString", array);
+        assert!(
+            machine
+                .string_value(result)
+                .is_some_and(|text| text.eq_ascii("[object Array]"))
+        );
     }
 }

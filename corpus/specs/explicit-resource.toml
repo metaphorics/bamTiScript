@@ -1,0 +1,19 @@
+schema = 1
+id = "explicit-resource"
+repository = "local"
+commit = "d17921136745d8f68172ea341b3eb51fceb06e55"
+license = "UNLICENSED"
+source_dir = "corpus/cases"
+entrypoint = "corpus/cases/explicit-resource.ts"
+node_args = []
+expected_timeout_ms = 15000
+constructs = [
+  "using-lifo-disposal",
+  "await-using-async-dispose",
+  "suppressed-error-chain",
+  "for-using-loop-head",
+  "resource-abrupt-completion",
+]
+source_files = [
+  "corpus/cases/explicit-resource.ts",
+]

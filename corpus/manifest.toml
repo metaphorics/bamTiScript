@@ -142,3 +142,51 @@ repository = "https://github.com/sindresorhus/yocto-queue"
 commit = "b07eac099753833b29d06c614149904445739776"
 spec = "corpus/specs/yocto-queue.toml"
 entrypoint = "corpus/cases/yocto-queue.ts"
+[[projects]]
+id = "derived-construction"
+repository = "local"
+commit = "2f0fd8c308717c827e30b19684fa114f7c5a2036"
+spec = "corpus/specs/derived-construction.toml"
+entrypoint = "corpus/cases/derived-construction.ts"
+
+[[projects]]
+id = "event-loop"
+repository = "local"
+commit = "c6cad132023e7405c4c2d5008106943a8d94e57f"
+spec = "corpus/specs/event-loop.toml"
+entrypoint = "corpus/cases/event-loop.ts"
+
+[[projects]]
+id = "explicit-resource"
+repository = "local"
+commit = "d17921136745d8f68172ea341b3eb51fceb06e55"
+spec = "corpus/specs/explicit-resource.toml"
+entrypoint = "corpus/cases/explicit-resource.ts"
+
+[[projects]]
+id = "for-await-iterator"
+repository = "local"
+commit = "006f26757ea92e6517cc80c1ed9bca7075bb9ee7"
+spec = "corpus/specs/for-await-iterator.toml"
+entrypoint = "corpus/cases/for-await-iterator.ts"
+
+[[projects]]
+id = "import-meta"
+repository = "local"
+commit = "4fa3e55353469b874c705d2cd0745f6cf5e218e8"
+spec = "corpus/specs/import-meta.toml"
+entrypoint = "corpus/cases/import-meta.ts"
+
+[[projects]]
+id = "lexical-environment"
+repository = "local"
+commit = "87d9ea925a30b200968a20327b3a874bcfdc945f"
+spec = "corpus/specs/lexical-environment.toml"
+entrypoint = "corpus/cases/lexical-environment.ts"
+
+[[projects]]
+id = "top-level-throw"
+repository = "local"
+commit = "aacb3ab4d926dc73de601d12887dbc4a0da32efe"
+spec = "corpus/specs/top-level-throw.toml"
+entrypoint = "corpus/cases/top-level-throw.ts"

@@ -31,6 +31,13 @@ pub struct RunOutcome {
     pub exit_code: i32,
     pub stdout: Buffer,
     pub stderr: Buffer,
+    pub truncation: Option<RunTruncation>,
+}
+
+#[napi(object)]
+pub struct RunTruncation {
+    pub elided: u32,
+    pub limit: u32,
 }
 
 #[napi(object)]
@@ -199,10 +206,30 @@ fn execute(request: RawRequest, cancel: &CancellationToken) -> Result<RunOutcome
     let context = ExecutionContext::new(cwd, environment)
         .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
     let outcome = cli_outcome_in_context_with_cancel(args, &context, cancel.clone());
+    let truncation = outcome
+        .truncation
+        .map(|notice| -> Result<RunTruncation> {
+            Ok(RunTruncation {
+                elided: u32::try_from(notice.elided()).map_err(|_| {
+                    Error::new(
+                        Status::GenericFailure,
+                        "truncation elided count exceeds the Node-API number range".to_owned(),
+                    )
+                })?,
+                limit: u32::try_from(notice.limit()).map_err(|_| {
+                    Error::new(
+                        Status::GenericFailure,
+                        "truncation limit exceeds the Node-API number range".to_owned(),
+                    )
+                })?,
+            })
+        })
+        .transpose()?;
     Ok(RunOutcome {
         exit_code: outcome.exit_code,
         stdout: outcome.stdout.into(),
         stderr: outcome.stderr.into(),
+        truncation,
     })
 }
 

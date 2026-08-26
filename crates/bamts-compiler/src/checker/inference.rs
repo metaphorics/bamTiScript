@@ -357,6 +357,7 @@ impl InferredTypeArguments {
                         .with_accessibility(property.access(), property.declaring_class())
                         .with_declaring_types(property.declaring_types().to_vec())
                         .with_method(property.is_method())
+                        .with_spreadable(property.spreadable())
                     })
                     .collect();
                 let call_signatures = object
@@ -1746,15 +1747,17 @@ mod tests {
         assert_eq!(inferred.instantiate(&mut table, other), other);
     }
 
-    /// A `readonly` member of a generic object type keeps its flag through
-    /// instantiation; without `.with_readonly` the flag is silently dropped.
+    /// Object-property metadata survives generic instantiation rather than
+    /// silently degrading the structural contract.
     #[test]
-    fn instantiation_preserves_readonly_on_object_properties() {
+    fn instantiation_preserves_object_property_flags() {
         let mut table = TypeTable::new();
         let t = table.named(parameter(1));
         let composite = table.object_type(vec![
             PropertyType::new("mutable", false, t),
-            PropertyType::new("locked", false, t).with_readonly(true),
+            PropertyType::new("locked", false, t)
+                .with_readonly(true)
+                .with_spreadable(true),
         ]);
 
         let number = table.number();
@@ -1773,12 +1776,17 @@ mod tests {
             .find(|property| property.name() == "locked")
             .expect("locked property");
         assert!(locked.readonly(), "readonly survives instantiation");
+        assert!(locked.spreadable(), "spreadability survives instantiation");
         let mutable = object
             .properties
             .iter()
             .find(|property| property.name() == "mutable")
             .expect("mutable property");
         assert!(!mutable.readonly(), "non-readonly stays non-readonly");
+        assert!(
+            !mutable.spreadable(),
+            "ordinary members stay non-spreadable"
+        );
     }
 
     /// Resolution is deterministic: the same session built twice yields the

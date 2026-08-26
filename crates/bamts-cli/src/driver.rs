@@ -2,37 +2,53 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+};
+use std::{thread, time::Duration};
 
-use bamts::{Error as BamtsError, resolve_project_with_cancel};
-use bamts_cancel::CancellationToken;
+use bamts::discover_project;
+use bamts_compiler::CancellationToken;
 use bamts_compiler::lower::LowerOptions;
 use bamts_compiler::pipeline::{
     FrontendMode, ProgramFrontendOutput, compile_program_frontend_with_cancel,
 };
 use bamts_compiler::program::{
-    ProgramLoadError, ProgramLowerError, ProgramLowerErrorKind, ResolvedProgram,
+    ProgramLoadError, ProgramLoader, ProgramLowerError, ResolvedProgram, lower_program,
     lower_program_with_cancel,
 };
 use bamts_compiler::{
-    diagnostic::DiagnosticReport,
+    diagnostic::{Diagnostic, DiagnosticReport, DiagnosticSeverity},
+    diagnostics_parser::map_parse_diagnostics,
     lint::{LintOverride, LintProfile, LintTable},
-    project::parse_bamts_toml,
+    project::{
+        ProjectConfig, ProjectRoot,
+        build_mode::BuildInfo,
+        effective::{
+            EffectiveProject, ProjectBuildOptions, ProjectCompileError, ProjectCompileOptions,
+            ProjectCompileResult, ProjectLoadRequest, ProjectOptionOverrides, compile_project,
+            compile_project_references, load_reference_closure,
+        },
+        parse_bamts_toml,
+        references::resolve_config_file_name,
+    },
+    service::filesystem::OsFileSystem,
 };
-#[cfg(windows)]
-use bamts_native::cache_guard::CacheGuardError;
-use bamts_native::cache_guard::{HeldArchive, PrivateCacheRoot};
 use bamts_runtime::{Limits, run_linked_program_with_cancel};
-use processkit::ErrorReason as PkErrorReason;
-use processkit::{CancellationToken as PkCancellationToken, Command as PkCommand};
 
 use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
+use crate::cli::{
+    diagnostic_format::{self as tsc_diagnostics, TscDiagnosticFormat},
+    tsc_args::{ParsedTscCommand, TscExitStatus},
+};
 use crate::context::ExecutionContext;
 use crate::diagnostics::{self, DiagnosticSource, TruncationNotice};
+use crate::output::{StdAtomicFs, publish_atomic};
 
 const NODE_STATICLIB: &[u8] = include_bytes!(env!("BAMTS_NODE_STATICLIB"));
 const HOST_TARGET: &str = env!("BAMTS_HOST_TARGET");
@@ -40,28 +56,18 @@ const BUILD_TARGET: &str = env!("BAMTS_BUILD_TARGET");
 static NEXT_CACHE_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Bytes and process status produced by one successful CLI command.
-///
-/// When diagnostics were rendered with a limit that caused some to be elided,
-/// the [`truncation`][CommandOutcome::truncation] field carries the typed
-/// notice. For the line-oriented formats the rendered `stderr` already contains
-/// the human-readable note; JSON and GitHub omit it from the text because they
-/// have structured schemas, but the typed notice is still available here.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct CommandOutcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: i32,
-    /// The truncation notice, if diagnostics were elided by the renderer.
-    ///
-    /// This is `Some` exactly when the rendered diagnostic count reached the
-    /// configured `--error-limit`. It is `None` for commands that do not render
-    /// diagnostics, or when all diagnostics fit under the cap.
     pub truncation: Option<TruncationNotice>,
 }
 
 /// A typed failure from compilation, execution, artifact publication, or linking.
 #[derive(Debug)]
 pub enum DriverError {
+    Cancelled,
     ReadSource {
         path: PathBuf,
         source: io::Error,
@@ -69,18 +75,15 @@ pub enum DriverError {
     UnsupportedSourceExtension {
         path: PathBuf,
     },
-    /// Source contains diagnostics that cannot pass the check/compile/run gate.
-    ///
-    /// `rendered` is the human-readable output that should be written to stderr.
-    /// `truncation` is the typed notice when the `--error-limit` capped the
-    /// report; it is already embedded in `rendered` for the line-oriented
-    /// formats and omitted from JSON/GitHub, but is preserved for programmatic
-    /// consumers.
     Diagnostics {
         rendered: String,
         truncation: Option<TruncationNotice>,
     },
     Usage(ArgsError),
+    NonUnicodeEnvironmentName,
+    NonUnicodeEnvironmentValue {
+        name: String,
+    },
     LintConfig {
         path: PathBuf,
         message: String,
@@ -91,12 +94,6 @@ pub enum DriverError {
     },
     ProgramLoad(ProgramLoadError),
     Lower(ProgramLowerError),
-    NonUnicodeEnvironmentName {
-        name: OsString,
-    },
-    NonUnicodeEnvironmentValue {
-        name: String,
-    },
     Jit(bamts_codegen::JitError),
     Native(bamts_runtime::NativeError),
     Aot(bamts_codegen::AotError),
@@ -147,11 +144,6 @@ pub enum DriverError {
     UnsafeFallbackCacheRoot {
         path: PathBuf,
     },
-    /// The project resolver returned an error from a later compiler stage.
-    UnexpectedResolution(BamtsError),
-    /// A caller-supplied [`CancellationToken`] was triggered during compilation,
-    /// linking, or execution.
-    Cancelled,
 }
 
 impl DriverError {
@@ -159,6 +151,13 @@ impl DriverError {
     pub const fn rendered_diagnostic(&self) -> Option<&str> {
         match self {
             Self::Diagnostics { rendered, .. } => Some(rendered.as_str()),
+            _ => None,
+        }
+    }
+    #[must_use]
+    pub const fn truncation_notice(&self) -> Option<TruncationNotice> {
+        match self {
+            Self::Diagnostics { truncation, .. } => *truncation,
             _ => None,
         }
     }
@@ -172,6 +171,7 @@ impl DriverError {
 impl fmt::Display for DriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("operation cancelled"),
             Self::ReadSource { path, source } => {
                 write!(formatter, "could not read `{}`: {source}", path.display())
             }
@@ -182,6 +182,13 @@ impl fmt::Display for DriverError {
             ),
             Self::Diagnostics { .. } => formatter.write_str("source contains error diagnostics"),
             Self::Usage(error) => error.fmt(formatter),
+            Self::NonUnicodeEnvironmentName => {
+                formatter.write_str("process environment contains a non-Unicode name")
+            }
+            Self::NonUnicodeEnvironmentValue { name } => write!(
+                formatter,
+                "process environment variable {name} contains a non-Unicode value"
+            ),
             Self::LintConfig { path, message } => {
                 write!(
                     formatter,
@@ -196,15 +203,6 @@ impl fmt::Display for DriverError {
             ),
             Self::ProgramLoad(error) => write!(formatter, "could not load program: {error}"),
             Self::Lower(error) => write!(formatter, "source cannot be lowered: {error}"),
-            Self::NonUnicodeEnvironmentName { name } => write!(
-                formatter,
-                "environment variable name `{}` is not valid Unicode for JIT execution",
-                name.to_string_lossy()
-            ),
-            Self::NonUnicodeEnvironmentValue { name } => write!(
-                formatter,
-                "environment variable `{name}` has a value that is not valid Unicode for JIT execution"
-            ),
             Self::Jit(error) => write!(formatter, "JIT compilation failed: {error}"),
             Self::Native(error) => write!(formatter, "program execution failed: {error}"),
             Self::Aot(error) => write!(formatter, "AOT object emission failed: {error}"),
@@ -280,13 +278,9 @@ impl fmt::Display for DriverError {
             ),
             Self::UnsafeFallbackCacheRoot { path } => write!(
                 formatter,
-                "cache root `{}` is not private to the current user",
+                "fallback cache root `{}` is not a private directory owned by the current user",
                 path.display()
             ),
-            Self::UnexpectedResolution(error) => {
-                write!(formatter, "project resolution failed unexpectedly: {error}")
-            }
-            Self::Cancelled => formatter.write_str("operation cancelled"),
         }
     }
 }
@@ -294,6 +288,7 @@ impl fmt::Display for DriverError {
 impl Error for DriverError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Cancelled => None,
             Self::ReadSource { source, .. }
             | Self::CreateDirectory { source, .. }
             | Self::CacheArchive { source, .. }
@@ -307,145 +302,504 @@ impl Error for DriverError {
             Self::Native(error) => Some(error),
             Self::Aot(error) => Some(error),
             Self::Usage(error) => Some(error),
-            Self::UnexpectedResolution(error) => Some(error),
             Self::MissingEntrypoint
             | Self::UnsupportedSourceExtension { .. }
             | Self::Diagnostics { .. }
+            | Self::NonUnicodeEnvironmentName
+            | Self::NonUnicodeEnvironmentValue { .. }
             | Self::LintConfig { .. }
             | Self::ProjectConfig { .. }
-            | Self::NonUnicodeEnvironmentName { .. }
-            | Self::NonUnicodeEnvironmentValue { .. }
             | Self::MultipleCompileInputs
             | Self::UnsupportedCompileTarget(_)
             | Self::UnsupportedOutputOption(_)
             | Self::ToolchainMissing { .. }
             | Self::ToolchainRejected { .. }
             | Self::LinkFailed { .. }
-            | Self::UnsafeFallbackCacheRoot { .. }
             | Self::CrossTargetLink { .. }
-            | Self::Cancelled => None,
+            | Self::UnsafeFallbackCacheRoot { .. } => None,
         }
     }
 }
 
-/// Per-phase wall times (and best-effort process peak RSS) recorded by the AOT
-/// driver for one `run --target aot` invocation.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct AotPhaseTelemetry {
-    /// Wall time to emit the object file, in fractional milliseconds.
-    pub object_wall_ms: f64,
-    /// Wall time to link the native executable, in fractional milliseconds.
-    pub link_wall_ms: f64,
-    /// Wall time to run the linked executable to completion, in fractional
-    /// milliseconds.
-    pub run_wall_ms: f64,
-    /// Best-effort driver process peak RSS in KiB (`/proc/self/status`
-    /// `VmHWM`); `0` when unavailable.
-    pub rss_kb: u64,
-}
-
 /// Executes one already-parsed CLI command.
 pub fn execute(args: &CliArgs) -> Result<CommandOutcome, DriverError> {
-    execute_with_telemetry(args).map(|(outcome, _telemetry)| outcome)
+    let context = ExecutionContext::ambient()?;
+    execute_in_context(args, &context)
 }
 
-/// Executes one parsed command with explicit process inputs.
+/// Executes one already-parsed command against explicit process inputs.
 pub fn execute_in_context(
     args: &CliArgs,
     context: &ExecutionContext,
 ) -> Result<CommandOutcome, DriverError> {
-    execute_with_telemetry_in_context(args, context).map(|(outcome, _telemetry)| outcome)
+    execute_in_context_with_cancel(args, context, CancellationToken::new())
 }
 
-/// [`execute`] with a caller-supplied cancellation token.
+/// [`execute`] with caller-controlled cooperative cancellation.
 pub fn execute_with_cancel(
     args: &CliArgs,
     cancel: CancellationToken,
 ) -> Result<CommandOutcome, DriverError> {
-    execute_with_telemetry_with_cancel(args, cancel).map(|(outcome, _telemetry)| outcome)
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    let context = ExecutionContext::ambient()?;
+    execute_in_context_with_cancel(args, &context, cancel)
 }
 
-/// [`execute_in_context`] with a caller-supplied cancellation token.
+/// The canonical CLI execution seam with explicit process inputs and cancellation.
 pub fn execute_in_context_with_cancel(
     args: &CliArgs,
     context: &ExecutionContext,
     cancel: CancellationToken,
 ) -> Result<CommandOutcome, DriverError> {
-    execute_with_telemetry_in_context_with_cancel(args, context, cancel)
-        .map(|(outcome, _telemetry)| outcome)
-}
-
-/// [`execute`] plus AOT phase telemetry.
-///
-/// The returned telemetry is `Some` only for a `run --target aot` command,
-/// which is the sole path with distinct object/link/run phases; every other
-/// command returns `None`.
-pub fn execute_with_telemetry(
-    args: &CliArgs,
-) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
-    if args.mode == Mode::Explain {
-        return explain(args);
-    }
-    let context = ExecutionContext::ambient()?;
-    execute_with_telemetry_in_context(args, &context)
-}
-
-/// [`execute_in_context`] plus AOT phase telemetry.
-pub fn execute_with_telemetry_in_context(
-    args: &CliArgs,
-    context: &ExecutionContext,
-) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
-    execute_with_telemetry_in_context_with_cancel(args, context, CancellationToken::new())
-}
-
-/// [`execute_with_telemetry`] with a caller-supplied cancellation token.
-pub fn execute_with_telemetry_with_cancel(
-    args: &CliArgs,
-    cancel: CancellationToken,
-) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    if args.mode == Mode::Explain {
-        return explain(args);
-    }
-    let context = ExecutionContext::ambient()?;
-    execute_with_telemetry_in_context_with_cancel(args, &context, cancel)
-}
-
-/// [`execute_with_telemetry_in_context`] with a caller-supplied cancellation
-/// token.
-pub fn execute_with_telemetry_in_context_with_cancel(
-    args: &CliArgs,
-    context: &ExecutionContext,
-    cancel: CancellationToken,
-) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
     cancel.check().map_err(|_| DriverError::Cancelled)?;
     match args.mode {
         Mode::Check | Mode::Compile | Mode::Run => {
-            let frontend = load_program_frontend_with_cancel(args, context, &cancel)?;
+            let frontend = load_program_frontend_in_context_with_cancel(args, context, &cancel)?;
             match args.mode {
-                Mode::Check => Ok((check(args, &frontend, &cancel)?, None)),
-                Mode::Compile => Ok((compile(args, &frontend, context, &cancel)?, None)),
-                Mode::Run => run_with_cancel(args, &frontend, context, &cancel),
+                Mode::Check => check(args, &frontend),
+                Mode::Compile => compile_in_context_with_cancel(args, &frontend, context, &cancel),
+                Mode::Run => run_in_context_with_cancel(args, &frontend, context, &cancel),
                 Mode::Explain => unreachable!("explain handled without a program"),
             }
         }
-        Mode::Explain => explain(args),
+        Mode::Explain => {
+            let rule = args
+                .explain_rule
+                .as_deref()
+                .ok_or(DriverError::Usage(ArgsError::MissingExplainRule))?;
+            let explanation = crate::args::explain_rule(rule).map_err(DriverError::Usage)?;
+            Ok(CommandOutcome {
+                stdout: explanation.into_bytes(),
+                ..CommandOutcome::default()
+            })
+        }
     }
 }
 
-fn explain(args: &CliArgs) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
-    let rule = args
-        .explain_rule
-        .as_deref()
-        .ok_or(DriverError::Usage(ArgsError::MissingExplainRule))?;
-    let explanation = crate::args::explain_rule(rule).map_err(DriverError::Usage)?;
-    Ok((
-        CommandOutcome {
-            stdout: explanation.into_bytes(),
+const TSC_HELP: &str = "\
+tsc: The TypeScript Compiler - Version 7.0.2
+
+COMMON COMMANDS
+
+  tsc
+  Compiles the current project (tsconfig.json in the working directory).
+
+  tsc app.ts util.ts
+  Ignoring tsconfig.json, compiles the specified files with default compiler options.
+
+  tsc -b
+  Build a composite project in the working directory.
+
+  tsc --init
+  Creates a tsconfig.json with the recommended settings in the working directory.
+
+  tsc -p ./path/to/tsconfig.json
+  Compiles the TypeScript project located at the specified path.
+
+  tsc --help --all
+  An expanded version of this information, showing all possible compiler options.
+
+  tsc --noEmit
+  tsc --target esnext
+  Compiles the current project, with additional settings.
+
+COMMAND LINE FLAGS
+
+--help, -h
+Print this message.
+
+--version, -v
+Print the compiler's version.
+
+--build, -b
+Build one or more projects and their dependencies, if out of date.
+";
+
+/// Executes a command parsed by the TypeScript-compatible argv parser.
+pub fn execute_tsc(command: &ParsedTscCommand) -> Result<CommandOutcome, DriverError> {
+    let context = ExecutionContext::ambient()?;
+    execute_tsc_in_context(command, &context)
+}
+
+fn execute_tsc_in_context(
+    command: &ParsedTscCommand,
+    context: &ExecutionContext,
+) -> Result<CommandOutcome, DriverError> {
+    let cwd = context.cwd();
+    if command.flag("help") {
+        return Ok(CommandOutcome {
+            stdout: TSC_HELP.as_bytes().to_vec(),
             ..CommandOutcome::default()
+        });
+    }
+    if command.flag("version") {
+        return Ok(CommandOutcome {
+            stdout: b"Version 7.0.2\n".to_vec(),
+            ..CommandOutcome::default()
+        });
+    }
+    if command.is_build {
+        return execute_tsc_build(command, cwd);
+    }
+    if command.project().is_some() || command.file_names.is_empty() {
+        return execute_tsc_project(command, cwd);
+    }
+    if let Some(option) = command.options.keys().find(|name| {
+        !matches!(
+            name.as_str(),
+            "allowJs"
+                | "checkJs"
+                | "declaration"
+                | "help"
+                | "jsx"
+                | "noEmit"
+                | "noEmitOnError"
+                | "out"
+                | "outDir"
+                | "outFile"
+                | "pretty"
+                | "sourceMap"
+                | "strict"
+                | "version"
+        )
+    }) {
+        return Ok(not_implemented(&format!(
+            "Compiler option '--{option}' has no canonical native driver mapping."
+        )));
+    }
+    if command
+        .option_str("jsx")
+        .is_some_and(|jsx| jsx != "preserve")
+    {
+        return Ok(not_implemented(
+            "Only '--jsx preserve' has a canonical native driver mapping.",
+        ));
+    }
+    if !command.flag("noEmit") && (command.flag("declaration") || command.flag("sourceMap")) {
+        return Ok(not_implemented(
+            "Declaration and source-map emission require canonical compiler outputs.",
+        ));
+    }
+    if command.file_names.len() > 1 {
+        return Ok(not_implemented(
+            "Direct multi-root programs require the canonical project loader.",
+        ));
+    }
+
+    let mut stderr = Vec::new();
+    let mut has_errors = false;
+    let mut outputs_generated = false;
+    for file_name in &command.file_names {
+        let mut args = command.to_cli_args();
+        args.entrypoint = Some(file_name.clone());
+        args.extra_inputs.clear();
+        let frontend = load_program_frontend_in_context_with_cancel(
+            &args,
+            context,
+            &CancellationToken::new(),
+        )?;
+        let (rendered, file_has_errors) = render_tsc_program_diagnostics(command, &frontend);
+        stderr.extend_from_slice(rendered.as_bytes());
+        has_errors |= file_has_errors;
+        if args.mode == Mode::Compile && file_has_errors && !command.flag("noEmitOnError") {
+            let mut outcome = not_implemented(
+                "Error-tolerant emission requires the canonical compiler output pipeline.",
+            );
+            stderr.extend_from_slice(&outcome.stderr);
+            outcome.stderr = stderr;
+            return Ok(outcome);
+        }
+        if args.mode == Mode::Compile && !file_has_errors {
+            let outcome = compile_in_context_with_cancel(
+                &args,
+                &frontend,
+                context,
+                &CancellationToken::new(),
+            )?;
+            outputs_generated = true;
+            if !outcome.stdout.is_empty() {
+                return Ok(CommandOutcome {
+                    stdout: outcome.stdout,
+                    stderr,
+                    exit_code: TscExitStatus::from_compilation(has_errors, outputs_generated)
+                        .code(),
+                    truncation: None,
+                });
+            }
+        }
+    }
+    Ok(CommandOutcome {
+        stderr,
+        exit_code: TscExitStatus::from_compilation(has_errors, outputs_generated).code(),
+        ..CommandOutcome::default()
+    })
+}
+#[cfg(test)]
+fn execute_tsc_in(command: &ParsedTscCommand, cwd: &Path) -> Result<CommandOutcome, DriverError> {
+    let environment = std::env::vars_os().collect();
+    let context = ExecutionContext::new(cwd, environment)?;
+    execute_tsc_in_context(command, &context)
+}
+
+fn execute_tsc_project(
+    command: &ParsedTscCommand,
+    cwd: &Path,
+) -> Result<CommandOutcome, DriverError> {
+    let filesystem = match OsFileSystem::new(cwd) {
+        Ok(filesystem) => filesystem,
+        Err(error) => return Ok(project_error_outcome(error.to_string())),
+    };
+    let request = ProjectLoadRequest {
+        config_path: Some(project_config_path(
+            cwd,
+            command.project().unwrap_or("tsconfig.json"),
+        )),
+        cwd: cwd.to_path_buf(),
+        overrides: project_overrides(command),
+        allow_missing_config: false,
+    };
+    let project = match EffectiveProject::load(&request, &filesystem) {
+        Ok(project) => project,
+        Err(error) => return Ok(project_compile_error_outcome(error)),
+    };
+    let result = match compile_project(&project, &ProjectCompileOptions::default(), &filesystem) {
+        Ok(result) => result,
+        Err(error) => return Ok(project_compile_error_outcome(error)),
+    };
+    if !result.up_to_date {
+        publish_project_result(&result)?;
+    }
+    Ok(project_result_outcome(command, &result))
+}
+
+fn execute_tsc_build(
+    command: &ParsedTscCommand,
+    cwd: &Path,
+) -> Result<CommandOutcome, DriverError> {
+    let filesystem = match OsFileSystem::new(cwd) {
+        Ok(filesystem) => filesystem,
+        Err(error) => return Ok(project_error_outcome(error.to_string())),
+    };
+    let root = match ProjectRoot::new(cwd) {
+        Ok(root) => root,
+        Err(error) => return Ok(project_error_outcome(error.to_string())),
+    };
+    let configs = if command.file_names.is_empty() {
+        vec![project_config_path(cwd, "tsconfig.json")]
+    } else {
+        command
+            .file_names
+            .iter()
+            .map(|path| project_config_path(cwd, path))
+            .collect()
+    };
+    if command.flag("clean") {
+        let (_, graph) = match load_reference_closure(&root, &configs, &filesystem) {
+            Ok(closure) => closure,
+            Err(error) => return Ok(project_compile_error_outcome(error)),
+        };
+        let mut order = match graph.topological_order() {
+            Ok(order) => order,
+            Err(error) => return Ok(project_error_outcome(error.to_string())),
+        };
+        order.reverse();
+        for path in order {
+            let Some(info_path) = graph
+                .node(&path)
+                .and_then(|node| node.build_info_path.as_deref())
+            else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(info_path) else {
+                continue;
+            };
+            let Ok(info) = BuildInfo::decode(&bytes) else {
+                continue;
+            };
+            if !command.flag("dry") {
+                for output in info.outputs {
+                    if let Err(source) = fs::remove_file(&output)
+                        && source.kind() != io::ErrorKind::NotFound
+                    {
+                        return Err(DriverError::ProjectConfig {
+                            path: output,
+                            message: source.to_string(),
+                        });
+                    }
+                }
+                let _ = fs::remove_file(info_path);
+            }
+        }
+        return Ok(CommandOutcome::default());
+    }
+
+    let stop_on_error = command
+        .options
+        .get("stopBuildOnErrors")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let report = match compile_project_references(
+        &root,
+        &configs,
+        cwd,
+        ProjectBuildOptions {
+            force: command.flag("force"),
+            stop_on_error,
         },
-        None,
-    ))
+        &filesystem,
+    ) {
+        Ok(report) => report,
+        Err(error) => return Ok(project_compile_error_outcome(error)),
+    };
+    let mut stderr = Vec::new();
+    let mut stdout = Vec::new();
+    let mut has_errors = false;
+    let mut outputs_generated = false;
+    for project in report.projects {
+        let outcome = project_result_outcome(command, &project.result);
+        stderr.extend_from_slice(&outcome.stderr);
+        has_errors |= outcome.exit_code != TscExitStatus::Success.code();
+        if command.flag("dry") {
+            writeln!(stdout, "Would build {}", project.config_path.display())
+                .expect("writing to Vec cannot fail");
+        } else if !project.result.up_to_date {
+            publish_project_result(&project.result)?;
+            outputs_generated |= project.result.emitted;
+        }
+    }
+    has_errors |= !report.blocked.is_empty();
+    Ok(CommandOutcome {
+        stdout,
+        stderr,
+        exit_code: TscExitStatus::from_compilation(has_errors, outputs_generated).code(),
+        truncation: None,
+    })
+}
+
+fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOverrides {
+    let boolean = |name: &str| command.options.get(name).and_then(|value| value.as_bool());
+    ProjectOptionOverrides {
+        no_emit: boolean("noEmit"),
+        no_emit_on_error: boolean("noEmitOnError"),
+        declaration: boolean("declaration"),
+        declaration_map: boolean("declarationMap"),
+        source_map: boolean("sourceMap"),
+        inline_source_map: boolean("inlineSourceMap"),
+        out_dir: command.option_str("outDir").map(PathBuf::from),
+        root_dir: command.option_str("rootDir").map(PathBuf::from),
+        out_file: command
+            .option_str("outFile")
+            .or_else(|| command.option_str("out"))
+            .map(PathBuf::from),
+        ts_build_info_file: command.option_str("tsBuildInfoFile").map(PathBuf::from),
+        strict: boolean("strict"),
+        allow_js: boolean("allowJs"),
+        check_js: boolean("checkJs"),
+        jsx: command.option_str("jsx").map(Arc::from),
+    }
+}
+
+fn project_config_path(cwd: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    resolve_config_file_name(path)
+}
+
+fn publish_project_result(result: &ProjectCompileResult) -> Result<(), DriverError> {
+    let mut atomic = StdAtomicFs;
+    for (path, bytes) in &result.outputs.files {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| DriverError::CreateDirectory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        publish_atomic(&mut atomic, path, bytes).map_err(|error| DriverError::ProjectConfig {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    }
+    if let Some((path, info)) = &result.build_info {
+        let bytes = info.encode().map_err(|error| DriverError::ProjectConfig {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| DriverError::CreateDirectory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        publish_atomic(&mut atomic, path, &bytes).map_err(|error| DriverError::ProjectConfig {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+fn project_result_outcome(
+    command: &ParsedTscCommand,
+    result: &ProjectCompileResult,
+) -> CommandOutcome {
+    let diagnostics = map_parse_diagnostics(&result.diagnostics);
+    let has_errors = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error);
+    let names = result
+        .sources
+        .iter()
+        .map(|source| source.path.to_string_lossy())
+        .collect::<Vec<_>>();
+    let sources = result
+        .sources
+        .iter()
+        .zip(&names)
+        .map(|(source, name)| DiagnosticSource {
+            id: source.id,
+            name,
+            text: &source.text,
+        })
+        .collect::<Vec<_>>();
+    let format = if command.pretty() {
+        TscDiagnosticFormat::Pretty
+    } else {
+        TscDiagnosticFormat::PrettyFalse
+    };
+    CommandOutcome {
+        stderr: tsc_diagnostics::render(format, &diagnostics, &sources).into_bytes(),
+        exit_code: TscExitStatus::from_compilation(has_errors, result.emitted).code(),
+        ..CommandOutcome::default()
+    }
+}
+
+fn project_compile_error_outcome(error: ProjectCompileError) -> CommandOutcome {
+    match error {
+        unsupported @ ProjectCompileError::UnsupportedOption { .. } => {
+            not_implemented(&unsupported.to_string())
+        }
+        other => project_error_outcome(other.to_string()),
+    }
+}
+
+fn project_error_outcome(message: String) -> CommandOutcome {
+    CommandOutcome {
+        stderr: format!("error TS5083: {message}\n").into_bytes(),
+        exit_code: TscExitStatus::DiagnosticsPresentOutputsSkipped.code(),
+        ..CommandOutcome::default()
+    }
+}
+
+fn not_implemented(message: &str) -> CommandOutcome {
+    CommandOutcome {
+        stderr: format!("error TS5047: {message}\n").into_bytes(),
+        exit_code: TscExitStatus::NotImplemented.code(),
+        ..CommandOutcome::default()
+    }
 }
 
 fn levels(args: &CliArgs, project_root: &Path) -> Result<LintTable, DriverError> {
@@ -498,78 +852,34 @@ fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> 
     })
 }
 
-/// Maps the shared facade resolution error into the CLI's typed driver error,
-/// preserving the same variants the inlined code produced before unification.
-fn map_resolution_error(error: BamtsError) -> DriverError {
-    match error {
-        BamtsError::ReadConfig { path, source } => DriverError::ReadSource { path, source },
-        BamtsError::ProjectConfig { path, source } => DriverError::ProjectConfig {
-            path,
-            message: source.to_string(),
-        },
-        BamtsError::ProgramLoad(load_error) => DriverError::ProgramLoad(load_error),
-        BamtsError::Cancelled(_) => DriverError::Cancelled,
-        error => DriverError::UnexpectedResolution(error),
-    }
-}
-
-fn map_lower_error(error: ProgramLowerError) -> DriverError {
-    if matches!(error.kind, ProgramLowerErrorKind::Cancelled(_)) {
-        DriverError::Cancelled
-    } else {
-        DriverError::Lower(error)
-    }
-}
-
-fn map_jit_error(error: bamts_codegen::JitError) -> DriverError {
-    match error {
-        bamts_codegen::JitError::Cancelled
-        | bamts_codegen::JitError::Lower(bamts_codegen::ProgramLowerError {
-            kind: bamts_codegen::LowerError::Cancelled,
-            ..
-        }) => DriverError::Cancelled,
-        error => DriverError::Jit(error),
-    }
-}
-
-fn map_aot_error(error: bamts_codegen::AotError) -> DriverError {
-    match error {
-        bamts_codegen::AotError::Cancelled
-        | bamts_codegen::AotError::Lower(bamts_codegen::ProgramLowerError {
-            kind: bamts_codegen::LowerError::Cancelled,
-            ..
-        }) => DriverError::Cancelled,
-        error => DriverError::Aot(error),
-    }
-}
-
-fn map_native_error(error: bamts_runtime::NativeError) -> DriverError {
-    match error {
-        bamts_runtime::NativeError::Cancelled => DriverError::Cancelled,
-        error => DriverError::Native(error),
-    }
-}
-
 fn lower_options(args: &CliArgs) -> LowerOptions {
     LowerOptions {
         javascript_compatibility: args.js_compat.enabled,
+        ..LowerOptions::default()
     }
 }
 
-fn check(
-    args: &CliArgs,
-    frontend: &LoadedProgramFrontend,
-    cancel: &CancellationToken,
-) -> Result<CommandOutcome, DriverError> {
-    let (rendered, truncation) = require_clean_frontend(args, frontend, cancel)?;
+fn check(args: &CliArgs, frontend: &LoadedProgramFrontend) -> Result<CommandOutcome, DriverError> {
+    let diagnostics = render_program_diagnostics(args, frontend);
+    if frontend
+        .output
+        .modules()
+        .iter()
+        .any(|module| module.has_errors())
+    {
+        return Err(DriverError::Diagnostics {
+            rendered: diagnostics.text,
+            truncation: diagnostics.truncation,
+        });
+    }
     Ok(CommandOutcome {
-        stderr: rendered.into_bytes(),
-        truncation,
+        stderr: diagnostics.text.into_bytes(),
+        truncation: diagnostics.truncation,
         ..CommandOutcome::default()
     })
 }
 
-fn compile(
+fn compile_in_context_with_cancel(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
     context: &ExecutionContext,
@@ -589,14 +899,14 @@ fn compile(
     }
 
     let entrypoint = required_entrypoint(args)?;
-    let (warnings, truncation) = require_clean_frontend(args, frontend, cancel)?;
+    let warnings = require_clean_frontend(args, frontend)?;
     let executable = lower_program_with_cancel(
         &frontend.program,
         &frontend.output,
         lower_options(args),
         cancel,
     )
-    .map_err(map_lower_error)?;
+    .map_err(DriverError::Lower)?;
     if BUILD_TARGET != HOST_TARGET {
         return Err(DriverError::CrossTargetLink {
             host: HOST_TARGET,
@@ -604,120 +914,63 @@ fn compile(
         });
     }
     let object = bamts_codegen::compile_aot_with_cancel(executable.wire(), HOST_TARGET, cancel)
-        .map_err(map_aot_error)?;
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    let destination = output_path(args, entrypoint, context)?;
-    let cache = cache_capability(context)?;
-    #[cfg(windows)]
-    {
-        let invocation_dir = cache
-            .create_invocation_dir("bamts-compile")
-            .map_err(map_cache_root_error)?;
-        let staged = invocation_dir.path().join(format!(
-            "bamts-compile-{}{}",
-            std::process::id(),
-            std::env::consts::EXE_SUFFIX
-        ));
-        link_executable_with_cancel(&object.bytes, &staged, &cache, context, cancel)?;
-        cache
-            .verify_executable(&staged)
-            .map_err(map_cache_root_error)?;
-        fs::copy(&staged, &destination).map_err(|source| DriverError::PublishExecutable {
-            path: destination.clone(),
-            source,
+        .map_err(|error| match error {
+            bamts_codegen::AotError::Cancelled => DriverError::Cancelled,
+            error => DriverError::Aot(error),
         })?;
-    }
-    #[cfg(not(windows))]
-    link_executable_with_cancel(&object.bytes, &destination, &cache, context, cancel)?;
+    let destination = output_path(args, entrypoint, context)?;
+    link_executable(&object.bytes, &destination, context, cancel)?;
     Ok(CommandOutcome {
-        stderr: warnings.into_bytes(),
-        truncation,
+        stderr: warnings.text.into_bytes(),
+        truncation: warnings.truncation,
         ..CommandOutcome::default()
     })
 }
 
-fn run_with_cancel(
+fn run_in_context_with_cancel(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
     context: &ExecutionContext,
     cancel: &CancellationToken,
-) -> Result<(CommandOutcome, Option<AotPhaseTelemetry>), DriverError> {
+) -> Result<CommandOutcome, DriverError> {
     let entrypoint = required_entrypoint(args)?;
-    let (warnings, truncation) = require_clean_frontend(args, frontend, cancel)?;
+    let warnings = require_clean_frontend(args, frontend)?;
     let executable = lower_program_with_cancel(
         &frontend.program,
         &frontend.output,
         lower_options(args),
         cancel,
     )
-    .map_err(map_lower_error)?;
+    .map_err(DriverError::Lower)?;
     match args.target {
-        ExecutionTarget::Jit => Ok((
-            run_jit_with_cancel(
-                args,
-                entrypoint,
-                warnings,
-                truncation,
-                &executable,
-                context,
-                cancel,
-            )?,
-            None,
-        )),
-        ExecutionTarget::Aot => {
-            let (outcome, telemetry) = run_aot_with_cancel(
-                args,
-                entrypoint,
-                warnings,
-                truncation,
-                &executable,
-                context,
-                cancel,
-            )?;
-            Ok((outcome, Some(telemetry)))
-        }
+        ExecutionTarget::Jit => run_jit(args, entrypoint, warnings, &executable, context, cancel),
+        ExecutionTarget::Aot => run_aot(args, entrypoint, warnings, &executable, context, cancel),
     }
 }
 
-fn run_jit_with_cancel(
+fn run_jit(
     args: &CliArgs,
     entrypoint: &Path,
-    warnings: String,
-    truncation: Option<TruncationNotice>,
+    warnings: RenderedDiagnostics,
     executable: &bamts_compiler::program::ExecutableProgram,
     context: &ExecutionContext,
     cancel: &CancellationToken,
 ) -> Result<CommandOutcome, DriverError> {
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
     let program =
-        bamts_codegen::compile_jit_with_cancel(executable.wire(), cancel).map_err(map_jit_error)?;
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
+        bamts_codegen::compile_jit_with_cancel(executable.wire(), cancel).map_err(|error| {
+            match error {
+                bamts_codegen::JitError::Cancelled => DriverError::Cancelled,
+                error => DriverError::Jit(error),
+            }
+        })?;
     let mut host = bamts_node::NodeHost::new();
+    populate_node_environment(&mut host, context)?;
     host.set_script_compiler(Box::new(bamts::ScriptCompiler));
     host.set_argv(
         ["bamts".to_owned(), entrypoint.display().to_string()]
             .into_iter()
             .chain(args.program_args.iter().cloned()),
     );
-    for (name, value) in context.envs() {
-        cancel.check().map_err(|_| DriverError::Cancelled)?;
-        if name == OsStr::new(bamts_node::AOT_ENTRYPOINT_ENV)
-            || name == OsStr::new(bamts_node::AOT_LAUNCH_TOKEN_ENV)
-        {
-            continue;
-        }
-        let name = name
-            .to_str()
-            .ok_or_else(|| DriverError::NonUnicodeEnvironmentName {
-                name: name.to_os_string(),
-            })?;
-        let value = value
-            .to_str()
-            .ok_or_else(|| DriverError::NonUnicodeEnvironmentValue {
-                name: name.to_owned(),
-            })?;
-        host.set_env(name, value);
-    }
     let outcome = run_linked_program_with_cancel(
         executable.wire(),
         &program,
@@ -725,346 +978,269 @@ fn run_jit_with_cancel(
         &Limits::default(),
         cancel.clone(),
     )
-    .map_err(map_native_error)?;
+    .map_err(DriverError::Native)?;
     let mut stdout = host.stdout().to_vec();
     stdout.extend_from_slice(&outcome.stdout);
     let exit_code = host.completion_exit_code(outcome.exit_code);
-    let mut stderr = warnings.into_bytes();
+    let mut stderr = warnings.text.into_bytes();
     stderr.extend_from_slice(host.stderr());
     Ok(CommandOutcome {
         stdout,
         stderr,
         exit_code,
-        truncation,
+        truncation: warnings.truncation,
     })
 }
 
-fn run_aot_with_cancel(
+fn run_aot(
     args: &CliArgs,
     entrypoint: &Path,
-    warnings: String,
-    truncation: Option<TruncationNotice>,
+    warnings: RenderedDiagnostics,
     executable: &bamts_compiler::program::ExecutableProgram,
     context: &ExecutionContext,
     cancel: &CancellationToken,
-) -> Result<(CommandOutcome, AotPhaseTelemetry), DriverError> {
+) -> Result<CommandOutcome, DriverError> {
     if BUILD_TARGET != HOST_TARGET {
         return Err(DriverError::CrossTargetLink {
             host: HOST_TARGET,
             target: BUILD_TARGET,
         });
     }
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    let object_started = Instant::now();
     let object = bamts_codegen::compile_aot_with_cancel(executable.wire(), HOST_TARGET, cancel)
-        .map_err(map_aot_error)?;
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    let object_wall_ms = elapsed_ms(object_started);
+        .map_err(|error| match error {
+            bamts_codegen::AotError::Cancelled => DriverError::Cancelled,
+            error => DriverError::Aot(error),
+        })?;
     let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    let cache = cache_capability(context)?;
-    #[cfg(windows)]
-    let invocation_dir = cache
-        .create_invocation_dir("bamts-run")
-        .map_err(map_cache_root_error)?;
-    #[cfg(windows)]
-    let destination = invocation_dir.path().join(format!(
+    let root = cache_root(context)?;
+    let destination = root.join("run").join(format!(
         "bamts-run-{}-{id}{}",
         std::process::id(),
         std::env::consts::EXE_SUFFIX
     ));
-    #[cfg(not(windows))]
-    let destination = {
-        let run_dir = cache.root_path().join("run");
-        fs::create_dir_all(&run_dir).map_err(|source| DriverError::CreateDirectory {
-            path: run_dir.clone(),
-            source,
-        })?;
-        run_dir.join(format!(
-            "bamts-run-{}-{id}{}",
-            std::process::id(),
-            std::env::consts::EXE_SUFFIX
-        ))
-    };
-    require_within_cache_root(&destination, cache.root_path())?;
-    let link_started = Instant::now();
-    link_executable_with_cancel(&object.bytes, &destination, &cache, context, cancel)?;
-    let link_wall_ms = elapsed_ms(link_started);
+    require_within_cache_root(&destination, &root)?;
+    link_executable(&object.bytes, &destination, context, cancel)?;
+    let _published = claim_published_executable(&destination, cancel)?;
+    require_within_cache_root(&destination, &root)?;
     let launch_token = format!("{}-{id}", std::process::id());
-    let run_started = Instant::now();
-    let entrypoint_env = entrypoint.as_os_str();
-    let token_env = OsStr::new(&launch_token);
-    let token_arg = OsStr::new(&launch_token);
-    let extra_envs = [
-        (OsStr::new(bamts_node::AOT_ENTRYPOINT_ENV), entrypoint_env),
-        (OsStr::new(bamts_node::AOT_LAUNCH_TOKEN_ENV), token_env),
-    ];
-    let mut run_args: Vec<&OsStr> = vec![token_arg];
-    for arg in &args.program_args {
-        run_args.push(OsStr::new(arg));
-    }
-    let destination_os = destination.as_os_str();
-    #[cfg(windows)]
-    cache
-        .verify_executable(&destination)
-        .map_err(map_cache_root_error)?;
-    let capture = managed_capture(destination_os, &run_args, context, &extra_envs, cancel)
-        .map_err(|error| map_pk_run_error(error, destination_os));
-    let run_wall_ms = elapsed_ms(run_started);
-    let _ = fs::remove_file(&destination);
-    #[cfg(windows)]
-    invocation_dir.close_and_remove();
-    let capture = capture?;
-    let exit_code = capture.exit_code();
-    let mut stderr = warnings.into_bytes();
-    stderr.extend_from_slice(&capture.stderr);
-    let telemetry = AotPhaseTelemetry {
-        object_wall_ms,
-        link_wall_ms,
-        run_wall_ms,
-        rss_kb: peak_rss_kb().unwrap_or(0),
-    };
-    Ok((
-        CommandOutcome {
-            stdout: capture.stdout,
-            stderr,
-            exit_code,
-            truncation,
-        },
-        telemetry,
-    ))
-}
-
-/// Fractional milliseconds elapsed since `started`.
-fn elapsed_ms(started: Instant) -> f64 {
-    started.elapsed().as_secs_f64() * 1_000.0
-}
-
-/// Best-effort driver process peak RSS, in KiB, from `/proc/self/status`
-/// `VmHWM`. Returns `None` when the file or field is unavailable.
-fn peak_rss_kb() -> Option<u64> {
-    let content = fs::read_to_string("/proc/self/status").ok()?;
-    content.lines().find_map(|line| {
-        line.strip_prefix("VmHWM:")?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
-}
-
-/// Constructs an [`ExitStatus`] from processkit's portable code/signal pair.
-fn exit_status_from_parts(code: Option<i32>, signal: Option<i32>) -> ExitStatus {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        signal.map_or_else(
-            || ExitStatus::from_raw(code.unwrap_or(1) << 8),
-            ExitStatus::from_raw,
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        use std::os::windows::process::ExitStatusExt;
-        let _ = signal;
-        ExitStatus::from_raw(code.unwrap_or(1) as u32)
-    }
-}
-
-/// Captured output and process status from a processkit-managed child process.
-#[derive(Debug)]
-struct ManagedCapture {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    status: ExitStatus,
-}
-
-impl ManagedCapture {
-    fn exit_code(&self) -> i32 {
-        self.status.code().unwrap_or(1)
-    }
-}
-
-/// Spawns `program` inside a processkit kill-on-drop process group, capturing
-/// raw stdout and stderr bytes, and returns the exit code. The `bamts` token
-/// is bridged to a processkit `CancellationToken` inside a per-call current-
-/// thread Tokio runtime: a `tokio::select!` polls the bamts token and races it
-/// against the processkit run. When the bamts token fires, the processkit
-/// token is cancelled, which kills the whole descendant tree and surfaces
-/// [`PkErrorReason::Cancelled`].
-///
-/// `extra_envs` are set on top of the context's `env_clear` + `envs` baseline.
-fn managed_capture(
-    program: &OsStr,
-    args: &[&OsStr],
-    context: &ExecutionContext,
-    extra_envs: &[(&OsStr, &OsStr)],
-    cancel: &CancellationToken,
-) -> Result<ManagedCapture, processkit::Error> {
-    if cancel.is_cancelled() {
-        return Err(PkErrorReason::Cancelled {
-            program: program.to_string_lossy().into_owned(),
-        }
-        .into());
-    }
-
-    // output_bytes preserves stdout exactly but processkit's result stores
-    // stderr as decoded text. Redirect stderr to a child-owned temporary file
-    // so the CLI retains the raw bytes produced by std::Command::output.
-    let stderr_path = tempfile::Builder::new()
-        .prefix("bamts-stderr-")
-        .tempfile_in(context.temp_dir())
-        .map_err(PkErrorReason::Io)?
-        .into_temp_path();
-    let pk_token = PkCancellationToken::new();
-    let bamts_token = cancel.clone();
-    let result = std::thread::scope(|scope| -> Result<_, processkit::Error> {
-        let worker = std::thread::Builder::new()
-            .name("bamts-processkit".to_owned())
-            .spawn_scoped(scope, || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .map_err(|source| PkErrorReason::Io(io::Error::other(source)))?;
-                runtime.block_on(async {
-                    let command = build_pk_command(
-                        program,
-                        args,
-                        context,
-                        extra_envs,
-                        pk_token.clone(),
-                        stderr_path.as_ref(),
-                    );
-                    let run_fut = command.output_bytes();
-                    tokio::pin!(run_fut);
-
-                    tokio::select! {
-                        biased;
-                        _ = bridge_cancel(bamts_token, pk_token.clone()) => run_fut.await,
-                        result = &mut run_fut => result,
-                    }
-                })
-            })
-            .map_err(|source| processkit::Error::from(PkErrorReason::Io(source)))?;
-        worker.join().map_err(|_| {
-            processkit::Error::from(PkErrorReason::Io(io::Error::other(
-                "processkit worker thread panicked",
-            )))
-        })?
-    })?;
-    let stderr = fs::read(&stderr_path).map_err(PkErrorReason::Io)?;
-    let status = exit_status_from_parts(result.code(), result.signal());
-    Ok(ManagedCapture {
-        stdout: result.into_stdout(),
-        stderr,
-        status,
-    })
-}
-
-/// Builds a processkit [`PkCommand`] with `env_clear`, the context's envs,
-/// extra envs, the context's cwd, and the processkit cancel token.
-fn build_pk_command(
-    program: &OsStr,
-    args: &[&OsStr],
-    context: &ExecutionContext,
-    extra_envs: &[(&OsStr, &OsStr)],
-    pk_token: PkCancellationToken,
-    stderr_path: &Path,
-) -> PkCommand {
-    let mut command = PkCommand::new(program)
+    let mut command = Command::new(&destination);
+    command
         .current_dir(context.cwd())
         .env_clear()
-        .cancel_on(pk_token)
-        .stderr_file(stderr_path);
+        .envs(context.envs())
+        .env(bamts_node::AOT_ENTRYPOINT_ENV, entrypoint.as_os_str())
+        .env(bamts_node::AOT_LAUNCH_TOKEN_ENV, &launch_token)
+        .arg(launch_token)
+        .args(&args.program_args);
+    let output = capture_process_with_cancel(&mut command, cancel);
+    let output = output
+        .map_err(|source| DriverError::LinkStart {
+            program: destination.into_os_string(),
+            source,
+        })?
+        .ok_or(DriverError::Cancelled)?;
+    let mut stderr = warnings.text.into_bytes();
+    stderr.extend_from_slice(&output.stderr);
+    Ok(CommandOutcome {
+        stdout: output.stdout,
+        stderr,
+        exit_code: output.status.code().unwrap_or(1),
+        truncation: warnings.truncation,
+    })
+}
+#[derive(Debug)]
+struct PublishedExecutable {
+    path: PathBuf,
+}
+
+impl Drop for PublishedExecutable {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn claim_published_executable(
+    destination: &Path,
+    cancel: &CancellationToken,
+) -> Result<PublishedExecutable, DriverError> {
+    let published = PublishedExecutable {
+        path: destination.to_owned(),
+    };
+    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    Ok(published)
+}
+
+fn populate_node_environment(
+    host: &mut bamts_node::NodeHost,
+    context: &ExecutionContext,
+) -> Result<(), DriverError> {
     for (name, value) in context.envs() {
-        command = command.env(name, value);
+        let name = name
+            .to_str()
+            .ok_or(DriverError::NonUnicodeEnvironmentName)?;
+        let value = value
+            .to_str()
+            .ok_or_else(|| DriverError::NonUnicodeEnvironmentValue {
+                name: name.to_owned(),
+            })?;
+        host.set_env(name, value);
     }
-    for (name, value) in extra_envs {
-        command = command.env(name, value);
-    }
-    for arg in args {
-        command = command.arg(arg);
-    }
-    command
+    Ok(())
 }
 
-/// Polls the bamts token; when it fires, cancels the processkit token. The
-/// future resolves once the bamts token is cancelled (or never, if it isn't).
-async fn bridge_cancel(bamts_token: CancellationToken, pk_token: PkCancellationToken) {
+fn capture_process_with_cancel(
+    command: &mut Command,
+    cancel: &CancellationToken,
+) -> io::Result<Option<Output>> {
+    configure_managed_process(command);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = terminate_managed_process(&mut child);
+        return Err(io::Error::other("managed child stdout was not piped"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = terminate_managed_process(&mut child);
+        return Err(io::Error::other("managed child stderr was not piped"));
+    };
+    let (stdout_reader, stdout_completion) = spawn_child_pipe_reader(stdout);
+    let (stderr_reader, stderr_completion) = spawn_child_pipe_reader(stderr);
+
+    let mut status = None;
+    let mut stdout_complete = false;
+    let mut stderr_complete = false;
     loop {
-        if bamts_token.is_cancelled() {
-            pk_token.cancel();
-            return;
+        if cancel.is_cancelled() {
+            let _ = terminate_managed_process(&mut child);
+            let _ = join_child_pipe(stdout_reader);
+            let _ = join_child_pipe(stderr_reader);
+            return Ok(None);
         }
-        // Bounded polling: check the bamts token at a 10 ms interval. The
-        // sleep yields to the runtime so the run future is polled between
-        // checks. No separate monitor task is spawned — the select! drives
-        // both arms in the current task, and the bridge resolves as soon as
-        // the bamts token fires or the run completes (whichever arm wins).
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-fn copy_io_error(source: &io::Error) -> io::Error {
-    io::Error::new(source.kind(), source.to_string())
-}
-
-/// Maps a processkit error to a [`DriverError`] for linker invocations.
-fn map_pk_link_error(error: processkit::Error, program: &OsStr) -> DriverError {
-    match error.reason() {
-        PkErrorReason::Cancelled { .. } => DriverError::Cancelled,
-        PkErrorReason::NotFound { .. } => DriverError::ToolchainMissing {
-            program: program.to_os_string(),
-        },
-        PkErrorReason::Spawn { source, .. } | PkErrorReason::Io(source) => DriverError::LinkStart {
-            program: program.to_os_string(),
-            source: copy_io_error(source),
-        },
-        _ => DriverError::LinkStart {
-            program: program.to_os_string(),
-            source: io::Error::other(error.to_string()),
-        },
-    }
-}
-
-/// Maps a processkit error to a [`DriverError`] for toolchain probe
-/// invocations.
-fn map_pk_probe_error(error: processkit::Error, program: &OsStr) -> DriverError {
-    match error.reason() {
-        PkErrorReason::Cancelled { .. } => DriverError::Cancelled,
-        PkErrorReason::NotFound { .. } => DriverError::ToolchainMissing {
-            program: program.to_os_string(),
-        },
-        PkErrorReason::Spawn { source, .. } | PkErrorReason::Io(source) => {
-            DriverError::ToolchainProbe {
-                program: program.to_os_string(),
-                source: copy_io_error(source),
+        for (completion, complete) in [
+            (&stdout_completion, &mut stdout_complete),
+            (&stderr_completion, &mut stderr_complete),
+        ] {
+            if !*complete {
+                match completion.try_recv() {
+                    Ok(Ok(())) => *complete = true,
+                    Ok(Err(error)) => {
+                        let _ = terminate_managed_process(&mut child);
+                        let _ = join_child_pipe(stdout_reader);
+                        let _ = join_child_pipe(stderr_reader);
+                        return Err(error);
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        let _ = terminate_managed_process(&mut child);
+                        let stdout = join_child_pipe(stdout_reader);
+                        let stderr = join_child_pipe(stderr_reader);
+                        return stdout.and(stderr).map(|_| None);
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
             }
         }
-        _ => DriverError::ToolchainProbe {
-            program: program.to_os_string(),
-            source: io::Error::other(error.to_string()),
-        },
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(child_status) => status = child_status,
+                Err(error) => {
+                    let _ = terminate_managed_process(&mut child);
+                    let _ = join_child_pipe(stdout_reader);
+                    let _ = join_child_pipe(stderr_reader);
+                    return Err(error);
+                }
+            }
+        }
+        if status.is_some() && stdout_complete && stderr_complete {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
+    Ok(Some(Output {
+        status: status.expect("managed child status is present after loop"),
+        stdout: join_child_pipe(stdout_reader)?,
+        stderr: join_child_pipe(stderr_reader)?,
+    }))
 }
 
-/// Maps a processkit error to a [`DriverError`] for AOT program execution.
-fn map_pk_run_error(error: processkit::Error, program: &OsStr) -> DriverError {
-    match error.reason() {
-        PkErrorReason::Cancelled { .. } => DriverError::Cancelled,
-        PkErrorReason::NotFound { .. } => DriverError::LinkStart {
-            program: program.to_os_string(),
-            source: io::Error::from(io::ErrorKind::NotFound),
-        },
-        PkErrorReason::Spawn { source, .. } | PkErrorReason::Io(source) => DriverError::LinkStart {
-            program: program.to_os_string(),
-            source: copy_io_error(source),
-        },
-        _ => DriverError::LinkStart {
-            program: program.to_os_string(),
-            source: io::Error::other(error.to_string()),
-        },
+fn spawn_child_pipe_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> (
+    thread::JoinHandle<io::Result<Vec<u8>>>,
+    Receiver<io::Result<()>>,
+) {
+    let (completion_sender, completion_receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = pipe.read_to_end(&mut bytes);
+        let completion = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()));
+        let _ = completion_sender.send(completion);
+        result.map(|_| bytes)
+    });
+    (reader, completion_receiver)
+}
+
+#[cfg(unix)]
+fn configure_managed_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_managed_process(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_managed_process(child: &mut std::process::Child) -> io::Result<()> {
+    let group = rustix::process::Pid::from_child(child);
+    let terminated = rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+        .map_err(|source| {
+            io::Error::other(format!(
+                "cannot terminate managed process group {group}: {source}"
+            ))
+        });
+    if terminated.is_err() {
+        let _ = child.kill();
     }
+    let waited = child.wait().map(|_| ());
+    terminated.and(waited)
+}
+
+#[cfg(windows)]
+fn terminate_managed_process(child: &mut std::process::Child) -> io::Result<()> {
+    let pid = child.id().to_string();
+    let terminated = Command::new("taskkill")
+        .args(["/PID", &pid, "/T", "/F"])
+        .status()
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "cannot terminate managed process tree {pid}: taskkill exited with {status}"
+                )))
+            }
+        });
+    if terminated.is_err() {
+        let _ = child.kill();
+    }
+    let waited = child.wait().map(|_| ());
+    terminated.and(waited)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn terminate_managed_process(child: &mut std::process::Child) -> io::Result<()> {
+    child.kill()?;
+    child.wait().map(|_| ())
+}
+
+fn join_child_pipe(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("managed child pipe reader panicked"))?
 }
 
 fn required_entrypoint(args: &CliArgs) -> Result<&Path, DriverError> {
@@ -1099,192 +1275,149 @@ fn output_path(
     Ok(entrypoint.with_file_name(file_name))
 }
 
-fn link_executable_with_cancel(
+fn link_executable(
     object: &[u8],
     destination: &Path,
-    cache: &PrivateCacheRoot,
     context: &ExecutionContext,
     cancel: &CancellationToken,
 ) -> Result<(), DriverError> {
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| DriverError::CreateDirectory {
         path: parent.to_owned(),
         source,
     })?;
-    let archive = cached_node_archive(cache)?;
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    let compiler = discover_toolchain_with_cancel(context, cancel)?;
-    let mut temporary = TemporaryLinkFiles::create(parent, destination)?;
-    temporary
-        .object_file
-        .write_all(object)
-        .and_then(|()| temporary.object_file.sync_all())
-        .map_err(|source| DriverError::WriteObject {
-            path: temporary.object.clone(),
-            source,
-        })?;
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
+    let archive = cached_node_archive(context)?;
+    let compiler = discover_toolchain(context, cancel)?;
+    let temporary = TemporaryLinkFiles::create(parent, destination)?;
+    fs::write(&temporary.object, object).map_err(|source| DriverError::WriteObject {
+        path: temporary.object.clone(),
+        source,
+    })?;
 
-    let mut link_args = vec![
-        temporary.object.as_os_str(),
-        archive.path().as_os_str(),
-        OsStr::new("-o"),
-        temporary.executable.as_os_str(),
-    ];
-    let extra: Vec<OsString>;
+    let mut command = Command::new(&compiler);
+    command
+        .current_dir(context.cwd())
+        .env_clear()
+        .envs(context.envs())
+        .arg(&temporary.object)
+        .arg(&archive)
+        .arg("-o")
+        .arg(&temporary.executable);
     if cfg!(target_os = "linux") {
-        extra = ["-ldl", "-lpthread", "-lm"]
-            .iter()
-            .map(|s| OsString::from(*s))
-            .collect();
-        for arg in &extra {
-            link_args.push(arg.as_os_str());
-        }
+        command.args(["-ldl", "-lpthread", "-lm"]);
     }
-    let capture = managed_capture(&compiler, &link_args, context, &[], cancel)
-        .map_err(|error| map_pk_link_error(error, &compiler))?;
-    if !capture.status.success() {
+    let output = capture_process_with_cancel(&mut command, cancel)
+        .map_err(|source| DriverError::LinkStart {
+            program: compiler.clone(),
+            source,
+        })?
+        .ok_or(DriverError::Cancelled)?;
+    if !output.status.success() {
         return Err(DriverError::LinkFailed {
             program: compiler,
-            status: capture.status,
-            stderr: String::from_utf8_lossy(&capture.stderr).into_owned(),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
     publish_linked_executable(&temporary.executable, destination)
 }
 
-#[cfg(test)]
-fn discover_toolchain(context: &ExecutionContext) -> Result<OsString, DriverError> {
-    discover_toolchain_with_cancel(context, &CancellationToken::new())
-}
-
-fn discover_toolchain_with_cancel(
+fn discover_toolchain(
     context: &ExecutionContext,
     cancel: &CancellationToken,
 ) -> Result<OsString, DriverError> {
     let program = context
         .env("CC")
-        .map(OsStr::to_os_string)
-        .unwrap_or_else(|| OsString::from("cc"));
-    probe_toolchain_with_cancel(program, context, cancel)
+        .map_or_else(|| OsString::from("cc"), OsStr::to_os_string);
+    probe_toolchain_in_context(program, context, cancel)
 }
 
-#[cfg(test)]
-fn probe_toolchain(program: OsString, context: &ExecutionContext) -> Result<OsString, DriverError> {
-    probe_toolchain_with_cancel(program, context, &CancellationToken::new())
-}
-
-fn probe_toolchain_with_cancel(
+fn probe_toolchain_in_context(
     program: OsString,
     context: &ExecutionContext,
     cancel: &CancellationToken,
 ) -> Result<OsString, DriverError> {
-    let probe_args = [OsStr::new("--version")];
-    match managed_capture(&program, &probe_args, context, &[], cancel) {
-        Ok(capture) if capture.status.success() => Ok(program),
-        Ok(capture) => Err(DriverError::ToolchainRejected {
+    let mut command = Command::new(&program);
+    command
+        .current_dir(context.cwd())
+        .env_clear()
+        .envs(context.envs())
+        .arg("--version");
+    match capture_process_with_cancel(&mut command, cancel) {
+        Ok(Some(output)) if output.status.success() => Ok(program),
+        Ok(Some(output)) => Err(DriverError::ToolchainRejected {
             program,
-            status: capture.status,
+            status: output.status,
         }),
-        Err(error) => Err(map_pk_probe_error(error, &program)),
+        Ok(None) => Err(DriverError::Cancelled),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Err(DriverError::ToolchainMissing { program })
+        }
+        Err(source) => Err(DriverError::ToolchainProbe { program, source }),
     }
 }
 
-fn cached_node_archive(cache: &PrivateCacheRoot) -> Result<HeldArchive, DriverError> {
+#[cfg(test)]
+fn probe_toolchain(program: OsString) -> Result<OsString, DriverError> {
+    let context = ExecutionContext::ambient()?;
+    probe_toolchain_in_context(program, &context, &CancellationToken::new())
+}
+fn cached_node_archive(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    let cache_dir = cache_root(context)?.join("runtime");
+    fs::create_dir_all(&cache_dir).map_err(|source| DriverError::CacheArchive {
+        path: cache_dir.clone(),
+        source,
+    })?;
     let extension = if cfg!(target_env = "msvc") {
         "lib"
     } else {
         "a"
     };
-    let file_name = format!(
+    let path = cache_dir.join(format!(
         "bamts-node-{:016x}.{extension}",
         content_hash(NODE_STATICLIB)
-    );
-
-    #[cfg(windows)]
-    {
-        let cache_dir = cache
-            .guard_child_dir(OsStr::new("runtime"))
-            .map_err(map_cache_archive_error)?;
-        return cache
-            .materialize_archive(&cache_dir, &file_name, NODE_STATICLIB)
-            .map_err(map_cache_archive_error);
+    ));
+    if path.is_file() {
+        return Ok(path);
     }
-
-    #[cfg(not(windows))]
-    {
-        let cache_dir = cache.root_path().join("runtime");
-        fs::create_dir_all(&cache_dir).map_err(|source| DriverError::CacheArchive {
-            path: cache_dir.clone(),
-            source,
-        })?;
-        let path = cache_dir.join(file_name);
-        if path.is_file() {
-            return Ok(HeldArchive::from_prevalidated(path));
-        }
-        let (temporary, mut file) = loop {
-            let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let temporary =
-                path.with_extension(format!("{extension}.{}.{}.tmp", std::process::id(), id));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-            {
-                Ok(file) => break (temporary, file),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(source) => {
-                    return Err(DriverError::CacheArchive {
-                        path: temporary,
-                        source,
-                    });
-                }
-            }
-        };
-        if let Err(error) = write_cached_archive(&mut file, &temporary) {
-            drop(file);
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
-        drop(file);
-        match fs::rename(&temporary, &path) {
-            Ok(()) => Ok(HeldArchive::from_prevalidated(path)),
-            Err(_error) if path.is_file() => {
-                let _ = fs::remove_file(&temporary);
-                Ok(HeldArchive::from_prevalidated(path))
-            }
+    let (temporary, mut file) = loop {
+        let id = NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary =
+            path.with_extension(format!("{extension}.{}.{}.tmp", std::process::id(), id));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
-                let _ = fs::remove_file(&temporary);
-                Err(DriverError::CacheArchive { path, source })
+                return Err(DriverError::CacheArchive {
+                    path: temporary,
+                    source,
+                });
             }
+        }
+    };
+    if let Err(error) = write_cached_archive(&mut file, &temporary) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    match fs::rename(&temporary, &path) {
+        Ok(()) => Ok(path),
+        Err(_error) if path.is_file() => {
+            let _ = fs::remove_file(&temporary);
+            Ok(path)
+        }
+        Err(source) => {
+            let _ = fs::remove_file(&temporary);
+            Err(DriverError::CacheArchive { path, source })
         }
     }
 }
 
-#[cfg(windows)]
-fn map_cache_root_error(error: CacheGuardError) -> DriverError {
-    match error {
-        CacheGuardError::Io { path, source } => DriverError::CreateDirectory { path, source },
-        error => DriverError::UnsafeFallbackCacheRoot {
-            path: error.path().to_owned(),
-        },
-    }
-}
-
-#[cfg(windows)]
-fn map_cache_archive_error(error: CacheGuardError) -> DriverError {
-    match error {
-        CacheGuardError::Io { path, source } => DriverError::CacheArchive { path, source },
-        error => DriverError::CacheArchive {
-            path: error.path().to_owned(),
-            source: io::Error::other(error.to_string()),
-        },
-    }
-}
-
-#[cfg(not(windows))]
 fn write_cached_archive(file: &mut File, path: &Path) -> Result<(), DriverError> {
     file.write_all(NODE_STATICLIB)
         .and_then(|()| file.sync_all())
@@ -1294,76 +1427,46 @@ fn write_cached_archive(file: &mut File, path: &Path) -> Result<(), DriverError>
         })
 }
 
-fn cache_capability(context: &ExecutionContext) -> Result<PrivateCacheRoot, DriverError> {
-    cache_capability_from_env_values(
-        context.env("BAMTS_CACHE_DIR"),
-        context.env("XDG_CACHE_HOME"),
-        context.env("HOME"),
+fn cache_root(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    if let Some(path) = context.env("BAMTS_CACHE_DIR") {
+        return Ok(context.resolve_path(path));
+    }
+    if let Some(path) = context.env("XDG_CACHE_HOME") {
+        return Ok(context.resolve_path(path).join("bamts"));
+    }
+    if let Some(path) = context.env("HOME") {
+        return Ok(context.resolve_path(path).join(".cache/bamts"));
+    }
+    ensure_private_fallback_cache_root_in_context(
+        fallback_cache_root_path_in_context(context)?,
         context,
     )
 }
 
-#[cfg(test)]
-fn cache_root(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
-    cache_capability(context).map(|cache| cache.root_path().to_owned())
-}
-
-#[cfg(test)]
-fn cache_root_from_env_values(
-    bamts_cache_dir: Option<&OsStr>,
-    xdg_cache_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-    context: &ExecutionContext,
-) -> Result<PathBuf, DriverError> {
-    cache_capability_from_env_values(bamts_cache_dir, xdg_cache_home, home, context)
-        .map(|cache| cache.root_path().to_owned())
-}
-
-fn cache_capability_from_env_values(
-    bamts_cache_dir: Option<&OsStr>,
-    xdg_cache_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-    context: &ExecutionContext,
-) -> Result<PrivateCacheRoot, DriverError> {
-    if let Some(path) = bamts_cache_dir {
-        return ensure_private_cache_capability(context.resolve_path(path), context);
-    }
-    if let Some(path) = xdg_cache_home {
-        return ensure_private_cache_capability(context.resolve_path(path).join("bamts"), context);
-    }
-    if let Some(path) = home {
-        match ensure_private_cache_capability(
-            context.resolve_path(path).join(".cache/bamts"),
-            context,
-        ) {
-            Ok(root) => return Ok(root),
-            Err(DriverError::UnsafeFallbackCacheRoot { .. }) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    ensure_private_cache_capability(fallback_cache_root_path(context)?, context)
-}
-
 #[cfg(unix)]
-fn fallback_cache_root_path(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
-    let parent = validate_private_cache_parent_chain(context.temp_dir(), context)?;
-    Ok(parent.join(format!("bamts-cache-{}", fallback_cache_user_key(context)?)))
+fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    let parent = validate_fallback_parent_chain_in_context(context.temp_dir(), context)?;
+    Ok(parent.join(format!(
+        "bamts-cache-{}",
+        fallback_cache_user_key_in_context(context)?
+    )))
 }
 
 #[cfg(not(unix))]
-fn fallback_cache_root_path(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
-    Ok(context
-        .temp_dir()
-        .join(format!("bamts-cache-{}", fallback_cache_user_key(context)?)))
+fn fallback_cache_root_path_in_context(context: &ExecutionContext) -> Result<PathBuf, DriverError> {
+    Ok(context.temp_dir().join(format!(
+        "bamts-cache-{}",
+        fallback_cache_user_key_in_context(context)?
+    )))
 }
 
 #[cfg(unix)]
-fn fallback_cache_user_key(context: &ExecutionContext) -> Result<String, DriverError> {
-    Ok(effective_uid(context)?.to_string())
+fn fallback_cache_user_key_in_context(context: &ExecutionContext) -> Result<String, DriverError> {
+    Ok(effective_uid_in_context(context)?.to_string())
 }
 
-#[cfg(all(not(unix), not(windows)))]
-fn fallback_cache_user_key(context: &ExecutionContext) -> Result<String, DriverError> {
+#[cfg(not(unix))]
+fn fallback_cache_user_key_in_context(context: &ExecutionContext) -> Result<String, DriverError> {
     Ok(context
         .env("USERNAME")
         .or_else(|| context.env("USER"))
@@ -1372,82 +1475,50 @@ fn fallback_cache_user_key(context: &ExecutionContext) -> Result<String, DriverE
         .unwrap_or_else(|| "default".to_owned()))
 }
 
-#[cfg(windows)]
-fn fallback_cache_user_key(_context: &ExecutionContext) -> Result<String, DriverError> {
-    PrivateCacheRoot::fallback_user_key().map_err(map_cache_root_error)
+#[cfg(all(test, unix))]
+fn fallback_cache_root_path() -> Result<PathBuf, DriverError> {
+    let context = ExecutionContext::ambient()?;
+    fallback_cache_root_path_in_context(&context)
 }
 
-fn ensure_private_cache_capability(
-    path: PathBuf,
-    context: &ExecutionContext,
-) -> Result<PrivateCacheRoot, DriverError> {
-    #[cfg(windows)]
-    {
-        let _ = context;
-        return PrivateCacheRoot::acquire(&path).map_err(map_cache_root_error);
-    }
-
-    #[cfg(not(windows))]
-    {
-        ensure_private_cache_root(path, context).map(PrivateCacheRoot::from_prevalidated)
-    }
-}
-#[cfg(not(windows))]
-fn ensure_private_cache_root(
+fn ensure_private_fallback_cache_root_in_context(
     path: PathBuf,
     context: &ExecutionContext,
 ) -> Result<PathBuf, DriverError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
-
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-
-    if let Err(source) = fs::create_dir_all(parent)
-        && source.kind() != io::ErrorKind::AlreadyExists
-    {
-        return Err(DriverError::CreateDirectory {
-            path: parent.to_owned(),
-            source,
-        });
-    }
-
     #[cfg(unix)]
     let path = {
-        let canonical_parent = validate_private_cache_parent_chain(parent, context)?;
-        canonical_parent.join(name)
+        let parent = path
+            .parent()
+            .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot { path: path.clone() })?;
+        validate_fallback_parent_chain_in_context(parent, context)?.join(name)
     };
-
-    match create_private_cache_dir(&path) {
+    match create_private_fallback_dir(&path) {
         Ok(()) => {}
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
         Err(source) => {
             return Err(DriverError::CreateDirectory { path, source });
         }
     }
-    validate_private_cache_dir(&path, context)?;
+    validate_private_fallback_dir_in_context(&path, context)?;
     Ok(path)
 }
+
 #[cfg(unix)]
-fn create_private_cache_dir(path: &Path) -> io::Result<()> {
+fn create_private_fallback_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new().mode(0o700).create(path)
 }
 
-#[cfg(all(not(unix), not(windows)))]
-fn create_private_cache_dir(path: &Path) -> io::Result<()> {
+#[cfg(not(unix))]
+fn create_private_fallback_dir(path: &Path) -> io::Result<()> {
     fs::create_dir(path)
 }
 
 #[cfg(unix)]
-fn validate_private_cache_parent_chain(
+fn validate_fallback_parent_chain_in_context(
     path: &Path,
     context: &ExecutionContext,
 ) -> Result<PathBuf, DriverError> {
@@ -1457,7 +1528,7 @@ fn validate_private_cache_parent_chain(
         path: path.to_owned(),
         source,
     })?;
-    let euid = effective_uid(context)?;
+    let euid = effective_uid_in_context(context)?;
     for ancestor in canonical.ancestors() {
         let metadata =
             fs::symlink_metadata(ancestor).map_err(|source| DriverError::CreateDirectory {
@@ -1478,14 +1549,17 @@ fn validate_private_cache_parent_chain(
 }
 
 #[cfg(unix)]
-fn validate_private_cache_dir(path: &Path, context: &ExecutionContext) -> Result<(), DriverError> {
+fn validate_private_fallback_dir_in_context(
+    path: &Path,
+    context: &ExecutionContext,
+) -> Result<(), DriverError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(path).map_err(|source| DriverError::CreateDirectory {
         path: path.to_owned(),
         source,
     })?;
-    let euid = effective_uid(context)?;
+    let euid = effective_uid_in_context(context)?;
     let permissions = metadata.permissions().mode() & 0o777;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
@@ -1499,8 +1573,11 @@ fn validate_private_cache_dir(path: &Path, context: &ExecutionContext) -> Result
     Ok(())
 }
 
-#[cfg(all(not(unix), not(windows)))]
-fn validate_private_cache_dir(path: &Path, _context: &ExecutionContext) -> Result<(), DriverError> {
+#[cfg(not(unix))]
+fn validate_private_fallback_dir_in_context(
+    path: &Path,
+    _context: &ExecutionContext,
+) -> Result<(), DriverError> {
     let metadata = fs::metadata(path).map_err(|source| DriverError::CreateDirectory {
         path: path.to_owned(),
         source,
@@ -1513,17 +1590,28 @@ fn validate_private_cache_dir(path: &Path, _context: &ExecutionContext) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
+fn ensure_private_fallback_cache_root(path: PathBuf) -> Result<PathBuf, DriverError> {
+    let context = ExecutionContext::ambient()?;
+    ensure_private_fallback_cache_root_in_context(path, &context)
+}
+
+#[cfg(all(test, unix))]
+fn validate_fallback_parent_chain(path: &Path) -> Result<PathBuf, DriverError> {
+    let context = ExecutionContext::ambient()?;
+    validate_fallback_parent_chain_in_context(path, &context)
+}
 /// Probe the effective user id without `unsafe` through an atomic random file.
 #[cfg(unix)]
-fn effective_uid(context: &ExecutionContext) -> Result<u32, DriverError> {
+fn effective_uid_in_context(context: &ExecutionContext) -> Result<u32, DriverError> {
     use std::os::unix::fs::MetadataExt;
 
-    let parent = context.temp_dir();
+    let parent = context.temp_dir().to_owned();
     let probe = tempfile::Builder::new()
         .prefix(".bamts-euid-")
-        .tempfile_in(parent)
+        .tempfile_in(&parent)
         .map_err(|source| DriverError::CreateDirectory {
-            path: parent.to_path_buf(),
+            path: parent,
             source,
         })?;
     probe
@@ -1536,26 +1624,14 @@ fn effective_uid(context: &ExecutionContext) -> Result<u32, DriverError> {
         })
 }
 
-/// Verify that the resolved parent directory of `path` is genuinely inside
-/// `root` on the filesystem, not just lexically. `root/run` being a symlink
-/// into a directory somebody else controls would pass a pure `starts_with`
-/// check; canonicalizing both paths and comparing catches that escape.
+#[cfg(test)]
+fn effective_uid() -> Result<u32, DriverError> {
+    let context = ExecutionContext::ambient()?;
+    effective_uid_in_context(&context)
+}
+
 fn require_within_cache_root(path: &Path, root: &Path) -> Result<(), DriverError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| DriverError::UnsafeFallbackCacheRoot {
-            path: path.to_owned(),
-        })?;
-    let canonical_parent =
-        fs::canonicalize(parent).map_err(|source| DriverError::CreateDirectory {
-            path: parent.to_owned(),
-            source,
-        })?;
-    let canonical_root = fs::canonicalize(root).map_err(|source| DriverError::CreateDirectory {
-        path: root.to_owned(),
-        source,
-    })?;
-    if canonical_parent.starts_with(&canonical_root) {
+    if path.starts_with(root) {
         Ok(())
     } else {
         Err(DriverError::UnsafeFallbackCacheRoot {
@@ -1577,7 +1653,6 @@ const fn content_hash(bytes: &[u8]) -> u64 {
 
 struct TemporaryLinkFiles {
     object: PathBuf,
-    object_file: File,
     executable: PathBuf,
 }
 
@@ -1595,10 +1670,9 @@ impl TemporaryLinkFiles {
                 .create_new(true)
                 .open(&object)
             {
-                Ok(object_file) => {
+                Ok(_) => {
                     return Ok(Self {
                         object,
-                        object_file,
                         executable: parent.join(format!("{prefix}.out")),
                     });
                 }
@@ -1653,17 +1727,21 @@ struct LoadedProgramFrontend {
     output: ProgramFrontendOutput,
 }
 
-fn load_program_frontend_with_cancel(
+fn load_program_frontend(args: &CliArgs) -> Result<LoadedProgramFrontend, DriverError> {
+    let context = ExecutionContext::ambient()?;
+    load_program_frontend_in_context_with_cancel(args, &context, &CancellationToken::new())
+}
+
+fn load_program_frontend_in_context_with_cancel(
     args: &CliArgs,
     context: &ExecutionContext,
     cancel: &CancellationToken,
 ) -> Result<LoadedProgramFrontend, DriverError> {
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
     if !args.extra_inputs.is_empty() {
         return Err(DriverError::MultipleCompileInputs);
     }
     let entrypoint = required_entrypoint(args)?;
-    let current_directory = context.cwd();
+    let current_directory = context.cwd().to_owned();
     let absolute_entrypoint = if entrypoint.is_absolute() {
         entrypoint.to_path_buf()
     } else {
@@ -1674,89 +1752,149 @@ fn load_program_frontend_with_cancel(
             path: absolute_entrypoint,
             source,
         })?;
-    let fallback_root = if absolute_entrypoint.starts_with(current_directory) {
-        current_directory.to_path_buf()
+    let fallback_root = if absolute_entrypoint.starts_with(&current_directory) {
+        current_directory
     } else {
         absolute_entrypoint
             .parent()
             .unwrap_or_else(|| Path::new("/"))
             .to_path_buf()
     };
-    let mut resolved = resolve_project_with_cancel(&absolute_entrypoint, fallback_root, cancel)
-        .map_err(map_resolution_error)?;
-    if args.js_compat.check_js {
-        resolved.program.enable_javascript_checking();
-    }
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    let levels = levels(args, resolved.root.path())?;
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    let output = compile_program_frontend_with_cancel(
-        &resolved.program,
-        FrontendMode::Check,
-        &levels,
-        cancel,
-    )
-    .map_err(|_| DriverError::Cancelled)?;
-    Ok(LoadedProgramFrontend {
-        program: resolved.program,
-        output,
-    })
+    let project = discover_project(&absolute_entrypoint, fallback_root);
+    let canonical_root = fs::canonicalize(project.root())
+        .map_err(|error| DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(error)))?;
+    let root = ProjectRoot::new(canonical_root).map_err(|error| {
+        DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            error,
+        )))
+    })?;
+    let config_path = project.config().to_owned();
+    let config_source = if config_path.is_file() {
+        fs::read_to_string(&config_path).map_err(|source| DriverError::ReadSource {
+            path: config_path.clone(),
+            source,
+        })?
+    } else {
+        "{}".to_owned()
+    };
+    let config = ProjectConfig::parse(&root, &config_path, &config_source).map_err(|error| {
+        DriverError::ProjectConfig {
+            path: config_path,
+            message: error.to_string(),
+        }
+    })?;
+    let loader = ProgramLoader::new(&root, config.options()).map_err(DriverError::ProgramLoad)?;
+    let program = loader
+        .load_with_cancel(&absolute_entrypoint, cancel)
+        .map_err(DriverError::ProgramLoad)?;
+    let levels = levels(args, root.path())?;
+    let output =
+        compile_program_frontend_with_cancel(&program, FrontendMode::Check, &levels, cancel)
+            .map_err(|_| DriverError::Cancelled)?;
+    Ok(LoadedProgramFrontend { program, output })
 }
 
+struct RenderedDiagnostics {
+    text: String,
+    truncation: Option<TruncationNotice>,
+}
 fn render_program_diagnostics(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
-    cancel: &CancellationToken,
-) -> Result<(String, Option<TruncationNotice>), DriverError> {
-    let mut diagnostics = Vec::new();
-    for module in frontend.output.modules() {
-        cancel.check().map_err(|_| DriverError::Cancelled)?;
-        for diagnostic in module.diagnostics() {
-            cancel.check().map_err(|_| DriverError::Cancelled)?;
-            diagnostics.push(diagnostic.clone());
-        }
-    }
-    let mut names = Vec::with_capacity(frontend.program.modules().len());
-    for module in frontend.program.modules() {
-        cancel.check().map_err(|_| DriverError::Cancelled)?;
-        names.push(module.path().to_string_lossy());
-    }
-    let mut sources = Vec::with_capacity(frontend.program.modules().len());
-    for (module, name) in frontend.program.modules().iter().zip(&names) {
-        cancel.check().map_err(|_| DriverError::Cancelled)?;
-        sources.push(DiagnosticSource {
+) -> RenderedDiagnostics {
+    let diagnostics = frontend
+        .output
+        .modules()
+        .iter()
+        .flat_map(|module| module.diagnostics().iter().cloned())
+        .collect::<Vec<_>>();
+    let names = frontend
+        .program
+        .modules()
+        .iter()
+        .map(|module| module.path().to_string_lossy())
+        .collect::<Vec<_>>();
+    let sources = frontend
+        .program
+        .modules()
+        .iter()
+        .zip(&names)
+        .map(|(module, name)| DiagnosticSource {
             id: module.source_id(),
             name,
             text: module.source(),
-        });
-    }
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    let rendered = diagnostics::render_report(
+        })
+        .collect::<Vec<_>>();
+    let (text, truncation) = diagnostics::render_report(
         args.diagnostics_format,
         &DiagnosticReport::new(&diagnostics),
         &sources,
         args.error_limit,
     );
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    Ok(rendered)
+    RenderedDiagnostics { text, truncation }
+}
+
+fn render_tsc_program_diagnostics(
+    command: &ParsedTscCommand,
+    frontend: &LoadedProgramFrontend,
+) -> (String, bool) {
+    let native = frontend
+        .output
+        .modules()
+        .iter()
+        .flat_map(|module| module.diagnostics().iter().cloned())
+        .collect::<Vec<Diagnostic>>();
+    let diagnostics = map_parse_diagnostics(&native);
+    let has_errors = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Error);
+    let names = frontend
+        .program
+        .modules()
+        .iter()
+        .map(|module| module.path().to_string_lossy())
+        .collect::<Vec<_>>();
+    let sources = frontend
+        .program
+        .modules()
+        .iter()
+        .zip(&names)
+        .map(|(module, name)| DiagnosticSource {
+            id: module.source_id(),
+            name,
+            text: module.source(),
+        })
+        .collect::<Vec<_>>();
+    let format = if command.pretty() {
+        TscDiagnosticFormat::Pretty
+    } else {
+        TscDiagnosticFormat::PrettyFalse
+    };
+    (
+        tsc_diagnostics::render(format, &diagnostics, &sources),
+        has_errors,
+    )
 }
 
 fn require_clean_frontend(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
-    cancel: &CancellationToken,
-) -> Result<(String, Option<TruncationNotice>), DriverError> {
-    let (rendered, truncation) = render_program_diagnostics(args, frontend, cancel)?;
-    for module in frontend.output.modules() {
-        cancel.check().map_err(|_| DriverError::Cancelled)?;
-        if module.has_errors() {
-            return Err(DriverError::Diagnostics {
-                rendered,
-                truncation,
-            });
-        }
+) -> Result<RenderedDiagnostics, DriverError> {
+    let diagnostics = render_program_diagnostics(args, frontend);
+    if frontend
+        .output
+        .modules()
+        .iter()
+        .any(|module| module.has_errors())
+    {
+        Err(DriverError::Diagnostics {
+            rendered: diagnostics.text,
+            truncation: diagnostics.truncation,
+        })
+    } else {
+        Ok(diagnostics)
     }
-    Ok((rendered, truncation))
 }
 
 /// Compiles a source entrypoint through the same frontend, lint, and lowering
@@ -1767,140 +1905,393 @@ fn require_clean_frontend(
 pub fn compile_program(
     args: &CliArgs,
 ) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
-    let context = ExecutionContext::ambient()?;
-    compile_program_in_context(args, &context)
-}
-
-/// Compiles with explicit process inputs.
-pub fn compile_program_in_context(
-    args: &CliArgs,
-    context: &ExecutionContext,
-) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
-    compile_program_in_context_with_cancel(args, context, CancellationToken::new())
-}
-
-/// [`compile_program`] with a caller-supplied cancellation token.
-pub fn compile_program_with_cancel(
-    args: &CliArgs,
-    cancel: CancellationToken,
-) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
-    cancel.check().map_err(|_| DriverError::Cancelled)?;
-    let context = ExecutionContext::ambient()?;
-    compile_program_in_context_with_cancel(args, &context, cancel)
-}
-
-/// [`compile_program_in_context`] with a caller-supplied cancellation token.
-pub fn compile_program_in_context_with_cancel(
-    args: &CliArgs,
-    context: &ExecutionContext,
-    cancel: CancellationToken,
-) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
-    let frontend = load_program_frontend_with_cancel(args, context, &cancel)?;
-    require_clean_frontend(args, &frontend, &cancel)?;
-    lower_program_with_cancel(
-        &frontend.program,
-        &frontend.output,
-        lower_options(args),
-        &cancel,
-    )
-    .map_err(map_lower_error)
+    let frontend = load_program_frontend(args)?;
+    require_clean_frontend(args, &frontend)?;
+    lower_program(&frontend.program, &frontend.output, lower_options(args))
+        .map_err(DriverError::Lower)
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
-    use std::{collections::BTreeMap, ffi::OsString};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    use std::{fs, process, thread};
 
-    use bamts_compiler::lint::{LintLevel, SourceDialect, rule_by_name};
-    use bamts_runtime::Host;
-
-    use crate::args::{ArgsError, parse_args};
-
-    #[cfg(target_os = "linux")]
-    use super::peak_rss_kb;
-    use super::{
-        BamtsError, DriverError, ProgramLoadError, content_hash, execute_with_telemetry, levels,
-        lower_options, map_resolution_error, probe_toolchain,
+    use bamts_compiler::{
+        CancellationToken,
+        lint::{LintLevel, SourceDialect, rule_by_name},
     };
 
-    fn ambient_context() -> crate::context::ExecutionContext {
-        crate::context::ExecutionContext::ambient().expect("ambient execution context")
-    }
+    use crate::args::{ArgsError, parse_args};
+    use crate::cli::tsc_args::{TscExitStatus, parse_tsc_args};
+    use crate::context::ExecutionContext;
 
-    fn explicit_context(
-        cwd: &Path,
-        env: impl IntoIterator<Item = (OsString, OsString)>,
-    ) -> crate::context::ExecutionContext {
-        crate::context::ExecutionContext::new(cwd, env.into_iter().collect::<BTreeMap<_, _>>())
-            .expect("explicit execution context")
-    }
+    use super::{
+        DriverError, capture_process_with_cancel, content_hash, execute_in_context, execute_tsc,
+        execute_tsc_in, levels, link_executable, lower_options, probe_toolchain,
+        probe_toolchain_in_context,
+    };
+
+    #[cfg(unix)]
     #[test]
-    fn map_resolution_error_preserves_variant_classification_and_message() {
-        use std::path::PathBuf;
+    fn hanging_toolchain_probe_maps_cancellation_to_driver_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
 
-        let path = PathBuf::from("/project/tsconfig.json");
-
-        let root = std::io::Error::new(std::io::ErrorKind::NotFound, "root missing");
-        let root_error =
-            map_resolution_error(BamtsError::ProgramLoad(ProgramLoadError::InvalidRoot(root)));
-        assert!(matches!(
-            root_error,
-            DriverError::ProgramLoad(ProgramLoadError::InvalidRoot(_))
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-cli-toolchain-probe-cancel-{}",
+            std::process::id()
         ));
-        let text = root_error.to_string();
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let compiler = directory.join("fake-cc");
+        fs::write(
+            &compiler,
+            "#!/bin/sh
+printf started > probe-started
+/bin/sleep 30
+",
+        )?;
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700))?;
+        let context = ExecutionContext::new(&directory, BTreeMap::new())?;
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let marker = directory.join("probe-started");
+        let canceller = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !marker.is_file() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let started = marker.is_file();
+            trigger.cancel();
+            started
+        });
+
+        let started = Instant::now();
+        let error = probe_toolchain_in_context(compiler.into_os_string(), &context, &cancel)
+            .expect_err("cancelled compiler probe must fail as cancellation");
+        assert!(matches!(error, DriverError::Cancelled));
         assert!(
-            !text.contains("<unknown>"),
-            "must not fabricate a path: {text}"
+            canceller
+                .join()
+                .expect("probe cancellation thread completes")
         );
-        assert!(text.contains("cannot canonicalize project root"));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "managed probe cancellation must be bounded"
+        );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
-        let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        let read_error = map_resolution_error(BamtsError::ReadConfig {
-            path: path.clone(),
-            source,
+    #[cfg(unix)]
+    #[test]
+    fn hanging_toolchain_link_maps_cancellation_to_driver_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-cli-toolchain-link-cancel-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let compiler = directory.join("fake-cc");
+        fs::write(
+            &compiler,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then exit 0; fi
+printf started > link-started
+/bin/sleep 30
+"#,
+        )?;
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700))?;
+        let context = ExecutionContext::new(
+            &directory,
+            BTreeMap::from([
+                (OsString::from("CC"), compiler.into_os_string()),
+                (
+                    OsString::from("XDG_CACHE_HOME"),
+                    directory.join("cache").into_os_string(),
+                ),
+            ]),
+        )?;
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let marker = directory.join("link-started");
+        let canceller = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !marker.is_file() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let started = marker.is_file();
+            trigger.cancel();
+            started
         });
-        assert!(matches!(
-            read_error,
-            DriverError::ReadSource { path: ref p, .. } if *p == path
-        ));
-        let text = read_error.to_string();
-        assert!(!text.contains("<unknown>"));
-        assert!(text.contains("could not read"));
-        assert!(text.contains("/project/tsconfig.json"));
 
-        use bamts_compiler::project::ConfigError;
-        let config_error = map_resolution_error(BamtsError::ProjectConfig {
-            path: path.clone(),
-            source: ConfigError::RootMustBeObject,
-        });
-        assert!(matches!(
-            config_error,
-            DriverError::ProjectConfig { path: ref p, .. } if *p == path
-        ));
-        let text = config_error.to_string();
-        assert!(!text.contains("<unknown>"));
-        assert!(text.contains("could not load project configuration"));
-        assert!(text.contains("tsconfig root must be an object"));
+        let started = Instant::now();
+        let error = link_executable(&[], &directory.join("output"), &context, &cancel)
+            .expect_err("cancelled linker must fail as cancellation");
+        assert!(matches!(error, DriverError::Cancelled));
+        assert!(
+            canceller
+                .join()
+                .expect("link cancellation thread completes")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "managed link cancellation must be bounded"
+        );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
-        let load_error =
-            map_resolution_error(BamtsError::ProgramLoad(ProgramLoadError::TooManySources));
-        assert!(matches!(
-            load_error,
-            DriverError::ProgramLoad(ProgramLoadError::TooManySources)
+    #[cfg(unix)]
+    #[test]
+    fn relative_cc_uses_explicit_cwd_and_environment_for_probe_and_link()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-cli-relative-toolchain-{}",
+            std::process::id()
         ));
-        let text = load_error.to_string();
-        assert!(!text.contains("<unknown>"));
-        assert!(text.contains("could not load program"));
-        assert!(text.contains("more than u32::MAX sources"));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let compiler = directory.join("fake-cc");
+        fs::write(
+            &compiler,
+            r#"#!/bin/sh
+printf '%s|%s
+' "$PWD" "$BAMTS_TOOLCHAIN_CONTEXT" >> toolchain.log
+if [ "$1" = "--version" ]; then exit 0; fi
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+        shift
+        printf '#!/bin/sh
+exit 0
+' > "$1"
+        exit 0
+    fi
+    shift
+done
+exit 2
+"#,
+        )?;
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700))?;
+        let context = ExecutionContext::new(
+            &directory,
+            BTreeMap::from([
+                (OsString::from("CC"), OsString::from("./fake-cc")),
+                (
+                    OsString::from("BAMTS_TOOLCHAIN_CONTEXT"),
+                    OsString::from("from-explicit-context"),
+                ),
+                (
+                    OsString::from("XDG_CACHE_HOME"),
+                    directory.join("cache").into_os_string(),
+                ),
+            ]),
+        )?;
+
+        link_executable(
+            &[],
+            &directory.join("linked-output"),
+            &context,
+            &CancellationToken::new(),
+        )?;
+        let expected = format!("{}|from-explicit-context", directory.display());
+        let observations = fs::read_to_string(directory.join("toolchain.log"))?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(observations, vec![expected.clone(), expected]);
+        assert!(directory.join("linked-output").is_file());
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    static NEXT_TSC_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct TscFixture(PathBuf);
+
+    impl TscFixture {
+        fn new() -> Self {
+            let id = NEXT_TSC_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("bamts-tsc-project-{}-{id}", process::id()));
+            fs::create_dir_all(&root).expect("create TSC fixture");
+            Self(root)
+        }
+
+        fn write(&self, path: &str, contents: &str) {
+            let path = self.0.join(path);
+            fs::create_dir_all(path.parent().expect("fixture file parent"))
+                .expect("create fixture parent");
+            fs::write(path, contents).expect("write fixture file");
+        }
+    }
+
+    impl Drop for TscFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
     }
 
     #[test]
-    fn jit_exit_code_prefers_host_zero() {
-        let mut host = bamts_node::NodeHost::new();
-        Host::set_exit_code(&mut host, 0);
-        assert_eq!(host.completion_exit_code(7), 0);
+    fn tsc_help_and_version_are_driver_commands() {
+        let help =
+            execute_tsc(&parse_tsc_args(["--help"]).expect("help parses")).expect("help executes");
+        assert_eq!(help.exit_code, TscExitStatus::Success.code());
+        assert!(
+            String::from_utf8(help.stdout)
+                .expect("UTF-8 help")
+                .starts_with("tsc: The TypeScript Compiler - Version 7.0.2")
+        );
+
+        let version = execute_tsc(&parse_tsc_args(["--version"]).expect("version parses"))
+            .expect("version executes");
+        assert_eq!(version.exit_code, TscExitStatus::Success.code());
+        assert_eq!(version.stdout, b"Version 7.0.2\n");
+    }
+
+    #[test]
+    fn tsc_direct_check_maps_parse_diagnostics_once() {
+        let id = NEXT_TSC_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("bamts-tsc-direct-{}-{id}.ts", std::process::id()));
+        std::fs::write(&path, "const value = ;\n").expect("write source");
+        let command = parse_tsc_args([
+            "--noEmit",
+            "--pretty",
+            "false",
+            path.to_str().expect("UTF-8 path"),
+        ])
+        .expect("direct command parses");
+        let outcome = execute_tsc(&command).expect("direct check executes");
+        let stderr = String::from_utf8(outcome.stderr).expect("UTF-8 diagnostics");
+        assert_eq!(
+            outcome.exit_code,
+            TscExitStatus::DiagnosticsPresentOutputsSkipped.code()
+        );
+        assert!(stderr.contains("error TS1109: Expression expected."));
+        assert!(!stderr.contains("BAMTS-P002"));
+        let emit = execute_tsc(
+            &parse_tsc_args([path.to_str().expect("UTF-8 path")]).expect("default emit parses"),
+        )
+        .expect("default emit returns a typed outcome");
+        assert_eq!(emit.exit_code, TscExitStatus::NotImplemented.code());
+        assert!(
+            String::from_utf8(emit.stderr)
+                .expect("UTF-8 diagnostics")
+                .contains("error TS5047: Error-tolerant emission")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tsc_unmapped_direct_program_shapes_fail_closed() {
+        let multi_root =
+            execute_tsc(&parse_tsc_args(["--noEmit", "a.ts", "b.ts"]).expect("multi-root parses"))
+                .expect("multi-root returns a typed outcome");
+        assert_eq!(multi_root.exit_code, TscExitStatus::NotImplemented.code());
+
+        let jsx = execute_tsc(
+            &parse_tsc_args(["--noEmit", "--jsx", "react", "component.tsx"])
+                .expect("JSX command parses"),
+        )
+        .expect("JSX command returns a typed outcome");
+        assert_eq!(jsx.exit_code, TscExitStatus::NotImplemented.code());
+    }
+
+    #[test]
+    fn tsc_project_emits_artifacts_and_honors_no_emit_on_error() {
+        let fixture = TscFixture::new();
+        fixture.write("src/main.ts", "export const answer = 42;\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["src/main.ts"],"compilerOptions":{"rootDir":"src","outDir":"dist","declaration":true}}"#,
+        );
+        let project = execute_tsc_in(
+            &parse_tsc_args(["-p", "tsconfig.json", "--pretty", "false"]).expect("project parses"),
+            &fixture.0,
+        )
+        .expect("project executes");
+        assert_eq!(project.exit_code, TscExitStatus::Success.code());
+        assert!(fixture.0.join("dist/main.js").is_file());
+        assert!(fixture.0.join("dist/main.d.ts").is_file());
+
+        fixture.write("src/main.ts", "const value = ;\n");
+        let gated = execute_tsc_in(
+            &parse_tsc_args([
+                "--project",
+                "tsconfig.json",
+                "--noEmitOnError",
+                "--outDir",
+                "gated",
+                "--pretty",
+                "false",
+            ])
+            .expect("gated project parses"),
+            &fixture.0,
+        )
+        .expect("gated project executes");
+        assert_eq!(
+            gated.exit_code,
+            TscExitStatus::DiagnosticsPresentOutputsSkipped.code()
+        );
+        assert!(!fixture.0.join("gated/main.js").exists());
+    }
+
+    #[test]
+    fn tsc_build_orders_references_and_stops_after_error() {
+        let fixture = TscFixture::new();
+        fixture.write("lib/src/lib.ts", "export const lib = 1;\n");
+        fixture.write(
+            "lib/tsconfig.json",
+            r#"{"files":["src/lib.ts"],"compilerOptions":{"composite":true,"rootDir":"src","outDir":"dist","noEmitOnError":true}}"#,
+        );
+        fixture.write("app/src/app.ts", "export const app = 1;\n");
+        fixture.write(
+            "app/tsconfig.json",
+            r#"{"files":["src/app.ts"],"references":[{"path":"../lib"}],"compilerOptions":{"composite":true,"rootDir":"src","outDir":"dist"}}"#,
+        );
+        let dry = execute_tsc_in(
+            &parse_tsc_args(["--build", "app", "--dry"]).expect("dry build parses"),
+            &fixture.0,
+        )
+        .expect("dry build executes");
+        assert_eq!(dry.exit_code, TscExitStatus::Success.code());
+        let dry = String::from_utf8(dry.stdout).expect("UTF-8 dry report");
+        assert!(dry.find("lib/tsconfig.json").unwrap() < dry.find("app/tsconfig.json").unwrap());
+        assert!(!fixture.0.join("lib/dist/lib.js").exists());
+
+        let built = execute_tsc_in(
+            &parse_tsc_args(["--build", "app"]).expect("build parses"),
+            &fixture.0,
+        )
+        .expect("build executes");
+        assert_eq!(built.exit_code, TscExitStatus::Success.code());
+        assert!(fixture.0.join("lib/dist/lib.js").is_file());
+        assert!(fixture.0.join("lib/dist/lib.d.ts").is_file());
+        assert!(fixture.0.join("app/dist/app.js").is_file());
+        assert!(fixture.0.join("app/dist/app.d.ts").is_file());
+        fs::remove_dir_all(fixture.0.join("app/dist")).expect("clear app outputs");
+
+        fixture.write("lib/src/lib.ts", "const value = ;\n");
+        let failed = execute_tsc_in(
+            &parse_tsc_args(["--build", "app", "--force"]).expect("build parses"),
+            &fixture.0,
+        )
+        .expect("build executes");
+        assert_eq!(
+            failed.exit_code,
+            TscExitStatus::DiagnosticsPresentOutputsSkipped.code()
+        );
+        assert!(!fixture.0.join("app/dist/app.js").exists());
     }
 
     #[test]
@@ -1911,123 +2302,9 @@ mod tests {
 
     #[test]
     fn missing_toolchain_is_typed() {
-        let context = ambient_context();
-        let error = probe_toolchain("/definitely/not/a/c/compiler".into(), &context)
+        let error = probe_toolchain("/definitely/not/a/c/compiler".into())
             .expect_err("missing compiler must fail");
         assert!(matches!(error, DriverError::ToolchainMissing { .. }));
-    }
-
-    #[test]
-    fn explicit_context_resolves_relative_entrypoint() {
-        let directory = tempfile::tempdir().expect("temporary project");
-        std::fs::write(directory.path().join("main.ts"), "const value: number = 1;")
-            .expect("write source");
-        let context = explicit_context(directory.path(), []);
-        let args = parse_args(["check", "main.ts"]).expect("arguments parse");
-
-        let outcome = super::execute_in_context(&args, &context).expect("context check");
-        assert_eq!(outcome.exit_code, 0);
-    }
-
-    #[test]
-    fn explicit_context_anchors_relative_output_paths() {
-        let directory = tempfile::tempdir().expect("temporary project");
-        let context = explicit_context(directory.path(), []);
-        let args =
-            parse_args(["compile", "--output", "dist/main", "main.ts"]).expect("arguments parse");
-
-        assert_eq!(
-            super::output_path(&args, Path::new("main.ts"), &context).unwrap(),
-            directory.path().join("dist/main")
-        );
-    }
-
-    #[test]
-    fn explicit_context_environment_controls_cache_and_toolchain() {
-        let directory = tempfile::tempdir().expect("temporary project");
-        let cache = std::env::temp_dir().join(format!(
-            "bamts-context-cache-{}-{}",
-            std::process::id(),
-            super::NEXT_CACHE_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&cache);
-        let context = explicit_context(
-            directory.path(),
-            [
-                (
-                    OsString::from("BAMTS_CACHE_DIR"),
-                    cache.clone().into_os_string(),
-                ),
-                (
-                    OsString::from("CC"),
-                    OsString::from("/definitely/context/compiler"),
-                ),
-            ],
-        );
-
-        assert_eq!(super::cache_root(&context).unwrap(), cache);
-        assert!(matches!(
-            super::discover_toolchain(&context),
-            Err(DriverError::ToolchainMissing { program })
-                if program == std::ffi::OsStr::new("/definitely/context/compiler")
-        ));
-        let _ = std::fs::remove_dir_all(&cache);
-    }
-
-    #[test]
-    fn explicit_contexts_keep_process_inputs_isolated() {
-        let first = tempfile::tempdir().expect("first directory");
-        let second = tempfile::tempdir().expect("second directory");
-        let first_context = explicit_context(
-            first.path(),
-            [(OsString::from("MARKER"), OsString::from("first"))],
-        );
-        let second_context = explicit_context(
-            second.path(),
-            [(OsString::from("MARKER"), OsString::from("second"))],
-        );
-
-        assert_eq!(first_context.cwd(), first.path());
-        assert_eq!(second_context.cwd(), second.path());
-        assert_eq!(
-            first_context.env("MARKER"),
-            Some(std::ffi::OsStr::new("first"))
-        );
-        assert_eq!(
-            second_context.env("MARKER"),
-            Some(std::ffi::OsStr::new("second"))
-        );
-    }
-
-    #[test]
-    fn explicit_contexts_anchor_relative_cache_paths_independently() {
-        let first = tempfile::tempdir().expect("first directory");
-        let second = tempfile::tempdir().expect("second directory");
-        #[cfg(unix)]
-        for directory in [&first, &second] {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(directory.path())
-                .expect("context directory metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(directory.path(), permissions)
-                .expect("secure context directory");
-        }
-        let relative = OsString::from(".bamts-cache");
-        let first_context = explicit_context(
-            first.path(),
-            [(OsString::from("BAMTS_CACHE_DIR"), relative.clone())],
-        );
-        let second_context = explicit_context(
-            second.path(),
-            [(OsString::from("BAMTS_CACHE_DIR"), relative)],
-        );
-
-        let first_root = super::cache_root(&first_context).expect("first cache");
-        let second_root = super::cache_root(&second_context).expect("second cache");
-        assert_eq!(first_root, first.path().join(".bamts-cache"));
-        assert_eq!(second_root, second.path().join(".bamts-cache"));
-        assert_ne!(first_root, second_root);
     }
 
     #[test]
@@ -2110,43 +2387,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fallback_cache_root_has_stable_per_user_path() {
-        let context = ambient_context();
-        let parent =
-            super::validate_private_cache_parent_chain(context.temp_dir(), &context).unwrap();
-        let expected = parent.join(format!(
-            "bamts-cache-{}",
-            super::effective_uid(&context).unwrap()
-        ));
-        assert_eq!(super::fallback_cache_root_path(&context).unwrap(), expected);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn home_cache_root_falls_back_when_existing_root_is_unsafe() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::Ordering;
-
-        let home = std::env::temp_dir().join(format!(
-            "bamts-cli-unsafe-home-cache-{}-{}",
-            std::process::id(),
-            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let unsafe_root = home.join(".cache/bamts");
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&unsafe_root).expect("create unsafe HOME cache fixture");
-        let mut permissions = std::fs::metadata(&unsafe_root)
-            .expect("unsafe HOME cache metadata")
-            .permissions();
-        permissions.set_mode(0o777);
-        std::fs::set_permissions(&unsafe_root, permissions).expect("chmod unsafe HOME cache");
-
-        let context = ambient_context();
-        let root = super::cache_root_from_env_values(None, None, Some(home.as_os_str()), &context)
-            .expect("unsafe HOME cache must use the private per-user fallback");
-
-        assert_eq!(root, super::fallback_cache_root_path(&context).unwrap());
-        assert_ne!(root, unsafe_root);
-        let _ = std::fs::remove_dir_all(&home);
+        let parent = super::validate_fallback_parent_chain(&std::env::temp_dir()).unwrap();
+        let expected = parent.join(format!("bamts-cache-{}", super::effective_uid().unwrap()));
+        assert_eq!(super::fallback_cache_root_path().unwrap(), expected);
     }
 
     #[cfg(unix)]
@@ -2161,8 +2404,7 @@ mod tests {
             super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&path);
-        let context = ambient_context();
-        let root = super::ensure_private_cache_root(path.clone(), &context)
+        let root = super::ensure_private_fallback_cache_root(path.clone())
             .expect("private fallback root should be created");
         let metadata = std::fs::symlink_metadata(&root).expect("metadata");
         assert!(metadata.is_dir());
@@ -2186,8 +2428,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
         permissions.set_mode(0o710);
         std::fs::set_permissions(&path, permissions).expect("chmod");
-        let context = ambient_context();
-        let error = super::ensure_private_cache_root(path.clone(), &context)
+        let error = super::ensure_private_fallback_cache_root(path.clone())
             .expect_err("group/other bits must be rejected");
         assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
         let _ = std::fs::remove_dir_all(&path);
@@ -2210,104 +2451,11 @@ mod tests {
         permissions.set_mode(0o777);
         std::fs::set_permissions(&parent, permissions).expect("chmod");
 
-        let context = ambient_context();
-        let error = super::ensure_private_cache_root(parent.join("cache"), &context)
+        let error = super::ensure_private_fallback_cache_root(parent.join("cache"))
             .expect_err("replaceable parent must be rejected");
 
         assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
         let _ = std::fs::remove_dir_all(&parent);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cache_root_validates_env_var_branch_ownership() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::Ordering;
-
-        let path = std::env::temp_dir().join(format!(
-            "bamts-cli-env-cache-ownership-{}-{}",
-            std::process::id(),
-            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-
-        let context = ambient_context();
-        let root = super::cache_root_from_env_values(Some(path.as_os_str()), None, None, &context)
-            .expect("BAMTS_CACHE_DIR branch should create and validate a private cache root");
-        let metadata = std::fs::symlink_metadata(&root).expect("metadata");
-        assert!(metadata.is_dir());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
-        assert_eq!(metadata.uid(), super::effective_uid(&context).unwrap());
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cache_root_rejects_world_writable_env_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::Ordering;
-
-        let path = std::env::temp_dir().join(format!(
-            "bamts-cli-env-cache-unsafe-{}-{}",
-            std::process::id(),
-            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir(&path).expect("create fixture root");
-        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_mode(0o777);
-        std::fs::set_permissions(&path, permissions).expect("chmod");
-
-        let context = ambient_context();
-        let error = super::cache_root_from_env_values(Some(path.as_os_str()), None, None, &context)
-            .expect_err("world-writable env cache root must be rejected");
-        assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn require_within_cache_root_rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
-        use std::sync::atomic::Ordering;
-
-        let workspace = std::env::temp_dir().join(format!(
-            "bamts-cli-containment-{}-{}",
-            std::process::id(),
-            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&workspace);
-        let root = workspace.join("root");
-        let outside = workspace.join("outside");
-        std::fs::create_dir_all(&root).expect("create root");
-        std::fs::create_dir_all(&outside).expect("create outside");
-        // `root/run` is a symlink to a directory outside the cache root.
-        symlink(&outside, root.join("run")).expect("create escaping symlink");
-        let destination = root.join("run").join("bamts-run-evil");
-        let error = super::require_within_cache_root(&destination, &root)
-            .expect_err("symlink escaping the cache root must be rejected");
-        assert!(matches!(error, DriverError::UnsafeFallbackCacheRoot { .. }));
-        let _ = std::fs::remove_dir_all(&workspace);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn require_within_cache_root_accepts_genuine_subdirectory() {
-        use std::sync::atomic::Ordering;
-
-        let workspace = std::env::temp_dir().join(format!(
-            "bamts-cli-containment-ok-{}-{}",
-            std::process::id(),
-            super::NEXT_CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&workspace);
-        let root = workspace.join("root");
-        let run_dir = root.join("run");
-        std::fs::create_dir_all(&run_dir).expect("create run dir");
-        let destination = run_dir.join("bamts-run-ok");
-        super::require_within_cache_root(&destination, &root)
-            .expect("genuine subdirectory of the cache root must be accepted");
-        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[cfg(unix)]
@@ -2336,38 +2484,383 @@ mod tests {
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
+    #[test]
+    fn check_keeps_truncation_notice_after_limited_diagnostics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-truncation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(
+            &entrypoint,
+            "const first: string = 1;\nconst second: string = 2;\n",
+        )?;
+
+        let args = parse_args([
+            "check",
+            "--error-limit",
+            "1",
+            entrypoint.to_str().expect("UTF-8 temp path"),
+        ])?;
+        let error = super::execute(&args).expect_err("type errors must fail check mode");
+        let rendered = error
+            .rendered_diagnostic()
+            .expect("diagnostic failure carries rendered output");
+        let first_diagnostic = rendered
+            .find("error[")
+            .expect("one diagnostic is rendered before the limit");
+        let notice = rendered
+            .find("diagnostic(s) elided after limit 1")
+            .expect("truncation notice is preserved");
+        assert_eq!(rendered.matches("error[").count(), 1);
+        assert!(
+            first_diagnostic < notice,
+            "notice follows rendered diagnostics"
+        );
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
 
     #[test]
-    fn run_executes_node_vm_scripts_with_jit_backend() -> Result<(), Box<dyn std::error::Error>> {
+    fn jit_uses_the_complete_explicit_execution_context() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-jit-context-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(
+            &entrypoint,
+            "process.stdout.write(process.env.BAMTS_EXPLICIT_CONTEXT);",
+        )?;
+        let context = ExecutionContext::new(
+            &directory,
+            BTreeMap::from([(
+                OsString::from("BAMTS_EXPLICIT_CONTEXT"),
+                OsString::from("from-explicit-context"),
+            )]),
+        )?;
+        let args = parse_args([
+            "run",
+            "--target",
+            "jit",
+            entrypoint.to_str().expect("UTF-8 temp path"),
+        ])?;
+
+        let outcome = execute_in_context(&args, &context)?;
+
+        assert_eq!(outcome.stdout, b"from-explicit-context");
+        assert_eq!(outcome.exit_code, 0);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn jit_compile_cancellation_maps_to_driver_cancelled() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-jit-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(&entrypoint, "process.stdout.write('unreachable');")?;
+        let context = ExecutionContext::new(&directory, BTreeMap::new())?;
+        let args = parse_args([
+            "run",
+            "--target",
+            "jit",
+            entrypoint.to_str().expect("UTF-8 temp path"),
+        ])?;
+        let frontend = super::load_program_frontend_in_context_with_cancel(
+            &args,
+            &context,
+            &CancellationToken::new(),
+        )?;
+        let warnings = super::require_clean_frontend(&args, &frontend)?;
+        let executable = bamts_compiler::program::lower_program(
+            &frontend.program,
+            &frontend.output,
+            super::lower_options(&args),
+        )?;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = super::run_jit(&args, &entrypoint, warnings, &executable, &context, &cancel)
+            .expect_err("cancelled JIT compilation must not become a backend error");
+
+        assert!(matches!(error, DriverError::Cancelled));
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_aot_codegen_maps_to_driver_cancelled() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-cli-aot-codegen-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(&entrypoint, "process.stdout.write('unreachable');")?;
+        let context = ExecutionContext::new(&directory, BTreeMap::new())?;
+        let args = parse_args([
+            "run",
+            "--target",
+            "aot",
+            entrypoint.to_str().expect("UTF-8 temp path"),
+        ])?;
+        let frontend = super::load_program_frontend_in_context_with_cancel(
+            &args,
+            &context,
+            &CancellationToken::new(),
+        )?;
+        let warnings = super::require_clean_frontend(&args, &frontend)?;
+        let executable = bamts_compiler::program::lower_program(
+            &frontend.program,
+            &frontend.output,
+            super::lower_options(&args),
+        )?;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = super::run_aot(&args, &entrypoint, warnings, &executable, &context, &cancel)
+            .expect_err("cancelled AOT compilation must not become a backend error");
+
+        assert!(matches!(error, DriverError::Cancelled));
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn post_link_cancellation_removes_published_executable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-cli-aot-published-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let destination = directory.join("published-aot");
+        std::fs::write(&destination, b"published")?;
+        assert!(
+            destination.is_file(),
+            "test requires a published destination"
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = super::claim_published_executable(&destination, &cancel)
+            .expect_err("post-link cancellation must abort before spawn");
+
+        assert!(matches!(error, DriverError::Cancelled));
+        assert_eq!(
+            destination.exists(),
+            false,
+            "published destination must be removed on cancellation"
+        );
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aot_children_run_in_the_explicit_context_cwd() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-aot-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let entrypoint = directory.join("main.ts");
+        let compiler = directory.join("fake-cc");
+        std::fs::write(&entrypoint, "process.stdout.write('unreachable');")?;
+        std::fs::write(
+            &compiler,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then exit 0; fi
+output=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then output=$2; break; fi
+  shift
+done
+printf '#!/bin/sh\npwd\n' > "$output"
+/bin/chmod 700 "$output"
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&compiler)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&compiler, permissions)?;
+        let context = ExecutionContext::new(
+            &directory,
+            BTreeMap::from([
+                (OsString::from("CC"), compiler.into_os_string()),
+                (
+                    OsString::from("XDG_CACHE_HOME"),
+                    directory.join("cache").into_os_string(),
+                ),
+            ]),
+        )?;
+        let args = parse_args([
+            "run",
+            "--target",
+            "aot",
+            entrypoint.to_str().expect("UTF-8 temp path"),
+        ])?;
+
+        let outcome = execute_in_context(&args, &context)?;
+
+        assert_eq!(
+            outcome.stdout,
+            format!("{}\n", directory.display()).as_bytes()
+        );
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn json_diagnostics_return_a_typed_truncation_notice() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory =
+            std::env::temp_dir().join(format!("bamts-cli-json-truncation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let entrypoint = directory.join("main.ts");
+        std::fs::write(
+            &entrypoint,
+            "const first: string = 1;\nconst second: string = 2;\n",
+        )?;
+        let args = parse_args([
+            "check",
+            "--json",
+            "--error-limit",
+            "1",
+            entrypoint.to_str().expect("UTF-8 temp path"),
+        ])?;
+
+        let error = super::execute(&args).expect_err("type errors must fail check mode");
+        let rendered = error
+            .rendered_diagnostic()
+            .expect("diagnostic failure carries JSON output");
+        let parsed: serde_json::Value = serde_json::from_str(rendered)?;
+        assert_eq!(parsed.as_array().map(Vec::len), Some(1));
+        assert!(!rendered.contains("diagnostic(s) elided"));
+        let notice = error
+            .truncation_notice()
+            .expect("structured formats carry typed elision metadata");
+        assert_eq!(notice.limit(), 1);
+        assert!(notice.elided() > 0);
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_capture_kills_descendant_without_external_kill_before_reader_join()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "bamts-cli-managed-descendant-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let empty_path = directory.join("empty-path");
+        std::fs::create_dir(&empty_path)?;
+        let pid_file = directory.join("descendant.pid");
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let cancellation_pid_file = pid_file.clone();
+        let canceller = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !cancellation_pid_file.is_file() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            trigger.cancel();
+        });
+        let mut command = process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"/bin/sleep 30 & child=$!; printf '%s' "$child" > "$1"; wait"#,
+                "bamts-managed-child",
+                pid_file.to_str().expect("UTF-8 PID path"),
+            ])
+            .env("PATH", empty_path);
+        let started = Instant::now();
+
+        let output = capture_process_with_cancel(&mut command, &cancel)?;
+
+        canceller.join().expect("cancellation thread completes");
+        assert!(output.is_none(), "cancellation has exit precedence");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "managed process-tree shutdown must be bounded"
+        );
+        let pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.split_whitespace().nth(2).map(str::to_owned))
+                .is_some_and(|state| state != "Z");
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant PID {pid} survived cancellation"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+    #[test]
+    fn run_executes_node_vm_scripts_with_the_linked_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
         let cases = [
             (
                 "default-import",
                 "import vm from 'node:vm'; process.stdout.write(String(vm.runInThisContext('1+1')) + '\\n');",
                 b"2\n".as_slice(),
+                0,
             ),
             (
                 "named-import",
                 "import { runInThisContext } from 'node:vm'; process.stdout.write(String(runInThisContext('1+1')) + '\\n');",
                 b"2\n".as_slice(),
+                0,
             ),
             (
                 "syntax-error",
                 "import vm from 'node:vm'; try { new vm.Script('('); } catch (error) { process.stdout.write(error.name + '\\n'); }",
                 b"SyntaxError\n".as_slice(),
+                0,
             ),
             (
                 "escaped-function",
                 "import vm from 'node:vm'; const script = new vm.Script('(function(){ return 42; })'); const f = script.runInThisContext(); process.stdout.write(String(f()) + '\\n');",
                 b"42\n".as_slice(),
+                0,
             ),
             (
                 "construct-runner",
                 "import vm from 'node:vm'; const runner = vm.runInThisContext; const before = runner.prototype; const after = {}; const options = { get filename() { runner.prototype = after; return 'changed.js'; } }; const fallback = new runner('1', options); const result = new runner('({ answer: 42 })'); process.stdout.write(String(Object.getPrototypeOf(fallback) === before) + ',' + String(runner.prototype === after) + ',' + String(result.answer) + '\\n');",
                 b"true,true,42\n".as_slice(),
+                0,
+            ),
+            (
+                "host-exit-override",
+                "process.exit(23);",
+                b"".as_slice(),
+                23,
             ),
         ];
 
-        for (name, source, expected_stdout) in cases {
+        for (name, source, expected_stdout, expected_exit_code) in cases {
             let directory =
                 std::env::temp_dir().join(format!("bamts-cli-vm-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&directory);
@@ -2375,289 +2868,12 @@ mod tests {
             let entrypoint = directory.join("main.ts");
             std::fs::write(&entrypoint, source)?;
 
-            let args = parse_args([
-                "run",
-                "--jit",
-                entrypoint.to_str().expect("UTF-8 temp path"),
-            ])?;
+            let args = parse_args(["run", entrypoint.to_str().expect("UTF-8 temp path")])?;
             let outcome = super::execute(&args)?;
             assert_eq!(outcome.stdout, expected_stdout, "{name}");
-            assert_eq!(outcome.exit_code, 0, "{name}");
+            assert_eq!(outcome.exit_code, expected_exit_code, "{name}");
             std::fs::remove_dir_all(directory)?;
         }
         Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn peak_rss_kb_reads_proc_status_on_linux() {
-        let rss = peak_rss_kb().expect("VmHWM is readable on this Linux host");
-        assert!(rss > 0, "peak RSS should be positive");
-    }
-
-    #[test]
-    fn execute_with_telemetry_reports_no_phases_for_jit_run()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory =
-            std::env::temp_dir().join(format!("bamts-cli-tel-jit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory)?;
-        let entrypoint = directory.join("main.ts");
-        std::fs::write(&entrypoint, "process.stdout.write('ok\\n');")?;
-
-        let args = parse_args([
-            "run",
-            "--jit",
-            entrypoint.to_str().expect("UTF-8 temp path"),
-        ])?;
-        let (outcome, telemetry) = execute_with_telemetry(&args)?;
-        assert_eq!(outcome.stdout, b"ok\n");
-        assert_eq!(outcome.exit_code, 0);
-        // The JIT path has no distinct object/link/run phases.
-        assert_eq!(telemetry, None);
-
-        std::fs::remove_dir_all(directory)?;
-        Ok(())
-    }
-
-    #[test]
-    fn execute_with_telemetry_records_aot_phase_walls() -> Result<(), Box<dyn std::error::Error>> {
-        let directory =
-            std::env::temp_dir().join(format!("bamts-cli-tel-aot-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory)?;
-        let entrypoint = directory.join("main.ts");
-        std::fs::write(&entrypoint, "process.stdout.write('ok\\n');")?;
-
-        let args = parse_args([
-            "run",
-            "--target",
-            "aot",
-            entrypoint.to_str().expect("UTF-8 temp path"),
-        ])?;
-        let result = execute_with_telemetry(&args);
-        std::fs::remove_dir_all(&directory)?;
-
-        match result {
-            Ok((outcome, telemetry)) => {
-                assert_eq!(outcome.stdout, b"ok\n");
-                assert_eq!(outcome.exit_code, 0);
-                let telemetry = telemetry.expect("AOT run reports phase telemetry");
-                assert!(telemetry.object_wall_ms > 0.0, "object phase timed");
-                assert!(telemetry.link_wall_ms > 0.0, "link phase timed");
-                assert!(telemetry.run_wall_ms > 0.0, "run phase timed");
-                assert!(telemetry.object_wall_ms.is_finite());
-            }
-            // A host without a C toolchain (or a cross-compiled build) cannot
-            // link natively; that is an environment limit, not a telemetry bug.
-            Err(DriverError::ToolchainMissing { .. })
-            | Err(DriverError::CrossTargetLink { .. }) => {}
-            Err(other) => return Err(Box::new(other)),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn pre_cancelled_token_aborts_probe_toolchain() {
-        let context = ambient_context();
-        let token = bamts_cancel::CancellationToken::new();
-        token.cancel();
-        let error = super::probe_toolchain_with_cancel(OsString::from("cc"), &context, &token)
-            .expect_err("pre-cancelled token must abort probe");
-        assert!(matches!(error, DriverError::Cancelled), "got {error:?}");
-    }
-
-    #[test]
-    fn managed_capture_runs_simple_command() {
-        let context = ambient_context();
-        let token = bamts_cancel::CancellationToken::new();
-        let capture = super::managed_capture(
-            std::ffi::OsStr::new("echo"),
-            &[std::ffi::OsStr::new("hello")],
-            &context,
-            &[],
-            &token,
-        )
-        .expect("echo should succeed");
-        assert_eq!(capture.exit_code(), 0);
-        assert!(
-            String::from_utf8_lossy(&capture.stdout).contains("hello"),
-            "stdout must contain echo output: {:?}",
-            capture.stdout,
-        );
-    }
-
-    #[test]
-    fn managed_capture_pre_cancelled_returns_cancelled() {
-        let context = ambient_context();
-        let token = bamts_cancel::CancellationToken::new();
-        token.cancel();
-        let error = super::managed_capture(
-            std::ffi::OsStr::new("echo"),
-            &[std::ffi::OsStr::new("hello")],
-            &context,
-            &[],
-            &token,
-        )
-        .expect_err("pre-cancelled token must abort managed_capture");
-        assert!(
-            error.is_cancelled(),
-            "processkit error must be Cancelled, got {:?}",
-            error.reason(),
-        );
-    }
-
-    #[test]
-    fn managed_capture_preserves_env_clear_and_envs() {
-        let context = explicit_context(
-            std::env::temp_dir().as_path(),
-            [
-                (
-                    OsString::from("PATH"),
-                    std::env::var_os("PATH").unwrap_or_default(),
-                ),
-                (
-                    OsString::from("BAMTS_TEST_VAR"),
-                    OsString::from("test-value"),
-                ),
-            ],
-        );
-        let token = bamts_cancel::CancellationToken::new();
-        // `printenv BAMTS_TEST_VAR` exits 0 and prints the value if the env
-        // var is set; exits 1 if not. On systems without printenv, skip.
-        let capture = super::managed_capture(
-            std::ffi::OsStr::new("printenv"),
-            &[std::ffi::OsStr::new("BAMTS_TEST_VAR")],
-            &context,
-            &[],
-            &token,
-        );
-        match capture {
-            Ok(capture) => {
-                assert_eq!(capture.exit_code(), 0, "env var must be set in child");
-                let stdout = String::from_utf8_lossy(&capture.stdout);
-                assert!(
-                    stdout.trim() == "test-value",
-                    "child must see the context env var: {stdout:?}",
-                );
-            }
-            Err(error) if error.is_not_found() => {
-                // printenv not installed — skip, not a failure.
-            }
-            Err(error) => panic!("managed_capture failed: {error}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_capture_preserves_raw_stream_bytes_and_exit_code() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let context = explicit_context(directory.path(), []);
-        let token = bamts_cancel::CancellationToken::new();
-        let capture = super::managed_capture(
-            std::ffi::OsStr::new("/bin/sh"),
-            &[
-                std::ffi::OsStr::new("-c"),
-                std::ffi::OsStr::new(r#"printf '\377\000x'; printf '\376\000e' >&2; exit 7"#),
-            ],
-            &context,
-            &[],
-            &token,
-        )
-        .expect("shell capture should complete");
-        assert_eq!(capture.stdout, [0xff, 0x00, b'x']);
-        assert_eq!(capture.stderr, [0xfe, 0x00, b'e']);
-        assert_eq!(capture.exit_code(), 7);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn wait_until_process_is_gone(pid: u32) -> bool {
-        let process = std::path::PathBuf::from(format!("/proc/{pid}"));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while process.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        !process.exists()
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cancelling_managed_capture_kills_parent_and_descendant_before_return() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let context = explicit_context(directory.path(), []);
-        let parent_file = directory.path().join("parent.pid");
-        let child_file = directory.path().join("child.pid");
-        let ready_file = directory.path().join("ready");
-        let cancel = bamts_cancel::CancellationToken::new();
-        let worker_cancel = cancel.clone();
-        let worker_context = context.clone();
-        let worker_parent = parent_file.clone();
-        let worker_child = child_file.clone();
-        let worker_ready = ready_file.clone();
-        let (send, receive) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let args = [
-                OsString::from("-c"),
-                OsString::from(r#"echo $$ > "$1"; /bin/sleep 60 & echo $! > "$2"; : > "$3"; wait"#),
-                OsString::from("bamts-cancel-test"),
-                worker_parent.into_os_string(),
-                worker_child.into_os_string(),
-                worker_ready.into_os_string(),
-            ];
-            let arg_refs = args.iter().map(OsString::as_os_str).collect::<Vec<_>>();
-            let result = super::managed_capture(
-                std::ffi::OsStr::new("/bin/sh"),
-                &arg_refs,
-                &worker_context,
-                &[],
-                &worker_cancel,
-            );
-            send.send(result.map(|capture| capture.exit_code())).ok();
-        });
-
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready_file.exists() {
-            if std::time::Instant::now() >= ready_deadline {
-                cancel.cancel();
-                let _ = receive.recv_timeout(std::time::Duration::from_secs(5));
-                worker.join().expect("managed-capture worker cleanup");
-                panic!("child tree did not report readiness within five seconds");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let parent_pid = std::fs::read_to_string(&parent_file)
-            .expect("parent pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric parent pid");
-        let child_pid = std::fs::read_to_string(&child_file)
-            .expect("child pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric child pid");
-
-        cancel.cancel();
-        let result = receive
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("managed capture must return within five seconds");
-        let error = result.expect_err("cancelled child tree must not produce an exit result");
-        assert!(error.is_cancelled(), "unexpected processkit error: {error}");
-        worker.join().expect("managed-capture worker");
-        assert!(
-            wait_until_process_is_gone(parent_pid),
-            "direct child survived cancellation"
-        );
-        assert!(
-            wait_until_process_is_gone(child_pid),
-            "descendant survived cancellation"
-        );
-    }
-
-    #[test]
-    fn exit_status_from_parts_round_trips() {
-        let status = super::exit_status_from_parts(Some(42), None);
-        assert_eq!(status.code(), Some(42));
-        let status = super::exit_status_from_parts(Some(0), None);
-        assert_eq!(status.code(), Some(0));
     }
 }

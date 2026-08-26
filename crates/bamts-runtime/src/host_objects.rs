@@ -374,19 +374,26 @@ impl<H: Host> Machine<'_, H> {
                         }
                         Ok(format!("[ {} ]", join_bounded(parts, total)))
                     }
-                    HeapEntry::Uint8Array { bytes, .. } => {
+                    HeapEntry::TypedArray { kind, .. } => {
                         if depth >= 2 {
-                            return Ok("[Uint8Array]".to_owned());
+                            return Ok(format!("[{}]", kind.name()));
                         }
-                        let total = bytes.len();
-                        let take = total.min(INSPECT_MAX_ITEMS);
-                        let parts: Vec<String> = bytes[..take].iter().map(u8::to_string).collect();
+                        let (_, total, values) =
+                            crate::intrinsics::builtins::typedarray_all::debug_elements(
+                                self,
+                                value,
+                                INSPECT_MAX_ITEMS,
+                            )?;
                         Ok(format!(
-                            "Uint8Array({}) [ {} ]",
+                            "{}({}) [ {} ]",
+                            kind.name(),
                             total,
-                            join_bounded(parts, total)
+                            join_bounded(values, total)
                         ))
                     }
+                    HeapEntry::ArrayBuffer { .. } => Ok("[ArrayBuffer]".to_owned()),
+                    HeapEntry::SharedArrayBuffer { .. } => Ok("[SharedArrayBuffer]".to_owned()),
+                    HeapEntry::DataView { .. } => Ok("[DataView]".to_owned()),
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Script { properties, .. }
                     | HeapEntry::Date { properties, .. }
@@ -394,7 +401,9 @@ impl<H: Host> Machine<'_, H> {
                     | HeapEntry::Collection { properties, .. }
                     | HeapEntry::Generator { properties, .. }
                     | HeapEntry::AsyncGenerator { properties, .. }
+                    | HeapEntry::AsyncFromSync { properties, .. }
                     | HeapEntry::Promise { properties, .. }
+                    | HeapEntry::DisposableStack { properties, .. }
                     | HeapEntry::Timeout { properties, .. } => {
                         if depth >= 2 {
                             return Ok("[Object]".to_owned());
@@ -436,7 +445,9 @@ impl<H: Host> Machine<'_, H> {
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
-                    | HeapEntry::PromiseAllElement { .. } => Ok("{}".to_owned()),
+                    | HeapEntry::PromiseAllElement { .. }
+                    | HeapEntry::WeakRef { .. }
+                    | HeapEntry::FinalizationRegistry { .. } => Ok("{}".to_owned()),
                 }
             }
         }
@@ -510,11 +521,31 @@ mod tests {
     }
 
     fn make_uint8array(machine: &mut Machine<'_, TestHost>, bytes: Vec<u8>) -> Value {
+        let byte_length = bytes.len();
+        let handle = crate::intrinsics::builtins::arraybuffer::ArrayBufferHandle::allocate(
+            machine,
+            byte_length,
+            None,
+        )
+        .expect("allocation succeeds");
+        handle
+            .with_bytes_mut(machine, |target| target.copy_from_slice(&bytes))
+            .expect("bytes copy succeeds");
         machine
-            .allocate(HeapEntry::Uint8Array {
-                bytes,
+            .allocate(HeapEntry::TypedArray {
+                kind: crate::intrinsics::builtins::typedarray_all::ElementKind::Uint8,
+                buffer: handle.value(),
+                byte_offset: 0,
+                byte_length: crate::intrinsics::builtins::typedarray_all::LengthSlot::Fixed(
+                    byte_length,
+                ),
+                array_length: crate::intrinsics::builtins::typedarray_all::LengthSlot::Fixed(
+                    byte_length,
+                ),
                 properties: PropertyMap::default(),
-                prototype: None,
+                prototype: Some(machine.intrinsics.builtins.typed_array_prototype(
+                    crate::intrinsics::builtins::typedarray_all::ElementKind::Uint8,
+                )),
                 extensible: true,
             })
             .expect("allocation succeeds")

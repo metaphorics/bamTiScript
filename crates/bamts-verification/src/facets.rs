@@ -1906,7 +1906,7 @@ fn schema_error(detail: impl Into<String>) -> VerificationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::corpus::OracleOutcome;
+    use crate::corpus::{OracleOutcome, Provenance};
 
     fn empty_map_json(entries: &[(&str, DiagnosticMappingStatus, Option<u32>)]) -> String {
         let evidence = "fixture evidence";
@@ -2001,8 +2001,10 @@ mod tests {
     fn fixture_case(id: &str, entrypoint: &str) -> CaseSpec {
         CaseSpec {
             id: id.to_owned(),
-            repository: format!("https://example.com/{id}"),
-            commit: "a".repeat(40),
+            provenance: Provenance::ExternalGit {
+                repository: format!("https://example.com/{id}"),
+                commit: "a".repeat(40),
+            },
             license: "MIT".into(),
             source_dir: format!("projects/{id}"),
             entrypoint: entrypoint.to_owned(),

@@ -4,6 +4,7 @@
 //! isolated behind fetch/extract helpers. Snapshot digests are walk-order
 //! independent via [`BTreeMap`].
 
+pub mod completion;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -25,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::corpus::{
-    ArtifactDirectory, CaseSpec, ExecutionMode, NODE_VERSION, OracleLimits, bounded_output,
-    cli_args, drain_stream, normalized_env, run_process,
+    ArtifactDirectory, CaseSpec, DigestAlgorithm, ExecutionMode, NODE_VERSION, OracleLimits,
+    Provenance, bounded_output, cli_args, drain_stream, normalized_env, run_process,
 };
 use crate::oracle_pins::{
     COMPILER_COMMIT, COMPILER_DIGEST, COMPILER_REPOSITORY, COMPILER_TAG, COMPILER_URL,
@@ -449,7 +450,7 @@ pub fn run_suite(
         .then(|| {
             let code_map = crate::facets::load_diagnostic_code_map(workspace_root)?;
             let baseline_groups = crate::check_cells::baseline_groups(&verified.snapshot.index);
-            Ok(crate::check_cells::CheckContext {
+            Ok::<_, VerificationError>(crate::check_cells::CheckContext {
                 code_map,
                 baseline_groups,
             })
@@ -1017,8 +1018,10 @@ fn execute_process_cell(
 fn scratch_case_spec(id: &str) -> CaseSpec {
     CaseSpec {
         id: id.replace(['/', '#'], "_"),
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: Provenance::LocalContent {
+            digest_algorithm: DigestAlgorithm::Sha256,
+            digest: "0".repeat(64),
+        },
         license: "Apache-2.0".to_owned(),
         source_dir: "src".to_owned(),
         entrypoint: "main.ts".to_owned(),

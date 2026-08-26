@@ -120,11 +120,38 @@ test("actual addon exposes the closed API and executes the buffered CLI", native
   assert.equal(outcome.exitCode, 0);
   assert.equal(Buffer.from(outcome.stdout).toString("utf8"), "bamts 0.2.0\n");
   assert.equal(Buffer.from(outcome.stderr).length, 0);
+  assert.equal(outcome.truncation, undefined);
 
   await assert.rejects(
     addon.run({ ...request([]), env: [Buffer.from("MISSING_EQUALS")] }),
     /environment entry must contain '='/,
   );
+});
+
+test("actual addon exports structured truncation for capped JSON diagnostics", nativeTest, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "bamti-napi-truncation-"));
+  try {
+    const entrypoint = join(directory, "main.ts");
+    await writeFile(
+      entrypoint,
+      "const first: string = 1;\nconst second: string = 2;\n",
+    );
+    const loadAddon = createRequire(import.meta.url);
+    const addon = loadAddon(resolve(addonPath));
+
+    const outcome = await addon.run(
+      request(["check", "--json", "--error-limit", "1", entrypoint]),
+    );
+
+    assert.equal(outcome.exitCode, 1);
+    assert.equal(
+      JSON.parse(Buffer.from(outcome.stderr).toString("utf8")).length,
+      1,
+    );
+    assert.deepEqual(outcome.truncation, { elided: 1, limit: 1 });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("actual addon unloads cleanly across worker environments", nativeTest, async () => {

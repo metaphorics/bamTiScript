@@ -10,6 +10,13 @@ use crate::{
     ScriptSource, ThrowOrigin,
 };
 
+pub(crate) mod async_iterators;
+pub(crate) mod dynamic_import;
+pub(crate) mod esm_eval;
+pub(crate) mod explicit_resource;
+pub(crate) mod generator_async;
+pub(crate) mod import_attributes;
+
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
     builtins: &mut BuiltinTable<H>,

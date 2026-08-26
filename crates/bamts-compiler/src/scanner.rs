@@ -856,7 +856,7 @@ impl<'a> Scanner<'a> {
 
     fn scan_regex(&mut self, start_u: usize) -> TokenKind {
         self.bump();
-        let mut in_class = false;
+        let mut class_depth = 0usize;
         loop {
             if self.is_cancelled() {
                 break;
@@ -899,14 +899,14 @@ impl<'a> Scanner<'a> {
                     }
                 }
                 Some('[') => {
-                    in_class = true;
+                    class_depth += 1;
                     self.bump();
                 }
                 Some(']') => {
-                    in_class = false;
+                    class_depth = class_depth.saturating_sub(1);
                     self.bump();
                 }
-                Some('/') if !in_class => {
+                Some('/') if class_depth == 0 => {
                     self.bump();
                     break;
                 }
@@ -935,8 +935,11 @@ impl<'a> Scanner<'a> {
             }
         }
 
-        let legacy_octal_leading_zero =
-            first == '0' && self.second().is_some_and(|d| d.is_ascii_digit());
+        let leading_zero_separator = first == '0' && self.second() == Some('_');
+        let legacy_octal_leading_zero = first == '0'
+            && self
+                .second()
+                .is_some_and(|next| next.is_ascii_digit() || next == '_');
         let mut is_integer = true;
 
         if first == '.' {
@@ -945,6 +948,14 @@ impl<'a> Scanner<'a> {
             self.consume_digits(10, start_u);
         } else {
             self.consume_digits(10, start_u);
+            if leading_zero_separator {
+                self.error(
+                    INVALID_NUMERIC_SEPARATOR,
+                    start_u,
+                    self.utf16_pos,
+                    "a decimal integer starting with zero cannot contain a separator",
+                );
+            }
             if self.first() == Some('.') {
                 is_integer = false;
                 self.bump();
@@ -969,18 +980,26 @@ impl<'a> Scanner<'a> {
         }
 
         if self.first() == Some('n') {
-            if is_integer && !legacy_octal_leading_zero {
-                self.bump();
-                return TokenKind::BigIntLiteral;
-            }
-            self.error(
-                INVALID_BIGINT_LITERAL,
-                start_u,
-                self.utf16_pos,
-                "a BigInt literal must be an integer without a leading zero",
-            );
+            let valid = is_integer && !legacy_octal_leading_zero;
             self.bump();
-            return TokenKind::NumericLiteral;
+            if !valid {
+                self.error(
+                    INVALID_BIGINT_LITERAL,
+                    start_u,
+                    self.utf16_pos,
+                    "a BigInt literal must be an integer without a leading zero",
+                );
+                return TokenKind::NumericLiteral;
+            }
+            if self.first().is_some_and(is_id_continue) || self.first() == Some('\\') {
+                self.error(
+                    INVALID_BIGINT_LITERAL,
+                    start_u,
+                    self.utf16_pos,
+                    "an identifier cannot immediately follow a BigInt literal",
+                );
+            }
+            return TokenKind::BigIntLiteral;
         }
 
         TokenKind::NumericLiteral
@@ -1000,6 +1019,17 @@ impl<'a> Scanner<'a> {
         }
         if self.first() == Some('n') {
             self.bump();
+            if !any {
+                return TokenKind::NumericLiteral;
+            }
+            if self.first().is_some_and(is_id_continue) || self.first() == Some('\\') {
+                self.error(
+                    INVALID_BIGINT_LITERAL,
+                    start_u,
+                    self.utf16_pos,
+                    "an identifier cannot immediately follow a BigInt literal",
+                );
+            }
             return TokenKind::BigIntLiteral;
         }
         TokenKind::NumericLiteral
@@ -1528,34 +1558,25 @@ impl<'a> Scanner<'a> {
     }
 }
 
-/// Returns whether a code point is scanner trivia whitespace.
-///
-/// This folds line terminators into whitespace; callers that need ASI decide by
-/// inspecting the token lexeme. U+FEFF (byte-order mark / ZWNBSP) is treated as
-/// whitespace, matching the ECMAScript `WhiteSpace` production.
+/// Returns whether a code point is ECMAScript scanner trivia whitespace.
 fn is_whitespace(c: char) -> bool {
-    c == '\u{FEFF}' || c.is_whitespace()
+    matches!(
+        c,
+        '\u{0009}' | '\u{000B}' | '\u{000C}' | '\u{0020}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}'
+    ) || is_line_terminator(c)
 }
 
 fn is_line_terminator(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
 
-/// Returns whether a code point may begin an identifier.
-///
-/// This uses `char::is_alphabetic` plus `$` and `_` as a total, allocation-free
-/// approximation of the Unicode `ID_Start` set, so classification never depends
-/// on an external table crate.
 fn is_id_start(c: char) -> bool {
-    c == '$' || c == '_' || c.is_alphabetic()
+    c == '$' || c == '_' || unicode_id_start::is_id_start(c)
 }
 
-/// Returns whether a code point may continue an identifier.
-///
-/// This approximates `ID_Continue` with `char::is_alphanumeric` plus `$`, `_`,
-/// and the ZWNJ/ZWJ joiners the ECMAScript grammar explicitly permits.
 fn is_id_continue(c: char) -> bool {
-    c == '$' || c == '_' || c == '\u{200C}' || c == '\u{200D}' || c.is_alphanumeric()
+    c == '$' || c == '\u{200C}' || c == '\u{200D}' || unicode_id_start::is_id_continue(c)
 }
 
 /// Returns whether an escaped identifier spells an unconditional reserved word.
@@ -2267,5 +2288,80 @@ mod tests {
             matches!(result, Err(ScanError::Cancelled(_))),
             "cancelled scan must return ScanError::Cancelled"
         );
+    }
+    #[test]
+    fn unicode_identifier_continue_uses_the_unicode_property() {
+        let source = "const cafe\u{0301} = 1; const join\u{203F} = 2; const escaped\\u0301 = 3;";
+        let recovered = scan_text(source);
+        assert!(
+            recovered.diagnostics().is_empty(),
+            "{:?}",
+            recovered.diagnostics()
+        );
+        let identifiers: Vec<&str> = recovered
+            .product()
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::Identifier)
+            .filter_map(|token| recovered.product().token_text(token))
+            .collect();
+        assert!(identifiers.contains(&"cafe\u{0301}"));
+        assert!(identifiers.contains(&"join\u{203F}"));
+        assert!(identifiers.contains(&"escaped\\u0301"));
+    }
+
+    #[test]
+    fn ecmascript_whitespace_excludes_next_line() {
+        for whitespace in ['\u{00A0}', '\u{1680}', '\u{2007}', '\u{202F}', '\u{FEFF}'] {
+            assert_eq!(kinds(&whitespace.to_string()), vec![TokenKind::Whitespace]);
+        }
+        let recovered = scan_text("\u{0085}");
+        assert_eq!(recovered.product().tokens()[0].kind(), TokenKind::Unknown);
+        assert_eq!(recovered.diagnostics()[0].code(), UNEXPECTED_CHARACTER);
+    }
+
+    #[test]
+    fn leading_zero_decimal_separators_are_rejected() {
+        for source in ["0_1", "0_1n"] {
+            let recovered = scan_text(source);
+            assert!(
+                recovered
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code() == INVALID_NUMERIC_SEPARATOR),
+                "{source} must reject its separator"
+            );
+            assert_tiles(source);
+        }
+        assert!(!kinds("0_1n").contains(&TokenKind::BigIntLiteral));
+    }
+
+    #[test]
+    fn incomplete_radix_bigints_recover_as_numeric_literals() {
+        for source in ["0xn", "0on", "0bn"] {
+            let recovered = scan_text(source);
+            assert_eq!(
+                recovered.product().tokens()[0].kind(),
+                TokenKind::NumericLiteral
+            );
+            assert!(
+                recovered
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code() == INVALID_NUMERIC_LITERAL)
+            );
+        }
+    }
+
+    #[test]
+    fn regex_rescan_tracks_nested_character_classes() {
+        let source =
+            Arc::new(SourceText::new("/[[a]/]/v;").expect("test source fits the per-file budget"));
+        let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::JavaScript, &source);
+        assert_eq!(scanner.next_token().kind(), TokenKind::Slash);
+        let regex = scanner.rescan_regex();
+        assert_eq!(regex.kind(), TokenKind::RegularExpressionLiteral);
+        assert_eq!(regex.range().end().get(), "/[[a]/]/v".len());
+        assert_eq!(scanner.next_token().kind(), TokenKind::Semicolon);
     }
 }

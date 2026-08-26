@@ -1,0 +1,18 @@
+schema = 1
+id = "event-loop"
+repository = "local"
+commit = "c6cad132023e7405c4c2d5008106943a8d94e57f"
+license = "UNLICENSED"
+source_dir = "corpus/cases"
+entrypoint = "corpus/cases/event-loop.ts"
+node_args = []
+expected_timeout_ms = 10000
+constructs = [
+  "microtask-order",
+  "timer-macrotask",
+  "nested-timer-microtask",
+  "event-loop-quiescence",
+]
+source_files = [
+  "corpus/cases/event-loop.ts",
+]

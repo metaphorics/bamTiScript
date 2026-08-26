@@ -26,16 +26,20 @@ use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex};
 
+use crate::vm::explicit_resource::DisposalStackState;
+use crate::vm::generator_async::GeneratorCompletion;
 use bamts_bytecode::{
     AccessorKind, BinaryOp, BindingId, BindingKind, Constant, ConstantId, DisposeHint, EcmaString,
     EcmaStringBuilder, EdgeId, EdgeTarget, Function, FunctionId, Instruction, IteratorCloseMode,
-    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, RESUME_NEXT, RESUME_RETURN,
-    RESUME_THROW, ResolvedExport, UnaryOp, Verified, format_number,
+    IteratorKind, Module, ModuleId, Pc, Program, ProgramModule, ResolvedExport, UnaryOp, Verified,
+    format_number,
 };
 pub use bamts_cancel::CancellationToken;
 use bamts_native::{Decoded, SlotId, Value};
+use intrinsics::builtins::typedarray_all::{self, ElementKind, LengthSlot};
 
 mod external_modules;
 mod gc;
@@ -44,7 +48,10 @@ mod intrinsics;
 mod native;
 mod vm;
 
-pub use native::{NativeEngine, NativeError, run_linked_program, run_linked_program_with_cancel};
+pub use native::{
+    NativeEngine, NativeError, TieredRunReport, UnitTieringSummary, run_linked_program,
+    run_linked_program_tiered, run_linked_program_with_cancel,
+};
 
 const RUNTIME_HEAP_SEGMENT: u16 = 1;
 
@@ -543,7 +550,7 @@ impl PropertyKey {
 }
 
 /// A stored property: a data value or an accessor descriptor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Property {
     Data {
         value: Value,
@@ -767,21 +774,8 @@ pub(crate) enum IteratorNextPrepared {
 
 #[derive(Clone, Debug)]
 enum IteratorState {
-    Keys {
-        index: usize,
-        keys: Vec<EcmaString>,
-    },
-    Protocol {
-        iterator: Value,
-        next: Value,
-    },
-    /// Async-from-sync adapter record (ECMA-262 27.1.5): created when an
-    /// async iterator lookup falls back to `Symbol.iterator`. Holds the sync
-    /// iterator and its `next` method.
-    AsyncFromSync {
-        iterator: Value,
-        next: Value,
-    },
+    Keys { index: usize, keys: Vec<EcmaString> },
+    Protocol { iterator: Value, next: Value },
 }
 
 #[derive(Clone, Debug)]
@@ -826,52 +820,11 @@ pub(crate) enum GeneratorResume {
         origin: ThrowOrigin,
     },
 }
-/// How a suspended generator body is re-entered. Abrupt completions are
-/// interpreted by the bytecode dispatch at the suspension's resume point.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResumeCompletion {
-    Next(Value),
-    Throw(Value),
-    Return(Value),
-}
-
-impl ResumeCompletion {
-    pub(crate) const fn value(self) -> Value {
-        match self {
-            Self::Next(value) | Self::Throw(value) | Self::Return(value) => value,
-        }
-    }
-
-    pub(crate) const fn mode(self) -> u32 {
-        match self {
-            Self::Next(_) => RESUME_NEXT as u32,
-            Self::Throw(_) => RESUME_THROW as u32,
-            Self::Return(_) => RESUME_RETURN as u32,
-        }
-    }
-
-    pub(crate) const fn sync_operation(self) -> &'static str {
-        match self {
-            Self::Next(_) => "Generator.prototype.next called on incompatible receiver",
-            Self::Throw(_) => "Generator.prototype.throw called on incompatible receiver",
-            Self::Return(_) => "Generator.prototype.return called on incompatible receiver",
-        }
-    }
-
-    pub(crate) const fn async_operation(self) -> &'static str {
-        match self {
-            Self::Next(_) => "AsyncGenerator.prototype.next called on incompatible receiver",
-            Self::Throw(_) => "AsyncGenerator.prototype.throw called on incompatible receiver",
-            Self::Return(_) => "AsyncGenerator.prototype.return called on incompatible receiver",
-        }
-    }
-}
-
 /// One resume request on an async generator plus the Promise handed back to
 /// the caller that the request settles.
 #[derive(Clone, Debug)]
 pub(crate) struct AsyncGeneratorRequest {
-    pub(crate) completion: ResumeCompletion,
+    pub(crate) completion: GeneratorCompletion,
     pub(crate) capability: Value,
 }
 
@@ -1019,13 +972,22 @@ pub(crate) enum PromiseReaction {
         done: bool,
         context: Option<Value>,
     },
-    /// Rejects the derived step promise of an async-from-sync step. Closes
-    /// the underlying sync iterator first when the step was not done; a done
-    /// step propagates the rejection without closing.
+    /// Closes the synchronous iterator, then rejects the derived
+    /// async-from-sync step promise with the original PromiseResolve rejection.
     AsyncFromSyncReject {
         derived: Value,
         sync_iterator: Value,
-        done: bool,
+        context: Option<Value>,
+    },
+
+    /// Continues one suspended `AsyncDisposableStack` drain after an awaited
+    /// disposer settles. The reaction owns the complete continuation so it can
+    /// be consumed exactly once by the microtask executor.
+    AsyncDisposeStep {
+        stack: Value,
+        pending_error: Option<Value>,
+        capability: Value,
+        rejected: bool,
         context: Option<Value>,
     },
     /// Resolves an `import()` promise when a local module evaluation fulfills.
@@ -1054,6 +1016,7 @@ impl PromiseReaction {
             | Self::ModuleDepReject { context, .. }
             | Self::AsyncFromSyncFulfill { context, .. }
             | Self::AsyncFromSyncReject { context, .. }
+            | Self::AsyncDisposeStep { context, .. }
             | Self::DynamicImportFulfill { context, .. }
             | Self::DynamicImportReject { context, .. } => *context,
         }
@@ -1075,6 +1038,10 @@ pub(crate) enum MicrotaskJob {
     },
     Callback {
         callback: Value,
+        context: Option<Value>,
+    },
+    FinalizationCleanup {
+        registry: Value,
         context: Option<Value>,
     },
 }
@@ -1221,8 +1188,47 @@ enum HeapEntry {
         prototype: Option<Value>,
         extensible: bool,
     },
-    Uint8Array {
-        bytes: Vec<u8>,
+    TypedArray {
+        kind: ElementKind,
+        buffer: Value,
+        byte_offset: usize,
+        byte_length: LengthSlot,
+        array_length: LengthSlot,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    DataView {
+        buffer: Value,
+        byte_offset: usize,
+        byte_length: LengthSlot,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    ArrayBuffer {
+        data: intrinsics::builtins::arraybuffer::ArrayBufferData,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    SharedArrayBuffer {
+        data: std::sync::Arc<intrinsics::builtins::arraybuffer::SharedBlock>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    WeakRef {
+        target: Option<Value>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    FinalizationRegistry {
+        cleanup_callback: Value,
+        cells: Vec<intrinsics::builtins::weakref_finalization::FinalizationCell>,
+        pending_holdings: VecDeque<Value>,
+        cleanup_scheduled: bool,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
@@ -1249,6 +1255,22 @@ enum HeapEntry {
     AsyncGenerator {
         state: AsyncGeneratorState,
         queue: VecDeque<AsyncGeneratorRequest>,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    AsyncFromSync {
+        iterator: Value,
+        next: Value,
+        properties: PropertyMap,
+        prototype: Option<Value>,
+        extensible: bool,
+    },
+    /// A synchronous or asynchronous explicit-resource stack. The state,
+    /// disposal hint, and ordinary object header have one heap owner.
+    DisposableStack {
+        state: DisposalStackState,
+        hint: DisposeHint,
         properties: PropertyMap,
         prototype: Option<Value>,
         extensible: bool,
@@ -1342,10 +1364,35 @@ impl HeapEntry {
             Self::Collection { size, .. } => size
                 .saturating_mul(CollectionEntry::BYTES.saturating_add(CollectionIndex::ENTRY_BYTES))
                 .saturating_add(1),
-            Self::Uint8Array {
-                bytes, properties, ..
-            } => bytes
+            Self::TypedArray { properties, .. } | Self::DataView { properties, .. } => {
+                properties.charge_bytes().saturating_add(1)
+            }
+            Self::ArrayBuffer {
+                data, properties, ..
+            } => data
+                .initial_bytes()
+                .saturating_add(properties.charge_bytes())
+                .saturating_add(1),
+            Self::SharedArrayBuffer {
+                data, properties, ..
+            } => data
+                .byte_length()
+                .saturating_add(properties.charge_bytes())
+                .saturating_add(1),
+            Self::WeakRef { properties, .. } => properties.charge_bytes().saturating_add(1),
+            Self::FinalizationRegistry {
+                cells,
+                pending_holdings,
+                properties,
+                ..
+            } => cells
                 .len()
+                .saturating_mul(intrinsics::builtins::weakref_finalization::FinalizationCell::BYTES)
+                .saturating_add(
+                    pending_holdings
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Value>()),
+                )
                 .saturating_add(properties.charge_bytes())
                 .saturating_add(1),
             Self::NativeFunction { callable, .. } => match callable {
@@ -1389,6 +1436,7 @@ impl HeapEntry {
                 };
                 state_bytes.saturating_add(queued)
             }
+            Self::AsyncFromSync { properties, .. } => properties.charge_bytes(),
             Self::Object { properties, .. } | Self::Timeout { properties, .. } => {
                 properties.charge_bytes().saturating_add(1)
             }
@@ -1410,6 +1458,7 @@ impl HeapEntry {
             | Self::BuiltinIterator { .. }
             | Self::Iterator { .. }
             | Self::Promise { .. }
+            | Self::DisposableStack { .. }
             | Self::PromiseResolver { .. }
             | Self::PromiseAll { .. }
             | Self::AsyncActivation { .. }
@@ -1676,6 +1725,38 @@ struct TimerRecord {
     interval_delay: Option<u32>,
 }
 
+pub(crate) enum ExternalJob {
+    ResolveWaitAsync { promise: u64, result: &'static str },
+}
+
+pub(crate) struct ExternalInbox {
+    queue: Mutex<VecDeque<ExternalJob>>,
+    signal: Condvar,
+    pending: AtomicUsize,
+}
+
+impl ExternalInbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(VecDeque::new()),
+            signal: Condvar::new(),
+            pending: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn reserve(&self) {
+        self.pending.fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
+    pub(crate) fn push(&self, job: ExternalJob) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(job);
+        self.signal.notify_one();
+    }
+}
+
 /// The production bytecode interpreter.
 pub struct Machine<'a, H: Host> {
     program: Option<&'a Program<Verified>>,
@@ -1684,6 +1765,9 @@ pub struct Machine<'a, H: Host> {
     limits: Limits,
     gc: gc::GcState,
     native_roots: Vec<Vec<Value>>,
+    /// Values kept strongly reachable for the current ECMAScript job by
+    /// WeakRef construction/deref. Cleared exactly once at the outer job seam.
+    kept_alive: Vec<Value>,
     frames: Vec<Frame>,
     heap: Vec<HeapEntry>,
     slot_bytes: Vec<usize>,
@@ -1719,6 +1803,8 @@ pub struct Machine<'a, H: Host> {
     async_boundaries: Vec<usize>,
     pending_async_suspend: Option<(Value, SuspendedActivation)>,
     microtasks: VecDeque<QueuedMicrotask>,
+    external_inbox: Arc<ExternalInbox>,
+    finalization_cleanup_queue: VecDeque<Value>,
     microtask_drain_active: bool,
     next_timer_id: Option<u64>,
     next_timer_sequence: Option<u64>,
@@ -1741,6 +1827,12 @@ pub struct Machine<'a, H: Host> {
     /// Host-compiled programs retained for the machine lifetime so their
     /// closures remain executable after the originating Script object dies.
     dynamic: Vec<DynamicModule>,
+    /// Intrinsic array (permanent GC root) retaining one frozen template
+    /// object per tagged-template bytecode site. Element offsets are tracked in
+    /// `template_sites`, so no cached Value lives only in Rust machine state.
+    template_objects: Value,
+    /// (module, function, pc) -> element offset into `template_objects`.
+    template_sites: BTreeMap<(u32, u32, u32), usize>,
     /// Cooperative cancellation signal checked at fuel, microtask, timer, and
     /// quiescence checkpoints. A fresh token (never cancelled) preserves the
     /// behavior of the existing fresh-token wrapper APIs.
@@ -1912,7 +2004,15 @@ pub fn run_with_telemetry<H: Host>(
 /// unavailable (non-Linux hosts, sandboxes).
 fn peak_rss_kb() -> Option<u64> {
     let content = std::fs::read_to_string("/proc/self/status").ok()?;
-    content.lines().find_map(|line| {
+    parse_peak_rss_kb(&content)
+}
+
+/// Parses the process peak resident set size, in KiB, from a
+/// `/proc/self/status`-shaped document. Selects the `VmHWM:` field (the peak
+/// resident set) rather than `VmRSS:` (the current resident set), returning
+/// `None` when the field or its numeric value is missing.
+fn parse_peak_rss_kb(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
         line.strip_prefix("VmHWM:")?
             .split_whitespace()
             .next()?
@@ -1999,6 +2099,16 @@ impl<'a, H: Host> Machine<'a, H> {
                 description: EcmaString::encode("vm context"),
             },
         );
+        let template_objects = intrinsics::push(
+            &mut heap,
+            HeapEntry::Array {
+                elements: Vec::new(),
+                properties: PropertyMap::default(),
+                prototype: None,
+                extensible: true,
+                length_writable: true,
+            },
+        );
         let argv_text = host.argv().to_vec();
         let argv_values: Vec<Value> = argv_text
             .into_iter()
@@ -2036,6 +2146,7 @@ impl<'a, H: Host> Machine<'a, H> {
             gc: gc::GcState::new(&limits),
             limits,
             native_roots: Vec::new(),
+            kept_alive: Vec::new(),
             fuel,
             frames: vec![frame],
             heap,
@@ -2054,6 +2165,8 @@ impl<'a, H: Host> Machine<'a, H> {
             async_boundaries: Vec::new(),
             pending_async_suspend: None,
             microtasks: VecDeque::new(),
+            external_inbox: ExternalInbox::new(),
+            finalization_cleanup_queue: VecDeque::new(),
             microtask_drain_active: false,
             next_timer_id: Some(1),
             next_timer_sequence: Some(0),
@@ -2095,6 +2208,8 @@ impl<'a, H: Host> Machine<'a, H> {
             },
             dynamic_base: program.map_or(1, |program| program.modules().len()),
             dynamic: Vec::new(),
+            template_objects,
+            template_sites: BTreeMap::new(),
             current_builtin_id: None,
             current_new_target: Value::UNDEFINED,
             has_instance_symbol: None,
@@ -2127,16 +2242,20 @@ impl<'a, H: Host> Machine<'a, H> {
     /// Otherwise the machine remains available for an explicit
     /// [`Self::drain_microtasks`] checkpoint.
     pub fn evaluate(&mut self) -> Result<Execution, RuntimeError> {
-        if let Some(program) = self.program {
-            let entry = program.entry();
-            self.frames.clear();
-            self.live_registers = 0;
-            self.instantiate_modules()?;
-            return self.evaluate_instantiated_module(entry);
-        }
-        Ok(self
-            .run_loop(0)?
-            .expect("the entry frame completes before the run loop stops"))
+        let result = (|| {
+            if let Some(program) = self.program {
+                let entry = program.entry();
+                self.frames.clear();
+                self.live_registers = 0;
+                self.instantiate_modules()?;
+                return self.evaluate_instantiated_module(entry);
+            }
+            Ok(self
+                .run_loop(0)?
+                .expect("the entry frame completes before the run loop stops"))
+        })();
+        self.clear_kept_alive_for_job();
+        result
     }
 
     /// Evaluates one module of an already-instantiated program and returns
@@ -2251,6 +2370,7 @@ impl<'a, H: Host> Machine<'a, H> {
             let callback_result = self.with_active_context(timer.context, |machine| {
                 machine.call_value(timer.callback, timer.handle, &timer.arguments)
             });
+            self.clear_kept_alive_for_job();
             match callback_result {
                 Ok(_) => {}
                 Err(EvalFailure::Runtime(kind)) => {
@@ -2423,6 +2543,53 @@ impl<'a, H: Host> Machine<'a, H> {
         !self.timers.is_empty()
     }
 
+    pub(crate) fn external_inbox(&self) -> Arc<ExternalInbox> {
+        Arc::clone(&self.external_inbox)
+    }
+
+    fn drain_external_jobs(&mut self) -> Result<(), RuntimeError> {
+        loop {
+            let job = self
+                .external_inbox
+                .queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front();
+            let Some(job) = job else {
+                return Ok(());
+            };
+            self.external_inbox
+                .pending
+                .fetch_sub(1, AtomicOrdering::AcqRel);
+            match job {
+                ExternalJob::ResolveWaitAsync { promise, result } => {
+                    let value = self
+                        .allocate(HeapEntry::String(EcmaString::encode(result)))
+                        .map_err(|kind| self.checkpoint_error(kind))?;
+                    self.fulfill_promise(Value::from_bits(promise), value)
+                        .map_err(|kind| self.checkpoint_error(kind))?;
+                }
+            }
+        }
+    }
+
+    fn wait_for_external_job(&self) {
+        let queue = self
+            .external_inbox
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(
+            self.external_inbox
+                .signal
+                .wait_while(queue, |queue| {
+                    queue.is_empty()
+                        && self.external_inbox.pending.load(AtomicOrdering::Acquire) != 0
+                })
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
     /// Drives the automatic event loop to quiescence after synchronous
     /// evaluation.
     ///
@@ -2441,33 +2608,40 @@ impl<'a, H: Host> Machine<'a, H> {
     /// instead of spinning. Existing fuel bounds recursive jobs and timers;
     /// exhausted work fails with [`RuntimeErrorKind::FuelExhausted`].
     pub(crate) fn run_to_quiescence(&mut self) -> Result<(), RuntimeError> {
-        self.drain_microtasks_automatic()?;
-        self.check_cancel()
-            .map_err(|kind| self.checkpoint_error(kind))?;
-        while self.has_pending_timers() {
-            match self.wait_for_timer_expiry_state()? {
-                TimerWait::Ready => {}
-                TimerWait::Stale => continue,
-                TimerWait::Idle => {
-                    return Err(
-                        self.checkpoint_error(RuntimeErrorKind::TimerProviderFailure {
-                            message: "the timer provider lost a live machine timer".to_owned(),
-                        }),
-                    );
-                }
-            }
+        loop {
+            self.drain_external_jobs()?;
+            self.drain_microtasks_automatic()?;
             self.check_cancel()
                 .map_err(|kind| self.checkpoint_error(kind))?;
-            let run = self.run_one_expired_timer()?;
-            if let Some(exception) = run.uncaught.into_iter().next() {
-                return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
-                    value: exception.value,
-                    origin: exception.origin,
-                }));
+            if self.has_pending_timers() {
+                match self.wait_for_timer_expiry_state()? {
+                    TimerWait::Ready => {}
+                    TimerWait::Stale => continue,
+                    TimerWait::Idle => {
+                        return Err(self.checkpoint_error(
+                            RuntimeErrorKind::TimerProviderFailure {
+                                message: "the timer provider lost a live machine timer".to_owned(),
+                            },
+                        ));
+                    }
+                }
+                self.check_cancel()
+                    .map_err(|kind| self.checkpoint_error(kind))?;
+                let run = self.run_one_expired_timer()?;
+                if let Some(exception) = run.uncaught.into_iter().next() {
+                    return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
+                        value: exception.value,
+                        origin: exception.origin,
+                    }));
+                }
+                continue;
             }
-            self.drain_microtasks_automatic()?;
+            if self.external_inbox.pending.load(AtomicOrdering::Acquire) != 0 {
+                self.wait_for_external_job();
+                continue;
+            }
+            return Ok(());
         }
-        Ok(())
     }
 
     pub(crate) fn schedule_timeout(
@@ -2659,6 +2833,7 @@ impl<'a, H: Host> Machine<'a, H> {
     /// throws settle their derived promises. Throws from `queueMicrotask`
     /// callbacks are returned in [`MicrotaskDrain::uncaught`].
     pub fn drain_microtasks(&mut self) -> Result<MicrotaskDrain, RuntimeError> {
+        self.drain_external_jobs()?;
         self.drain_microtasks_core(MicrotaskExceptionPolicy::CollectAndContinue)
     }
 
@@ -2693,7 +2868,12 @@ impl<'a, H: Host> Machine<'a, H> {
         self.microtask_drain_active = true;
         let result = (|| {
             let mut report = MicrotaskDrain::default();
-            while self.microtasks.front().is_some() {
+            loop {
+                self.schedule_finalization_cleanup_jobs()
+                    .map_err(|kind| self.checkpoint_error(kind))?;
+                if self.microtasks.front().is_none() {
+                    break;
+                }
                 self.consume_fuel(1)
                     .map_err(|kind| self.checkpoint_error(kind))?;
                 self.collect_if_pending();
@@ -2703,9 +2883,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     .expect("the queued microtask remains present after fuel charging");
                 self.refund_machine(queued.retained_bytes);
                 report.executed = report.executed.saturating_add(1);
-                let Some(exception) = self
-                    .execute_microtask_job(queued.job)
-                    .map_err(|kind| self.checkpoint_error(kind))?
+                let is_finalization_cleanup =
+                    matches!(&queued.job, MicrotaskJob::FinalizationCleanup { .. });
+                let job_result = self.execute_microtask_job(queued.job);
+                self.clear_kept_alive_for_job();
+                let Some(exception) = job_result.map_err(|kind| self.checkpoint_error(kind))?
                 else {
                     continue;
                 };
@@ -2715,7 +2897,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     })
                 })?;
                 report.uncaught.push(exception);
-                if exception_policy == MicrotaskExceptionPolicy::StopAtFirst {
+                if is_finalization_cleanup
+                    || exception_policy == MicrotaskExceptionPolicy::StopAtFirst
+                {
                     break;
                 }
             }
@@ -2776,6 +2960,10 @@ impl<'a, H: Host> Machine<'a, H> {
             MicrotaskJob::Callback { callback, context } => self
                 .with_active_context(context, |machine| {
                     machine.execute_callback_microtask(callback)
+                }),
+            MicrotaskJob::FinalizationCleanup { registry, context } => self
+                .with_active_context(context, |machine| {
+                    machine.execute_finalization_cleanup_job(registry)
                 }),
         }
     }
@@ -2873,10 +3061,21 @@ impl<'a, H: Host> Machine<'a, H> {
                 PromiseCompletion::Rejected,
             ),
             PromiseReaction::AsyncFulfill { activation, .. } => {
-                self.resume_async(activation, value, None)
+                crate::vm::generator_async::resume_async_function(
+                    self,
+                    activation,
+                    crate::vm::generator_async::AwaitSettlement::Fulfilled(value),
+                )
             }
             PromiseReaction::AsyncReject { activation, .. } => {
-                self.resume_async(activation, value, Some(origin))
+                crate::vm::generator_async::resume_async_function(
+                    self,
+                    activation,
+                    crate::vm::generator_async::AwaitSettlement::Rejected {
+                        reason: value,
+                        origin,
+                    },
+                )
             }
             PromiseReaction::AsyncGeneratorFulfill { generator, .. } => {
                 self.resume_async_generator(generator, value, None)
@@ -2906,13 +3105,31 @@ impl<'a, H: Host> Machine<'a, H> {
             PromiseReaction::AsyncFromSyncReject {
                 derived,
                 sync_iterator,
-                done,
                 ..
             } => {
-                if !done {
-                    self.close_protocol_iterator_preserving_abrupt(sync_iterator)?;
-                }
+                self.close_protocol_iterator_preserving_abrupt(sync_iterator)?;
                 self.reject_promise(derived, value, origin)
+            }
+            PromiseReaction::AsyncDisposeStep {
+                stack,
+                pending_error,
+                capability,
+                rejected,
+                ..
+            } => {
+                let settled_error = rejected.then_some(value);
+                match self.continue_async_disposal(stack, pending_error, settled_error, capability)
+                {
+                    Ok(()) => Ok(()),
+                    Err(EvalFailure::Runtime(kind)) => Err(kind),
+                    Err(failure) => {
+                        self.reject_promise_failure(capability, failure)
+                            .map_err(|failure| match failure {
+                                EvalFailure::Runtime(kind) => kind,
+                                _ => RuntimeErrorKind::InvalidValue { value: capability },
+                            })
+                    }
+                }
             }
             PromiseReaction::DynamicImportFulfill {
                 promise, target, ..
@@ -3503,10 +3720,9 @@ impl<'a, H: Host> Machine<'a, H> {
         };
         match &self.heap[index] {
             HeapEntry::Iterator {
-                state:
-                    IteratorState::Protocol { iterator, .. }
-                    | IteratorState::AsyncFromSync { iterator, .. },
-            } => Ok(Some(*iterator)),
+                state: IteratorState::Protocol { iterator, .. },
+            }
+            | HeapEntry::AsyncFromSync { iterator, .. } => Ok(Some(*iterator)),
             _ => Ok(None),
         }
     }
@@ -4933,6 +5149,45 @@ impl<'a, H: Host> Machine<'a, H> {
                 return Ok(promise);
             }
         };
+        self.import_dynamic_resolved(requester, specifier)
+    }
+
+    pub(crate) fn import_dynamic_expression_with_attributes(
+        &mut self,
+        requester: ModuleId,
+        specifier: Value,
+        options: Value,
+    ) -> Result<Value, EvalFailure> {
+        let specifier = match self.coerce_string_observable(specifier) {
+            Ok(specifier) => specifier,
+            Err(EvalFailure::Runtime(kind)) => return Err(EvalFailure::Runtime(kind)),
+            Err(failure) => {
+                let promise = self.create_promise()?;
+                self.reject_promise_failure(promise, failure)?;
+                return Ok(promise);
+            }
+        };
+        let attributes = match self.dynamic_import_attributes(options) {
+            Ok(attributes) => attributes,
+            Err(failure) => {
+                let promise = self.create_promise()?;
+                self.reject_promise_failure(promise, failure)?;
+                return Ok(promise);
+            }
+        };
+        if let Err(failure) = self.canonical_import_attributes(attributes) {
+            let promise = self.create_promise()?;
+            self.reject_promise_failure(promise, failure)?;
+            return Ok(promise);
+        }
+        self.import_dynamic_resolved(requester, specifier)
+    }
+
+    fn import_dynamic_resolved(
+        &mut self,
+        requester: ModuleId,
+        specifier: EcmaString,
+    ) -> Result<Value, EvalFailure> {
         let Some(target) = self.resolve_dynamic_specifier(requester, &specifier) else {
             let promise = self.create_promise()?;
             self.reject_promise_failure(
@@ -4970,6 +5225,71 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
             },
         }
+    }
+
+    fn dynamic_import_attributes(&mut self, options: Value) -> Result<Option<Value>, EvalFailure> {
+        if options == Value::UNDEFINED {
+            return Ok(None);
+        }
+        if !self.is_object(options) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "import options is not an object",
+            }));
+        }
+        let with_key = PropertyKey::Named(EcmaString::encode("with"));
+        let attributes = self.get_property_key(options, &with_key)?;
+        if attributes != Value::UNDEFINED {
+            return self.require_attributes_object(attributes);
+        }
+        let assert_key = PropertyKey::Named(EcmaString::encode("assert"));
+        let attributes = self.get_property_key(options, &assert_key)?;
+        self.require_attributes_object(attributes)
+    }
+
+    fn require_attributes_object(&self, attributes: Value) -> Result<Option<Value>, EvalFailure> {
+        if attributes == Value::UNDEFINED {
+            return Ok(None);
+        }
+        if !self.is_object(attributes) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "import attributes is not an object",
+            }));
+        }
+        Ok(Some(attributes))
+    }
+
+    pub(crate) fn canonical_import_attributes(
+        &mut self,
+        attributes: Option<Value>,
+    ) -> Result<(), EvalFailure> {
+        let Some(attributes) = attributes else {
+            return Ok(());
+        };
+        for key in self.own_property_keys(attributes)? {
+            if !self.own_property_is_enumerable(attributes, &key)? {
+                continue;
+            }
+            let value = self.get_property_key(attributes, &key)?;
+            if self.string_value(value).is_none() {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "import attribute value is not a string",
+                }));
+            }
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "import attributes are not supported by this host",
+            }));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn import_namespace_with_attributes(
+        &mut self,
+        requester: ModuleId,
+        specifier: ConstantId,
+        attributes: Value,
+    ) -> Result<Value, EvalFailure> {
+        self.canonical_import_attributes(Some(attributes))?;
+        self.import_namespace(requester, specifier)
     }
 
     /// Reports whether the resolved dynamic edge also carries a static
@@ -5906,6 +6226,119 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
                 }
+                Instruction::GetSuper {
+                    dst,
+                    home,
+                    receiver,
+                    key,
+                } => {
+                    let home = self.read_register(frame_index, home.get());
+                    let receiver = self.read_register(frame_index, receiver.get());
+                    let key_value = self.read_register(frame_index, key.get());
+                    let key = match self.to_property_key(key_value) {
+                        Ok(key) => key,
+                        Err(failure) => {
+                            self.resolve_failure(failure, pc)?;
+                            continue;
+                        }
+                    };
+                    match self.get_super(home, receiver, &key) {
+                        Ok(value) => {
+                            self.write_register(frame_index, dst.get(), value);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::SetSuper {
+                    home,
+                    receiver,
+                    key,
+                    value,
+                } => {
+                    let home = self.read_register(frame_index, home.get());
+                    let receiver = self.read_register(frame_index, receiver.get());
+                    let key_value = self.read_register(frame_index, key.get());
+                    let key = match self.to_property_key(key_value) {
+                        Ok(key) => key,
+                        Err(failure) => {
+                            self.resolve_failure(failure, pc)?;
+                            continue;
+                        }
+                    };
+                    let value = self.read_register(frame_index, value.get());
+                    match self.set_super(home, receiver, key, value) {
+                        Ok(SetOutcome::Done) => self.frames[frame_index].pc = pc + 1,
+                        Ok(SetOutcome::Setter(setter)) => {
+                            self.frames[frame_index].pc = pc + 1;
+                            self.execute_call(CallRequest {
+                                callee: setter,
+                                this_value: receiver,
+                                arguments: &[value],
+                                destination: None,
+                                call_pc: pc,
+                                constructed: None,
+                                new_target: Value::UNDEFINED,
+                            })?;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::ImportAttributes {
+                    dst,
+                    specifier,
+                    attributes,
+                } => {
+                    let attributes = self.read_register(frame_index, attributes.get());
+                    match self.import_namespace_with_attributes(module_id, specifier, attributes) {
+                        Ok(namespace) => {
+                            self.write_register(frame_index, dst.get(), namespace);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::ImportDynamicAttributes {
+                    dst,
+                    specifier,
+                    attributes,
+                } => {
+                    let specifier = self.read_register(frame_index, specifier.get());
+                    let attributes = self.read_register(frame_index, attributes.get());
+                    match self
+                        .import_dynamic_expression_with_attributes(module_id, specifier, attributes)
+                    {
+                        Ok(promise) => {
+                            self.write_register(frame_index, dst.get(), promise);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::CopyDataProperties {
+                    target,
+                    source,
+                    excluded,
+                } => {
+                    let target = self.read_register(frame_index, target.get());
+                    let source = self.read_register(frame_index, source.get());
+                    let excluded = self.read_register(frame_index, excluded.get());
+                    match self.copy_data_properties(target, source, excluded) {
+                        Ok(()) => self.frames[frame_index].pc = pc + 1,
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
+                Instruction::GetTemplateObject { dst, cooked, raw } => {
+                    let cooked = self.read_register(frame_index, cooked.get());
+                    let raw = self.read_register(frame_index, raw.get());
+                    match self.template_object(cooked, raw) {
+                        Ok(template) => {
+                            self.write_register(frame_index, dst.get(), template);
+                            self.frames[frame_index].pc = pc + 1;
+                        }
+                        Err(failure) => self.resolve_failure(failure, pc)?,
+                    }
+                }
                 Instruction::Export { .. } => {
                     return Err(self.error_here_at(
                         RuntimeErrorKind::InvalidVerifiedProgram {
@@ -6224,14 +6657,8 @@ impl<'a, H: Host> Machine<'a, H> {
 
     #[cfg(test)]
     fn test_global(&self, name: &str) -> Option<Value> {
-        let key = PropertyKey::Named(EcmaString::encode(name));
-        match self
-            .own_descriptor(self.global_object, &key)
-            .expect("test global descriptor lookup succeeds")
-        {
-            Some(Property::Data { value, .. }) => Some(value),
-            _ => None,
-        }
+        let index = self.runtime_slot(self.global_object).ok()??;
+        self.own_data_property(index, name)
     }
 
     /// Classifies a callee into the shared dispatch categories.
@@ -6628,7 +7055,8 @@ impl<'a, H: Host> Machine<'a, H> {
                         return Ok(());
                     }
                     if flags.is_async && !flags.is_generator {
-                        return match self.start_async_call(
+                        return match crate::vm::generator_async::start_async_function(
+                            self,
                             target,
                             &captures,
                             context,
@@ -6691,7 +7119,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         Ok(intrinsics::BuiltinOutcome::AsyncGeneratorResume {
                             generator,
                             completion,
-                        }) => match self.enqueue_async_generator_next(generator, completion) {
+                        }) => match self.enqueue_async_generator_request(generator, completion) {
                             Ok(value) => {
                                 if let Some(register) = destination {
                                     self.write_register(self.frames.len() - 1, register, value);
@@ -6997,6 +7425,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 .map(|index| &self.heap[index])
             {
                 Some(HeapEntry::String(_)) => self.intrinsics.string_prototype,
+                Some(HeapEntry::BigInt(_)) => self.intrinsics.builtins.bigint_prototype(),
                 Some(HeapEntry::Symbol { .. }) => self.intrinsics.builtins.symbol_prototype(),
                 _ => self.intrinsics.object_prototype,
             },
@@ -7076,6 +7505,17 @@ impl<'a, H: Host> Machine<'a, H> {
     /// constructor, or `Value::UNDEFINED` outside builtin construction.
     pub(crate) fn current_new_target(&self) -> Value {
         self.current_new_target
+    }
+
+    /// Clears the WeakRef same-job strong roots at an outer ECMAScript job
+    /// boundary, refunding their machine-retained byte charge exactly once.
+    pub(crate) fn clear_kept_alive_for_job(&mut self) {
+        self.refund_machine(
+            self.kept_alive
+                .len()
+                .saturating_mul(std::mem::size_of::<Value>()),
+        );
+        self.kept_alive.clear();
     }
 
     pub(crate) fn throw_error(
@@ -7234,7 +7674,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         intrinsics::BuiltinOutcome::AsyncGeneratorResume {
                             generator,
                             completion,
-                        } => return self.enqueue_async_generator_next(generator, completion),
+                        } => return self.enqueue_async_generator_request(generator, completion),
                     }
                 }
                 CalleeKind::Runtime {
@@ -7270,7 +7710,8 @@ impl<'a, H: Host> Machine<'a, H> {
                             .map_err(EvalFailure::Runtime);
                     }
                     if flags.is_async && !flags.is_generator {
-                        return self.start_async_call(
+                        return crate::vm::generator_async::start_async_function(
+                            self,
                             target,
                             &captures,
                             context,
@@ -7548,7 +7989,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::String(_) => self
                         .runtime_slot(self.intrinsics.string_prototype)
                         .map_err(EvalFailure::Runtime)?,
-                    HeapEntry::BigInt(_) | HeapEntry::PrivateName { .. } => self
+                    HeapEntry::BigInt(_) => self
+                        .runtime_slot(self.intrinsics.builtins.bigint_prototype())
+                        .map_err(EvalFailure::Runtime)?,
+                    HeapEntry::PrivateName { .. } => self
                         .runtime_slot(self.intrinsics.object_prototype)
                         .map_err(EvalFailure::Runtime)?,
                     HeapEntry::Symbol { .. } => self
@@ -7572,6 +8016,17 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(GetOutcome::Value(Value::UNDEFINED));
         };
         for _ in 0..=self.heap.len() {
+            if let PropertyKey::Named(name) = key
+                && let HeapEntry::TypedArray { .. } = &self.heap[node]
+                && let Some(typed_index) = typedarray_all::typed_array_index(name)
+            {
+                let view = self.value_for_runtime_index(node)?;
+                let value = match typed_index {
+                    Some(offset) => typedarray_all::read_element(self, view, offset)?,
+                    None => Value::UNDEFINED,
+                };
+                return Ok(GetOutcome::Value(value));
+            }
             if let Some(found) = self.own_get(node, key) {
                 return self.found_outcome(found);
             }
@@ -7611,7 +8066,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::String(_) => self
                         .runtime_slot(self.intrinsics.string_prototype)
                         .map_err(EvalFailure::Runtime)?,
-                    HeapEntry::BigInt(_) | HeapEntry::PrivateName { .. } => self
+                    HeapEntry::BigInt(_) => self
+                        .runtime_slot(self.intrinsics.builtins.bigint_prototype())
+                        .map_err(EvalFailure::Runtime)?,
+                    HeapEntry::PrivateName { .. } => self
                         .runtime_slot(self.intrinsics.object_prototype)
                         .map_err(EvalFailure::Runtime)?,
                     HeapEntry::Symbol { .. } => self
@@ -7635,6 +8093,16 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(GetOutcome::Value(Value::UNDEFINED));
         };
         for _ in 0..=self.heap.len() {
+            if let HeapEntry::TypedArray { .. } = &self.heap[node]
+                && let Some(typed_index) = typedarray_all::typed_array_index_ascii(name)
+            {
+                let view = self.value_for_runtime_index(node)?;
+                let value = match typed_index {
+                    Some(offset) => typedarray_all::read_element(self, view, offset)?,
+                    None => Value::UNDEFINED,
+                };
+                return Ok(GetOutcome::Value(value));
+            }
             if let Some(found) = self.own_get_ascii(node, name) {
                 return self.found_outcome(found);
             }
@@ -7675,6 +8143,14 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Bounds-resolved element count of the TypedArray at `index`. Detached
+    /// or out-of-bounds views expose zero accessible elements.
+    fn typed_array_length_at(&self, index: usize) -> Option<usize> {
+        let view = self.value_for_runtime_index(index).ok()?;
+        let bounds = typedarray_all::typed_array_bounds(self, view).ok()?;
+        (!bounds.out_of_bounds).then_some(bounds.element_length)
+    }
+
     fn primitive_get(&self, index: usize, key: &PropertyKey) -> Option<Found> {
         match &self.heap[index] {
             HeapEntry::String(text) => string_own_get(text, key),
@@ -7706,13 +8182,22 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::Promise { properties, .. }
-            | HeapEntry::Timeout { properties, .. } => property_lookup_ascii(properties, name),
+            | HeapEntry::WeakRef { properties, .. }
+            | HeapEntry::FinalizationRegistry { properties, .. }
+            | HeapEntry::DisposableStack { properties, .. }
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::SharedArrayBuffer { properties, .. } => {
+                property_lookup_ascii(properties, name)
+            }
+            HeapEntry::DataView { properties, .. } => property_lookup_ascii(properties, name),
             HeapEntry::Array {
                 elements,
                 properties,
@@ -7729,14 +8214,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 property_lookup_ascii(properties, name)
             }
-            HeapEntry::Uint8Array {
-                bytes, properties, ..
-            } => {
-                if let Some(index) = uint8array_index_ascii(name) {
-                    let value = index
-                        .and_then(|offset| bytes.get(offset))
-                        .map_or(Value::UNDEFINED, |byte| Value::int32(u32::from(*byte)));
-                    return Some(Found::Value(value));
+            HeapEntry::TypedArray { properties, .. } => {
+                if let Some(typed_index) = typedarray_all::typed_array_index_ascii(name) {
+                    return typed_index
+                        .zip(self.typed_array_length_at(index))
+                        .is_some_and(|(offset, length)| offset < length)
+                        .then_some(Found::Value(Value::UNDEFINED));
                 }
                 property_lookup_ascii(properties, name)
             }
@@ -7863,12 +8346,19 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::Promise { properties, .. }
-            | HeapEntry::Timeout { properties, .. } => property_lookup(properties, key),
+            | HeapEntry::WeakRef { properties, .. }
+            | HeapEntry::FinalizationRegistry { properties, .. }
+            | HeapEntry::DisposableStack { properties, .. }
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::SharedArrayBuffer { properties, .. } => property_lookup(properties, key),
+            HeapEntry::DataView { properties, .. } => property_lookup(properties, key),
             HeapEntry::Array {
                 elements,
                 properties,
@@ -7887,16 +8377,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 property_lookup(properties, key)
             }
-            HeapEntry::Uint8Array {
-                bytes, properties, ..
-            } => {
+            HeapEntry::TypedArray { properties, .. } => {
                 if let PropertyKey::Named(name) = key
-                    && let Some(index) = uint8array_index(name)
+                    && let Some(typed_index) = typedarray_all::typed_array_index(name)
                 {
-                    let value = index
-                        .and_then(|offset| bytes.get(offset))
-                        .map_or(Value::UNDEFINED, |byte| Value::int32(u32::from(*byte)));
-                    return Some(Found::Value(value));
+                    return typed_index
+                        .zip(self.typed_array_length_at(index))
+                        .is_some_and(|(offset, length)| offset < length)
+                        .then_some(Found::Value(Value::UNDEFINED));
                 }
                 property_lookup(properties, key)
             }
@@ -8062,6 +8550,7 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Array { properties, .. }
             | HeapEntry::Function { properties, .. }
@@ -8070,8 +8559,14 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Uint8Array { properties, .. }
+            | HeapEntry::TypedArray { properties, .. }
+            | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::SharedArrayBuffer { properties, .. }
+            | HeapEntry::DataView { properties, .. }
             | HeapEntry::Promise { properties, .. }
+            | HeapEntry::WeakRef { properties, .. }
+            | HeapEntry::FinalizationRegistry { properties, .. }
+            | HeapEntry::DisposableStack { properties, .. }
             | HeapEntry::Timeout { properties, .. } => properties,
             _ => return None,
         };
@@ -8086,6 +8581,7 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { prototype, .. }
             | HeapEntry::Generator { prototype, .. }
             | HeapEntry::AsyncGenerator { prototype, .. }
+            | HeapEntry::AsyncFromSync { prototype, .. }
             | HeapEntry::Script { prototype, .. }
             | HeapEntry::Array { prototype, .. }
             | HeapEntry::Function { prototype, .. }
@@ -8093,8 +8589,14 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { prototype, .. }
             | HeapEntry::BuiltinIterator { prototype, .. }
             | HeapEntry::Collection { prototype, .. }
-            | HeapEntry::Uint8Array { prototype, .. }
+            | HeapEntry::TypedArray { prototype, .. }
+            | HeapEntry::ArrayBuffer { prototype, .. }
+            | HeapEntry::SharedArrayBuffer { prototype, .. }
+            | HeapEntry::DataView { prototype, .. }
             | HeapEntry::Promise { prototype, .. }
+            | HeapEntry::WeakRef { prototype, .. }
+            | HeapEntry::FinalizationRegistry { prototype, .. }
+            | HeapEntry::DisposableStack { prototype, .. }
             | HeapEntry::Timeout { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
             HeapEntry::NativeFunction { prototype, .. } => {
@@ -8105,6 +8607,30 @@ impl<'a, H: Host> Machine<'a, H> {
         match prototype {
             Some(value) => self.runtime_slot(value).map_err(EvalFailure::Runtime),
             None => Ok(None),
+        }
+    }
+
+    fn value_for_runtime_index(&self, index: usize) -> Result<Value, EvalFailure> {
+        let slot = u32::try_from(index + 1).map_err(|_| {
+            EvalFailure::Throw(ThrowOrigin::RangeError {
+                operation: "runtime heap slot exceeds u32",
+            })
+        })?;
+        Ok(Value::heap_ref(
+            SlotId::from_parts(RUNTIME_HEAP_SEGMENT, slot).expect("runtime heap slot is nonzero"),
+        ))
+    }
+
+    fn super_base(&self, home: Value) -> Result<Value, EvalFailure> {
+        let home_index = self
+            .runtime_slot(home)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "super home object is not an object",
+            }))?;
+        match self.prototype_index(home_index)? {
+            Some(base_index) => self.value_for_runtime_index(base_index),
+            None => Ok(Value::NULL),
         }
     }
 
@@ -8160,8 +8686,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     self.host.set_env(&name, &text);
                     return Ok(SetOutcome::Done);
                 }
-                if matches!(self.heap[index], HeapEntry::Uint8Array { .. })
-                    && matches!(&key, PropertyKey::Named(name) if uint8array_index(name).is_some())
+                if matches!(self.heap[index], HeapEntry::TypedArray { .. })
+                    && matches!(&key, PropertyKey::Named(name) if typedarray_all::typed_array_index(name).is_some())
                 {
                     self.set_own_data(index, key, value)?;
                     return Ok(SetOutcome::Done);
@@ -8196,6 +8722,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 HeapEntry::Object { properties, .. }
                 | HeapEntry::Generator { properties, .. }
                 | HeapEntry::AsyncGenerator { properties, .. }
+                | HeapEntry::AsyncFromSync { properties, .. }
                 | HeapEntry::Script { properties, .. }
                 | HeapEntry::Array { properties, .. }
                 | HeapEntry::Function { properties, .. }
@@ -8204,8 +8731,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Date { properties, .. }
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
-                | HeapEntry::Uint8Array { properties, .. }
+                | HeapEntry::TypedArray { properties, .. }
+                | HeapEntry::ArrayBuffer { properties, .. }
+                | HeapEntry::SharedArrayBuffer { properties, .. }
+                | HeapEntry::DataView { properties, .. }
                 | HeapEntry::Promise { properties, .. }
+                | HeapEntry::WeakRef { properties, .. }
+                | HeapEntry::FinalizationRegistry { properties, .. }
+                | HeapEntry::DisposableStack { properties, .. }
                 | HeapEntry::Timeout { properties, .. } => match properties.get(key) {
                     Some(Property::Accessor { setter, .. }) => Some(Some(*setter)),
                     Some(Property::Data { .. }) => Some(None),
@@ -8231,6 +8764,78 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    pub(crate) fn set_super(
+        &mut self,
+        home: Value,
+        receiver: Value,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<SetOutcome, EvalFailure> {
+        let receiver_index = self
+            .runtime_slot(receiver)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "set super property on primitive",
+            }))?;
+        let mut base = self.super_base(home)?;
+        if base == Value::NULL {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "set super property through null prototype",
+            }));
+        }
+
+        let inherited = loop {
+            if let Some(descriptor) = self.own_descriptor(base, &key)? {
+                break Some(descriptor);
+            }
+            let base_index = self
+                .runtime_slot(base)
+                .map_err(EvalFailure::Runtime)?
+                .expect("non-null super base is an object");
+            let Some(prototype_index) = self.prototype_index(base_index)? else {
+                break None;
+            };
+            base = self.value_for_runtime_index(prototype_index)?;
+        };
+
+        match inherited {
+            Some(Property::Accessor {
+                setter: Some(setter),
+                ..
+            }) => Ok(SetOutcome::Setter(setter)),
+            Some(Property::Accessor { setter: None, .. }) => {
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set super property without setter",
+                }))
+            }
+            Some(Property::Data {
+                writable: false, ..
+            }) => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "assign to read only super property",
+            })),
+            Some(Property::Data { writable: true, .. }) | None => {
+                self.set_own_data(receiver_index, key, value)?;
+                Ok(SetOutcome::Done)
+            }
+        }
+    }
+
+    pub(crate) fn get_super(
+        &mut self,
+        home: Value,
+        receiver: Value,
+        key: &PropertyKey,
+    ) -> Result<Value, EvalFailure> {
+        let base = self.super_base(home)?;
+        match self.resolve_get(base, key)? {
+            GetOutcome::Value(value) => Ok(value),
+            GetOutcome::Text(text) => self
+                .allocate(HeapEntry::String(text))
+                .map_err(EvalFailure::Runtime),
+            GetOutcome::Getter(getter) => self.call_value(getter, receiver, &[]),
+        }
+    }
+
     fn own_has_non_accessor(&self, index: usize, key: &PropertyKey) -> bool {
         match &self.heap[index] {
             HeapEntry::Array { elements, .. } => {
@@ -8246,11 +8851,14 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 false
             }
-            HeapEntry::Uint8Array { bytes, .. } => key
+            HeapEntry::TypedArray { .. } => key
                 .as_string()
-                .and_then(uint8array_index)
+                .and_then(typedarray_all::typed_array_index)
                 .flatten()
-                .is_some_and(|offset| offset < bytes.len()),
+                .is_some_and(|offset| {
+                    self.typed_array_length_at(index)
+                        .is_some_and(|length| offset < length)
+                }),
             HeapEntry::Function { .. } => {
                 (key.eq_ascii("length") || key.eq_ascii("name"))
                     && match key {
@@ -8260,6 +8868,10 @@ impl<'a, H: Host> Machine<'a, H> {
                         PropertyKey::Named(_) => self.own_data_property(index, "name").is_none(),
                         _ => false,
                     }
+            }
+            HeapEntry::WeakRef { properties, .. }
+            | HeapEntry::FinalizationRegistry { properties, .. } => {
+                matches!(properties.get(key), Some(Property::Data { .. }))
             }
             _ => false,
         }
@@ -8272,24 +8884,14 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
     ) -> Result<(), EvalFailure> {
         if let PropertyKey::Named(name) = &key
-            && let Some(typed_index) = uint8array_index(name)
-            && matches!(self.heap[index], HeapEntry::Uint8Array { .. })
+            && let Some(typed_index) = typedarray_all::typed_array_index(name)
+            && matches!(self.heap[index], HeapEntry::TypedArray { .. })
         {
             let Some(offset) = typed_index else {
                 return Ok(());
             };
-            let in_bounds = matches!(
-                &self.heap[index],
-                HeapEntry::Uint8Array { bytes, .. } if offset < bytes.len()
-            );
-            if !in_bounds {
-                return Ok(());
-            }
-            let byte = crate::intrinsics::builtins::to_uint8(self, value)?;
-            let HeapEntry::Uint8Array { bytes, .. } = &mut self.heap[index] else {
-                unreachable!("Uint8Array brand was checked")
-            };
-            bytes[offset] = byte;
+            let view = self.value_for_runtime_index(index)?;
+            typedarray_all::write_element(self, view, offset, value)?;
             return Ok(());
         }
         if matches!(&key, PropertyKey::Named(name) if name.eq_ascii("length"))
@@ -8373,6 +8975,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
+            | HeapEntry::AsyncFromSync {
+                properties,
+                extensible,
+                ..
+            }
             | HeapEntry::Script {
                 properties,
                 extensible,
@@ -8408,12 +9015,42 @@ impl<'a, H: Host> Machine<'a, H> {
                 extensible,
                 ..
             }
-            | HeapEntry::Uint8Array {
+            | HeapEntry::TypedArray {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::ArrayBuffer {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::SharedArrayBuffer {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::DataView {
                 properties,
                 extensible,
                 ..
             }
             | HeapEntry::Promise {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::WeakRef {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::FinalizationRegistry {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::DisposableStack {
                 properties,
                 extensible,
                 ..
@@ -8458,6 +9095,7 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -8465,8 +9103,14 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Uint8Array { properties, .. }
+            | HeapEntry::TypedArray { properties, .. }
+            | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::SharedArrayBuffer { properties, .. }
+            | HeapEntry::DataView { properties, .. }
             | HeapEntry::Promise { properties, .. }
+            | HeapEntry::DisposableStack { properties, .. }
+            | HeapEntry::WeakRef { properties, .. }
+            | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
                 usize::from(!properties.contains_key(&key)) * key.charge_bytes()
             }
@@ -8528,6 +9172,7 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -8535,8 +9180,14 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::Date { properties, .. }
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
-            | HeapEntry::Uint8Array { properties, .. }
+            | HeapEntry::TypedArray { properties, .. }
+            | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::SharedArrayBuffer { properties, .. }
+            | HeapEntry::DataView { properties, .. }
             | HeapEntry::Promise { properties, .. }
+            | HeapEntry::WeakRef { properties, .. }
+            | HeapEntry::FinalizationRegistry { properties, .. }
+            | HeapEntry::DisposableStack { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
                 let descriptor = match properties.get(&key) {
                     Some(Property::Data {
@@ -8646,8 +9297,8 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
                 if let PropertyKey::Named(name) = &key
-                    && uint8array_index(name).is_some()
-                    && matches!(self.heap[index], HeapEntry::Uint8Array { .. })
+                    && typedarray_all::typed_array_index(name).is_some()
+                    && matches!(self.heap[index], HeapEntry::TypedArray { .. })
                 {
                     return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "define accessor on typed array index",
@@ -8665,6 +9316,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         ..
                     }
                     | HeapEntry::AsyncGenerator {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::AsyncFromSync {
                         properties,
                         extensible,
                         ..
@@ -8709,12 +9365,42 @@ impl<'a, H: Host> Machine<'a, H> {
                         extensible,
                         ..
                     }
-                    | HeapEntry::Uint8Array {
+                    | HeapEntry::TypedArray {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::ArrayBuffer {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::SharedArrayBuffer {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::DataView {
                         properties,
                         extensible,
                         ..
                     }
                     | HeapEntry::Promise {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::WeakRef {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::FinalizationRegistry {
+                        properties,
+                        extensible,
+                        ..
+                    }
+                    | HeapEntry::DisposableStack {
                         properties,
                         extensible,
                         ..
@@ -8747,6 +9433,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Generator { properties, .. }
                     | HeapEntry::AsyncGenerator { properties, .. }
+                    | HeapEntry::AsyncFromSync { properties, .. }
                     | HeapEntry::Script { properties, .. }
                     | HeapEntry::Array { properties, .. }
                     | HeapEntry::Function { properties, .. }
@@ -8755,8 +9442,14 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
-                    | HeapEntry::Uint8Array { properties, .. }
-                    | HeapEntry::Promise { properties, .. } => properties,
+                    | HeapEntry::TypedArray { properties, .. }
+                    | HeapEntry::ArrayBuffer { properties, .. }
+                    | HeapEntry::SharedArrayBuffer { properties, .. }
+                    | HeapEntry::DataView { properties, .. }
+                    | HeapEntry::Promise { properties, .. }
+                    | HeapEntry::WeakRef { properties, .. }
+                    | HeapEntry::FinalizationRegistry { properties, .. }
+                    | HeapEntry::DisposableStack { properties, .. } => properties,
                     _ => unreachable!("validated object cannot change heap entry kind"),
                 };
                 match properties.get_mut(&key) {
@@ -8792,15 +9485,20 @@ impl<'a, H: Host> Machine<'a, H> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
                 if let PropertyKey::Named(name) = key
-                    && let Some(typed_index) = uint8array_index(name)
-                    && let HeapEntry::Uint8Array { bytes, .. } = &self.heap[index]
+                    && let Some(typed_index) = typedarray_all::typed_array_index(name)
+                    && matches!(self.heap[index], HeapEntry::TypedArray { .. })
                 {
-                    return Ok(typed_index.is_none_or(|offset| offset >= bytes.len()));
+                    let view = self.value_for_runtime_index(index)?;
+                    let bounds = typedarray_all::typed_array_bounds(self, view)?;
+                    return Ok(typed_index.is_none_or(|offset| {
+                        bounds.out_of_bounds || offset >= bounds.element_length
+                    }));
                 }
                 let released = match &mut self.heap[index] {
                     HeapEntry::Object { properties, .. }
                     | HeapEntry::Generator { properties, .. }
                     | HeapEntry::AsyncGenerator { properties, .. }
+                    | HeapEntry::AsyncFromSync { properties, .. }
                     | HeapEntry::Script { properties, .. }
                     | HeapEntry::Function { properties, .. }
                     | HeapEntry::NativeFunction { properties, .. }
@@ -8808,8 +9506,14 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { properties, .. }
                     | HeapEntry::BuiltinIterator { properties, .. }
                     | HeapEntry::Collection { properties, .. }
-                    | HeapEntry::Uint8Array { properties, .. }
+                    | HeapEntry::TypedArray { properties, .. }
+                    | HeapEntry::ArrayBuffer { properties, .. }
+                    | HeapEntry::SharedArrayBuffer { properties, .. }
+                    | HeapEntry::DataView { properties, .. }
                     | HeapEntry::Promise { properties, .. }
+                    | HeapEntry::WeakRef { properties, .. }
+                    | HeapEntry::FinalizationRegistry { properties, .. }
+                    | HeapEntry::DisposableStack { properties, .. }
                     | HeapEntry::Timeout { properties, .. } => {
                         let Some(property) = properties.get(key) else {
                             return Ok(true);
@@ -9007,6 +9711,160 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(())
     }
 
+    pub(crate) fn copy_data_properties(
+        &mut self,
+        target: Value,
+        source: Value,
+        excluded: Value,
+    ) -> Result<(), EvalFailure> {
+        if !self.is_object(target) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "object rest target is not an object",
+            }));
+        }
+        let excluded_keys = self.excluded_property_keys(excluded)?;
+        for key in self.own_property_keys(source)? {
+            if excluded_keys.contains(&key) {
+                continue;
+            }
+            if !self.own_property_is_enumerable(source, &key)? {
+                continue;
+            }
+            let value = self.get_property_key(source, &key)?;
+            self.define_descriptor(
+                target,
+                key,
+                Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn excluded_property_keys(&self, excluded: Value) -> Result<Vec<PropertyKey>, EvalFailure> {
+        let Some(index) = self.runtime_slot(excluded).map_err(EvalFailure::Runtime)? else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "object rest excluded keys is not an array",
+            }));
+        };
+        let HeapEntry::Array { elements, .. } = &self.heap[index] else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "object rest excluded keys is not an array",
+            }));
+        };
+        let mut keys = Vec::with_capacity(elements.len());
+        for element in elements {
+            if *element != Value::HOLE {
+                keys.push(self.to_property_key(*element)?);
+            }
+        }
+        Ok(keys)
+    }
+
+    pub(crate) fn template_object(
+        &mut self,
+        cooked: Value,
+        raw: Value,
+    ) -> Result<Value, EvalFailure> {
+        let site = {
+            let frame = self
+                .frames
+                .last()
+                .expect("template object executes inside a frame");
+            (frame.module.get(), frame.function as u32, frame.pc as u32)
+        };
+        self.template_object_at(site, cooked, raw)
+    }
+
+    pub(crate) fn template_object_at(
+        &mut self,
+        site: (u32, u32, u32),
+        cooked: Value,
+        raw: Value,
+    ) -> Result<Value, EvalFailure> {
+        let cache_index = self
+            .runtime_slot(self.template_objects)
+            .map_err(EvalFailure::Runtime)?
+            .expect("template object cache is an engine array");
+        if let Some(offset) = self.template_sites.get(&site) {
+            let HeapEntry::Array { elements, .. } = &self.heap[cache_index] else {
+                unreachable!("template object cache is an engine array");
+            };
+            return Ok(elements[*offset]);
+        }
+        for array in [cooked, raw] {
+            let Some(index) = self.runtime_slot(array).map_err(EvalFailure::Runtime)? else {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "template strings is not an array",
+                }));
+            };
+            if !matches!(self.heap[index], HeapEntry::Array { .. }) {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "template strings is not an array",
+                }));
+            }
+        }
+        self.define_descriptor(
+            cooked,
+            PropertyKey::Named(EcmaString::encode("raw")),
+            Property::Data {
+                value: raw,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        )?;
+        self.freeze_template_array(raw)?;
+        self.freeze_template_array(cooked)?;
+        let HeapEntry::Array { elements, .. } = &self.heap[cache_index] else {
+            unreachable!("template object cache is an engine array");
+        };
+        let offset = elements.len();
+        self.array_push(self.template_objects, cooked)?;
+        self.template_sites.insert(site, offset);
+        Ok(cooked)
+    }
+
+    fn freeze_template_array(&mut self, array: Value) -> Result<(), EvalFailure> {
+        let index = self
+            .runtime_slot(array)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "template strings is not an array",
+            }))?;
+        let HeapEntry::Array {
+            properties,
+            extensible,
+            length_writable,
+            ..
+        } = &mut self.heap[index]
+        else {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "template strings is not an array",
+            }));
+        };
+        *extensible = false;
+        *length_writable = false;
+        for (_, property) in properties.0.iter_mut() {
+            match property {
+                Property::Data {
+                    writable,
+                    configurable,
+                    ..
+                } => {
+                    *writable = false;
+                    *configurable = false;
+                }
+                Property::Accessor { configurable, .. } => *configurable = false,
+            }
+        }
+        Ok(())
+    }
+
     fn set_prototype(&mut self, object: Value, prototype: Value) -> Result<(), EvalFailure> {
         let prototype = match self.runtime_slot(prototype).map_err(EvalFailure::Runtime)? {
             Some(_) => Some(prototype),
@@ -9052,10 +9910,34 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::Collection {
                     prototype: slot, ..
                 }
-                | HeapEntry::Uint8Array {
+                | HeapEntry::TypedArray {
+                    prototype: slot, ..
+                }
+                | HeapEntry::ArrayBuffer {
+                    prototype: slot, ..
+                }
+                | HeapEntry::SharedArrayBuffer {
+                    prototype: slot, ..
+                }
+                | HeapEntry::DataView {
                     prototype: slot, ..
                 }
                 | HeapEntry::Promise {
+                    prototype: slot, ..
+                }
+                | HeapEntry::WeakRef {
+                    prototype: slot, ..
+                }
+                | HeapEntry::FinalizationRegistry {
+                    prototype: slot, ..
+                }
+                | HeapEntry::DisposableStack {
+                    prototype: slot, ..
+                }
+                | HeapEntry::ProcessEnv {
+                    prototype: slot, ..
+                }
+                | HeapEntry::Timeout {
                     prototype: slot, ..
                 }
                 | HeapEntry::NativeFunction {
@@ -9089,87 +9971,55 @@ impl<'a, H: Host> Machine<'a, H> {
     fn resume_generator(
         &mut self,
         generator: Value,
-        completion: ResumeCompletion,
+        completion: GeneratorCompletion,
     ) -> Result<Value, EvalFailure> {
-        let state = self.take_generator_state(generator).map_err(|failure| {
-            if let EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Generator.prototype.next called on incompatible receiver",
-            }) = failure
-            {
-                return EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: completion.sync_operation(),
-                });
-            }
-            failure
-        })?;
-        if matches!(&state, GeneratorState::Completed) {
-            return match completion {
-                ResumeCompletion::Next(_) => self.iterator_result(Value::UNDEFINED, true),
-                ResumeCompletion::Throw(value) => Err(EvalFailure::ThrowValueOrigin {
-                    value,
-                    origin: ThrowOrigin::Bytecode,
-                }),
-                ResumeCompletion::Return(value) => self.iterator_result(value, true),
-            };
-        }
-
+        let operation =
+            crate::vm::generator_async::prepare_generator_operation(self, generator, completion)?;
         let stop_depth = self.frames.len();
         let return_to = self.frames.last().map(|frame| ReturnTo {
             destination: None,
             call_pc: frame.pc,
             constructed: None,
         });
-        let prepared = match state {
-            GeneratorState::SuspendedStart(start) => match completion {
-                ResumeCompletion::Next(_) => self
-                    .push_frame(ActivationRequest {
-                        target: start.target,
-                        captures: &start.captures,
-                        context: start.context,
-                        this_value: start.this_value,
-                        new_target: start.new_target,
-                        arguments: &start.args,
-                        return_to,
-                    })
-                    .map_err(|error| EvalFailure::Runtime(error.kind)),
-                ResumeCompletion::Throw(value) => {
-                    self.settle_generator_completed(generator)?;
-                    return Err(EvalFailure::ThrowValueOrigin {
-                        value,
-                        origin: ThrowOrigin::Bytecode,
-                    });
-                }
-                ResumeCompletion::Return(value) => {
-                    self.settle_generator_completed(generator)?;
-                    return self.iterator_result(value, true);
-                }
-            },
-            GeneratorState::Suspended(activation) => {
-                self.push_resumed_generator_frame(activation, completion, return_to)
+        let prepared = match operation {
+            crate::vm::generator_async::PreparedGeneratorOperation::Start { start, .. } => self
+                .push_frame(ActivationRequest {
+                    target: start.target,
+                    captures: &start.captures,
+                    context: start.context,
+                    this_value: start.this_value,
+                    new_target: start.new_target,
+                    arguments: &start.args,
+                    return_to,
+                })
+                .map_err(|error| EvalFailure::Runtime(error.kind)),
+            crate::vm::generator_async::PreparedGeneratorOperation::Resume {
+                activation,
+                completion,
+            } => self.push_resumed_generator_frame(activation, completion, return_to),
+            crate::vm::generator_async::PreparedGeneratorOperation::Complete(value) => {
+                return self.iterator_result(value, true);
             }
-            GeneratorState::Executing | GeneratorState::Completed => unreachable!(),
+            crate::vm::generator_async::PreparedGeneratorOperation::Raise { value, origin } => {
+                return Err(EvalFailure::ThrowValueOrigin { value, origin });
+            }
         };
         if let Err(failure) = prepared {
             self.settle_generator_completed(generator)?;
             return Err(failure);
         }
-
-        let resumed = self.run_generator_activation(stop_depth);
+        let resumed = self.run_generator_activation(stop_depth)?;
         match resumed {
-            Ok(GeneratorResume::Yield { value, activation }) => {
+            GeneratorResume::Yield { value, activation } => {
                 self.settle_generator_yield(generator, value, activation)
             }
-            Ok(GeneratorResume::Return(value)) => {
+            GeneratorResume::Return(value) => {
                 self.settle_generator_completed(generator)?;
                 self.iterator_result(value, true)
             }
-            Ok(GeneratorResume::Throw { value, origin }) => {
+            GeneratorResume::Throw { value, origin } => {
                 self.settle_generator_completed(generator)?;
                 Err(EvalFailure::ThrowValueOrigin { value, origin })
-            }
-            Err(failure) => {
-                self.settle_generator_completed(generator)?;
-                Err(failure)
             }
         }
     }
@@ -9177,7 +10027,7 @@ impl<'a, H: Host> Machine<'a, H> {
     fn push_resumed_generator_frame(
         &mut self,
         activation: SuspendedActivation,
-        completion: ResumeCompletion,
+        completion: GeneratorCompletion,
         return_to: Option<ReturnTo>,
     ) -> Result<(), EvalFailure> {
         if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
@@ -9263,32 +10113,6 @@ impl<'a, H: Host> Machine<'a, H> {
                     kind => Err(EvalFailure::Runtime(kind)),
                 }
             }
-        }
-    }
-
-    pub(crate) fn take_generator_state(
-        &mut self,
-        generator: Value,
-    ) -> Result<GeneratorState, EvalFailure> {
-        let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Generator.prototype.next called on incompatible receiver",
-            }));
-        };
-        let HeapEntry::Generator { state, .. } = &mut self.heap[index] else {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "Generator.prototype.next called on incompatible receiver",
-            }));
-        };
-        match std::mem::replace(state, GeneratorState::Executing) {
-            GeneratorState::Executing => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "generator is already running",
-            })),
-            GeneratorState::Completed => {
-                *state = GeneratorState::Completed;
-                Ok(GeneratorState::Completed)
-            }
-            state => Ok(state),
         }
     }
 
@@ -9613,13 +10437,13 @@ impl<'a, H: Host> Machine<'a, H> {
     /// incompatible receiver rejects the returned Promise; otherwise the
     /// request joins the FIFO and the front request drives the body when the
     /// generator is idle.
-    pub(crate) fn enqueue_async_generator_next(
+    pub(crate) fn enqueue_async_generator_request(
         &mut self,
         generator: Value,
-        completion: ResumeCompletion,
+        completion: GeneratorCompletion,
     ) -> Result<Value, EvalFailure> {
         let capability = self.create_promise()?;
-        let operation = completion.async_operation();
+        let operation = completion.operation().async_receiver_error();
         let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)? else {
             self.reject_promise(
                 capability,
@@ -9642,16 +10466,26 @@ impl<'a, H: Host> Machine<'a, H> {
             completion,
             capability,
         });
-        let idle = !matches!(
-            state,
-            AsyncGeneratorState::Executing
-                | AsyncGeneratorState::AwaitingOperand(_)
-                | AsyncGeneratorState::AwaitingYield(_)
-                | AsyncGeneratorState::AwaitingResumption(_)
-                | AsyncGeneratorState::AwaitingReturn
+        let should_drive = !matches!(
+            crate::vm::async_iterators::async_generator_plan((&*state).into(), completion),
+            crate::vm::async_iterators::AsyncGeneratorPlan::EnqueueOnly
         );
-        if idle {
-            self.drive_async_generator(generator)?;
+        if should_drive && let Err(failure) = self.drive_async_generator(generator) {
+            let (reason, origin, fatal) = match failure {
+                EvalFailure::Runtime(kind) => (Value::UNDEFINED, ThrowOrigin::Bytecode, Some(kind)),
+                failure => {
+                    let (reason, origin) = self.promise_rejection_value(failure)?;
+                    (reason, origin, None)
+                }
+            };
+            let request = self.pop_async_generator_front(generator)?;
+            self.reject_promise(request.capability, reason, origin)
+                .map_err(EvalFailure::Runtime)?;
+            let drained = self.drive_async_generator(generator);
+            if let Some(kind) = fatal {
+                return Err(EvalFailure::Runtime(kind));
+            }
+            drained?;
         }
         Ok(capability)
     }
@@ -9664,9 +10498,7 @@ impl<'a, H: Host> Machine<'a, H> {
     /// done: true}`.
     pub(crate) fn drive_async_generator(&mut self, generator: Value) -> Result<(), EvalFailure> {
         loop {
-            // Phase 1: inspect state and queue front without holding borrows
-            // across subsequent self-method calls (borrow checker).
-            let (is_completed, front_completion) = {
+            let plan = {
                 let Some(index) = self.runtime_slot(generator).map_err(EvalFailure::Runtime)?
                 else {
                     return Err(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
@@ -9678,144 +10510,110 @@ impl<'a, H: Host> Machine<'a, H> {
                         value: generator,
                     }));
                 };
-                if matches!(
-                    state,
-                    AsyncGeneratorState::Executing
-                        | AsyncGeneratorState::AwaitingOperand(_)
-                        | AsyncGeneratorState::AwaitingYield(_)
-                        | AsyncGeneratorState::AwaitingResumption(_)
-                        | AsyncGeneratorState::AwaitingReturn
-                ) {
+                let Some(request) = queue.front() else {
                     return Ok(());
-                }
-                if queue.is_empty() {
-                    return Ok(());
-                }
-                (
-                    matches!(state, AsyncGeneratorState::Completed),
-                    queue.front().expect("queue non-empty").completion,
-                )
+                };
+                crate::vm::async_iterators::async_generator_plan(state.into(), request.completion)
             };
 
-            // Phase 2: act on the state, dropping all borrows first.
-            if is_completed {
-                match front_completion {
-                    ResumeCompletion::Throw(value) => {
-                        let request = self.pop_async_generator_front(generator)?;
-                        self.reject_promise(request.capability, value, ThrowOrigin::Bytecode)
-                            .map_err(EvalFailure::Runtime)?;
-                    }
-                    ResumeCompletion::Return(value) => {
-                        // Don't pop; leave the request queued so the
-                        // AwaitingReturn reaction settles it. Transition
-                        // Completed → Executing → AwaitingReturn, then await.
-                        self.take_async_generator_state(generator)?;
-                        let result = self
-                            .replace_async_generator_state(
-                                generator,
-                                AsyncGeneratorState::AwaitingReturn,
-                            )
-                            .map_err(EvalFailure::Runtime)
-                            .and_then(|()| self.await_promise_for_generator(value, generator));
-                        if result.is_err() {
-                            self.complete_async_generator(generator)?;
-                        }
-                        return result;
-                    }
-                    ResumeCompletion::Next(_) => {
-                        let request = self.pop_async_generator_front(generator)?;
-                        let result = self.iterator_result(Value::UNDEFINED, true)?;
-                        self.resolve_promise(request.capability, result)
-                            .map_err(EvalFailure::Runtime)?;
-                    }
+            use crate::vm::async_iterators::AsyncGeneratorPlan;
+            match plan {
+                AsyncGeneratorPlan::EnqueueOnly => return Ok(()),
+                AsyncGeneratorPlan::DrainNext => {
+                    let request = self.pop_async_generator_front(generator)?;
+                    let result = self.iterator_result(Value::UNDEFINED, true)?;
+                    self.resolve_promise(request.capability, result)
+                        .map_err(EvalFailure::Runtime)?;
                 }
-                continue;
-            }
-
-            // Not Completed: SuspendedStart or SuspendedYield. Take the state
-            // (sets to Executing) and dispatch the body.
-            let state = self.take_async_generator_state(generator)?;
-            let stop_depth = self.frames.len();
-            let return_to = self.frames.last().map(|frame| ReturnTo {
-                destination: None,
-                call_pc: frame.pc,
-                constructed: None,
-            });
-            match state {
-                AsyncGeneratorState::SuspendedStart(start) => match front_completion {
-                    ResumeCompletion::Next(_) => {
-                        let pushed = self
-                            .push_frame(ActivationRequest {
-                                target: start.target,
-                                captures: &start.captures,
-                                context: start.context,
-                                this_value: start.this_value,
-                                new_target: start.new_target,
-                                arguments: &start.args,
-                                return_to,
-                            })
-                            .map_err(|error| EvalFailure::Runtime(error.kind));
-                        let step = match pushed {
-                            Ok(()) => self.drive_async_generator_activation(stop_depth, None),
-                            Err(failure) => Err(failure),
-                        };
-                        self.settle_async_generator_step(generator, step)?;
-                    }
-                    ResumeCompletion::Throw(value) => {
-                        let request = self.pop_async_generator_front(generator)?;
+                AsyncGeneratorPlan::DrainThrow { value, origin } => {
+                    let request = self.pop_async_generator_front(generator)?;
+                    self.reject_promise(request.capability, value, origin)
+                        .map_err(EvalFailure::Runtime)?;
+                }
+                AsyncGeneratorPlan::AwaitReturn(value) => {
+                    self.take_async_generator_state(generator)?;
+                    let result = self
+                        .replace_async_generator_state(
+                            generator,
+                            AsyncGeneratorState::AwaitingReturn,
+                        )
+                        .map_err(EvalFailure::Runtime)
+                        .and_then(|()| self.await_promise_for_generator(value, generator));
+                    if result.is_err() {
                         self.complete_async_generator(generator)?;
-                        self.reject_promise(request.capability, value, ThrowOrigin::Bytecode)
-                            .map_err(EvalFailure::Runtime)?;
-                        continue;
                     }
-                    ResumeCompletion::Return(value) => {
-                        let result = self
-                            .replace_async_generator_state(
-                                generator,
-                                AsyncGeneratorState::AwaitingReturn,
-                            )
-                            .map_err(EvalFailure::Runtime)
-                            .and_then(|()| self.await_promise_for_generator(value, generator));
-                        if result.is_err() {
-                            self.complete_async_generator(generator)?;
-                        }
-                        return result;
+                    return result;
+                }
+                AsyncGeneratorPlan::SettleThrow { value, origin } => {
+                    self.take_async_generator_state(generator)?;
+                    let request = self.pop_async_generator_front(generator)?;
+                    self.complete_async_generator(generator)?;
+                    self.reject_promise(request.capability, value, origin)
+                        .map_err(EvalFailure::Runtime)?;
+                }
+                AsyncGeneratorPlan::StartDrive => {
+                    let state = self.take_async_generator_state(generator)?;
+                    let AsyncGeneratorState::SuspendedStart(start) = state else {
+                        unreachable!("async generator plan selected a non-start state")
+                    };
+                    let stop_depth = self.frames.len();
+                    let return_to = self.frames.last().map(|frame| ReturnTo {
+                        destination: None,
+                        call_pc: frame.pc,
+                        constructed: None,
+                    });
+                    let pushed = self
+                        .push_frame(ActivationRequest {
+                            target: start.target,
+                            captures: &start.captures,
+                            context: start.context,
+                            this_value: start.this_value,
+                            new_target: start.new_target,
+                            arguments: &start.args,
+                            return_to,
+                        })
+                        .map_err(|error| EvalFailure::Runtime(error.kind));
+                    let step = match pushed {
+                        Ok(()) => self.drive_async_generator_activation(stop_depth, None),
+                        Err(failure) => Err(failure),
+                    };
+                    self.settle_async_generator_step(generator, step)?;
+                }
+                AsyncGeneratorPlan::AwaitResumption(value) => {
+                    let state = self.take_async_generator_state(generator)?;
+                    let AsyncGeneratorState::SuspendedYield(activation) = state else {
+                        unreachable!("async generator plan selected a non-yield state")
+                    };
+                    let register_count = activation.registers.len();
+                    let result = self
+                        .replace_async_generator_state(
+                            generator,
+                            AsyncGeneratorState::AwaitingResumption(activation),
+                        )
+                        .map_err(EvalFailure::Runtime)
+                        .and_then(|()| self.await_promise_for_generator(value, generator));
+                    if result.is_err() {
+                        self.release_suspended_activation_registers(register_count);
+                        self.complete_async_generator(generator)?;
                     }
-                },
-                AsyncGeneratorState::SuspendedYield(activation) => match front_completion {
-                    ResumeCompletion::Next(_) | ResumeCompletion::Throw(_) => {
-                        let step = self
-                            .push_resumed_generator_frame(activation, front_completion, return_to)
-                            .and_then(|()| self.drive_async_generator_activation(stop_depth, None));
-                        self.settle_async_generator_step(generator, step)?;
-                    }
-                    ResumeCompletion::Return(value) => {
-                        // Park in AwaitingResumption and await the return
-                        // operand. On fulfillment, resume_async_generator
-                        // re-enters with Return(value); on rejection, with
-                        // Throw(reason). Any setup failure must release the
-                        // activation registers and complete the generator.
-                        let register_count = activation.registers.len();
-                        let result = self
-                            .replace_async_generator_state(
-                                generator,
-                                AsyncGeneratorState::AwaitingResumption(activation),
-                            )
-                            .map_err(EvalFailure::Runtime)
-                            .and_then(|()| self.await_promise_for_generator(value, generator));
-                        if result.is_err() {
-                            self.release_suspended_activation_registers(register_count);
-                            self.complete_async_generator(generator)?;
-                        }
-                        return result;
-                    }
-                },
-                AsyncGeneratorState::Executing
-                | AsyncGeneratorState::AwaitingOperand(_)
-                | AsyncGeneratorState::AwaitingYield(_)
-                | AsyncGeneratorState::AwaitingResumption(_)
-                | AsyncGeneratorState::AwaitingReturn
-                | AsyncGeneratorState::Completed => unreachable!(),
+                    return result;
+                }
+                AsyncGeneratorPlan::Drive(completion) => {
+                    let state = self.take_async_generator_state(generator)?;
+                    let AsyncGeneratorState::SuspendedYield(activation) = state else {
+                        unreachable!("async generator plan selected a non-yield state")
+                    };
+                    let stop_depth = self.frames.len();
+                    let return_to = self.frames.last().map(|frame| ReturnTo {
+                        destination: None,
+                        call_pc: frame.pc,
+                        constructed: None,
+                    });
+                    let step = self
+                        .push_resumed_generator_frame(activation, completion, return_to)
+                        .and_then(|()| self.drive_async_generator_activation(stop_depth, None));
+                    self.settle_async_generator_step(generator, step)?;
+                }
             }
         }
     }
@@ -10094,7 +10892,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 .drive_resumed_async_generator(
                     generator,
                     activation,
-                    ResumeCompletion::Next(value),
+                    GeneratorCompletion::Normal(value),
                     None,
                 ),
             (AsyncGeneratorState::AwaitingOperand(activation), Some(origin)) => {
@@ -10106,7 +10904,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.drive_resumed_async_generator(
                     generator,
                     activation,
-                    ResumeCompletion::Next(Value::UNDEFINED),
+                    GeneratorCompletion::Normal(Value::UNDEFINED),
                     Some((value, origin, suspend_pc)),
                 )
             }
@@ -10114,17 +10912,17 @@ impl<'a, H: Host> Machine<'a, H> {
                 .drive_resumed_async_generator(
                     generator,
                     activation,
-                    ResumeCompletion::Return(value),
+                    GeneratorCompletion::Return(value),
                     None,
                 ),
-            (AsyncGeneratorState::AwaitingResumption(activation), Some(_)) => {
+            (AsyncGeneratorState::AwaitingResumption(activation), Some(origin)) => {
                 // The suspension is a Suspend instruction with a mode
                 // register; re-enter with Throw(value) and let the
                 // compiler's inline abrupt dispatch handle it — no inject.
                 self.drive_resumed_async_generator(
                     generator,
                     activation,
-                    ResumeCompletion::Throw(value),
+                    GeneratorCompletion::Throw { value, origin },
                     None,
                 )
             }
@@ -10137,7 +10935,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 self.drive_resumed_async_generator(
                     generator,
                     activation,
-                    ResumeCompletion::Next(Value::UNDEFINED),
+                    GeneratorCompletion::Normal(Value::UNDEFINED),
                     Some((value, origin, suspend_pc)),
                 )
             }
@@ -10171,7 +10969,7 @@ impl<'a, H: Host> Machine<'a, H> {
         &mut self,
         generator: Value,
         activation: SuspendedActivation,
-        completion: ResumeCompletion,
+        completion: GeneratorCompletion,
         inject: Option<(Value, ThrowOrigin, usize)>,
     ) -> Result<(), RuntimeErrorKind> {
         let stop_depth = self.frames.len();
@@ -10571,8 +11369,16 @@ impl<'a, H: Host> Machine<'a, H> {
         iterator: Value,
         next: Value,
     ) -> Result<Value, EvalFailure> {
-        self.allocate(HeapEntry::Iterator {
-            state: IteratorState::AsyncFromSync { iterator, next },
+        self.allocate(HeapEntry::AsyncFromSync {
+            iterator,
+            next,
+            properties: PropertyMap::default(),
+            prototype: Some(
+                self.intrinsics
+                    .builtins
+                    .async_from_sync_iterator_prototype(),
+            ),
+            extensible: true,
         })
         .map_err(EvalFailure::Runtime)
     }
@@ -10580,18 +11386,23 @@ impl<'a, H: Host> Machine<'a, H> {
     fn own_property_keys(&self, src: Value) -> Result<Vec<PropertyKey>, EvalFailure> {
         match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
-                HeapEntry::Uint8Array {
-                    bytes, properties, ..
-                } => Ok((0..bytes.len())
-                    .map(|index| PropertyKey::Named(EcmaString::encode(&index.to_string())))
-                    .chain(ordered_property_keys(properties).into_iter().filter(|key| {
-                        key.as_string()
-                            .is_none_or(|name| uint8array_index(name).is_none())
-                    }))
-                    .collect()),
+                HeapEntry::TypedArray { properties, .. } => {
+                    let length = self.typed_array_length_at(index).unwrap_or_default();
+                    Ok((0..length)
+                        .map(|index| PropertyKey::Named(EcmaString::encode(&index.to_string())))
+                        .chain(ordered_property_keys(properties).into_iter().filter(|key| {
+                            key.as_string().is_none_or(|name| {
+                                typedarray_all::typed_array_index(name).is_none()
+                            })
+                        }))
+                        .collect())
+                }
                 HeapEntry::Object { properties, .. }
+                | HeapEntry::WeakRef { properties, .. }
+                | HeapEntry::FinalizationRegistry { properties, .. }
                 | HeapEntry::Generator { properties, .. }
                 | HeapEntry::AsyncGenerator { properties, .. }
+                | HeapEntry::AsyncFromSync { properties, .. }
                 | HeapEntry::Script { properties, .. }
                 | HeapEntry::Function { properties, .. }
                 | HeapEntry::NativeFunction { properties, .. }
@@ -10600,7 +11411,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 | HeapEntry::BuiltinIterator { properties, .. }
                 | HeapEntry::Collection { properties, .. }
                 | HeapEntry::Promise { properties, .. }
-                | HeapEntry::Timeout { properties, .. } => Ok(ordered_property_keys(properties)),
+                | HeapEntry::DisposableStack { properties, .. }
+                | HeapEntry::Timeout { properties, .. }
+                | HeapEntry::ArrayBuffer { properties, .. }
+                | HeapEntry::SharedArrayBuffer { properties, .. }
+                | HeapEntry::DataView { properties, .. } => Ok(ordered_property_keys(properties)),
                 HeapEntry::Array {
                     elements,
                     properties,
@@ -10703,14 +11518,15 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::String(text) => key.as_string().is_some_and(|name| {
                 array_index(name).is_some_and(|offset| (offset as usize) < text.len_units())
             }),
-            HeapEntry::Uint8Array {
-                bytes, properties, ..
-            } => properties.get(key).map_or_else(
+            HeapEntry::TypedArray { properties, .. } => properties.get(key).map_or_else(
                 || {
                     key.as_string()
-                        .and_then(uint8array_index)
+                        .and_then(typedarray_all::typed_array_index)
                         .flatten()
-                        .is_some_and(|offset| offset < bytes.len())
+                        .is_some_and(|offset| {
+                            self.typed_array_length_at(index)
+                                .is_some_and(|length| offset < length)
+                        })
                 },
                 Property::enumerable,
             ),
@@ -10720,6 +11536,7 @@ impl<'a, H: Host> Machine<'a, H> {
             HeapEntry::Object { properties, .. }
             | HeapEntry::Generator { properties, .. }
             | HeapEntry::AsyncGenerator { properties, .. }
+            | HeapEntry::AsyncFromSync { properties, .. }
             | HeapEntry::Script { properties, .. }
             | HeapEntry::Function { properties, .. }
             | HeapEntry::NativeFunction { properties, .. }
@@ -10728,7 +11545,13 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::BuiltinIterator { properties, .. }
             | HeapEntry::Collection { properties, .. }
             | HeapEntry::Promise { properties, .. }
-            | HeapEntry::Timeout { properties, .. } => {
+            | HeapEntry::WeakRef { properties, .. }
+            | HeapEntry::FinalizationRegistry { properties, .. }
+            | HeapEntry::DisposableStack { properties, .. }
+            | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::SharedArrayBuffer { properties, .. }
+            | HeapEntry::DataView { properties, .. } => {
                 properties.get(key).is_some_and(Property::enumerable)
             }
             _ => false,
@@ -10802,10 +11625,81 @@ impl<'a, H: Host> Machine<'a, H> {
     /// raw sync iterator-result object before any await, PromiseResolves only
     /// its `value`, and settles a derived step promise with a freshly built
     /// `{ value: unwrapped, done }` result. The raw result object itself is
-    /// never assimilated. A failed step and a rejected non-done value close
-    /// the sync iterator; a done step propagates a value rejection without
-    /// closing. Shared by the interpreter and the native helper path so every
-    /// backend observes the same semantics.
+    /// never assimilated. A failed synchronous step closes the sync iterator;
+    /// rejection while unwrapping its value propagates without closing. Shared
+    /// by the interpreter and native helper path so every backend agrees.
+    pub(crate) fn async_from_sync_iterator_method(
+        &mut self,
+        adapter: Value,
+        operation: vm::generator_async::GeneratorOperation,
+        value: Value,
+    ) -> Result<Value, EvalFailure> {
+        let carrier = self
+            .runtime_slot(adapter)
+            .map_err(EvalFailure::Runtime)?
+            .and_then(|index| match &self.heap[index] {
+                HeapEntry::AsyncFromSync { iterator, next, .. } => Some((*iterator, *next)),
+                _ => None,
+            });
+        let Some((iterator, next)) = carrier else {
+            let rejected = self.create_promise()?;
+            self.reject_promise(
+                rejected,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "AsyncFromSyncIterator method called on incompatible receiver",
+                },
+            )
+            .map_err(EvalFailure::Runtime)?;
+            return Ok(rejected);
+        };
+        let method = match operation {
+            vm::generator_async::GeneratorOperation::Next => next,
+            vm::generator_async::GeneratorOperation::Return => {
+                self.get_named_property(iterator, "return")?
+            }
+            vm::generator_async::GeneratorOperation::Throw => {
+                self.get_named_property(iterator, "throw")?
+            }
+        };
+        if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
+            let settled = self.create_promise()?;
+            match operation {
+                vm::generator_async::GeneratorOperation::Return => {
+                    let result = self.iterator_result(value, true)?;
+                    self.resolve_promise(settled, result)
+                        .map_err(EvalFailure::Runtime)?;
+                }
+                vm::generator_async::GeneratorOperation::Throw => {
+                    self.reject_promise(
+                        settled,
+                        Value::UNDEFINED,
+                        ThrowOrigin::TypeError {
+                            operation: "sync iterator has no throw method",
+                        },
+                    )
+                    .map_err(EvalFailure::Runtime)?;
+                }
+                vm::generator_async::GeneratorOperation::Next => unreachable!(),
+            }
+            return Ok(settled);
+        }
+        if !self.is_callable(method)? {
+            let rejected = self.create_promise()?;
+            self.reject_promise(
+                rejected,
+                Value::UNDEFINED,
+                ThrowOrigin::TypeError {
+                    operation: "sync iterator method is not callable",
+                },
+            )
+            .map_err(EvalFailure::Runtime)?;
+            return Ok(rejected);
+        }
+        let result = self.call_value(method, iterator, &[value]);
+        self.async_from_sync_continuation(iterator, result)
+    }
+
     pub(crate) fn async_from_sync_continuation(
         &mut self,
         sync_iterator: Value,
@@ -10820,7 +11714,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             Ok((done, value)) => {
                 let resolved = self.promise_resolve(value)?;
-                self.attach_async_from_sync_reactions(sync_iterator, derived, resolved, done)?;
+                self.attach_async_from_sync_reactions(derived, resolved, done, sync_iterator)?;
             }
         }
         Ok(derived)
@@ -10849,10 +11743,10 @@ impl<'a, H: Host> Machine<'a, H> {
     /// microtask charging.
     fn attach_async_from_sync_reactions(
         &mut self,
-        sync_iterator: Value,
         derived: Value,
         resolved: Value,
         done: bool,
+        sync_iterator: Value,
     ) -> Result<(), EvalFailure> {
         let index = self
             .runtime_slot(resolved)
@@ -10892,7 +11786,6 @@ impl<'a, H: Host> Machine<'a, H> {
                 PromiseReaction::AsyncFromSyncReject {
                     derived,
                     sync_iterator,
-                    done,
                     context: self.context_global,
                 }
             };
@@ -10925,7 +11818,6 @@ impl<'a, H: Host> Machine<'a, H> {
         reject_reactions.push(PromiseReaction::AsyncFromSyncReject {
             derived,
             sync_iterator,
-            done,
             context,
         });
         Ok(())
@@ -10963,12 +11855,12 @@ impl<'a, H: Host> Machine<'a, H> {
                 callee: *next,
                 this_value: *iterator,
             }),
-            HeapEntry::Iterator {
-                state: IteratorState::AsyncFromSync { iterator, next },
-            } => Ok(IteratorNextPrepared::AsyncFromSyncCall {
-                callee: *next,
-                this_value: *iterator,
-            }),
+            HeapEntry::AsyncFromSync { iterator, next, .. } => {
+                Ok(IteratorNextPrepared::AsyncFromSyncCall {
+                    callee: *next,
+                    this_value: *iterator,
+                })
+            }
             _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "iterator next on non-iterator",
             })),
@@ -11033,32 +11925,16 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             UnaryOp::Plus => self.to_number(operand),
             UnaryOp::Negate => {
-                if let Some(text) = self.bigint_text(operand) {
-                    let negated = if text == "0" {
-                        "0".to_owned()
-                    } else if let Some(positive) = text.strip_prefix('-') {
-                        positive.to_owned()
-                    } else {
-                        format!("-{text}")
-                    };
-                    return self
-                        .allocate(HeapEntry::BigInt(negated))
-                        .map_err(EvalFailure::Runtime);
+                if let Some(value) = intrinsics::builtins::bigint::unary_minus(self, operand)? {
+                    return Ok(value);
                 }
                 let number =
                     numeric_f64(self.to_number(operand)?).expect("ToNumber returns numeric");
                 Ok(number_value(-number))
             }
             UnaryOp::BitwiseNot => {
-                if let Some(text) = self.bigint_text(operand) {
-                    let value = text.parse::<i128>().map_err(|_| {
-                        EvalFailure::Throw(ThrowOrigin::RangeError {
-                            operation: "bigint bitwise not",
-                        })
-                    })?;
-                    return self
-                        .allocate(HeapEntry::BigInt((!value).to_string()))
-                        .map_err(EvalFailure::Runtime);
+                if let Some(value) = intrinsics::builtins::bigint::bitwise_not(self, operand)? {
+                    return Ok(value);
                 }
                 Ok(Value::int32(
                     (!to_int32(numeric_f64(self.to_number(operand)?).unwrap())) as u32,
@@ -11147,25 +12023,13 @@ impl<'a, H: Host> Machine<'a, H> {
                 .allocate(HeapEntry::String(builder.finish()))
                 .map_err(EvalFailure::Runtime);
         }
-        let left_bigint = self.bigint_text(left).map(str::to_owned);
-        let right_bigint = self.bigint_text(right).map(str::to_owned);
-        match (left_bigint, right_bigint) {
-            (Some(left), Some(right)) => {
-                let sum = bigint_i128(&left)?
-                    .checked_add(bigint_i128(&right)?)
-                    .ok_or(EvalFailure::Throw(ThrowOrigin::RangeError {
-                        operation: "bigint add overflow",
-                    }))?;
-                return self
-                    .allocate(HeapEntry::BigInt(sum.to_string()))
-                    .map_err(EvalFailure::Runtime);
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "add bigint and number",
-                }));
-            }
-            (None, None) => {}
+        if let Some(sum) = intrinsics::builtins::bigint::binary_op(
+            self,
+            intrinsics::builtins::bigint::BigIntBinaryOp::Add,
+            left,
+            right,
+        )? {
+            return Ok(sum);
         }
         let left = numeric_f64(self.to_number(left)?).unwrap();
         let right = numeric_f64(self.to_number(right)?).unwrap();
@@ -11178,18 +12042,10 @@ impl<'a, H: Host> Machine<'a, H> {
         left: Value,
         right: Value,
     ) -> Result<Value, EvalFailure> {
-        let left_bigint = self.bigint_text(left).map(str::to_owned);
-        let right_bigint = self.bigint_text(right).map(str::to_owned);
-        if left_bigint.is_some() || right_bigint.is_some() {
-            let (Some(left), Some(right)) = (left_bigint, right_bigint) else {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "mix bigint and number",
-                }));
-            };
-            let result = bigint_binary(op, &left, &right)?;
-            return self
-                .allocate(HeapEntry::BigInt(result))
-                .map_err(EvalFailure::Runtime);
+        if let Some(result) =
+            intrinsics::builtins::bigint::binary_op(self, bigint_binary_op(op), left, right)?
+        {
+            return Ok(result);
         }
         let left = numeric_f64(self.to_number(left)?).unwrap();
         let right = numeric_f64(self.to_number(right)?).unwrap();
@@ -11306,6 +12162,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::Object { .. }
                         | HeapEntry::Generator { .. }
                         | HeapEntry::AsyncGenerator { .. }
+                        | HeapEntry::AsyncFromSync { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Array { .. }
                         | HeapEntry::Function { .. }
@@ -11317,15 +12174,21 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
-                        | HeapEntry::Uint8Array { .. }
+                        | HeapEntry::TypedArray { .. }
+                        | HeapEntry::ArrayBuffer { .. }
+                        | HeapEntry::SharedArrayBuffer { .. }
+                        | HeapEntry::DataView { .. }
                         | HeapEntry::Promise { .. }
+                        | HeapEntry::DisposableStack { .. }
                         | HeapEntry::PromiseResolver { .. }
                         | HeapEntry::PromiseAll { .. }
                         | HeapEntry::AsyncActivation { .. }
                         | HeapEntry::PromiseAllElement { .. }
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. }
-                        | HeapEntry::Timeout { .. } => Ok(Value::number(f64::NAN)),
+                        | HeapEntry::Timeout { .. }
+                        | HeapEntry::WeakRef { .. }
+                        | HeapEntry::FinalizationRegistry { .. } => Ok(Value::number(f64::NAN)),
                         HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                     },
                     None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -11353,6 +12216,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::Object { .. }
                     | HeapEntry::Generator { .. }
                     | HeapEntry::AsyncGenerator { .. }
+                    | HeapEntry::AsyncFromSync { .. }
                     | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::Function { .. }
@@ -11366,15 +12230,21 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { .. }
                     | HeapEntry::BuiltinIterator { .. }
                     | HeapEntry::Collection { .. }
-                    | HeapEntry::Uint8Array { .. }
+                    | HeapEntry::TypedArray { .. }
+                    | HeapEntry::ArrayBuffer { .. }
+                    | HeapEntry::SharedArrayBuffer { .. }
+                    | HeapEntry::DataView { .. }
                     | HeapEntry::Promise { .. }
+                    | HeapEntry::DisposableStack { .. }
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. }
-                    | HeapEntry::Timeout { .. } => true,
+                    | HeapEntry::Timeout { .. }
+                    | HeapEntry::WeakRef { .. }
+                    | HeapEntry::FinalizationRegistry { .. } => true,
                     HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                 },
                 Ok(None) => true,
@@ -11399,6 +12269,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::Object { .. }
                     | HeapEntry::Generator { .. }
                     | HeapEntry::AsyncGenerator { .. }
+                    | HeapEntry::AsyncFromSync { .. }
                     | HeapEntry::Script { .. }
                     | HeapEntry::Array { .. }
                     | HeapEntry::ModuleNamespace { .. }
@@ -11408,15 +12279,21 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Date { .. }
                     | HeapEntry::BuiltinIterator { .. }
                     | HeapEntry::Collection { .. }
-                    | HeapEntry::Uint8Array { .. }
+                    | HeapEntry::TypedArray { .. }
+                    | HeapEntry::ArrayBuffer { .. }
+                    | HeapEntry::SharedArrayBuffer { .. }
+                    | HeapEntry::DataView { .. }
                     | HeapEntry::Promise { .. }
+                    | HeapEntry::DisposableStack { .. }
                     | HeapEntry::PromiseResolver { .. }
                     | HeapEntry::PromiseAll { .. }
                     | HeapEntry::AsyncActivation { .. }
                     | HeapEntry::PromiseAllElement { .. }
                     | HeapEntry::ProcessEnv { .. }
                     | HeapEntry::Iterator { .. }
-                    | HeapEntry::Timeout { .. } => "object",
+                    | HeapEntry::Timeout { .. }
+                    | HeapEntry::WeakRef { .. }
+                    | HeapEntry::FinalizationRegistry { .. } => "object",
                     HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                 },
                 _ => "object",
@@ -11444,16 +12321,35 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn abstract_equal(&self, left: Value, right: Value) -> Result<bool, EvalFailure> {
+    fn abstract_equal(&mut self, left: Value, right: Value) -> Result<bool, EvalFailure> {
         if self.strict_equal(left, right) {
             return Ok(true);
         }
-        if matches!(
-            (left.decode(), right.decode()),
-            (Some(Decoded::Null), Some(Decoded::Undefined))
-                | (Some(Decoded::Undefined), Some(Decoded::Null))
-        ) {
-            return Ok(true);
+        let left_nullish = matches!(
+            left.decode(),
+            Some(Decoded::Null | Decoded::Undefined | Decoded::Hole | Decoded::Uninitialized)
+                | None
+        );
+        let right_nullish = matches!(
+            right.decode(),
+            Some(Decoded::Null | Decoded::Undefined | Decoded::Hole | Decoded::Uninitialized)
+                | None
+        );
+        if left_nullish || right_nullish {
+            return Ok(left_nullish && right_nullish);
+        }
+        let left_object = self.is_object(left);
+        let right_object = self.is_object(right);
+        if left_object && !right_object {
+            let primitive = self.coerce_primitive_default(left)?;
+            return self.abstract_equal(primitive, right);
+        }
+        if !left_object && right_object {
+            let primitive = self.coerce_primitive_default(right)?;
+            return self.abstract_equal(left, primitive);
+        }
+        if let Some(equal) = intrinsics::builtins::bigint::loose_equals(self, left, right)? {
+            return Ok(equal);
         }
         let left_number = self.to_number(left);
         let right_number = self.to_number(right);
@@ -11464,15 +12360,17 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn relational_compare(
-        &self,
+        &mut self,
         left: Value,
         right: Value,
     ) -> Result<Option<Ordering>, EvalFailure> {
+        let left = self.coerce_primitive_observable(left, false)?;
+        let right = self.coerce_primitive_observable(right, false)?;
         if let (Some(left), Some(right)) = (self.string_text(left), self.string_text(right)) {
             return Ok(Some(left.cmp(right)));
         }
-        if let (Some(left), Some(right)) = (self.bigint_text(left), self.bigint_text(right)) {
-            return Ok(Some(bigint_i128(left)?.cmp(&bigint_i128(right)?)));
+        if let Some(ordering) = intrinsics::builtins::bigint::compare(self, left, right)? {
+            return Ok(ordering);
         }
         let left = numeric_f64(self.to_number(left)?).unwrap();
         let right = numeric_f64(self.to_number(right)?).unwrap();
@@ -11622,12 +12520,17 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::Object { .. }
                         | HeapEntry::Generator { .. }
                         | HeapEntry::AsyncGenerator { .. }
+                        | HeapEntry::AsyncFromSync { .. }
                         | HeapEntry::Script { .. }
                         | HeapEntry::Date { .. }
                         | HeapEntry::BuiltinIterator { .. }
                         | HeapEntry::Collection { .. }
-                        | HeapEntry::Uint8Array { .. }
+                        | HeapEntry::TypedArray { .. }
+                        | HeapEntry::ArrayBuffer { .. }
+                        | HeapEntry::SharedArrayBuffer { .. }
+                        | HeapEntry::DataView { .. }
                         | HeapEntry::Promise { .. }
+                        | HeapEntry::DisposableStack { .. }
                         | HeapEntry::PromiseResolver { .. }
                         | HeapEntry::PromiseAll { .. }
                         | HeapEntry::AsyncActivation { .. }
@@ -11637,7 +12540,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         | HeapEntry::ProcessEnv { .. }
                         | HeapEntry::Iterator { .. }
                         | HeapEntry::Timeout { .. }
-                        | HeapEntry::HashState { .. } => Ok(EcmaString::encode("[object Object]")),
+                        | HeapEntry::HashState { .. }
+                        | HeapEntry::WeakRef { .. }
+                        | HeapEntry::FinalizationRegistry { .. } => {
+                            Ok(EcmaString::encode("[object Object]"))
+                        }
                         HeapEntry::RegExp { pattern, flags, .. } => {
                             let mut builder = EcmaStringBuilder::with_capacity(
                                 pattern
@@ -11719,14 +12626,6 @@ impl<'a, H: Host> Machine<'a, H> {
         let index = self.runtime_slot(value).ok()??;
         match &self.heap[index] {
             HeapEntry::String(text) => Some(text),
-            _ => None,
-        }
-    }
-
-    fn bigint_text(&self, value: Value) -> Option<&str> {
-        let index = self.runtime_slot(value).ok()??;
-        match &self.heap[index] {
-            HeapEntry::BigInt(text) => Some(text),
             _ => None,
         }
     }
@@ -11913,55 +12812,6 @@ fn string_own_get_ascii(text: &EcmaString, name: &str) -> Option<Found> {
     Some(Found::Text(EcmaString::from_units(&[unit])))
 }
 
-fn uint8array_index(key: &EcmaString) -> Option<Option<usize>> {
-    let Ok(key) = key.to_utf8_strict() else {
-        return None;
-    };
-    uint8array_index_ascii(&key)
-}
-
-fn uint8array_index_ascii(key: &str) -> Option<Option<usize>> {
-    if key == "-0" {
-        return Some(None);
-    }
-    if !key.is_empty()
-        && key.is_ascii()
-        && key.bytes().all(|byte| byte.is_ascii_digit())
-        && (key.len() == 1 || key.as_bytes()[0] != b'0')
-    {
-        let mut index = 0_usize;
-        let mut overflowed = false;
-        for byte in key.bytes() {
-            match index
-                .checked_mul(10)
-                .and_then(|index| index.checked_add(usize::from(byte - b'0')))
-            {
-                Some(next) => index = next,
-                None => {
-                    overflowed = true;
-                    break;
-                }
-            }
-        }
-        if !overflowed {
-            return Some(Some(index));
-        }
-    }
-    let number = match key {
-        "NaN" => f64::NAN,
-        "Infinity" => f64::INFINITY,
-        "-Infinity" => f64::NEG_INFINITY,
-        _ => key.parse::<f64>().ok()?,
-    };
-    if format_number(number) != key {
-        return None;
-    }
-    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 || number >= usize::MAX as f64 {
-        return Some(None);
-    }
-    Some(Some(number as usize))
-}
-
 fn exact_array_length(value: Value) -> Option<usize> {
     let number = numeric_f64(value)?;
     if number.is_finite() && number >= 0.0 && number.fract() == 0.0 && number <= u32::MAX as f64 {
@@ -12019,77 +12869,23 @@ pub(crate) fn array_set_length(
     apply_array_length(elements, properties, length, operation)
 }
 
-fn bigint_i128(text: &str) -> Result<i128, EvalFailure> {
-    text.parse::<i128>().map_err(|_| {
-        EvalFailure::Throw(ThrowOrigin::RangeError {
-            operation: "bigint magnitude exceeds runtime width",
-        })
-    })
-}
+fn bigint_binary_op(op: BinaryOp) -> intrinsics::builtins::bigint::BigIntBinaryOp {
+    use intrinsics::builtins::bigint::BigIntBinaryOp;
 
-fn bigint_binary(op: BinaryOp, left: &str, right: &str) -> Result<String, EvalFailure> {
-    let left = bigint_i128(left)?;
-    let right = bigint_i128(right)?;
-    let overflow =
-        |operation: &'static str| EvalFailure::Throw(ThrowOrigin::RangeError { operation });
-    let result = match op {
-        BinaryOp::Subtract => left
-            .checked_sub(right)
-            .ok_or_else(|| overflow("bigint subtract overflow"))?,
-        BinaryOp::Multiply => left
-            .checked_mul(right)
-            .ok_or_else(|| overflow("bigint multiply overflow"))?,
-        BinaryOp::Divide => {
-            if right == 0 {
-                return Err(EvalFailure::Throw(ThrowOrigin::RangeError {
-                    operation: "bigint division by zero",
-                }));
-            }
-            left.checked_div(right)
-                .ok_or_else(|| overflow("bigint divide overflow"))?
-        }
-        BinaryOp::Remainder => {
-            if right == 0 {
-                return Err(EvalFailure::Throw(ThrowOrigin::RangeError {
-                    operation: "bigint remainder by zero",
-                }));
-            }
-            left.checked_rem(right)
-                .ok_or_else(|| overflow("bigint remainder overflow"))?
-        }
-        BinaryOp::Exponent => {
-            if right < 0 {
-                return Err(EvalFailure::Throw(ThrowOrigin::RangeError {
-                    operation: "bigint negative exponent",
-                }));
-            }
-            let exponent =
-                u32::try_from(right).map_err(|_| overflow("bigint exponent overflow"))?;
-            left.checked_pow(exponent)
-                .ok_or_else(|| overflow("bigint exponent overflow"))?
-        }
-        BinaryOp::BitAnd => left & right,
-        BinaryOp::BitOr => left | right,
-        BinaryOp::BitXor => left ^ right,
-        BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
-            let left_shift = (op == BinaryOp::ShiftLeft) == (right >= 0);
-            let amount =
-                u32::try_from(right.unsigned_abs()).map_err(|_| overflow("bigint shift width"))?;
-            let shifted = if left_shift {
-                left.checked_shl(amount)
-            } else {
-                left.checked_shr(amount)
-            };
-            shifted.ok_or_else(|| overflow("bigint shift overflow"))?
-        }
-        BinaryOp::UnsignedShiftRight => {
-            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "unsigned shift on bigint",
-            }));
-        }
-        _ => unreachable!("bigint arithmetic partition"),
-    };
-    Ok(result.to_string())
+    match op {
+        BinaryOp::Subtract => BigIntBinaryOp::Subtract,
+        BinaryOp::Multiply => BigIntBinaryOp::Multiply,
+        BinaryOp::Divide => BigIntBinaryOp::Divide,
+        BinaryOp::Remainder => BigIntBinaryOp::Remainder,
+        BinaryOp::Exponent => BigIntBinaryOp::Exponentiate,
+        BinaryOp::BitAnd => BigIntBinaryOp::BitAnd,
+        BinaryOp::BitOr => BigIntBinaryOp::BitOr,
+        BinaryOp::BitXor => BigIntBinaryOp::BitXor,
+        BinaryOp::ShiftLeft => BigIntBinaryOp::LeftShift,
+        BinaryOp::ShiftRight => BigIntBinaryOp::RightShift,
+        BinaryOp::UnsignedShiftRight => BigIntBinaryOp::UnsignedRightShift,
+        _ => unreachable!("numeric binary operator partition"),
+    }
 }
 
 pub(crate) fn unary_from_selector(op: u32) -> Option<UnaryOp> {
@@ -12323,12 +13119,42 @@ mod tests {
         // The interpreter wall is a finite, non-negative measurement.
         assert!(telemetry.interpreter_wall_ms >= 0.0);
         assert!(telemetry.interpreter_wall_ms.is_finite());
-        // On this Linux host VmHWM is readable, so peak RSS is populated.
-        assert!(telemetry.rss_kb > 0, "peak RSS should be read from /proc");
         // The telemetry seam produces the same outcome as `run`.
         let mut plain_host = TestHost;
         let plain = super::run(&program, &mut plain_host, &Limits::default()).expect("halt runs");
         assert_eq!(plain, outcome);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_with_telemetry_reports_peak_rss_on_linux() {
+        let program = verified(
+            vec![],
+            vec![function(0, 0, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let (_, telemetry) = super::run_with_telemetry(&program, &mut host, &Limits::default());
+        assert!(
+            telemetry.rss_kb > 0,
+            "peak RSS should be read from /proc on Linux"
+        );
+    }
+
+    #[test]
+    fn parse_peak_rss_kb_selects_vmhwm_not_vmrss() {
+        let status = "Name:	bamts-runtime
+VmRSS:	   64000 kB
+VmHWM:	   32000 kB
+VmPeak:	64000 kB";
+        assert_eq!(super::parse_peak_rss_kb(status), Some(32_000));
+    }
+
+    #[test]
+    fn parse_peak_rss_kb_returns_none_when_only_vmrss_present() {
+        let status = "Name:	bamts-runtime
+VmRSS:	64000 kB
+VmPeak:	64000 kB";
+        assert_eq!(super::parse_peak_rss_kb(status), None);
     }
 
     fn namespace_descriptor_entry() -> Function {
@@ -12459,17 +13285,29 @@ mod tests {
     }
 
     #[test]
-    fn uint8array_canonical_numeric_keys_never_become_ordinary_properties() {
-        assert!(uint8array_index_ascii("4294967295").is_some());
+    fn typed_array_canonical_numeric_keys_never_become_ordinary_properties() {
+        assert!(typedarray_all::typed_array_index_ascii("4294967295").is_some());
         for key in ["-0", "NaN", "Infinity", "1.5"] {
-            assert_eq!(uint8array_index_ascii(key), Some(None), "{key}");
+            assert_eq!(
+                typedarray_all::typed_array_index_ascii(key),
+                Some(None),
+                "{key}"
+            );
         }
-        assert_eq!(uint8array_index_ascii("01"), None);
+        assert_eq!(typedarray_all::typed_array_index_ascii("01"), None);
 
         with_machine(Limits::default(), |machine| {
+            let buffer =
+                intrinsics::builtins::arraybuffer::ArrayBufferHandle::allocate(machine, 1, None)
+                    .unwrap()
+                    .value();
             let typed = machine
-                .allocate(HeapEntry::Uint8Array {
-                    bytes: vec![0],
+                .allocate(HeapEntry::TypedArray {
+                    kind: ElementKind::Uint8,
+                    buffer,
+                    byte_offset: 0,
+                    byte_length: LengthSlot::Fixed(1),
+                    array_length: LengthSlot::Fixed(1),
                     properties: PropertyMap::default(),
                     prototype: Some(machine.intrinsics.object_prototype),
                     extensible: true,
@@ -13762,7 +14600,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_generator_reentrant_next_is_a_type_error() {
+    fn reentrant_resume_reports_generator_is_already_running() {
         let program = verified(
             Vec::new(),
             vec![
@@ -13776,11 +14614,104 @@ mod tests {
         machine.live_registers = 0;
         let callable = generator_callable(&mut machine, 1);
         let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
-        let _ = machine.take_generator_state(generator).unwrap();
+        let _ = crate::vm::generator_async::prepare_generator_operation(
+            &mut machine,
+            generator,
+            GeneratorCompletion::Normal(Value::UNDEFINED),
+        )
+        .unwrap();
 
         assert!(matches!(
             generator_next(&mut machine, generator, Value::UNDEFINED),
-            Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
+            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "generator is already running",
+            }))
+        ));
+    }
+
+    #[test]
+    fn queued_async_generator_completions_survive_collection() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(0, 1, vec![Instruction::Halt], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        machine.test_set_global("queued_generator", generator);
+        let rooted = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let rooted_index = machine.runtime_slot(rooted).unwrap().unwrap();
+        let capability = machine.create_promise().unwrap();
+        let generator_index = machine.runtime_slot(generator).unwrap().unwrap();
+        let HeapEntry::AsyncGenerator { queue, .. } = &mut machine.heap[generator_index] else {
+            panic!("async generator expected");
+        };
+        queue.push_back(AsyncGeneratorRequest {
+            completion: GeneratorCompletion::Return(rooted),
+            capability,
+        });
+
+        machine.collect_garbage();
+
+        assert!(matches!(
+            machine.heap[rooted_index],
+            HeapEntry::Object { .. }
+        ));
+    }
+
+    #[test]
+    fn throw_origin_survives_the_completion_algebra() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(0, 1, vec![Instruction::Halt], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let origin = ThrowOrigin::TypeError {
+            operation: "completion-origin",
+        };
+
+        assert!(matches!(
+            machine.resume_generator(
+                generator,
+                GeneratorCompletion::Throw {
+                    value: Value::int32(41),
+                    origin,
+                },
+            ),
+            Err(EvalFailure::ThrowValueOrigin { value, origin: actual })
+                if value == Value::int32(41) && actual == origin
+        ));
+        assert!(matches!(
+            machine.resume_generator(
+                generator,
+                GeneratorCompletion::Throw {
+                    value: Value::int32(43),
+                    origin,
+                },
+            ),
+            Err(EvalFailure::ThrowValueOrigin { value, origin: actual })
+                if value == Value::int32(43) && actual == origin
         ));
     }
 
@@ -14485,6 +15416,78 @@ mod tests {
             settled_iterator_result(&mut machine, capability),
             (Value::int32(41), false),
         );
+    }
+
+    #[test]
+    fn async_generator_fatal_drive_failure_cleans_queue_and_propagates() {
+        let program = verified(
+            vec![Constant::Int32(41)],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(
+                    0,
+                    2,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(1),
+                            src: reg(0),
+                            resume: pc(2),
+                            mode: reg(0),
+                        },
+                        Instruction::Return { value: reg(1) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let limits = Limits {
+            max_microtasks: 0,
+            ..Limits::default()
+        };
+        let mut machine = Machine::new(&program, &mut host, limits);
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+
+        let index = machine.runtime_slot(generator).unwrap().unwrap();
+        let start_state = match &mut machine.heap[index] {
+            HeapEntry::AsyncGenerator { state, .. } => {
+                std::mem::replace(state, AsyncGeneratorState::Executing)
+            }
+            _ => unreachable!("async generator remains allocated"),
+        };
+        let front = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let queued = async_generator_next(&mut machine, generator, Value::UNDEFINED).unwrap();
+        let HeapEntry::AsyncGenerator { state, .. } = &mut machine.heap[index] else {
+            unreachable!("async generator remains allocated");
+        };
+        *state = start_state;
+
+        assert!(matches!(
+            async_generator_next(&mut machine, generator, Value::UNDEFINED),
+            Err(EvalFailure::Runtime(
+                RuntimeErrorKind::MicrotaskQueueLimitExceeded { limit: 0 }
+            ))
+        ));
+        assert_eq!(rejected_reason(&machine, front), Value::UNDEFINED);
+        assert_eq!(
+            settled_iterator_result(&mut machine, queued),
+            (Value::UNDEFINED, true),
+        );
+        assert!(matches!(
+            &machine.heap[index],
+            HeapEntry::AsyncGenerator {
+                state: AsyncGeneratorState::Completed,
+                queue,
+                ..
+            } if queue.is_empty()
+        ));
     }
 
     #[test]
@@ -16762,14 +17765,15 @@ mod tests {
                     extensible: true,
                 })
                 .unwrap();
+            let allowed_unscopables_key = machine
+                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
+                .unwrap();
             let allowed = machine
                 .allocate(HeapEntry::Object {
                     properties: {
                         let mut properties = PropertyMap::default();
                         properties.insert(
-                            machine
-                                .to_property_key(machine.intrinsics.builtins.symbol_unscopables())
-                                .unwrap(),
+                            allowed_unscopables_key,
                             Property::Data {
                                 value: allowed_blocklist,
                                 writable: true,
@@ -25610,6 +26614,77 @@ mod tests {
     }
 
     #[test]
+    fn sync_generator_resume_writes_mode_register_for_return_and_throw() {
+        let program = verified(
+            vec![
+                Constant::Int32(2),
+                Constant::Int32(1),
+                Constant::String(EcmaString::encode("finally")),
+                Constant::Int32(42),
+            ],
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                generator_function(
+                    0,
+                    6,
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(2),
+                            constant: cid(3),
+                        },
+                        Instruction::Suspend {
+                            dst: reg(3),
+                            src: reg(2),
+                            resume: pc(4),
+                            mode: reg(4),
+                        },
+                        Instruction::Binary {
+                            dst: reg(5),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(4),
+                            right: reg(0),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(5),
+                            target: pc(7),
+                        },
+                        Instruction::Throw { value: reg(3) },
+                        Instruction::StoreGlobal {
+                            name: cid(2),
+                            value: reg(1),
+                        },
+                        Instruction::Return { value: reg(3) },
+                    ],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+        let generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        assert_eq!(
+            generator_next(&mut machine, generator, Value::UNDEFINED).unwrap(),
+            (Value::int32(42), false),
+        );
+        assert_eq!(
+            generator_return(&mut machine, generator, Value::int32(7)).unwrap(),
+            (Value::int32(7), true),
+        );
+        assert_eq!(machine.test_global("finally"), Some(Value::int32(1)));
+    }
+
+    #[test]
     fn sync_generator_resume_next_return_throw_modes() {
         let program = verified(
             vec![Constant::Int32(42), Constant::Int32(0), Constant::Int32(1)],
@@ -25907,12 +26982,67 @@ mod tests {
     }
 
     #[test]
-    fn async_generator_yield_and_await_abrupt_completions() {
+    fn async_generator_return_on_completed_generator_awaits_value() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 1, vec![Instruction::Halt], Vec::new()),
+                async_generator_function(0, 1, vec![Instruction::Halt], Vec::new()),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        machine.frames.clear();
+        machine.live_registers = 0;
+        let callable = generator_callable(&mut machine, 1);
+
+        let fulfilled_generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let completed =
+            async_generator_next(&mut machine, fulfilled_generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, completed),
+            (Value::UNDEFINED, true),
+        );
+        let fulfilled_operand = machine.create_promise().unwrap();
+        let fulfilled_return =
+            async_generator_return(&mut machine, fulfilled_generator, fulfilled_operand).unwrap();
+        assert!(pending_promise(&machine, fulfilled_return));
+        machine
+            .resolve_promise(fulfilled_operand, Value::int32(17))
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, fulfilled_return),
+            (Value::int32(17), true),
+        );
+
+        let rejected_generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let completed =
+            async_generator_next(&mut machine, rejected_generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, completed),
+            (Value::UNDEFINED, true),
+        );
+        let rejected_operand = machine.create_promise().unwrap();
+        let rejected_return =
+            async_generator_return(&mut machine, rejected_generator, rejected_operand).unwrap();
+        machine
+            .reject_promise(rejected_operand, Value::int32(19), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(rejected_reason(&machine, rejected_return), Value::int32(19));
+    }
+
+    #[test]
+    fn async_generator_return_at_suspended_yield_awaits_operand_before_resuming() {
         // A3/A5: .return(v) at SuspendedYield awaits the operand, runs the body's
         // "finally" path, and preserves FIFO for a request queued behind the return.
         let return_program = verified(
             vec![
                 Constant::Int32(0),
+                Constant::Int32(2),
                 Constant::Int32(42),
                 Constant::Int32(99),
                 Constant::String(EcmaString::encode("finally")),
@@ -25921,20 +27051,24 @@ mod tests {
                 function(0, 1, vec![Instruction::Halt], Vec::new()),
                 async_generator_function(
                     0,
-                    6,
+                    7,
                     vec![
                         Instruction::LoadConst {
                             dst: reg(0),
                             constant: cid(0),
                         },
                         Instruction::LoadConst {
-                            dst: reg(1),
+                            dst: reg(6),
                             constant: cid(1),
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(2),
                         },
                         Instruction::Suspend {
                             dst: reg(2),
                             src: reg(1),
-                            resume: pc(3),
+                            resume: pc(4),
                             mode: reg(3),
                         },
                         Instruction::Binary {
@@ -25945,17 +27079,28 @@ mod tests {
                         },
                         Instruction::JumpIfTrue {
                             condition: reg(4),
-                            target: pc(8),
+                            target: pc(9),
                         },
+                        Instruction::Binary {
+                            dst: reg(4),
+                            op: BinaryOp::StrictEqual,
+                            left: reg(3),
+                            right: reg(6),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(4),
+                            target: pc(10),
+                        },
+                        Instruction::Throw { value: reg(2) },
+                        Instruction::Return { value: reg(2) },
                         Instruction::LoadConst {
                             dst: reg(5),
-                            constant: cid(2),
+                            constant: cid(3),
                         },
                         Instruction::StoreGlobal {
-                            name: cid(3),
+                            name: cid(4),
                             value: reg(5),
                         },
-                        Instruction::Return { value: reg(2) },
                         Instruction::Return { value: reg(2) },
                     ],
                     Vec::new(),
@@ -25997,6 +27142,23 @@ mod tests {
         );
         assert_eq!(machine.test_global("finally"), Some(Value::int32(99)));
         assert_eq!(machine.live_registers, 0);
+
+        let rejected_generator = machine.call_value(callable, Value::UNDEFINED, &[]).unwrap();
+        let first =
+            async_generator_next(&mut machine, rejected_generator, Value::UNDEFINED).unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            settled_iterator_result(&mut machine, first),
+            (Value::int32(42), false),
+        );
+        let rejected_operand = machine.create_promise().unwrap();
+        let rejected_return =
+            async_generator_return(&mut machine, rejected_generator, rejected_operand).unwrap();
+        machine
+            .reject_promise(rejected_operand, Value::int32(13), ThrowOrigin::Bytecode)
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(rejected_reason(&machine, rejected_return), Value::int32(13));
 
         // A4: .throw() at SuspendedYield is catchable by a handler around the yield.
         let throw_program = verified(
@@ -26180,5 +27342,604 @@ mod tests {
             (Value::int32(7), true),
         );
         assert_eq!(machine.live_registers, 0);
+    }
+    #[test]
+    fn async_from_sync_value_rejection_calls_return_once() {
+        fn count_return<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            let count = machine
+                .get_named_property(this, "return_count")?
+                .decode()
+                .and_then(|value| match value {
+                    Decoded::Int32(count) => Some(count),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            machine.set_data_property(this, "return_count", Value::int32(count + 1))?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::UNDEFINED))
+        }
+
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let iterator = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                extensible: true,
+                boxed_primitive: None,
+            })
+            .unwrap();
+        let return_id = machine
+            .intrinsics
+            .builtins
+            .register(intrinsics::BuiltinDef {
+                name: "count return",
+                length: 0,
+                handler: count_return::<TestHost>,
+            });
+        let return_method =
+            intrinsics::native_function(&mut machine.heap, return_id, "count return", 0);
+        machine
+            .set_data_property(iterator, "return", return_method)
+            .unwrap();
+        let rejected = machine.create_promise().unwrap();
+        let origin = ThrowOrigin::TypeError {
+            operation: "value rejection",
+        };
+        machine
+            .reject_promise(rejected, Value::int32(73), origin)
+            .unwrap();
+        let result = machine.iterator_result(rejected, false).unwrap();
+
+        let derived = machine
+            .async_from_sync_continuation(iterator, Ok(result))
+            .unwrap();
+        machine.drain_microtasks().unwrap();
+        assert_eq!(
+            machine
+                .get_named_property(iterator, "return_count")
+                .unwrap(),
+            Value::int32(1),
+        );
+        let index = machine.runtime_slot(derived).unwrap().unwrap();
+        assert!(matches!(
+            machine.heap[index],
+            HeapEntry::Promise {
+                state: PromiseState::Rejected {
+                    reason,
+                    origin: actual,
+                },
+                ..
+            } if reason == Value::int32(73) && actual == origin
+        ));
+    }
+
+    #[test]
+    fn for_await_async_from_sync_uses_real_prototype_methods() {
+        let program = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let iterator = machine
+            .allocate(HeapEntry::Object {
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.object_prototype),
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap();
+        let next = machine
+            .get_named_property(machine.intrinsics.builtins.iterator_prototype(), "next")
+            .unwrap();
+        let adapter = machine
+            .create_async_from_sync_iterator(iterator, next)
+            .unwrap();
+        let index = machine.runtime_slot(adapter).unwrap().unwrap();
+        assert!(matches!(
+            machine.heap[index],
+            HeapEntry::AsyncFromSync { .. }
+        ));
+        for name in ["next", "return", "throw"] {
+            let method = machine.get_named_property(adapter, name).unwrap();
+            assert!(machine.is_callable(method).unwrap());
+        }
+    }
+
+    #[test]
+    fn extension_super_uses_home_prototype_and_receiver() {
+        fn marker_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            Ok(intrinsics::BuiltinOutcome::Value(
+                machine.get_named_property(this, "marker")?,
+            ))
+        }
+
+        fn hit_setter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            machine.set_data_property(this, "hit", args[0])?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::UNDEFINED))
+        }
+
+        with_machine(Limits::default(), |machine| {
+            let mut install =
+                |name: &'static str, handler: intrinsics::BuiltinHandler<TestHost>| {
+                    let id = machine
+                        .intrinsics
+                        .builtins
+                        .register(intrinsics::BuiltinDef {
+                            name,
+                            length: 0,
+                            handler,
+                        });
+                    intrinsics::native_function(&mut machine.heap, id, name, 0)
+                };
+            let getter = install("get super marker", marker_getter::<TestHost>);
+            let setter = install("set super hit", hit_setter::<TestHost>);
+            let object_prototype = machine.intrinsics.object_prototype;
+            let object = |machine: &mut Machine<'_, TestHost>, prototype| {
+                machine
+                    .allocate(HeapEntry::Object {
+                        properties: PropertyMap::default(),
+                        prototype,
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap()
+            };
+            let base = object(machine, Some(object_prototype));
+            machine
+                .define_descriptor(
+                    base,
+                    PropertyKey::Named(EcmaString::encode("x")),
+                    Property::Accessor {
+                        getter: Some(getter),
+                        setter: None,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            machine
+                .define_descriptor(
+                    base,
+                    PropertyKey::Named(EcmaString::encode("y")),
+                    Property::Accessor {
+                        getter: None,
+                        setter: Some(setter),
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            let home = object(machine, Some(base));
+            let receiver = object(machine, Some(object_prototype));
+            machine
+                .set_data_property(receiver, "x", Value::int32(999))
+                .unwrap();
+            machine
+                .set_data_property(receiver, "marker", Value::int32(7))
+                .unwrap();
+
+            let x = PropertyKey::Named(EcmaString::encode("x"));
+            assert_eq!(
+                machine.get_super(home, receiver, &x).unwrap(),
+                Value::int32(7),
+                "receiver override must not win; prototype getter binds receiver as this"
+            );
+
+            let y = PropertyKey::Named(EcmaString::encode("y"));
+            let setter = match machine
+                .set_super(home, receiver, y, Value::int32(42))
+                .unwrap()
+            {
+                SetOutcome::Setter(setter) => setter,
+                SetOutcome::Done => panic!("home prototype setter must be selected"),
+            };
+            machine
+                .call_value(setter, receiver, &[Value::int32(42)])
+                .unwrap();
+            assert_eq!(
+                machine.get_named_property(receiver, "hit").unwrap(),
+                Value::int32(42),
+                "setter must receive receiver as this"
+            );
+
+            let z = PropertyKey::Named(EcmaString::encode("z"));
+            assert!(matches!(
+                machine
+                    .set_super(home, receiver, z.clone(), Value::int32(43))
+                    .unwrap(),
+                SetOutcome::Done
+            ));
+            assert!(matches!(
+                machine.own_descriptor(receiver, &z).unwrap(),
+                Some(Property::Data { value, .. }) if value == Value::int32(43)
+            ));
+            assert!(machine.own_descriptor(home, &z).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn extension_copy_data_properties_excludes_before_get_and_defines() {
+        fn kept_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            let reads = machine.get_named_property(this, "reads")?;
+            let count = match reads.decode() {
+                Some(Decoded::Int32(count)) => count + 1,
+                _ => 1,
+            };
+            machine.set_data_property(this, "reads", Value::int32(count))?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(5)))
+        }
+
+        fn excluded_getter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            machine.set_data_property(this, "excludedRead", Value::TRUE)?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::int32(9)))
+        }
+
+        fn target_setter<H: Host>(
+            machine: &mut Machine<'_, H>,
+            this: Value,
+            _args: &[Value],
+            _constructing: bool,
+        ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
+            machine.set_data_property(this, "setterRan", Value::TRUE)?;
+            Ok(intrinsics::BuiltinOutcome::Value(Value::UNDEFINED))
+        }
+
+        with_machine(Limits::default(), |machine| {
+            let mut install =
+                |name: &'static str, handler: intrinsics::BuiltinHandler<TestHost>| {
+                    let id = machine
+                        .intrinsics
+                        .builtins
+                        .register(intrinsics::BuiltinDef {
+                            name,
+                            length: 0,
+                            handler,
+                        });
+                    intrinsics::native_function(&mut machine.heap, id, name, 0)
+                };
+            let kept_getter = install("get kept", kept_getter::<TestHost>);
+            let excluded_getter = install("get excluded", excluded_getter::<TestHost>);
+            let target_setter = install("set target", target_setter::<TestHost>);
+            let prototype = machine.intrinsics.object_prototype;
+            let object = |machine: &mut Machine<'_, TestHost>| {
+                machine
+                    .allocate(HeapEntry::Object {
+                        properties: PropertyMap::default(),
+                        prototype: Some(prototype),
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap()
+            };
+            let source = object(machine);
+            let target = object(machine);
+            machine
+                .set_data_property(source, "reads", Value::int32(0))
+                .unwrap();
+            machine
+                .define_descriptor(
+                    source,
+                    PropertyKey::Named(EcmaString::encode("kept")),
+                    Property::Accessor {
+                        getter: Some(kept_getter),
+                        setter: None,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            machine
+                .define_descriptor(
+                    source,
+                    PropertyKey::Named(EcmaString::encode("gone")),
+                    Property::Accessor {
+                        getter: Some(excluded_getter),
+                        setter: None,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            machine
+                .define_descriptor(
+                    source,
+                    PropertyKey::Named(EcmaString::encode("hidden")),
+                    Property::Data {
+                        value: Value::int32(77),
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            machine
+                .define_descriptor(
+                    target,
+                    PropertyKey::Named(EcmaString::encode("kept")),
+                    Property::Accessor {
+                        getter: None,
+                        setter: Some(target_setter),
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            let gone = machine
+                .allocate(HeapEntry::String(EcmaString::encode("gone")))
+                .unwrap();
+            let excluded = machine
+                .allocate(HeapEntry::Array {
+                    elements: vec![gone],
+                    properties: PropertyMap::default(),
+                    prototype: Some(machine.intrinsics.array_prototype),
+                    extensible: true,
+                    length_writable: true,
+                })
+                .unwrap();
+
+            machine
+                .copy_data_properties(target, source, excluded)
+                .unwrap();
+
+            assert!(matches!(
+                machine
+                    .own_descriptor(
+                        target,
+                        &PropertyKey::Named(EcmaString::encode("kept")),
+                    )
+                    .unwrap(),
+                Some(Property::Data {
+                    value,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                }) if value == Value::int32(5)
+            ));
+            assert_eq!(
+                machine.get_named_property(source, "reads").unwrap(),
+                Value::int32(1),
+                "included getter is observed exactly once"
+            );
+            for (object, name) in [
+                (source, "excludedRead"),
+                (target, "gone"),
+                (target, "hidden"),
+                (target, "setterRan"),
+            ] {
+                assert!(
+                    machine
+                        .own_descriptor(object, &PropertyKey::Named(EcmaString::encode(name)))
+                        .unwrap()
+                        .is_none(),
+                    "unexpected own property {name}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn extension_template_object_identity_descriptors_and_gc_rooting() {
+        with_machine(Limits::default(), |machine| {
+            let string = |machine: &mut Machine<'_, TestHost>, value| {
+                machine
+                    .allocate(HeapEntry::String(EcmaString::encode(value)))
+                    .unwrap()
+            };
+            let array = |machine: &mut Machine<'_, TestHost>, elements| {
+                machine
+                    .allocate(HeapEntry::Array {
+                        elements,
+                        properties: PropertyMap::default(),
+                        prototype: Some(machine.intrinsics.array_prototype),
+                        extensible: true,
+                        length_writable: true,
+                    })
+                    .unwrap()
+            };
+            let x = string(machine, "x");
+            let y = string(machine, "y");
+            let upper_x = string(machine, "X");
+            let upper_y = string(machine, "Y");
+            let cooked = array(machine, vec![x, y]);
+            let raw = array(machine, vec![upper_x, upper_y]);
+            let template = machine.template_object_at((0, 1, 7), cooked, raw).unwrap();
+            let new = string(machine, "new");
+            let upper_new = string(machine, "NEW");
+            let other_cooked = array(machine, vec![new]);
+            let other_raw = array(machine, vec![upper_new]);
+            assert_eq!(
+                machine
+                    .template_object_at((0, 1, 7), other_cooked, other_raw)
+                    .unwrap(),
+                template,
+                "one template site must preserve object identity"
+            );
+
+            let raw_key = PropertyKey::Named(EcmaString::encode("raw"));
+            assert!(matches!(
+                machine.own_descriptor(template, &raw_key).unwrap(),
+                Some(Property::Data {
+                    value,
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                }) if value == raw
+            ));
+            for value in [template, raw] {
+                let index = machine.runtime_slot(value).unwrap().unwrap();
+                assert!(matches!(
+                    machine.heap[index],
+                    HeapEntry::Array {
+                        extensible: false,
+                        length_writable: false,
+                        ..
+                    }
+                ));
+            }
+
+            machine.collect_garbage();
+            assert!(
+                machine
+                    .own_descriptor(template, &raw_key)
+                    .unwrap()
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn clear_kept_alive_for_job_refunds_retained_roots() {
+        with_machine(Limits::default(), |machine| {
+            let before = machine.machine_bytes;
+            let retained = 2 * std::mem::size_of::<Value>();
+            machine.charge_machine(retained).unwrap();
+            machine
+                .kept_alive
+                .extend([Value::int32(1), Value::int32(2)]);
+            assert_eq!(machine.machine_bytes, before + retained);
+
+            machine.clear_kept_alive_for_job();
+
+            assert!(machine.kept_alive.is_empty());
+            assert_eq!(machine.machine_bytes, before);
+            machine.assert_heap_ledger();
+        });
+    }
+
+    #[test]
+    fn extension_set_super_rejects_inherited_non_writable_data() {
+        with_machine(Limits::default(), |machine| {
+            let prototype = machine.intrinsics.object_prototype;
+            let object = |machine: &mut Machine<'_, TestHost>, prototype| {
+                machine
+                    .allocate(HeapEntry::Object {
+                        properties: PropertyMap::default(),
+                        prototype,
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap()
+            };
+            let base = object(machine, Some(prototype));
+            let key = PropertyKey::Named(EcmaString::encode("x"));
+            machine
+                .define_descriptor(
+                    base,
+                    key.clone(),
+                    Property::Data {
+                        value: Value::int32(1),
+                        writable: false,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            let home = object(machine, Some(base));
+            let receiver = object(machine, Some(prototype));
+
+            assert!(matches!(
+                machine.set_super(home, receiver, key.clone(), Value::int32(2)),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }))
+                    if operation == "assign to read only super property"
+            ));
+            assert!(machine.own_descriptor(receiver, &key).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn extension_set_super_rejects_inherited_accessor_without_setter() {
+        with_machine(Limits::default(), |machine| {
+            let prototype = machine.intrinsics.object_prototype;
+            let object = |machine: &mut Machine<'_, TestHost>, prototype| {
+                machine
+                    .allocate(HeapEntry::Object {
+                        properties: PropertyMap::default(),
+                        prototype,
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap()
+            };
+            let base = object(machine, Some(prototype));
+            let key = PropertyKey::Named(EcmaString::encode("x"));
+            machine
+                .define_descriptor(
+                    base,
+                    key.clone(),
+                    Property::Accessor {
+                        getter: None,
+                        setter: None,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+                .unwrap();
+            let home = object(machine, Some(base));
+            let receiver = object(machine, Some(prototype));
+
+            assert!(matches!(
+                machine.set_super(home, receiver, key.clone(), Value::int32(2)),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }))
+                    if operation == "set super property without setter"
+            ));
+            assert!(machine.own_descriptor(receiver, &key).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn extension_set_super_rejects_null_home_prototype() {
+        with_machine(Limits::default(), |machine| {
+            let prototype = machine.intrinsics.object_prototype;
+            let object = |machine: &mut Machine<'_, TestHost>, prototype| {
+                machine
+                    .allocate(HeapEntry::Object {
+                        properties: PropertyMap::default(),
+                        prototype,
+                        boxed_primitive: None,
+                        extensible: true,
+                    })
+                    .unwrap()
+            };
+            let home = object(machine, None);
+            let receiver = object(machine, Some(prototype));
+            let key = PropertyKey::Named(EcmaString::encode("x"));
+
+            assert!(matches!(
+                machine.set_super(home, receiver, key.clone(), Value::int32(2)),
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError { operation }))
+                    if operation == "set super property through null prototype"
+            ));
+            assert!(machine.own_descriptor(receiver, &key).unwrap().is_none());
+        });
     }
 }

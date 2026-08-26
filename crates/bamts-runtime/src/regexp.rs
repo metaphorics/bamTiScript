@@ -656,6 +656,84 @@ fn unicode_simple_fold(value: u32) -> u32 {
         .unwrap_or(value)
 }
 
+/// Expands a code-point set to its Unicode simple-case-folding closure. Used
+/// when complementing a property escape under `i` so `\P{...}` excludes every
+/// case variant of the positive set, not just the literal table members.
+pub(crate) fn unicode_simple_fold_closure(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    fn contains(ranges: &[(u32, u32)], value: u32) -> bool {
+        ranges
+            .iter()
+            .any(|&(start, end)| start <= value && value <= end)
+    }
+
+    fn merge(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+        if ranges.is_empty() {
+            return ranges;
+        }
+        ranges.sort_unstable_by_key(|&(start, _)| start);
+        let mut merged = Vec::with_capacity(ranges.len());
+        let mut current = ranges[0];
+        for (start, end) in ranges.into_iter().skip(1) {
+            if start <= current.1.saturating_add(1) {
+                current.1 = current.1.max(end);
+            } else {
+                merged.push(current);
+                current = (start, end);
+            }
+        }
+        merged.push(current);
+        merged
+    }
+
+    let mut result = ranges.to_vec();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &(start, end, step, delta) in UNICODE_SIMPLE_FOLD_RANGES {
+            let mut segment_hit = false;
+            for source in (start..=end).step_by(step as usize) {
+                let target = offset_code_point(source, delta).unwrap_or(source);
+                if contains(&result, source) || contains(&result, target) {
+                    segment_hit = true;
+                    break;
+                }
+            }
+            if !segment_hit {
+                continue;
+            }
+            if !contains(&result, start) || !contains(&result, end) {
+                result.push((start, end));
+                changed = true;
+            }
+            if let (Some(target_start), Some(target_end)) = (
+                offset_code_point(start, delta),
+                offset_code_point(end, delta),
+            ) {
+                let (lo, hi) = if target_start <= target_end {
+                    (target_start, target_end)
+                } else {
+                    (target_end, target_start)
+                };
+                if !contains(&result, lo) || !contains(&result, hi) {
+                    result.push((lo, hi));
+                    changed = true;
+                }
+            }
+        }
+        for &(source, target) in UNICODE_SIMPLE_FOLD_SINGLETONS {
+            if contains(&result, source) || contains(&result, target) {
+                for value in [source, target] {
+                    if !contains(&result, value) {
+                        result.push((value, value));
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    merge(result)
+}
+
 fn offset_code_point(value: u32, delta: i32) -> Option<u32> {
     if delta < 0 {
         value.checked_sub(delta.unsigned_abs())

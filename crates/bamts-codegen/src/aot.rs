@@ -8,13 +8,30 @@ use bamts_cancel::{CancellationToken, Cancelled};
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{ExternalName, Function, UserExternalName};
 use cranelift_codegen::isa;
-use cranelift_codegen::settings::{self, Flags};
+use cranelift_codegen::settings::{self, Configurable, Flags};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::{
     HELPER_NAMESPACE, Helper, LowerError, LoweredProgram, ProgramLowerError, function_symbol,
     lower_program_with_cancel,
+};
+
+mod emission;
+mod linking;
+mod reproducible;
+
+pub use emission::{
+    EmissionError, EmittedObject, SUPPORTED_TARGET_TRIPLES, TargetDescriptor, content_digest,
+    emit_for_target, emit_for_target_with_cancel, emit_for_targets, require_matching_target,
+};
+pub use linking::{
+    LinkCacheKey, LinkError, LinkFlags, LinkInput, LinkInputRole, LinkPlan, LinkProvenance,
+    TargetFormat, plan_link, resolve_symbols, validate_linked_image,
+};
+pub use reproducible::{
+    BuildCacheKey, REPRODUCIBLE_FILE_NAME, ReproducibleArtifact, ReproducibleError,
+    canonical_object_metadata, emit_reproducible,
 };
 
 const HELPER_COUNT: u32 = bamts_native::HELPER_COUNT;
@@ -150,7 +167,11 @@ pub fn compile_aot_with_cancel(
     cancel: &CancellationToken,
 ) -> Result<AotObject, AotError> {
     cancel.check()?;
-    let flags = Flags::new(settings::builder());
+    let mut flag_builder = settings::builder();
+    flag_builder
+        .set("is_pic", "true")
+        .map_err(|error| AotError::TargetBuild(error.to_string()))?;
+    let flags = Flags::new(flag_builder);
     let isa_builder =
         isa::lookup_by_name(target).map_err(|error| AotError::TargetLookup(error.to_string()))?;
     cancel.check()?;
@@ -484,7 +505,8 @@ mod tests {
         decode_verified_program,
     };
     use cranelift_object::object::{
-        Object, ObjectSection, ObjectSymbol, RelocationTarget, SymbolIndex,
+        Object, ObjectSection, ObjectSymbol, RelocationKind, RelocationTarget, SectionKind,
+        SymbolIndex,
     };
 
     fn function(code: Vec<Instruction>, register_count: u32) -> BytecodeFunction {
@@ -652,6 +674,24 @@ mod tests {
         }));
         assert_eq!((emitted.entry_module, emitted.entry_function), (1, 0));
         assert_eq!(emitted.entry_symbol, function_symbol(1, 0));
+    }
+
+    #[test]
+    fn executable_sections_have_no_absolute_relocations() {
+        let emitted = compile_aot(&test_program(), target()).expect("AOT object emits");
+        let file = cranelift_object::object::File::parse(&*emitted.bytes).expect("object parses");
+        for section in file
+            .sections()
+            .filter(|section| section.kind() == SectionKind::Text)
+        {
+            for (offset, relocation) in section.relocations() {
+                assert_ne!(
+                    relocation.kind(),
+                    RelocationKind::Absolute,
+                    "absolute relocation at {offset:#x} in executable section"
+                );
+            }
+        }
     }
 
     #[test]

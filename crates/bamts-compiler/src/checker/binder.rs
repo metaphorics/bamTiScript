@@ -352,9 +352,11 @@ pub struct PropertyType {
     /// Class and interface symbols whose polymorphic `this` appears in this
     /// property's type. Access control does not use this provenance.
     declaring_types: Vec<SymbolId>,
-    /// Whether this property was declared as a method member. Used when
-    /// merging same-name overloads in object types.
     is_method: bool,
+    /// Whether this property is spreadable. Ordinary object/interface
+    /// members default to `false`; properties that legitimately propagate
+    /// through spread keep the flag explicitly.
+    spreadable: bool,
 }
 
 impl PropertyType {
@@ -370,6 +372,7 @@ impl PropertyType {
             declaring_class: None,
             declaring_types: Vec::new(),
             is_method: false,
+            spreadable: false,
         }
     }
 
@@ -424,8 +427,19 @@ impl PropertyType {
     }
 
     #[must_use]
+    pub fn with_spreadable(mut self, spreadable: bool) -> Self {
+        self.spreadable = spreadable;
+        self
+    }
+
+    #[must_use]
     pub const fn is_method(&self) -> bool {
         self.is_method
+    }
+
+    #[must_use]
+    pub const fn spreadable(&self) -> bool {
+        self.spreadable
     }
 
     #[must_use]
@@ -480,6 +494,7 @@ impl PartialEq for PropertyType {
             && self.declaring_class == other.declaring_class
             && self.declaring_types == other.declaring_types
             && self.is_method == other.is_method
+            && self.spreadable == other.spreadable
     }
 }
 
@@ -496,6 +511,7 @@ impl std::hash::Hash for PropertyType {
         self.declaring_class.hash(state);
         self.declaring_types.hash(state);
         self.is_method.hash(state);
+        self.spreadable.hash(state);
     }
 }
 
@@ -3306,7 +3322,8 @@ impl TypeTable {
                             .with_getter_only(first.getter_only())
                             .with_accessibility(first.access(), first.declaring_class())
                             .with_declaring_types(declaring_types)
-                            .with_method(true);
+                            .with_method(true)
+                            .with_spreadable(first.spreadable());
                 }
             }
             merged.push(property);
@@ -3644,6 +3661,7 @@ impl TypeTable {
                             .with_accessibility(property.access(), declaring_class)
                             .with_declaring_types(declaring_types)
                             .with_method(property.is_method)
+                            .with_spreadable(property.spreadable)
                         })
                         .collect();
                     let call_signatures = object
@@ -15291,7 +15309,8 @@ impl<'src> Binder<'src> {
                                     source_property.name.as_ref(),
                                     source_property.optional(),
                                     source_property.type_id(),
-                                );
+                                )
+                                .with_spreadable(source_property.spreadable());
                                 upsert_property(&mut properties, fresh);
                             }
                             index_signatures.extend(object.index_signatures);

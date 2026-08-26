@@ -4,7 +4,8 @@ use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_string, define_data, install_function, range_error, type_error, value_number,
+    allocate_string, define_data, install_function, number_format, range_error,
+    to_integer_or_infinity, type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyKey};
@@ -44,6 +45,8 @@ pub(super) fn install<H: Host>(
     for (name, length, handler) in [
         ("toString", 1, to_string::<H> as BuiltinHandler<H>),
         ("toFixed", 1, to_fixed::<H>),
+        ("toExponential", 1, to_exponential::<H>),
+        ("toPrecision", 1, to_precision::<H>),
         ("valueOf", 0, value_of::<H>),
     ] {
         let f = install_function(heap, builtins, name, length, handler);
@@ -68,6 +71,8 @@ fn constructor<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let value = if args.is_empty() {
         Value::int32(0)
+    } else if let Some(number) = super::bigint::bigint_to_number(machine, args[0])? {
+        number
     } else {
         machine.to_number(args[0])?
     };
@@ -144,91 +149,17 @@ fn is_nan<H: Host>(
             .is_some_and(f64::is_nan),
     )))
 }
-fn is_js_whitespace(unit: u16) -> bool {
-    matches!(
-        unit,
-        0x0009 | 0x000a | 0x000b | 0x000c | 0x000d | 0x0020 | 0x00a0 | 0x1680 | 0x2000
-            ..=0x200a | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff
-    )
-}
-fn trim_start_js(units: &[u16]) -> &[u16] {
-    &units[units
-        .iter()
-        .take_while(|unit| is_js_whitespace(**unit))
-        .count()..]
-}
-fn is_ascii_digit(unit: u16) -> bool {
-    (u16::from(b'0')..=u16::from(b'9')).contains(&unit)
-}
-fn starts_ascii(units: &[u16], ascii: &[u8]) -> bool {
-    units.len() >= ascii.len()
-        && units
-            .iter()
-            .zip(ascii)
-            .all(|(unit, byte)| *unit == u16::from(*byte))
-}
-fn parse_float_units(units: &[u16]) -> f64 {
-    let units = trim_start_js(units);
-    let mut cursor = 0;
-    let mut sign = 1.0;
-    match units.first() {
-        Some(unit) if *unit == u16::from(b'-') => {
-            sign = -1.0;
-            cursor = 1;
-        }
-        Some(unit) if *unit == u16::from(b'+') => cursor = 1,
-        _ => {}
-    }
-    if starts_ascii(&units[cursor..], b"Infinity") {
-        return sign * f64::INFINITY;
-    }
-    let digits_start = cursor;
-    while units.get(cursor).is_some_and(|unit| is_ascii_digit(*unit)) {
-        cursor += 1;
-    }
-    let mut found = cursor > digits_start;
-    if units.get(cursor) == Some(&u16::from(b'.')) {
-        cursor += 1;
-        let fraction_start = cursor;
-        while units.get(cursor).is_some_and(|unit| is_ascii_digit(*unit)) {
-            cursor += 1;
-        }
-        found |= cursor > fraction_start;
-    }
-    if !found {
-        return f64::NAN;
-    }
-    if matches!(units.get(cursor), Some(unit) if *unit == u16::from(b'e') || *unit == u16::from(b'E'))
-    {
-        let exponent = cursor;
-        cursor += 1;
-        if matches!(units.get(cursor), Some(unit) if *unit == u16::from(b'+') || *unit == u16::from(b'-'))
-        {
-            cursor += 1;
-        }
-        let exponent_digits = cursor;
-        while units.get(cursor).is_some_and(|unit| is_ascii_digit(*unit)) {
-            cursor += 1;
-        }
-        if cursor == exponent_digits {
-            cursor = exponent;
-        }
-    }
-    EcmaString::from_units(&units[..cursor])
-        .to_utf8_strict()
-        .expect("numeric prefix contains only ASCII units")
-        .parse()
-        .unwrap_or(f64::NAN)
-}
 pub(super) fn parse_float<H: Host>(
     machine: &mut Machine<'_, H>,
     _: Value,
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let text = machine
+        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .to_utf8_lossy();
     Ok(BuiltinOutcome::Value(crate::number_value(
-        parse_float_units(text.as_units()),
+        number_format::parse_float(&text),
     )))
 }
 /// ECMAScript ToInt32 applied to the parseInt radix argument: wraps the
@@ -239,7 +170,7 @@ fn to_int32_radix(number: f64) -> i32 {
     if !number.is_finite() || number == 0.0 {
         0
     } else {
-        number.trunc().rem_euclid(4_294_967_296.0) as i32
+        number.trunc().rem_euclid(4_294_967_296.0) as u32 as i32
     }
 }
 pub(super) fn parse_int<H: Host>(
@@ -248,63 +179,15 @@ pub(super) fn parse_int<H: Host>(
     args: &[Value],
     _: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
-    let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let units = trim_start_js(text.as_units());
-    let mut cursor = 0;
-    let mut sign = 1.0;
-    match units.first() {
-        Some(unit) if *unit == u16::from(b'-') => {
-            sign = -1.0;
-            cursor = 1;
-        }
-        Some(unit) if *unit == u16::from(b'+') => cursor = 1,
-        _ => {}
-    }
+    let text = machine
+        .to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?
+        .to_utf8_lossy();
     let requested = to_int32_radix(value_number(
-        machine.to_number(args.get(1).copied().unwrap_or(Value::int32(0)))?,
+        machine.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))?,
     ));
-    let mut radix = if requested == 0 { 10 } else { requested };
-    if !(2..=36).contains(&radix) {
-        return Ok(BuiltinOutcome::Value(crate::number_value(f64::NAN)));
-    }
-    if (requested == 0 || radix == 16)
-        && (starts_ascii(&units[cursor..], b"0x") || starts_ascii(&units[cursor..], b"0X"))
-    {
-        radix = 16;
-        cursor += 2;
-    }
-    let mut value = 0.0;
-    let mut found = false;
-    for &unit in &units[cursor..] {
-        let digit = match unit {
-            unit if (u16::from(b'0')..=u16::from(b'9')).contains(&unit) => {
-                u32::from(unit - u16::from(b'0'))
-            }
-            unit if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) => {
-                u32::from(unit - u16::from(b'a')) + 10
-            }
-            unit if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) => {
-                u32::from(unit - u16::from(b'A')) + 10
-            }
-            _ => break,
-        };
-        if digit >= radix as u32 {
-            break;
-        }
-        found = true;
-        value = value * f64::from(radix) + f64::from(digit);
-        // Once the accumulator overflows to infinity, further digits cannot
-        // change the result; stop scanning to avoid charging the machine for
-        // arbitrarily long trailing input.
-        if !value.is_finite() {
-            break;
-        }
-    }
-    Ok(BuiltinOutcome::Value(crate::number_value(if found {
-        sign * value
-    } else {
-        f64::NAN
-    })))
+    Ok(BuiltinOutcome::Value(crate::number_value(
+        number_format::parse_int(&text, requested),
+    )))
 }
 pub(super) fn global_is_nan<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -335,37 +218,16 @@ fn to_string<H: Host>(
         this,
         "Number.prototype.toString requires that 'this' be a Number",
     )?;
-    let radix =
-        value_number(machine.to_number(args.first().copied().unwrap_or(Value::int32(10)))?) as u32;
-    if !(2..=36).contains(&radix) {
-        return Err(range_error(
-            "toString() radix argument must be between 2 and 36",
-        ));
-    }
-    let text = if radix == 10 || !n.is_finite() {
-        crate::format_number(n)
-    } else {
-        radix_string(n, radix)
+    let radix = match args.first().copied() {
+        None | Some(Value::UNDEFINED) => 10.0,
+        Some(value) => to_integer_or_infinity(machine, value)?,
     };
+    let text =
+        number_format::to_string_radix(n, radix).map_err(|error| range_error(error.message()))?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
         EcmaString::encode(&text),
     )?))
-}
-fn radix_string(n: f64, radix: u32) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let sign = if n.is_sign_negative() { "-" } else { "" };
-    let mut integer = n.abs().trunc() as u128;
-    if integer == 0 {
-        return format!("{sign}0");
-    }
-    let mut out = Vec::new();
-    while integer > 0 {
-        out.push(DIGITS[(integer % u128::from(radix)) as usize] as char);
-        integer /= u128::from(radix)
-    }
-    out.reverse();
-    format!("{sign}{}", out.into_iter().collect::<String>())
 }
 fn to_fixed<H: Host>(
     machine: &mut Machine<'_, H>,
@@ -379,22 +241,59 @@ fn to_fixed<H: Host>(
         "Number.prototype.toFixed requires that 'this' be a Number",
     )?;
     let digits =
-        value_number(machine.to_number(args.first().copied().unwrap_or(Value::int32(0)))?) as i32;
-    if !(0..=100).contains(&digits) {
-        return Err(range_error(
-            "toFixed() digits argument must be between 0 and 100",
-        ));
-    }
-    let text = if !n.is_finite() || n.abs() >= 1e21 {
-        crate::format_number(n)
-    } else {
-        format!("{:.*}", digits as usize, n)
-    };
+        to_integer_or_infinity(machine, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let text = number_format::to_fixed(n, digits).map_err(|error| range_error(error.message()))?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
         EcmaString::encode(&text),
     )?))
 }
+fn to_exponential<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let n = primitive_number(
+        machine,
+        this,
+        "Number.prototype.toExponential requires that 'this' be a Number",
+    )?;
+    let digits = match args.first().copied() {
+        None | Some(Value::UNDEFINED) => None,
+        Some(value) => Some(to_integer_or_infinity(machine, value)?),
+    };
+    let text =
+        number_format::to_exponential(n, digits).map_err(|error| range_error(error.message()))?;
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        EcmaString::encode(&text),
+    )?))
+}
+
+fn to_precision<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let n = primitive_number(
+        machine,
+        this,
+        "Number.prototype.toPrecision requires that 'this' be a Number",
+    )?;
+    let precision = match args.first().copied() {
+        None | Some(Value::UNDEFINED) => None,
+        Some(value) => Some(to_integer_or_infinity(machine, value)?),
+    };
+    let text =
+        number_format::to_precision(n, precision).map_err(|error| range_error(error.message()))?;
+    Ok(BuiltinOutcome::Value(allocate_string(
+        machine,
+        EcmaString::encode(&text),
+    )?))
+}
+
 fn value_of<H: Host>(
     machine: &mut Machine<'_, H>,
     this: Value,
@@ -513,5 +412,103 @@ mod tests {
             f64::INFINITY,
             "an overflowing integer literal must saturate to Infinity"
         );
+    }
+
+    fn outcome_text(machine: &Machine<'_, TestHost>, outcome: BuiltinOutcome) -> String {
+        let BuiltinOutcome::Value(value) = outcome else {
+            panic!("expected a string value outcome");
+        };
+        machine
+            .to_string(value)
+            .expect("string result")
+            .to_utf8_lossy()
+    }
+
+    #[test]
+    fn implicit_and_prototype_number_formatting_agree_on_boundaries() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let corpus = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            0.1,
+            0.1 + 0.2,
+            1.0 / 3.0,
+            1e-6,
+            1e-7,
+            -1e-7,
+            1e20,
+            9.999e20,
+            1e21,
+            -1e21,
+            9_007_199_254_740_991.0,
+            9_007_199_254_740_992.0,
+            123_456_789_012_345_678_901.0,
+            f64::from_bits(1),
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ];
+        for value in corpus {
+            let expected = bamts_bytecode::format_number(value);
+            let implicit = Machine::<TestHost>::ordinary_number_to_string(value);
+            let number = crate::number_value(value);
+            let prototype_outcome = to_string(&mut machine, number, &[], false).expect("toString");
+            let prototype = outcome_text(&machine, prototype_outcome);
+            let radix_outcome =
+                to_string(&mut machine, number, &[Value::int32(10)], false).expect("toString(10)");
+            let radix_ten = outcome_text(&machine, radix_outcome);
+            let precision_outcome =
+                to_precision(&mut machine, number, &[], false).expect("toPrecision");
+            let precision_default = outcome_text(&machine, precision_outcome);
+            assert_eq!(implicit, expected, "implicit ToString for {value}");
+            assert_eq!(prototype, expected, "Number.prototype.toString for {value}");
+            assert_eq!(
+                radix_ten, expected,
+                "Number.prototype.toString(10) for {value}"
+            );
+            assert_eq!(
+                precision_default, expected,
+                "Number.prototype.toPrecision() for {value}"
+            );
+            assert_eq!(
+                number_format::to_string_radix(value, 10.0),
+                Ok(expected.clone()),
+                "radix-10 leaf for {value}"
+            );
+        }
+
+        for (value, expected) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            assert_eq!(bamts_bytecode::format_number(value), expected);
+            assert_eq!(
+                Machine::<TestHost>::ordinary_number_to_string(value),
+                expected
+            );
+            let number = crate::number_value(value);
+            let outcome = to_string(&mut machine, number, &[], false).expect("toString");
+            assert_eq!(outcome_text(&machine, outcome), expected);
+        }
+    }
+
+    #[test]
+    fn number_wrapper_coercion_is_observable_for_formatting_methods() {
+        let program = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let boxed = machine
+            .box_primitive(crate::number_value(1e21))
+            .expect("Number wrapper");
+        let text_outcome = to_string(&mut machine, boxed, &[], false).expect("wrapper toString");
+        assert_eq!(outcome_text(&machine, text_outcome), "1e+21");
+        let fixed_outcome =
+            to_fixed(&mut machine, boxed, &[Value::int32(2)], false).expect("wrapper toFixed");
+        assert_eq!(outcome_text(&machine, fixed_outcome), "1e+21");
     }
 }

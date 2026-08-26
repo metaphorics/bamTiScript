@@ -1,16 +1,21 @@
 use std::collections::BTreeMap;
 
-use bamts_bytecode::{EcmaString, EcmaStringBuilder, IteratorKind};
+use super::property_descriptor::{
+    PropertyDescriptor as CanonicalPropertyDescriptor, collect_property_descriptors,
+    is_extensible as descriptor_is_extensible, to_property_descriptor,
+    validate_and_apply_property_descriptor,
+};
+use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_array, allocate_string, define_data, install_function, range_error,
-    to_integer_or_infinity, type_error, value_number,
+    allocate_string, define_data, install_function, range_error, to_integer_or_infinity,
+    type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
-    BoundCallable, CollectionKind, EvalFailure, HeapEntry, Host, Machine, NativeCallable, Property,
-    PropertyKey, PropertyMap, RuntimeErrorKind,
+    BoundCallable, EvalFailure, HeapEntry, Host, Machine, NativeCallable, Property, PropertyKey,
+    PropertyMap, RuntimeErrorKind,
 };
 
 pub(super) fn install<H: Host>(
@@ -23,31 +28,7 @@ pub(super) fn install<H: Host>(
     builtins.set_constructor_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode("Object"), constructor);
 
-    for (name, length, handler) in [
-        ("keys", 1, keys::<H> as BuiltinHandler<H>),
-        ("values", 1, values::<H>),
-        ("entries", 1, entries::<H>),
-        ("assign", 2, assign::<H>),
-        ("create", 2, create::<H>),
-        ("freeze", 1, freeze::<H>),
-        ("isFrozen", 1, is_frozen::<H>),
-        ("defineProperty", 3, define_property::<H>),
-        ("defineProperties", 2, define_properties::<H>),
-        ("getOwnPropertyNames", 1, get_own_property_names::<H>),
-        ("getOwnPropertySymbols", 1, get_own_property_symbols::<H>),
-        (
-            "getOwnPropertyDescriptor",
-            2,
-            get_own_property_descriptor::<H>,
-        ),
-        ("getPrototypeOf", 1, get_prototype_of::<H>),
-        ("setPrototypeOf", 2, set_prototype_of::<H>),
-        ("fromEntries", 1, from_entries::<H>),
-        ("hasOwn", 2, has_own::<H>),
-    ] {
-        let function = install_function(heap, builtins, name, length, handler);
-        machine_static(heap, constructor, name, function);
-    }
+    super::object_statics::install(heap, builtins, constructor);
 
     for (name, length, handler) in [
         ("toString", 0, prototype_to_string::<H> as BuiltinHandler<H>),
@@ -70,17 +51,6 @@ pub(super) fn install<H: Host>(
         let function = install_function(heap, builtins, name, length, handler);
         define_data(heap, builtins.function_prototype(), name, function);
     }
-}
-
-fn machine_static(heap: &mut [HeapEntry], constructor: Value, name: &str, value: Value) {
-    let index = super::heap_index(constructor);
-    let HeapEntry::NativeFunction { properties, .. } = &mut heap[index] else {
-        panic!("constructor must be native");
-    };
-    properties.insert(
-        PropertyKey::Named(EcmaString::encode(name)),
-        super::builtin_property(value),
-    );
 }
 
 fn constructor<H: Host>(
@@ -138,88 +108,7 @@ fn object_arg<H: Host>(
     Ok(value)
 }
 
-fn own_names<H: Host>(
-    machine: &Machine<'_, H>,
-    value: Value,
-) -> Result<Vec<EcmaString>, EvalFailure> {
-    Ok(machine
-        .own_property_keys(value)?
-        .into_iter()
-        .filter_map(|key| match key {
-            PropertyKey::Named(name) => Some(name),
-            PropertyKey::Symbol(_) | PropertyKey::Private(_) => None,
-        })
-        .collect())
-}
-
-fn keys<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let values = machine
-        .enumerable_keys(value)?
-        .into_iter()
-        .map(|name| allocate_string(machine, name))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(BuiltinOutcome::Value(allocate_array(machine, values)?))
-}
-
-fn values<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let mut output = Vec::new();
-    for name in machine.enumerable_keys(source)? {
-        output.push(machine.get_property_key(source, &PropertyKey::Named(name))?);
-    }
-    Ok(BuiltinOutcome::Value(allocate_array(machine, output)?))
-}
-
-fn entries<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let source = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let mut output = Vec::new();
-    for name in machine.enumerable_keys(source)? {
-        let key = allocate_string(machine, name.clone())?;
-        let value = machine.get_property_key(source, &PropertyKey::Named(name))?;
-        output.push(allocate_array(machine, vec![key, value])?);
-    }
-    Ok(BuiltinOutcome::Value(allocate_array(machine, output)?))
-}
-
-fn assign<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let target = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    for source in args.iter().copied().skip(1) {
-        if matches!(source.decode(), Some(Decoded::Undefined | Decoded::Null)) {
-            continue;
-        }
-        for key in machine.own_property_keys(source)? {
-            if !machine.own_property_is_enumerable(source, &key)? {
-                continue;
-            }
-            let value = machine.get_property_key(source, &key)?;
-            machine.set_data_property_key(target, key, value)?;
-        }
-    }
-    Ok(BuiltinOutcome::Value(target))
-}
-
-fn create<H: Host>(
+pub(super) fn create<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
@@ -247,173 +136,11 @@ fn create<H: Host>(
     Ok(BuiltinOutcome::Value(object))
 }
 
-fn freeze<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
-    machine.mark_frozen(value)?;
-    Ok(BuiltinOutcome::Value(value))
-}
-
-fn is_frozen<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
-    Ok(BuiltinOutcome::Value(Value::boolean(
-        machine.is_frozen_value(value)?,
-    )))
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PropertyDescriptor {
-    value: Option<Value>,
-    writable: Option<bool>,
-    getter: Option<Value>,
-    setter: Option<Value>,
-    enumerable: Option<bool>,
-    configurable: Option<bool>,
-}
-
-impl PropertyDescriptor {
-    fn is_accessor(self) -> bool {
-        self.getter.is_some() || self.setter.is_some()
-    }
-
-    fn is_data(self) -> bool {
-        self.value.is_some() || self.writable.is_some()
-    }
-
-    fn into_property(self, current: Option<Property>) -> Property {
-        let enumerable = self
-            .enumerable
-            .unwrap_or_else(|| current.as_ref().is_some_and(Property::enumerable));
-        let configurable = self
-            .configurable
-            .unwrap_or_else(|| current.as_ref().is_some_and(Property::configurable));
-
-        if self.is_accessor() {
-            let (current_getter, current_setter) = match current {
-                Some(Property::Accessor { getter, setter, .. }) => (getter, setter),
-                _ => (None, None),
-            };
-            return Property::Accessor {
-                getter: self
-                    .getter
-                    .map(|value| (value != Value::UNDEFINED).then_some(value))
-                    .unwrap_or(current_getter),
-                setter: self
-                    .setter
-                    .map(|value| (value != Value::UNDEFINED).then_some(value))
-                    .unwrap_or(current_setter),
-                enumerable,
-                configurable,
-            };
-        }
-
-        if self.is_data() {
-            let (current_value, current_writable) = match current {
-                Some(Property::Data {
-                    value, writable, ..
-                }) => (value, writable),
-                _ => (Value::UNDEFINED, false),
-            };
-            return Property::Data {
-                value: self.value.unwrap_or(current_value),
-                writable: self.writable.unwrap_or(current_writable),
-                enumerable,
-                configurable,
-            };
-        }
-
-        match current {
-            Some(Property::Accessor { getter, setter, .. }) => Property::Accessor {
-                getter,
-                setter,
-                enumerable,
-                configurable,
-            },
-            Some(Property::Data {
-                value, writable, ..
-            }) => Property::Data {
-                value,
-                writable,
-                enumerable,
-                configurable,
-            },
-            None => Property::Data {
-                value: Value::UNDEFINED,
-                writable: false,
-                enumerable,
-                configurable,
-            },
-        }
-    }
-}
-
-fn descriptor_field<H: Host>(
-    machine: &mut Machine<'_, H>,
-    descriptor: Value,
-    name: &str,
-) -> Result<Option<Value>, EvalFailure> {
-    let key = PropertyKey::Named(EcmaString::encode(name));
-    if !machine.has_property(descriptor, &key)? {
-        return Ok(None);
-    }
-    machine.get_property_key(descriptor, &key).map(Some)
-}
-
-fn descriptor_from<H: Host>(
-    machine: &mut Machine<'_, H>,
-    descriptor: Value,
-) -> Result<PropertyDescriptor, EvalFailure> {
-    if !machine.is_object(descriptor) {
-        return Err(type_error("Property description must be an object"));
-    }
-    let enumerable =
-        descriptor_field(machine, descriptor, "enumerable")?.map(|value| machine.to_boolean(value));
-    let configurable = descriptor_field(machine, descriptor, "configurable")?
-        .map(|value| machine.to_boolean(value));
-    let value = descriptor_field(machine, descriptor, "value")?;
-    let writable =
-        descriptor_field(machine, descriptor, "writable")?.map(|value| machine.to_boolean(value));
-    let getter = descriptor_field(machine, descriptor, "get")?;
-    if let Some(getter) = getter
-        && getter != Value::UNDEFINED
-        && !machine.is_callable(getter)?
-    {
-        return Err(type_error("Invalid property descriptor"));
-    }
-    let setter = descriptor_field(machine, descriptor, "set")?;
-    if let Some(setter) = setter
-        && setter != Value::UNDEFINED
-        && !machine.is_callable(setter)?
-    {
-        return Err(type_error("Invalid property descriptor"));
-    }
-    if (getter.is_some() || setter.is_some()) && (value.is_some() || writable.is_some()) {
-        return Err(type_error("Invalid property descriptor"));
-    }
-    Ok(PropertyDescriptor {
-        value,
-        writable,
-        getter,
-        setter,
-        enumerable,
-        configurable,
-    })
-}
-
 fn define_array_length_descriptor<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
     key: &PropertyKey,
-    descriptor: PropertyDescriptor,
+    descriptor: CanonicalPropertyDescriptor,
 ) -> Result<bool, EvalFailure> {
     let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
         return Ok(false);
@@ -458,139 +185,30 @@ fn define_array_length_descriptor<H: Host>(
     Ok(true)
 }
 
-fn apply_property_descriptor<H: Host>(
+pub(super) fn apply_property_descriptor<H: Host>(
     machine: &mut Machine<'_, H>,
     target: Value,
     key: PropertyKey,
-    descriptor: PropertyDescriptor,
+    descriptor: CanonicalPropertyDescriptor,
 ) -> Result<(), EvalFailure> {
     if define_array_length_descriptor(machine, target, &key, descriptor)? {
         return Ok(());
     }
     let current = machine.own_descriptor(target, &key)?;
-    validate_property_descriptor(machine, current.as_ref(), descriptor)?;
-    machine.define_descriptor(target, key, descriptor.into_property(current))
-}
-
-/// ECMA-262 §7.2.10 SameValue(x, y).
-///
-/// Like SameValueZero except that `+0` and `-0` are distinct.
-fn same_value<H: Host>(machine: &Machine<'_, H>, left: Value, right: Value) -> bool {
-    match (left.decode(), right.decode()) {
-        (Some(Decoded::Number(a)), Some(Decoded::Number(b))) => {
-            if a.is_nan() && b.is_nan() {
-                return true;
-            }
-            if a == 0.0 && b == 0.0 {
-                return a.is_sign_positive() == b.is_sign_positive();
-            }
-            a == b
-        }
-        (Some(Decoded::Number(a)), Some(Decoded::Int32(b)))
-        | (Some(Decoded::Int32(b)), Some(Decoded::Number(a))) => {
-            // The Int32 payload is a two's-complement u32; interpret it as a
-            // signed i32 before converting to f64 so negative values compare
-            // to their mathematical Number equivalents.
-            let b_f64 = f64::from(b as i32);
-            // b_f64 is always finite — never NaN. Only a can be NaN, and NaN
-            // compares unequal to every finite f64, so SameValue(NaN, <int>)
-            // correctly falls through to false without a dedicated guard. The
-            // +0/-0 split still matters: Int32(0) maps to +0.0, so a negative
-            // zero must not match it.
-            if a == 0.0 && b_f64 == 0.0 {
-                return a.is_sign_positive();
-            }
-            a == b_f64
-        }
-        _ => machine.same_value_zero(left, right),
-    }
-}
-
-/// ECMA-262 §10.1.6.3 ValidateAndApplyPropertyDescriptor — validation half.
-///
-/// When `current` is absent the property is being created and any descriptor is
-/// accepted. When `current` is configurable any change is permitted. Otherwise
-/// the spec forbids: making the property configurable, changing enumerability,
-/// converting between data and accessor form, making a non-writable data
-/// property writable, or changing the value of a non-writable data property
-/// (using SameValue). A no-op redefinition that changes nothing is allowed.
-fn validate_property_descriptor<H: Host>(
-    machine: &Machine<'_, H>,
-    current: Option<&Property>,
-    descriptor: PropertyDescriptor,
-) -> Result<(), EvalFailure> {
-    let Some(current) = current else {
-        return Ok(());
-    };
-    if current.configurable() {
-        return Ok(());
-    }
-    if descriptor.configurable == Some(true) {
-        return Err(type_error(
-            "Cannot redefine property: non-configurable property cannot be made configurable",
-        ));
-    }
-    if descriptor
-        .enumerable
-        .is_some_and(|enumerable| enumerable != current.enumerable())
-    {
-        return Err(type_error(
-            "Cannot redefine property: cannot change enumerability of non-configurable property",
-        ));
-    }
-    match current {
-        Property::Data {
-            writable, value, ..
-        } => {
-            if descriptor.is_accessor() {
-                return Err(type_error(
-                    "Cannot redefine property: cannot convert non-configurable data property to accessor",
-                ));
-            }
-            if !*writable {
-                if descriptor.writable == Some(true) {
-                    return Err(type_error(
-                        "Cannot redefine property: cannot make non-writable property writable",
-                    ));
-                }
-                if descriptor
-                    .value
-                    .is_some_and(|next| !same_value(machine, next, *value))
-                {
-                    return Err(type_error(
-                        "Cannot redefine property: cannot change value of non-writable property",
-                    ));
-                }
-            }
-        }
-        Property::Accessor { getter, setter, .. } => {
-            if descriptor.is_data() {
-                return Err(type_error(
-                    "Cannot redefine property: cannot convert non-configurable accessor property to data",
-                ));
-            }
-            if descriptor
-                .getter
-                .is_some_and(|next| !same_value(machine, next, getter.unwrap_or(Value::UNDEFINED)))
-            {
-                return Err(type_error(
-                    "Cannot redefine property: cannot change getter of non-configurable accessor property",
-                ));
-            }
-            if descriptor
-                .setter
-                .is_some_and(|next| !same_value(machine, next, setter.unwrap_or(Value::UNDEFINED)))
-            {
-                return Err(type_error(
-                    "Cannot redefine property: cannot change setter of non-configurable accessor property",
-                ));
-            }
-        }
+    let extensible = descriptor_is_extensible(machine, target)?;
+    if !validate_and_apply_property_descriptor(
+        machine,
+        Some((target, key)),
+        extensible,
+        descriptor,
+        current,
+    )? {
+        return Err(type_error("Cannot redefine property"));
     }
     Ok(())
 }
 
-fn define_property<H: Host>(
+pub(super) fn define_property<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
@@ -600,8 +218,9 @@ fn define_property<H: Host>(
     if !machine.is_object(target) {
         return Err(type_error("Object.defineProperty called on non-object"));
     }
-    let key = machine.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-    let descriptor = descriptor_from(machine, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+    let key = machine.observable_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+    let descriptor =
+        to_property_descriptor(machine, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
     apply_property_descriptor(machine, target, key, descriptor)?;
     Ok(BuiltinOutcome::Value(target))
 }
@@ -611,24 +230,15 @@ fn define_properties_on<H: Host>(
     target: Value,
     descriptors: Value,
 ) -> Result<(), EvalFailure> {
-    let mut definitions = Vec::new();
-    for key in machine.own_property_keys(descriptors)? {
-        if !machine
-            .own_descriptor(descriptors, &key)?
-            .is_some_and(|property| property.enumerable())
-        {
-            continue;
-        }
-        let descriptor = machine.get_property_key(descriptors, &key)?;
-        definitions.push((key, descriptor_from(machine, descriptor)?));
-    }
+    let descriptors = machine.value_to_object(descriptors)?;
+    let definitions = collect_property_descriptors(machine, descriptors)?;
     for (key, descriptor) in definitions {
         apply_property_descriptor(machine, target, key, descriptor)?;
     }
     Ok(())
 }
 
-fn define_properties<H: Host>(
+pub(super) fn define_properties<H: Host>(
     machine: &mut Machine<'_, H>,
     _this: Value,
     args: &[Value],
@@ -645,191 +255,6 @@ fn define_properties<H: Host>(
     let descriptors = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     define_properties_on(machine, target, descriptors)?;
     Ok(BuiltinOutcome::Value(target))
-}
-
-fn get_own_property_names<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let names = own_names(machine, value)?
-        .into_iter()
-        .map(|name| allocate_string(machine, name))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(BuiltinOutcome::Value(allocate_array(machine, names)?))
-}
-
-fn get_own_property_symbols<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let symbols = machine
-        .own_property_keys(value)?
-        .into_iter()
-        .filter_map(|key| match key {
-            PropertyKey::Symbol(index) => Some(Value::heap_ref(
-                bamts_native::SlotId::from_parts(crate::RUNTIME_HEAP_SEGMENT, index + 1)
-                    .expect("property key is a valid runtime heap slot"),
-            )),
-            PropertyKey::Named(_) | PropertyKey::Private(_) => None,
-        })
-        .collect();
-    Ok(BuiltinOutcome::Value(allocate_array(machine, symbols)?))
-}
-
-fn get_own_property_descriptor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let target = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let key = machine.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-    let Some(property) = machine.own_descriptor(target, &key)? else {
-        return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
-    };
-    let descriptor = machine
-        .allocate(HeapEntry::Object {
-            properties: PropertyMap::default(),
-            prototype: Some(machine.intrinsics.object_prototype),
-            extensible: true,
-            boxed_primitive: None,
-        })
-        .map_err(EvalFailure::Runtime)?;
-    match property {
-        Property::Data {
-            value,
-            writable,
-            enumerable,
-            configurable,
-        } => {
-            machine.set_data_property(descriptor, "value", value)?;
-            machine.set_data_property(descriptor, "writable", Value::boolean(writable))?;
-            machine.set_data_property(descriptor, "enumerable", Value::boolean(enumerable))?;
-            machine.set_data_property(descriptor, "configurable", Value::boolean(configurable))?;
-        }
-        Property::Accessor {
-            getter,
-            setter,
-            enumerable,
-            configurable,
-        } => {
-            machine.set_data_property(descriptor, "get", getter.unwrap_or(Value::UNDEFINED))?;
-            machine.set_data_property(descriptor, "set", setter.unwrap_or(Value::UNDEFINED))?;
-            machine.set_data_property(descriptor, "enumerable", Value::boolean(enumerable))?;
-            machine.set_data_property(descriptor, "configurable", Value::boolean(configurable))?;
-        }
-    }
-    Ok(BuiltinOutcome::Value(descriptor))
-}
-
-fn get_prototype_of<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let target = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    Ok(BuiltinOutcome::Value(
-        machine.prototype_value(target)?.unwrap_or(Value::NULL),
-    ))
-}
-
-fn set_prototype_of<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let target = object_arg(
-        machine,
-        args,
-        "Object.setPrototypeOf called on null or undefined",
-    )?;
-    let prototype = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    if prototype != Value::NULL && !machine.is_object(prototype) {
-        return Err(type_error("Object prototype may only be an Object or null"));
-    }
-    machine.set_prototype_value(target, (prototype != Value::NULL).then_some(prototype))?;
-    Ok(BuiltinOutcome::Value(target))
-}
-
-fn from_entries<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let iterable = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let object = machine
-        .allocate(HeapEntry::Object {
-            properties: PropertyMap::default(),
-            prototype: Some(machine.intrinsics.object_prototype),
-            extensible: true,
-            boxed_primitive: None,
-        })
-        .map_err(EvalFailure::Runtime)?;
-    let depth = machine.native_roots.len();
-    machine.push_native_roots(depth, &[object, iterable]);
-    let result: Result<(), EvalFailure> = (|| {
-        let iterator = machine.create_iterator(iterable, IteratorKind::Sync)?;
-        machine.refresh_native_roots(depth, &[object, iterator]);
-        loop {
-            let (done, entry) = machine.iterator_next(iterator)?;
-            if done {
-                break;
-            }
-            machine.refresh_native_roots(depth, &[object, iterator, entry]);
-            let inserted = (|| {
-                if !machine.is_object(entry) {
-                    return Err(type_error("Iterator value is not an entry object"));
-                }
-                let key_value = machine.get_named_property(entry, "0")?;
-                machine.refresh_native_roots(depth, &[object, iterator, entry, key_value]);
-                let key = machine.to_property_key(key_value)?;
-                machine.refresh_native_roots(depth, &[object, iterator, entry, key_value]);
-                let value = machine.get_named_property(entry, "1")?;
-                machine.refresh_native_roots(depth, &[object, iterator, entry, key_value, value]);
-                machine.create_data_property_key(object, key, value)
-            })();
-            if let Err(failure) = inserted {
-                match &failure {
-                    EvalFailure::ThrowValue(value)
-                    | EvalFailure::ThrowValueOrigin { value, .. } => {
-                        machine.refresh_native_roots(depth, &[object, iterator, *value]);
-                    }
-                    EvalFailure::Throw(_) | EvalFailure::Runtime(_) => {
-                        machine.refresh_native_roots(depth, &[object, iterator]);
-                    }
-                }
-                return Err(super::collections::close_iterator_preserving_failure(
-                    machine, iterator, failure,
-                ));
-            }
-        }
-        Ok(())
-    })();
-    machine.pop_native_roots(depth);
-    result?;
-    Ok(BuiltinOutcome::Value(object))
-}
-
-fn has_own<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let target = object_arg(machine, args, "Cannot convert undefined or null to object")?;
-    let key = machine.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-    Ok(BuiltinOutcome::Value(Value::boolean(
-        machine.has_own_property_key(target, &key)?,
-    )))
 }
 
 fn prototype_to_string<H: Host>(
@@ -1073,163 +498,10 @@ fn function_bind<H: Host>(
     Ok(BuiltinOutcome::Value(value))
 }
 
-pub(super) fn structured_clone<H: Host>(
-    machine: &mut Machine<'_, H>,
-    _this: Value,
-    args: &[Value],
-    _constructing: bool,
-) -> Result<BuiltinOutcome, EvalFailure> {
-    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let mut seen = BTreeMap::new();
-    Ok(BuiltinOutcome::Value(clone_value(
-        machine, value, &mut seen,
-    )?))
-}
-
-fn clone_value<H: Host>(
-    machine: &mut Machine<'_, H>,
-    value: Value,
-    seen: &mut BTreeMap<usize, Value>,
-) -> Result<Value, EvalFailure> {
-    let Some(Decoded::HeapRef(_)) = value.decode() else {
-        return Ok(value);
-    };
-    let index = machine
-        .runtime_slot(value)
-        .map_err(EvalFailure::Runtime)?
-        .ok_or_else(|| type_error("cannot clone host object"))?;
-    if let Some(clone) = seen.get(&index) {
-        return Ok(*clone);
-    }
-    if matches!(
-        &machine.heap[index],
-        HeapEntry::Collection {
-            kind: CollectionKind::WeakMap | CollectionKind::WeakSet,
-            ..
-        }
-    ) {
-        return Err(type_error("value could not be cloned"));
-    }
-    match machine.heap[index].clone() {
-        HeapEntry::String(text) => allocate_string(machine, text),
-        HeapEntry::Array { elements, .. } => {
-            let clone = allocate_array(machine, vec![Value::HOLE; elements.len()])?;
-            seen.insert(index, clone);
-            let mut copied = vec![Value::HOLE; elements.len()];
-            for (offset, element) in elements.into_iter().enumerate() {
-                if element != Value::HOLE {
-                    copied[offset] = clone_value(machine, element, seen)?;
-                }
-            }
-            machine.replace_array_elements(clone, copied)?;
-            Ok(clone)
-        }
-        HeapEntry::Object {
-            properties,
-            prototype,
-            ..
-        }
-        | HeapEntry::Script {
-            properties,
-            prototype,
-            ..
-        } => {
-            let clone = machine
-                .allocate(HeapEntry::Object {
-                    properties: PropertyMap::default(),
-                    prototype,
-                    extensible: true,
-                    boxed_primitive: None,
-                })
-                .map_err(EvalFailure::Runtime)?;
-            seen.insert(index, clone);
-            for (key, _) in properties.0 {
-                if let PropertyKey::Named(name) = key {
-                    let key = PropertyKey::Named(name);
-                    let source = machine.get_property_key(value, &key)?;
-                    let copied = clone_value(machine, source, seen)?;
-                    machine.set_data_property_key(clone, key, copied)?;
-                }
-            }
-            Ok(clone)
-        }
-        HeapEntry::Date {
-            time, prototype, ..
-        } => {
-            let clone = machine
-                .allocate(HeapEntry::Date {
-                    time,
-                    properties: PropertyMap::default(),
-                    prototype,
-                    extensible: true,
-                })
-                .map_err(EvalFailure::Runtime)?;
-            seen.insert(index, clone);
-            Ok(clone)
-        }
-        HeapEntry::Collection {
-            kind,
-            entries,
-            prototype,
-            ..
-        } => {
-            let clone = machine
-                .allocate(HeapEntry::Collection {
-                    kind,
-                    entries: Vec::new(),
-                    index: crate::CollectionIndex::default(),
-                    size: 0,
-                    next_order: 0,
-                    properties: PropertyMap::default(),
-                    prototype,
-                    extensible: true,
-                })
-                .map_err(EvalFailure::Runtime)?;
-            seen.insert(index, clone);
-            let clone_index = machine.runtime_slot(clone).unwrap().unwrap();
-            for entry in entries.into_iter().filter(|entry| entry.live) {
-                let key = clone_value(machine, entry.key, seen)?;
-                let value = clone_value(machine, entry.value, seen)?;
-                super::collections::append_collection_entry(machine, clone_index, key, value)?;
-            }
-            Ok(clone)
-        }
-        HeapEntry::Uint8Array {
-            bytes,
-            properties,
-            prototype,
-            extensible,
-        } => {
-            let clone = machine
-                .allocate(HeapEntry::Uint8Array {
-                    bytes,
-                    properties: PropertyMap::default(),
-                    prototype,
-                    extensible,
-                })
-                .map_err(EvalFailure::Runtime)?;
-            seen.insert(index, clone);
-            for (key, property) in properties.0 {
-                if key.eq_ascii("length")
-                    || key
-                        .as_string()
-                        .is_some_and(|name| crate::uint8array_index(name).is_some())
-                {
-                    continue;
-                }
-                if let Property::Data { value, .. } = property {
-                    let copied = clone_value(machine, value, seen)?;
-                    machine.set_data_property_key(clone, key, copied)?;
-                }
-            }
-            Ok(clone)
-        }
-        _ => Err(type_error("value could not be cloned")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::allocate_array;
+    use super::super::property_descriptor::same_value;
     use super::super::test_support::{TestHost, blank_program, ordinary_object};
     use super::*;
     use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
@@ -1609,15 +881,13 @@ mod tests {
                 description: EcmaString::encode("private"),
             })
             .unwrap();
+        let public_key = symbol_key(&machine, symbol);
+        let private_key = machine.to_property_key(private).unwrap();
         machine
-            .set_data_property_key(target, symbol_key(&machine, symbol), Value::int32(1))
+            .set_data_property_key(target, public_key, Value::int32(1))
             .unwrap();
         machine
-            .set_data_property_key(
-                target,
-                machine.to_property_key(private).unwrap(),
-                Value::int32(2),
-            )
+            .set_data_property_key(target, private_key, Value::int32(2))
             .unwrap();
 
         let symbols = call_object(&mut machine, "getOwnPropertySymbols", &[target]).unwrap();
@@ -3605,10 +2875,9 @@ mod tests {
         let source = custom_iterable(&mut machine, vec![entry]);
 
         let result = call_object(&mut machine, "fromEntries", &[source]).unwrap();
+        let property_key = symbol_key(&machine, key);
         assert_eq!(
-            machine
-                .get_property_key(result, &symbol_key(&machine, key))
-                .unwrap(),
+            machine.get_property_key(result, &property_key).unwrap(),
             Value::int32(7)
         );
         let description = machine.get_named_property(key, "description").unwrap();
@@ -4070,5 +3339,16 @@ mod tests {
             Value::number(-1.0),
             "property value must use the new Number representation"
         );
+    }
+    #[test]
+    fn define_properties_to_objects_descriptor_collection() {
+        let module = blank_program("<test>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let target = ordinary_object(&mut machine);
+
+        assert!(call_define_properties(&mut machine, target, Value::UNDEFINED).is_err());
+        assert!(call_define_properties(&mut machine, target, Value::NULL).is_err());
+        assert!(machine.own_property_keys(target).unwrap().is_empty());
     }
 }

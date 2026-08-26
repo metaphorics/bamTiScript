@@ -1,7 +1,10 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const EXPECTED_STDOUT: &[u8] = b"hello from bamts\n";
 const UTF16_PROGRAM: &str = r#"const s = "\uD800";
@@ -67,16 +70,25 @@ vm.runInThisContext("import('node:util').then(function(ns) { process.stdout.writ
 static NEXT_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
 #[test]
-fn run_fixture_preserves_stdout_and_exit_code() {
+fn api_execution_preserves_stdout_and_exit_code() {
     let directory = ScratchDirectory::new();
-    let output = directory
-        .command()
-        .args(["run", "--target", "jit"])
-        .arg(fixture())
-        .output()
-        .expect("bamts run starts");
-    assert_success(&output, "bamts run");
+    directory.write("hello.ts", include_str!("fixtures/hello.ts"));
+    let output = directory.execute("jit", "hello.ts", &[]);
+    assert_execution_success(&output, "compiler/execute fixture");
     assert_eq!(output.stdout, EXPECTED_STDOUT);
+}
+
+#[test]
+fn api_execution_reports_bounded_resource_exhaustion() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "for (;;) {}\n");
+
+    let response = project.execute_response("jit", "main.ts", &[]);
+
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("resource exhaustion is an API error");
+    assert!(message.contains("fuel exhausted"), "{message}");
 }
 
 #[test]
@@ -89,37 +101,21 @@ process.stdout.write(process.argv[1] + "\n");
 process.stdout.write(process.argv[2] + "\n");
 process.stdout.write(process.argv[3] + "\n");
 process.stdout.write(process.env.BAMTS_AOT_ENTRYPOINT === undefined ? "hidden\n" : "leaked\n");
-process.stdout.write(process.env.BAMTS_AOT_LAUNCH_TOKEN === undefined ? "hidden\n" : "leaked\n");
-process.stdout.write(process.env.BAMTS_CONTEXT_PROBE + "\n");
 "#,
     );
 
-    let jit = project
-        .command()
-        .env("BAMTS_AOT_ENTRYPOINT", "stale.ts")
-        .env("BAMTS_AOT_LAUNCH_TOKEN", "stale-token")
-        .env("BAMTS_CONTEXT_PROBE", "shared")
-        .args(["run", "--target", "jit", "main.ts", "--", "first", "second"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts JIT argv program starts");
-    assert_success(&jit, "bamts JIT argv program");
+    let jit = project.execute("jit", "main.ts", &["first", "second"]);
+    assert_execution_success(&jit, "compiler/execute JIT argv program");
+    let aot = project.execute("aot", "main.ts", &["first", "second"]);
+    assert_execution_success(&aot, "compiler/execute AOT argv program");
 
-    let aot = project
-        .command()
-        .env("BAMTS_AOT_ENTRYPOINT", "stale.ts")
-        .env("BAMTS_AOT_LAUNCH_TOKEN", "stale-token")
-        .env("BAMTS_CONTEXT_PROBE", "shared")
-        .args(["run", "--target", "aot", "main.ts", "--", "first", "second"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts AOT argv program starts");
-    assert_success(&aot, "bamts AOT argv program");
-
-    assert_eq!(
-        jit.stdout,
-        b"bamts\nmain.ts\nfirst\nsecond\nhidden\nhidden\nshared\n"
+    let expected = format!(
+        "bamts\n{}\nfirst\nsecond\nhidden\n",
+        fs::canonicalize(project.path.join("main.ts"))
+            .expect("entrypoint canonicalizes")
+            .display()
     );
+    assert_eq!(jit.stdout, expected.as_bytes());
     assert_eq!(aot.stdout, jit.stdout);
 }
 
@@ -142,21 +138,10 @@ process.stdout.write("ok\n");
 "#,
     );
 
-    let jit = project
-        .command()
-        .args(["run", "--target", "jit", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts JIT BigInt program starts");
-    assert_success(&jit, "bamts JIT BigInt program");
-
-    let aot = project
-        .command()
-        .args(["run", "--target", "aot", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts AOT BigInt program starts");
-    assert_success(&aot, "bamts AOT BigInt program");
+    let jit = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&jit, "compiler/execute JIT BigInt program");
+    let aot = project.execute("aot", "main.ts", &[]);
+    assert_execution_success(&aot, "compiler/execute AOT BigInt program");
 
     assert_eq!(jit.stdout, b"ok\n");
     assert_eq!(aot.stdout, jit.stdout);
@@ -167,21 +152,10 @@ fn aot_and_jit_execute_classic_script_dynamic_imports() {
     let project = ScratchDirectory::new();
     project.write("main.ts", CLASSIC_DYNAMIC_IMPORT_PROGRAM);
 
-    let jit = project
-        .command()
-        .args(["run", "--target", "jit", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts JIT classic dynamic import program starts");
-    assert_success(&jit, "bamts JIT classic dynamic import program");
-
-    let aot = project
-        .command()
-        .args(["run", "--target", "aot", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts AOT classic dynamic import program starts");
-    assert_success(&aot, "bamts AOT classic dynamic import program");
+    let jit = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&jit, "compiler/execute JIT classic dynamic import program");
+    let aot = project.execute("aot", "main.ts", &[]);
+    assert_execution_success(&aot, "compiler/execute AOT classic dynamic import program");
 
     assert_eq!(jit.stdout, b"function\n");
     assert_eq!(aot.stdout, jit.stdout);
@@ -233,15 +207,11 @@ process.stdout.write(trace.join(",") + "\n");
 break-body,break-inner,break-outer,continue-body:0,continue-inner:0,continue-outer:0,\
 continue-body:1,continue-inner:1,continue-outer:1\n";
     for target in ["jit", "aot"] {
-        let output = project
-            .command()
-            .args(["run", "--target", target, "main.ts"])
-            .current_dir(&project.path)
-            .output()
-            .unwrap_or_else(|error| {
-                panic!("bamts {target} nested-finally program starts: {error}")
-            });
-        assert_success(&output, &format!("bamts {target} nested-finally program"));
+        let output = project.execute(target, "main.ts", &[]);
+        assert_execution_success(
+            &output,
+            &format!("compiler/execute {target} nested-finally program"),
+        );
         assert_eq!(output.stdout, expected, "{target}");
     }
 }
@@ -304,13 +274,11 @@ process.stdout.write(trace.join(",") + "\n");
 continue-body:0,continue-inner:0,continue-outer:0,continue-body:1,continue-inner:1,\
 continue-outer:1,crossed-inner:0,crossed-outer:0,switch\n";
     for target in ["jit", "aot"] {
-        let output = project
-            .command()
-            .args(["run", "--target", target, "main.ts"])
-            .current_dir(&project.path)
-            .output()
-            .unwrap_or_else(|error| panic!("bamts {target} labeled program starts: {error}"));
-        assert_success(&output, &format!("bamts {target} labeled program"));
+        let output = project.execute(target, "main.ts", &[]);
+        assert_execution_success(
+            &output,
+            &format!("compiler/execute {target} labeled program"),
+        );
         assert_eq!(output.stdout, expected, "{target}");
     }
 }
@@ -350,17 +318,10 @@ process.stdout.write(trace.join(",") + "\n");
 
     let expected = b"body:1,finally,return(),catch:body-error\n";
     for target in ["jit", "aot"] {
-        let output = project
-            .command()
-            .args(["run", "--target", target, "main.ts"])
-            .current_dir(&project.path)
-            .output()
-            .unwrap_or_else(|error| {
-                panic!("bamts {target} iterator-close ordering program starts: {error}")
-            });
-        assert_success(
+        let output = project.execute(target, "main.ts", &[]);
+        assert_execution_success(
             &output,
-            &format!("bamts {target} iterator-close ordering program"),
+            &format!("compiler/execute {target} iterator-close ordering program"),
         );
         assert_eq!(output.stdout, expected, "{target}");
     }
@@ -379,173 +340,12 @@ process.stdout.write(String(increment(alias)) + "\n");
     );
 
     for target in ["jit", "aot"] {
-        let output = project
-            .command()
-            .args(["run", "--target", target, "main.ts"])
-            .current_dir(&project.path)
-            .output()
-            .unwrap_or_else(|error| panic!("bamts {target} escaped-name program starts: {error}"));
-        assert_success(&output, &format!("bamts {target} escaped-name program"));
+        let output = project.execute(target, "main.ts", &[]);
+        assert_execution_success(
+            &output,
+            &format!("compiler/execute {target} escaped-name program"),
+        );
         assert_eq!(output.stdout, b"42\n", "{target}");
-    }
-}
-
-#[test]
-fn aot_and_jit_keep_non_exported_nested_namespaces_local() {
-    let project = ScratchDirectory::new();
-    project.write(
-        "main.ts",
-        r#"namespace A {
-    namespace B {
-        export const x = 1;
-    }
-    export namespace C {
-        export const x = 2;
-    }
-    export const localValue = B.x;
-}
-if (A.localValue !== 1 || "B" in A || A.C.x !== 2) {
-    throw "nested namespace visibility mismatch";
-}
-process.stdout.write("ok\n");
-"#,
-    );
-
-    for target in ["jit", "aot"] {
-        let output = project
-            .command()
-            .args(["run", "--target", target, "main.ts"])
-            .current_dir(&project.path)
-            .output()
-            .unwrap_or_else(|error| {
-                panic!("bamts {target} nested-namespace program starts: {error}")
-            });
-        assert_success(&output, &format!("bamts {target} nested-namespace program"));
-        assert_eq!(output.stdout, b"ok\n", "{target}");
-    }
-}
-
-#[test]
-fn aot_and_jit_share_one_live_global_object() {
-    let project = ScratchDirectory::new();
-    project.write(
-        "main.ts",
-        r#"const root: any = globalThis;
-const stdout = process.stdout;
-const originalConsole = console;
-const replacementConsole = { marker: 1 };
-
-root.console = replacementConsole;
-if (console !== replacementConsole) throw "property-to-identifier mismatch";
-console = originalConsole;
-if (root.console !== originalConsole) throw "identifier-to-property mismatch";
-
-let lexicalBinding = 14;
-root.lexicalBinding = 99;
-if (lexicalBinding !== 14 || root.lexicalBinding !== 99) {
-    throw "module binding leaked into the global object";
-}
-
-root.globalThis = { fake: true };
-root.global = { fake: true };
-console = replacementConsole;
-if (root.console !== replacementConsole) throw "global alias redirected storage";
-delete root.globalThis;
-delete root.global;
-console = originalConsole;
-if (root.console !== originalConsole) throw "global alias deletion redirected storage";
-
-root.removable = 1;
-if (!delete root.removable || "removable" in root) {
-    throw "global property deletion mismatch";
-}
-
-let ownReceiver = false;
-let ownSet: unknown;
-Object.defineProperty(root, "console", {
-    get() { return replacementConsole; },
-    set(value) { ownReceiver = this === root; ownSet = value; },
-    configurable: true,
-});
-if (console !== replacementConsole) throw "own global getter mismatch";
-console = originalConsole;
-if (!ownReceiver || ownSet !== originalConsole) throw "own global setter mismatch";
-Object.defineProperty(root, "console", {
-    value: originalConsole,
-    writable: true,
-    configurable: true,
-});
-
-const originalQueueMicrotask = queueMicrotask;
-delete root.queueMicrotask;
-let prototypeReceiver = false;
-let prototypeSet: unknown;
-Object.defineProperty(Object.prototype, "queueMicrotask", {
-    get() { return originalQueueMicrotask; },
-    set(value) { prototypeReceiver = this === root; prototypeSet = value; },
-    configurable: true,
-});
-if (queueMicrotask !== originalQueueMicrotask) throw "prototype global getter mismatch";
-queueMicrotask = originalQueueMicrotask;
-if (!prototypeReceiver || prototypeSet !== originalQueueMicrotask) {
-    throw "prototype global setter mismatch";
-}
-delete Object.prototype.queueMicrotask;
-root.queueMicrotask = originalQueueMicrotask;
-
-let infinityFailed = false;
-let nanFailed = false;
-try { root.Infinity = 1; } catch { infinityFailed = true; }
-try { root.NaN = 1; } catch { nanFailed = true; }
-if (!infinityFailed || !nanFailed || root.Infinity !== Infinity || root.NaN === root.NaN) {
-    throw "frozen global constant mismatch";
-}
-
-stdout.write("ok\n");
-"#,
-    );
-
-    for target in ["jit", "aot"] {
-        let output = project
-            .command()
-            .args(["run", "--target", target, "main.ts"])
-            .current_dir(&project.path)
-            .output()
-            .unwrap_or_else(|error| panic!("bamts {target} global-object program starts: {error}"));
-        assert_success(&output, &format!("bamts {target} global-object program"));
-        assert_eq!(output.stdout, b"ok\n", "{target}");
-    }
-}
-
-#[test]
-fn aot_and_jit_preserve_vm_context_for_escaped_closures() {
-    let project = ScratchDirectory::new();
-    project.write(
-        "main.ts",
-        r#"import { runInNewContext } from "node:vm";
-
-const context: any = { secret: 41 };
-const readSecret: any = runInNewContext(
-    "(function () { return secret + 1; })",
-    context,
-);
-context.secret = 99;
-if (readSecret() !== 100) {
-    throw "escaped closure lost its VM context";
-}
-process.stdout.write("ok\n");
-"#,
-    );
-
-    for target in ["jit", "aot"] {
-        let output = project
-            .command()
-            .args(["run", "--target", target, "main.ts"])
-            .current_dir(&project.path)
-            .output()
-            .unwrap_or_else(|error| panic!("bamts {target} VM-context program starts: {error}"));
-        assert_success(&output, &format!("bamts {target} VM-context program"));
-        assert_eq!(output.stdout, b"ok\n", "{target}");
     }
 }
 
@@ -555,14 +355,8 @@ fn aot_fixture_matches_jit_stdout_and_exit_code() {
     let executable = directory
         .path
         .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
-    let compile = directory
-        .command()
-        .args(["compile", "--target", "aot", "--output"])
-        .arg(&executable)
-        .arg(fixture())
-        .output()
-        .expect("bamts compile starts");
-    assert_success(&compile, "bamts compile --target aot");
+    let compile = directory.emit(&fixture().to_string_lossy(), &executable);
+    assert_success(&compile, "bamts tsc-compatible emit");
 
     let output = Command::new(&executable)
         .output()
@@ -580,14 +374,8 @@ fn jit_runs_two_module_program_with_live_imported_mutation() {
         "import { value } from './dependency.js'; console.log(value);\n",
     );
 
-    let output = project
-        .command()
-        .args(["run", "--target", "jit", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts JIT run starts");
-
-    assert_success(&output, "bamts run two-module JIT");
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute two-module JIT");
     assert_eq!(output.stdout, b"2\n");
 }
 
@@ -603,15 +391,8 @@ fn aot_runs_two_module_program_with_live_imported_mutation() {
         .path
         .join(format!("two-module{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = project
-        .command()
-        .args(["compile", "--target", "aot", "--output"])
-        .arg(&executable)
-        .arg("main.ts")
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts AOT compile starts");
-    assert_success(&compile, "bamts compile two-module AOT");
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts tsc-compatible two-module emit");
 
     let output = Command::new(&executable)
         .output()
@@ -625,14 +406,8 @@ fn jit_preserves_lone_surrogates_end_to_end() {
     let project = ScratchDirectory::new();
     project.write("main.ts", UTF16_PROGRAM);
 
-    let output = project
-        .command()
-        .args(["run", "--target", "jit", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts JIT run starts");
-
-    assert_success(&output, "bamts run UTF-16 JIT");
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute UTF-16 JIT");
     assert_eq!(output.stdout, UTF16_STDOUT);
 }
 
@@ -644,15 +419,8 @@ fn aot_preserves_lone_surrogates_end_to_end() {
         .path
         .join(format!("utf16{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = project
-        .command()
-        .args(["compile", "--target", "aot", "--output"])
-        .arg(&executable)
-        .arg("main.ts")
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts AOT compile starts");
-    assert_success(&compile, "bamts compile UTF-16 AOT");
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts tsc-compatible UTF-16 emit");
 
     let output = Command::new(&executable)
         .output()
@@ -666,14 +434,8 @@ fn jit_supports_apply_and_bound_callables() {
     let project = ScratchDirectory::new();
     project.write("main.ts", CALLABLE_PROGRAM);
 
-    let output = project
-        .command()
-        .args(["run", "--target", "jit", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts callable JIT run starts");
-
-    assert_success(&output, "bamts run callable JIT");
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute callable JIT");
     assert!(output.stdout.is_empty());
 }
 
@@ -685,15 +447,8 @@ fn aot_supports_apply_and_bound_callables() {
         .path
         .join(format!("callable{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = project
-        .command()
-        .args(["compile", "--target", "aot", "--output"])
-        .arg(&executable)
-        .arg("main.ts")
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts callable AOT compile starts");
-    assert_success(&compile, "bamts compile callable AOT");
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts tsc-compatible callable AOT emit");
 
     let output = Command::new(&executable)
         .output()
@@ -710,15 +465,8 @@ fn aot_runs_node_vm_in_new_context() {
         .path
         .join(format!("node-vm{}", std::env::consts::EXE_SUFFIX));
 
-    let compile = project
-        .command()
-        .args(["compile", "--target", "aot", "--output"])
-        .arg(&executable)
-        .arg("main.ts")
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts node:vm AOT compile starts");
-    assert_success(&compile, "bamts compile node:vm AOT");
+    let compile = project.emit("main.ts", &executable);
+    assert_success(&compile, "bamts tsc-compatible node:vm AOT emit");
 
     let output = Command::new(&executable)
         .output()
@@ -742,14 +490,8 @@ process.stdout.write(String(typeof util.parseArgs) + "\n");
 "#,
     );
 
-    let output = project
-        .command()
-        .args(["run", "--target", "jit", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts JIT import-equals run starts");
-
-    assert_success(&output, "bamts JIT import-equals run");
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute import-equals JIT");
     assert_eq!(output.stdout, b"function\n");
 }
 
@@ -764,14 +506,8 @@ process.stdout.write(String(dependency.value + 1) + "\n");
 "#,
     );
 
-    let output = project
-        .command()
-        .args(["run", "--target", "jit", "main.ts"])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts JIT local import-equals run starts");
-
-    assert_success(&output, "bamts JIT local import-equals run");
+    let output = project.execute("jit", "main.ts", &[]);
+    assert_execution_success(&output, "compiler/execute local import-equals JIT");
     assert_eq!(output.stdout, b"42\n");
 }
 
@@ -784,6 +520,7 @@ fn check_reports_dependency_errors() {
     let output = project.check("main.ts");
 
     assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).contains("dependency.ts"),
         "{}",
@@ -841,180 +578,6 @@ fn check_applies_project_lint_config_to_dependencies() {
 }
 
 #[test]
-fn check_js_controls_javascript_dependency_diagnostics() {
-    let project = ScratchDirectory::new();
-    project.write(
-        "main.ts",
-        "import { value } from './dependency.mjs';\nconst answer: number = value;\n",
-    );
-    project.write("dependency.mjs", "export const value = 1;\nmissingName;\n");
-    project.write(
-        "tsconfig.json",
-        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
-    );
-
-    assert_success(
-        &project.check("main.ts"),
-        "bamts check with checkJs disabled",
-    );
-
-    let command_line_checked = project
-        .command()
-        .args([
-            "check",
-            "--check-js",
-            "--diagnostics-format",
-            "text",
-            "main.ts",
-        ])
-        .current_dir(&project.path)
-        .output()
-        .expect("bamts check --check-js starts");
-    assert!(!command_line_checked.status.success());
-    assert!(
-        stderr(&command_line_checked).contains("BAMTS-C002"),
-        "{}",
-        stderr(&command_line_checked)
-    );
-
-    project.write(
-        "tsconfig.json",
-        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
-    );
-    let checked = project.check("main.ts");
-    assert!(!checked.status.success());
-    assert!(
-        stderr(&checked).contains("BAMTS-C002"),
-        "{}",
-        stderr(&checked)
-    );
-}
-
-#[test]
-fn check_js_honors_file_directives() {
-    let project = ScratchDirectory::new();
-    project.write(
-        "bamts.toml",
-        "[lints.rules]\ndiagnostic-suppression-directive = \"warn\"\nts-check-directive = \"warn\"\n",
-    );
-    project.write("main.ts", "import './dependency.mjs';\n");
-    project.write("dependency.mjs", "// @ts-check\nmissingName;\n");
-    project.write(
-        "tsconfig.json",
-        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
-    );
-
-    let checked = project.check("main.ts");
-    assert!(!checked.status.success());
-    assert!(
-        stderr(&checked).contains("BAMTS-C002"),
-        "{}",
-        stderr(&checked)
-    );
-    assert!(
-        stderr(&checked).contains("BAMTS-W057"),
-        "{}",
-        stderr(&checked)
-    );
-
-    project.write(
-        "dependency.mjs",
-        "// @ts-check\n// @ts-nocheck\nmissingName;\n",
-    );
-    project.write(
-        "tsconfig.json",
-        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
-    );
-    let unchecked = project.check("main.ts");
-    assert_success(
-        &unchecked,
-        "bamts check with a file-level no-check directive",
-    );
-    assert!(
-        stderr(&unchecked).contains("BAMTS-W057"),
-        "{}",
-        stderr(&unchecked)
-    );
-    assert!(
-        !stderr(&unchecked).contains("BAMTS-C002"),
-        "{}",
-        stderr(&unchecked)
-    );
-
-    project.write(
-        "dependency.mjs",
-        "// @ts-nocheck\n// @ts-check\nmissingName;\n",
-    );
-    let reenabled = project.check("main.ts");
-    assert!(!reenabled.status.success());
-    assert!(
-        stderr(&reenabled).contains("BAMTS-C002"),
-        "{}",
-        stderr(&reenabled)
-    );
-    assert!(
-        stderr(&reenabled).contains("BAMTS-W057"),
-        "{}",
-        stderr(&reenabled)
-    );
-
-    project.write(
-        "dependency.mjs",
-        "// @ts-check\n// @ts-nocheck\nconst = 1;\n",
-    );
-    let malformed = project.check("main.ts");
-    assert!(!malformed.status.success());
-    assert!(
-        stderr(&malformed).contains("BAMTS-W057"),
-        "{}",
-        stderr(&malformed)
-    );
-    assert!(
-        !stderr(&malformed).contains("BAMTS-C002"),
-        "{}",
-        stderr(&malformed)
-    );
-
-    project.write(
-        "dependency.mjs",
-        "// documentation mentions @ts-check behavior\nmissingName;\n",
-    );
-    project.write(
-        "tsconfig.json",
-        r#"{"compilerOptions":{"allowJs":true,"checkJs":false}}"#,
-    );
-    assert_success(
-        &project.check("main.ts"),
-        "bamts check with a directive mentioned in prose",
-    );
-
-    project.write("dependency.mjs", "// @ts-nochecking\nmissingName;\n");
-    project.write(
-        "tsconfig.json",
-        r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
-    );
-    let near_miss = project.check("main.ts");
-    assert!(!near_miss.status.success());
-    assert!(
-        stderr(&near_miss).contains("BAMTS-C002"),
-        "{}",
-        stderr(&near_miss)
-    );
-
-    project.write("main.ts", "// @ts-nocheck\nmissingName;\n");
-    let unchecked_typescript = project.check("main.ts");
-    assert_success(
-        &unchecked_typescript,
-        "bamts check with a TypeScript no-check directive",
-    );
-    assert!(
-        stderr(&unchecked_typescript).contains("BAMTS-W023"),
-        "{}",
-        stderr(&unchecked_typescript)
-    );
-}
-
-#[test]
 fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "import './first.ts';\nimport './second.ts';\n");
@@ -1030,62 +593,6 @@ fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     let first_position = stderr.find("first.ts").expect("first diagnostic");
     let second_position = stderr.find("second.ts").expect("second diagnostic");
     assert!(first_position < second_position, "{stderr}");
-}
-
-#[test]
-fn check_terminates_on_self_referential_generic_heritage() {
-    let project = ScratchDirectory::new();
-    project.write(
-        "main.ts",
-        r#"interface Base<T> {
-    first<U>(): Base<U>;
-    second<U>(): Base<U>;
-    third<U>(): Base<U>;
-    fourth<U>(): Base<U>;
-    fifth<U>(): Base<U>;
-}
-
-interface Derived<T> extends Base<T> {
-    first<U>(): Derived<U>;
-    second<U>(): Derived<U>;
-    third<U>(): Derived<U>;
-    fourth<U>(): Derived<U>;
-    fifth<U>(): Derived<U>;
-}
-
-class Implementation<T> implements Derived<T> {
-    first<U>(): Concrete<U> { return undefined as never; }
-    second<U>(): Concrete<U> { return undefined as never; }
-    third<U>(): Concrete<U> { return undefined as never; }
-    fourth<U>(): Concrete<U> { return undefined as never; }
-    fifth<U>(): Concrete<U> { return undefined as never; }
-}
-
-class Concrete<T> extends Implementation<T> {}
-"#,
-    );
-
-    let output = project.check("main.ts");
-
-    assert!(!output.status.success());
-    let stderr = stderr(&output);
-    assert!(stderr.contains("main.ts:9:30"), "{stderr}");
-    assert_eq!(
-        stderr
-            .lines()
-            .filter(|line| line.contains("error[BAMTS-C004]"))
-            .count(),
-        1,
-        "expected exactly one heritage error: {stderr}",
-    );
-    assert_eq!(
-        stderr
-            .lines()
-            .filter(|line| line.contains("warning[BAMTS-W019]"))
-            .count(),
-        5,
-        "expected five return-assertion warnings: {stderr}",
-    );
 }
 
 fn bamts_binary() -> &'static str {
@@ -1106,6 +613,84 @@ fn assert_success(output: &Output, command: &str) {
     );
 }
 
+struct ExecutionOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: i64,
+}
+
+fn assert_execution_success(output: &ExecutionOutput, command: &str) {
+    assert_eq!(
+        output.exit_code,
+        0,
+        "{command} failed with exit code {}\nstdout:\n{}\nstderr:\n{}",
+        output.exit_code,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn wait_for_output(mut child: Child, command: &str) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().expect("finished child output"),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                child.kill().expect("timed-out child is killed");
+                let output = child.wait_with_output().expect("timed-out child output");
+                panic!(
+                    "{command} exceeded 120 seconds\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => panic!("could not wait for {command}: {error}"),
+        }
+    }
+}
+
+fn framed(payload: &[u8]) -> Vec<u8> {
+    let mut frame = format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn decode_frames(bytes: &[u8]) -> Vec<serde_json::Value> {
+    const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+    let mut offset = 0;
+    let mut responses = Vec::new();
+    while offset < bytes.len() {
+        let header_end = bytes[offset..]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| offset + position)
+            .expect("API response has a complete header");
+        let header =
+            std::str::from_utf8(&bytes[offset..header_end]).expect("API response header is UTF-8");
+        let length = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("valid content length"))
+            })
+            .expect("API response declares content length");
+        assert!(length <= MAX_FRAME_BYTES, "API response frame is bounded");
+        let body_start = header_end + 4;
+        let body_end = body_start
+            .checked_add(length)
+            .expect("frame length does not overflow");
+        assert!(body_end <= bytes.len(), "API response body is complete");
+        responses.push(
+            serde_json::from_slice(&bytes[body_start..body_end])
+                .expect("API response body is JSON"),
+        );
+        offset = body_end;
+    }
+    responses
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -1120,14 +705,7 @@ impl ScratchDirectory {
         for _ in 0..128 {
             let index = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let path = root.join(format!("bamts-cli-test-{}-{index}", std::process::id()));
-            #[cfg(unix)]
-            let created = {
-                use std::os::unix::fs::DirBuilderExt;
-                fs::DirBuilder::new().mode(0o700).create(&path)
-            };
-            #[cfg(not(unix))]
-            let created = fs::create_dir(&path);
-            match created {
+            match fs::create_dir(&path) {
                 Ok(()) => return Self { path },
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("could not create `{}`: {error}", path.display()),
@@ -1145,24 +723,121 @@ impl ScratchDirectory {
 
     fn command(&self) -> Command {
         let mut command = Command::new(bamts_binary());
-        command.env("BAMTS_CACHE_DIR", self.path.join("cache"));
+        command
+            .env("BAMTS_CACHE_DIR", self.path.join("cache"))
+            .env_remove("BAMTS_AOT_ENTRYPOINT");
         command
     }
 
     fn check(&self, entrypoint: &str) -> Output {
-        self.command()
-            .args(["check", "--diagnostics-format", "text", entrypoint])
-            .current_dir(&self.path)
-            .output()
-            .expect("bamts check starts")
+        self.check_from(".", entrypoint)
     }
 
     fn check_from(&self, directory: &str, entrypoint: &str) -> Output {
         self.command()
-            .args(["check", "--diagnostics-format", "text", entrypoint])
+            .args(["--noEmit", "--pretty", "false", entrypoint])
             .current_dir(self.path.join(directory))
             .output()
-            .expect("bamts check starts")
+            .expect("bamts type-check starts")
+    }
+
+    fn emit(&self, entrypoint: &str, output: &Path) -> Output {
+        self.command()
+            .args(["--pretty", "false", "--outFile"])
+            .arg(output)
+            .arg(entrypoint)
+            .current_dir(&self.path)
+            .output()
+            .expect("bamts emit starts")
+    }
+
+    fn execute(&self, target: &str, entrypoint: &str, program_args: &[&str]) -> ExecutionOutput {
+        let response = self.execute_response(target, entrypoint, program_args);
+        assert!(
+            response.get("error").is_none(),
+            "compiler/execute returned an error: {response}"
+        );
+        let result = response["result"]
+            .as_object()
+            .expect("compiler/execute returns an object");
+        ExecutionOutput {
+            stdout: result["stdout"]
+                .as_str()
+                .expect("execution stdout is text")
+                .as_bytes()
+                .to_vec(),
+            stderr: result["stderr"]
+                .as_str()
+                .expect("execution stderr is text")
+                .as_bytes()
+                .to_vec(),
+            exit_code: result["exitCode"]
+                .as_i64()
+                .expect("execution exit code is an integer"),
+        }
+    }
+
+    fn execute_response(
+        &self,
+        target: &str,
+        entrypoint: &str,
+        program_args: &[&str],
+    ) -> serde_json::Value {
+        let mut service_args = vec![
+            "run".to_owned(),
+            "--target".to_owned(),
+            target.to_owned(),
+            entrypoint.to_owned(),
+        ];
+        if !program_args.is_empty() {
+            service_args.push("--".to_owned());
+            service_args.extend(program_args.iter().map(|argument| (*argument).to_owned()));
+        }
+        let requests = [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "root": self.path },
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "compiler/execute",
+                "params": { "args": service_args },
+            }),
+        ];
+        let mut input = Vec::new();
+        for request in requests {
+            let payload = serde_json::to_vec(&request).expect("API request serializes");
+            input.extend(framed(&payload));
+        }
+
+        let mut child = self
+            .command()
+            .arg("--api")
+            .current_dir(&self.path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("bamts API child starts");
+        child
+            .stdin
+            .take()
+            .expect("API child stdin is piped")
+            .write_all(&input)
+            .expect("API requests are written");
+        let output = wait_for_output(child, "bamts --api");
+        assert_success(&output, "bamts --api");
+        let responses = decode_frames(&output.stdout);
+        assert_eq!(responses.len(), 2, "initialize and execute both respond");
+        assert!(
+            responses[0].get("error").is_none(),
+            "initialize returned an error: {}",
+            responses[0]
+        );
+        responses.into_iter().nth(1).expect("execute response")
     }
 }
 

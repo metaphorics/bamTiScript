@@ -35,6 +35,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use bamts_cli::{
     args::{CliArgs, ExecutionTarget, Mode, parse_args},
@@ -54,14 +55,20 @@ pub const NODE_VERSION_OUTPUT: &str = "v24.18.0";
 pub const MANIFEST_PATH: &str = "corpus/manifest.toml";
 
 /// The complete pinned corpus, in manifest order.
-pub const PINNED_CASE_IDS: [&str; 20] = [
+pub const PINNED_CASE_IDS: [&str; 27] = [
     "citty",
     "defu",
+    "derived-construction",
     "destr",
     "dot-prop",
     "escape-string-regexp",
+    "event-loop",
+    "explicit-resource",
+    "for-await-iterator",
     "hookable",
+    "import-meta",
     "is-plain-obj",
+    "lexical-environment",
     "mitt",
     "ohash",
     "p-defer",
@@ -71,6 +78,7 @@ pub const PINNED_CASE_IDS: [&str; 20] = [
     "perfect-debounce",
     "rou3",
     "tiny-invariant",
+    "top-level-throw",
     "tslib",
     "ufo",
     "valita",
@@ -93,7 +101,18 @@ pub const TASK_106_SYNC_CASE_IDS: [&str; 11] = [
 ];
 
 /// Pinned Node builtin cases completed by Task 107, in manifest order.
-pub const TASK_107_NODE_CASE_IDS: [&str; 3] = ["citty", "is-plain-obj", "ohash"];
+pub const TASK_107_NODE_CASE_IDS: [&str; 10] = [
+    "citty",
+    "derived-construction",
+    "event-loop",
+    "explicit-resource",
+    "for-await-iterator",
+    "import-meta",
+    "is-plain-obj",
+    "lexical-environment",
+    "ohash",
+    "top-level-throw",
+];
 
 /// The only environment variables the oracle exposes to a case.  Everything
 /// inherited from the parent process is cleared before these are set.
@@ -102,8 +121,9 @@ pub const NORMALIZED_ENV: [&str; 4] = ["TZ=UTC", "LANG=C", "LC_ALL=C", "NO_COLOR
 pub const COMPARE_KEYS: [&str; 2] = ["stdout", "exit_code"];
 
 const COMMIT_LEN: usize = 40;
+const SHA256_LEN: usize = 64;
 const MIN_TIMEOUT_MS: u64 = 1;
-const MAX_TIMEOUT_MS: u64 = 120_000;
+const MAX_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1 << 20;
 const READ_CHUNK: usize = 8192;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -112,28 +132,6 @@ const NODE_VERSION_OUTPUT_CAP: usize = 128;
 const INTERPRETER_FUEL_PER_MILLISECOND: u64 = 10_000;
 const CORPUS_WORKER_REQUEST: &str = "BAMTS_CORPUS_WORKER_REQUEST";
 const CORPUS_WORKER_TEST: &str = "corpus_differential_worker";
-const HARNESS_OWNED_ARGS: &[&str] = &[
-    "check",
-    "compile",
-    "run",
-    "explain",
-    "-c",
-    "--compile",
-    "-r",
-    "--run",
-    "--check",
-    "aot",
-    "jit",
-    "--aot",
-    "--jit",
-    "-t",
-    "--target",
-    "-o",
-    "--output",
-    "--out-dir",
-    "--output-dir",
-    "--js-compat",
-];
 
 // ---------------------------------------------------------------------------
 // Validated records
@@ -148,12 +146,33 @@ pub struct CorpusManifest {
     pub projects: Vec<ManifestProject>,
 }
 
-/// A single manifest project entry.  Paths are guaranteed clean and relative.
+/// Supported local content-digest algorithms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DigestAlgorithm {
+    #[serde(rename = "sha256")]
+    Sha256,
+}
+
+/// Content-addressed provenance for a corpus project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source_kind")]
+pub enum Provenance {
+    /// Source vendored from an external Git repository at an exact commit.
+    #[serde(rename = "git")]
+    ExternalGit { repository: String, commit: String },
+    /// Locally authored source bound to its canonical content digest.
+    #[serde(rename = "local")]
+    LocalContent {
+        digest_algorithm: DigestAlgorithm,
+        digest: String,
+    },
+}
+
+/// A single manifest project entry. Paths are guaranteed clean and relative.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestProject {
     pub id: String,
-    pub repository: String,
-    pub commit: String,
+    pub provenance: Provenance,
     pub spec: String,
     pub entrypoint: String,
 }
@@ -162,8 +181,7 @@ pub struct ManifestProject {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaseSpec {
     pub id: String,
-    pub repository: String,
-    pub commit: String,
+    pub provenance: Provenance,
     pub license: String,
     pub source_dir: String,
     pub entrypoint: String,
@@ -211,23 +229,74 @@ struct RawManifest {
     projects: Vec<RawProject>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawProject {
     id: String,
-    repository: String,
-    commit: String,
+    provenance: Provenance,
     spec: String,
     entrypoint: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "source_kind", deny_unknown_fields)]
+enum RawProjectDocument {
+    #[serde(rename = "git")]
+    Git {
+        id: String,
+        repository: String,
+        commit: String,
+        spec: String,
+        entrypoint: String,
+    },
+    #[serde(rename = "local")]
+    Local {
+        id: String,
+        digest_algorithm: DigestAlgorithm,
+        digest: String,
+        spec: String,
+        entrypoint: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for RawProject {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(match RawProjectDocument::deserialize(deserializer)? {
+            RawProjectDocument::Git {
+                id,
+                repository,
+                commit,
+                spec,
+                entrypoint,
+            } => Self {
+                id,
+                provenance: Provenance::ExternalGit { repository, commit },
+                spec,
+                entrypoint,
+            },
+            RawProjectDocument::Local {
+                id,
+                digest_algorithm,
+                digest,
+                spec,
+                entrypoint,
+            } => Self {
+                id,
+                provenance: Provenance::LocalContent {
+                    digest_algorithm,
+                    digest,
+                },
+                spec,
+                entrypoint,
+            },
+        })
+    }
+}
+
 struct RawSpec {
     schema: u32,
     id: String,
-    repository: String,
-    commit: String,
+    provenance: Provenance,
     license: String,
     source_dir: String,
     entrypoint: String,
@@ -235,8 +304,108 @@ struct RawSpec {
     expected_timeout_ms: u64,
     constructs: Vec<String>,
     source_files: Vec<String>,
-    #[serde(default)]
     compiler_args: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "source_kind", deny_unknown_fields)]
+enum RawSpecDocument {
+    #[serde(rename = "git")]
+    Git {
+        schema: u32,
+        id: String,
+        repository: String,
+        commit: String,
+        license: String,
+        source_dir: String,
+        entrypoint: String,
+        node_args: Vec<String>,
+        expected_timeout_ms: u64,
+        constructs: Vec<String>,
+        source_files: Vec<String>,
+        #[serde(default)]
+        compiler_args: Vec<String>,
+    },
+    #[serde(rename = "local")]
+    Local {
+        schema: u32,
+        id: String,
+        digest_algorithm: DigestAlgorithm,
+        digest: String,
+        license: String,
+        source_dir: String,
+        entrypoint: String,
+        node_args: Vec<String>,
+        expected_timeout_ms: u64,
+        constructs: Vec<String>,
+        source_files: Vec<String>,
+        #[serde(default)]
+        compiler_args: Vec<String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for RawSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(match RawSpecDocument::deserialize(deserializer)? {
+            RawSpecDocument::Git {
+                schema,
+                id,
+                repository,
+                commit,
+                license,
+                source_dir,
+                entrypoint,
+                node_args,
+                expected_timeout_ms,
+                constructs,
+                source_files,
+                compiler_args,
+            } => Self {
+                schema,
+                id,
+                provenance: Provenance::ExternalGit { repository, commit },
+                license,
+                source_dir,
+                entrypoint,
+                node_args,
+                expected_timeout_ms,
+                constructs,
+                source_files,
+                compiler_args,
+            },
+            RawSpecDocument::Local {
+                schema,
+                id,
+                digest_algorithm,
+                digest,
+                license,
+                source_dir,
+                entrypoint,
+                node_args,
+                expected_timeout_ms,
+                constructs,
+                source_files,
+                compiler_args,
+            } => Self {
+                schema,
+                id,
+                provenance: Provenance::LocalContent {
+                    digest_algorithm,
+                    digest,
+                },
+                license,
+                source_dir,
+                entrypoint,
+                node_args,
+                expected_timeout_ms,
+                constructs,
+                source_files,
+                compiler_args,
+            },
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +423,6 @@ pub fn load_manifest(root: &Path) -> Result<CorpusManifest> {
 /// that each declared source directory, entrypoint, and source file exists.
 pub fn load_corpus(root: &Path) -> Result<Corpus> {
     let manifest = load_manifest(root)?;
-    let manifest_path = root.join(MANIFEST_PATH);
-    verify_pinned_case_ids(&manifest_path, &manifest.projects)?;
     verify_exact_layout(root, &manifest)?;
     let mut cases = Vec::with_capacity(manifest.projects.len());
     for project in &manifest.projects {
@@ -263,6 +430,7 @@ pub fn load_corpus(root: &Path) -> Result<Corpus> {
         let raw: RawSpec = parse_toml(&spec_path)?;
         let spec = validate_spec(&spec_path, raw, project)?;
         verify_case_paths(root, &spec_path, &spec)?;
+        verify_local_content_digest(root, &spec_path, &spec)?;
         cases.push(spec);
     }
     Ok(Corpus { manifest, cases })
@@ -316,8 +484,7 @@ fn validate_manifest(path: &Path, raw: RawManifest) -> Result<CorpusManifest> {
         }
         projects.push(ManifestProject {
             id: raw_project.id,
-            repository: raw_project.repository,
-            commit: raw_project.commit,
+            provenance: raw_project.provenance,
             spec: raw_project.spec,
             entrypoint: raw_project.entrypoint,
         });
@@ -333,12 +500,7 @@ fn validate_manifest(path: &Path, raw: RawManifest) -> Result<CorpusManifest> {
 
 fn validate_project(path: &Path, project: &RawProject) -> Result<()> {
     require_nonempty(path, "project id", &project.id)?;
-    require_nonempty(
-        path,
-        &format!("project `{}` repository", project.id),
-        &project.repository,
-    )?;
-    require_commit(path, &project.id, &project.commit)?;
+    validate_provenance(path, &project.id, &project.provenance)?;
     require_clean_relative(
         path,
         &format!("project `{}` spec", project.id),
@@ -355,10 +517,17 @@ fn validate_project(path: &Path, project: &RawProject) -> Result<()> {
 fn validate_spec(path: &Path, raw: RawSpec, project: &ManifestProject) -> Result<CaseSpec> {
     require_schema(path, raw.schema)?;
     require_match(path, "id", &raw.id, &project.id)?;
-    require_match(path, "repository", &raw.repository, &project.repository)?;
-    require_match(path, "commit", &raw.commit, &project.commit)?;
+    if raw.provenance != project.provenance {
+        return Err(schema_error(
+            path,
+            format!(
+                "spec provenance `{:?}` does not match manifest provenance `{:?}`",
+                raw.provenance, project.provenance
+            ),
+        ));
+    }
     require_match(path, "entrypoint", &raw.entrypoint, &project.entrypoint)?;
-    require_commit(path, &raw.id, &raw.commit)?;
+    validate_provenance(path, &raw.id, &raw.provenance)?;
     require_nonempty(path, "license", &raw.license)?;
     require_clean_relative(path, "source_dir", &raw.source_dir)?;
     require_clean_relative(path, "entrypoint", &raw.entrypoint)?;
@@ -372,7 +541,6 @@ fn validate_spec(path: &Path, raw: RawSpec, project: &ManifestProject) -> Result
     }
 
     validate_node_args(path, &raw.node_args)?;
-    validate_compiler_args(path, &raw.compiler_args)?;
 
     if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&raw.expected_timeout_ms) {
         return Err(schema_error(
@@ -386,8 +554,7 @@ fn validate_spec(path: &Path, raw: RawSpec, project: &ManifestProject) -> Result
 
     Ok(CaseSpec {
         id: raw.id,
-        repository: raw.repository,
-        commit: raw.commit,
+        provenance: raw.provenance,
         license: raw.license,
         source_dir: raw.source_dir,
         entrypoint: raw.entrypoint,
@@ -397,39 +564,6 @@ fn validate_spec(path: &Path, raw: RawSpec, project: &ManifestProject) -> Result
         source_files: raw.source_files,
         compiler_args: raw.compiler_args,
     })
-}
-
-fn verify_pinned_case_ids(path: &Path, projects: &[ManifestProject]) -> Result<()> {
-    let manifest_ids: Vec<&str> = projects.iter().map(|project| project.id.as_str()).collect();
-    if manifest_ids != PINNED_CASE_IDS {
-        return Err(VerificationError::new(
-            ErrorCode::SetMismatch,
-            format!(
-                "{}: manifest project IDs do not match the pinned list: expected {:?}, got {:?}",
-                path.display(),
-                PINNED_CASE_IDS,
-                manifest_ids
-            ),
-        ));
-    }
-    let pinned: BTreeSet<&str> = PINNED_CASE_IDS.iter().copied().collect();
-    for (name, subset) in [
-        ("TASK_106_SYNC_CASE_IDS", TASK_106_SYNC_CASE_IDS.as_slice()),
-        ("TASK_107_NODE_CASE_IDS", TASK_107_NODE_CASE_IDS.as_slice()),
-    ] {
-        if let Some(id) = subset.iter().find(|id| !pinned.contains(*id)) {
-            return Err(VerificationError::new(
-                ErrorCode::SetMismatch,
-                format!(
-                    "{}: {} contains id `{}` not present in PINNED_CASE_IDS",
-                    path.display(),
-                    name,
-                    *id
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn verify_exact_layout(root: &Path, manifest: &CorpusManifest) -> Result<()> {
@@ -519,6 +653,36 @@ fn verify_case_paths(root: &Path, spec_path: &Path, spec: &CaseSpec) -> Result<(
     Ok(())
 }
 
+fn verify_local_content_digest(root: &Path, spec_path: &Path, spec: &CaseSpec) -> Result<()> {
+    let Provenance::LocalContent { digest, .. } = &spec.provenance else {
+        return Ok(());
+    };
+
+    let mut source_files = spec.source_files.iter().collect::<Vec<_>>();
+    source_files.sort_unstable();
+    let mut hasher = Sha256::new();
+    for source_file in source_files {
+        hasher.update(source_file.as_bytes());
+        hasher.update(b"\0");
+        let source_path = root.join(source_file);
+        let bytes = fs::read(&source_path).map_err(|error| io_error(&source_path, &error))?;
+        hasher.update(bytes);
+        hasher.update(b"\n");
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual == *digest {
+        Ok(())
+    } else {
+        Err(VerificationError::new(
+            ErrorCode::Digest,
+            format!(
+                "{}: local source digest mismatch: expected `{digest}`, actual `{actual}`",
+                spec_path.display()
+            ),
+        ))
+    }
+}
+
 fn validate_node_args(path: &Path, args: &[String]) -> Result<()> {
     // node_args are forwarded verbatim to the interpreter; an empty argument is
     // never meaningful and signals a malformed spec.
@@ -527,26 +691,6 @@ fn validate_node_args(path: &Path, args: &[String]) -> Result<()> {
             path,
             "node_args must not contain empty entries",
         ));
-    }
-    Ok(())
-}
-
-fn validate_compiler_args(path: &Path, args: &[String]) -> Result<()> {
-    for argument in args {
-        let trimmed = argument.trim();
-        if trimmed.is_empty() {
-            return Err(schema_error(
-                path,
-                "compiler_args must not contain empty or whitespace-only entries",
-            ));
-        }
-        let name = trimmed.split_once('=').map_or(trimmed, |(name, _)| name);
-        if HARNESS_OWNED_ARGS.contains(&name) {
-            return Err(schema_error(
-                path,
-                format!("compiler_args contains harness-owned argument `{argument}`"),
-            ));
-        }
     }
     Ok(())
 }
@@ -731,20 +875,19 @@ impl CorpusFailure {
     #[must_use]
     pub fn from_driver_error(error: &driver::DriverError) -> Self {
         let stage = match error {
-            driver::DriverError::ReadSource { .. } | driver::DriverError::ProgramLoad(_) => {
-                CorpusStage::Load
-            }
+            driver::DriverError::Cancelled
+            | driver::DriverError::ReadSource { .. }
+            | driver::DriverError::ProgramLoad(_) => CorpusStage::Load,
             driver::DriverError::UnsupportedSourceExtension { .. }
             | driver::DriverError::Usage(_)
-            | driver::DriverError::LintConfig { .. }
-            | driver::DriverError::ProjectConfig { .. }
-            | driver::DriverError::NonUnicodeEnvironmentName { .. }
+            | driver::DriverError::NonUnicodeEnvironmentName
             | driver::DriverError::NonUnicodeEnvironmentValue { .. }
+            | driver::DriverError::ProjectConfig { .. }
+            | driver::DriverError::LintConfig { .. }
             | driver::DriverError::MissingEntrypoint
             | driver::DriverError::MultipleCompileInputs
             | driver::DriverError::UnsupportedCompileTarget(_)
-            | driver::DriverError::UnsupportedOutputOption(_)
-            | driver::DriverError::UnexpectedResolution(_) => CorpusStage::Resolve,
+            | driver::DriverError::UnsupportedOutputOption(_) => CorpusStage::Resolve,
             driver::DriverError::Diagnostics { .. } => CorpusStage::Check,
             driver::DriverError::Lower(error) => program_lower_stage(error),
             driver::DriverError::Jit(error) => jit_stage(error),
@@ -760,7 +903,6 @@ impl CorpusFailure {
             | driver::DriverError::LinkStart { .. }
             | driver::DriverError::LinkFailed { .. }
             | driver::DriverError::PublishExecutable { .. }
-            | driver::DriverError::Cancelled
             | driver::DriverError::CrossTargetLink { .. } => CorpusStage::Link,
         };
         Self {
@@ -774,14 +916,25 @@ impl CorpusFailure {
     /// reported as evaluation failures.
     #[must_use]
     pub fn from_facade_error(error: &bamts::Error) -> Self {
-        let stage = match error {
-            bamts::Error::ReadConfig { .. } | bamts::Error::ProgramLoad(_) => CorpusStage::Load,
-            bamts::Error::ProjectConfig { .. } => CorpusStage::Resolve,
-            bamts::Error::Diagnostics { .. } => CorpusStage::Check,
-            bamts::Error::Lower(error) => program_lower_stage(error),
-            bamts::Error::Runtime(_) => CorpusStage::Evaluate,
-            bamts::Error::Aot(error) => aot_stage(error),
-            _ => CorpusStage::Load,
+        let stage = if matches!(error, bamts::Error::Cancelled(_)) {
+            CorpusStage::Load
+        } else if matches!(error, bamts::Error::Runtime(_)) {
+            CorpusStage::Evaluate
+        } else if matches!(
+            error,
+            bamts::Error::ReadConfig { .. } | bamts::Error::ProgramLoad(_)
+        ) {
+            CorpusStage::Load
+        } else if matches!(error, bamts::Error::ProjectConfig { .. }) {
+            CorpusStage::Resolve
+        } else if matches!(error, bamts::Error::Diagnostics { .. }) {
+            CorpusStage::Check
+        } else if let bamts::Error::Lower(error) = error {
+            program_lower_stage(error)
+        } else if let bamts::Error::Aot(error) = error {
+            aot_stage(error)
+        } else {
+            panic!("unclassified bamts facade error: {error}")
         };
         Self {
             stage,
@@ -827,8 +980,8 @@ fn jit_stage(error: &bamts_codegen::JitError) -> CorpusStage {
         bamts_codegen::JitError::Lower(_) => CorpusStage::Lower,
         bamts_codegen::JitError::InvalidLoweredModule(_)
         | bamts_codegen::JitError::Module(_)
-        | bamts_codegen::JitError::Cancelled
-        | bamts_codegen::JitError::UnknownHelper { .. } => CorpusStage::Instantiate,
+        | bamts_codegen::JitError::UnknownHelper { .. }
+        | bamts_codegen::JitError::Cancelled => CorpusStage::Instantiate,
     }
 }
 
@@ -840,8 +993,8 @@ fn aot_stage(error: &bamts_codegen::AotError) -> CorpusStage {
         | bamts_codegen::AotError::TargetEndianness(_)
         | bamts_codegen::AotError::InvalidLoweredModule(_)
         | bamts_codegen::AotError::Module(_)
-        | bamts_codegen::AotError::Cancelled
-        | bamts_codegen::AotError::Emit(_) => CorpusStage::Instantiate,
+        | bamts_codegen::AotError::Emit(_)
+        | bamts_codegen::AotError::Cancelled => CorpusStage::Instantiate,
     }
 }
 
@@ -858,11 +1011,22 @@ fn native_stage(error: &bamts_runtime::NativeError) -> CorpusStage {
 
 fn driver_error_evidence(error: &driver::DriverError) -> String {
     match error {
-        driver::DriverError::Diagnostics { rendered, .. } => {
+        driver::DriverError::Diagnostics {
+            rendered,
+            truncation,
+        } => {
             let code = first_diagnostic_code(rendered);
-            match code {
+            let evidence = match code {
                 Some(code) => format!("diagnostic={code}; rendered={}", bounded_text(rendered)),
                 None => format!("rendered={}", bounded_text(rendered)),
+            };
+            match truncation {
+                Some(notice) => format!(
+                    "{evidence}; diagnostics_truncated=true; elided={}; limit={}",
+                    notice.elided(),
+                    notice.limit()
+                ),
+                None => evidence,
             }
         }
         driver::DriverError::Native(bamts_runtime::NativeError::Runtime(error)) => format!(
@@ -877,24 +1041,26 @@ fn driver_error_evidence(error: &driver::DriverError) -> String {
 }
 
 fn facade_error_evidence(error: &bamts::Error) -> String {
-    match error {
-        bamts::Error::Diagnostics { diagnostics } => match diagnostics.first() {
+    if let bamts::Error::Diagnostics { diagnostics } = error {
+        return match diagnostics.first() {
             Some(first) => format!(
                 "diagnostic={}; {}",
                 first.code(),
                 bounded_text(&error.to_string())
             ),
             None => bounded_text(&error.to_string()),
-        },
-        bamts::Error::Runtime(error) => format!(
+        };
+    }
+    if let bamts::Error::Runtime(error) = error {
+        return format!(
             "runtime function={} pc={} opcode={:?}; error={}",
             error.function.get(),
             error.pc.get(),
             error.source.instruction,
             bounded_text(&error.to_string())
-        ),
-        _ => bounded_text(&error.to_string()),
+        );
     }
+    bounded_text(&error.to_string())
 }
 
 fn first_diagnostic_code(rendered: &str) -> Option<&str> {
@@ -928,15 +1094,6 @@ fn bounded_text(text: &str) -> String {
 }
 
 /// Runs validated corpus cases through the public `bamts_cli` driver.
-///
-/// # Preconditions
-///
-/// The repository manifest must already have been validated by [`load_corpus`].
-/// Every execution mode re-executes [`std::env::current_exe`] as a libtest
-/// worker, so the current executable must be a libtest binary containing an
-/// `#[ignore]` test named `corpus_differential_worker` that is selected with
-/// `--exact corpus_differential_worker --ignored --nocapture` and calls
-/// [`run_corpus_worker_from_env`].
 #[derive(Debug, Clone)]
 pub struct BamtsRunner {
     root: PathBuf,
@@ -964,21 +1121,87 @@ impl BamtsRunner {
         require_clean_relative(&manifest, "entrypoint", &spec.entrypoint)
             .map_err(|error| corpus_stage_error(CorpusStage::Resolve, error))?;
         match mode {
-            ExecutionMode::Interpreter | ExecutionMode::Jit => {
-                self.run_in_process_worker(spec, mode)
-            }
+            ExecutionMode::Interpreter => self.run_interpreter(spec),
+            ExecutionMode::Jit => self.run_jit(spec),
             ExecutionMode::Aot => self.run_aot(spec),
         }
     }
 
-    fn run_in_process_worker(&self, spec: &CaseSpec, mode: ExecutionMode) -> Result<OracleOutcome> {
-        let operation = match mode {
-            ExecutionMode::Interpreter => WorkerOperation::Interpreter,
-            ExecutionMode::Jit => WorkerOperation::Jit,
-            ExecutionMode::Aot => unreachable!("AOT uses run_aot"),
-        };
+    /// Runs one validated case through the bytecode interpreter in-process.
+    /// Runtime fuel is selected from the case's remaining wall-time budget.
+    fn run_interpreter(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
+        let entrypoint = self.root.join(&spec.entrypoint);
         let started = Instant::now();
-        let artifacts = ArtifactDirectory::create(&self.root, spec, mode)
+        let args = cli_args(
+            Mode::Run,
+            ExecutionTarget::Jit,
+            entrypoint.clone(),
+            None,
+            case_requires_javascript_compatibility(spec),
+            &spec.compiler_args,
+        )?;
+        let executable = driver::compile_program(&args)
+            .map_err(|error| driver_error(spec, ExecutionMode::Interpreter, &error))?;
+        let remaining = spec.timeout().saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(timeout_outcome(Vec::new(), self.max_output_bytes));
+        }
+
+        let mut host = bamts_node::NodeHost::new();
+        host.set_script_compiler(Box::new(bamts_node::ScriptCompiler));
+        host.set_argv(["bamts".to_owned(), entrypoint.display().to_string()]);
+        let limits = interpreter_limits(remaining);
+        let outcome = match bamts_runtime::run(executable.wire(), &mut host, &limits) {
+            Ok(outcome) => outcome,
+            Err(error)
+                if matches!(
+                    &error.kind,
+                    bamts_runtime::RuntimeErrorKind::FuelExhausted { .. }
+                ) =>
+            {
+                return Ok(timeout_outcome(
+                    host.stderr().to_vec(),
+                    self.max_output_bytes,
+                ));
+            }
+            Err(error)
+                if matches!(
+                    &error.kind,
+                    bamts_runtime::RuntimeErrorKind::UncaughtThrow { .. }
+                ) =>
+            {
+                return Ok(process_rejection_outcome(
+                    host.stdout().to_vec(),
+                    host.stderr().to_vec(),
+                    self.max_output_bytes,
+                ));
+            }
+            Err(error) => {
+                return Err(facade_error(
+                    spec,
+                    ExecutionMode::Interpreter,
+                    &bamts::Error::from(error),
+                ));
+            }
+        };
+        let mut stdout = host.stdout().to_vec();
+        stdout.extend_from_slice(&outcome.stdout);
+        let exit_code = select_host_exit_code(host.exit_code(), outcome.exit_code);
+        Ok(driver_outcome(
+            driver::CommandOutcome {
+                stdout,
+                stderr: host.stderr().to_vec(),
+                exit_code,
+                truncation: None,
+            },
+            started.elapsed() >= spec.timeout(),
+            self.max_output_bytes,
+        ))
+    }
+
+    fn run_jit(&self, spec: &CaseSpec) -> Result<OracleOutcome> {
+        let started = Instant::now();
+        let artifacts = ArtifactDirectory::create(&self.root, spec, ExecutionMode::Jit)
             .map_err(|error| corpus_stage_error(CorpusStage::Spawn, error))?;
         let Some(budget) = remaining_case_budget(spec.timeout(), started.elapsed()) else {
             return Ok(timeout_outcome(Vec::new(), self.max_output_bytes));
@@ -986,7 +1209,7 @@ impl BamtsRunner {
         let request = WorkerRequest {
             root: self.root.clone(),
             spec: spec.clone(),
-            operation,
+            operation: WorkerOperation::Jit,
             max_output_bytes: self.max_output_bytes,
             executable: None,
         };
@@ -994,14 +1217,14 @@ impl BamtsRunner {
             WorkerRun::TimedOut(outcome) => Ok(outcome),
             WorkerRun::Completed(WorkerResponse::Outcome(outcome)) => Ok(outcome),
             WorkerRun::Completed(WorkerResponse::Failure(failure)) => {
-                Err(mode_failure(spec, mode, failure))
+                Err(mode_failure(spec, ExecutionMode::Jit, failure))
             }
-            WorkerRun::Completed(WorkerResponse::Compile { .. }) => Err(VerificationError::new(
+            WorkerRun::Completed(WorkerResponse::Compile {
+                stderr: _,
+                stderr_truncated: _,
+            }) => Err(VerificationError::new(
                 ErrorCode::ToolFailed,
-                format!(
-                    "corpus {} worker returned an AOT compile response",
-                    mode.as_str()
-                ),
+                "corpus JIT worker returned an AOT compile response",
             )),
         }
     }
@@ -1076,7 +1299,6 @@ struct WorkerRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum WorkerOperation {
-    Interpreter,
     Jit,
     AotCompile,
 }
@@ -1117,14 +1339,6 @@ pub fn run_corpus_worker_from_env() -> Result<()> {
 }
 
 fn execute_worker_request(request: &WorkerRequest) -> Result<WorkerResponse> {
-    match request.operation {
-        WorkerOperation::Interpreter => execute_interpreter_request(request),
-        WorkerOperation::Jit | WorkerOperation::AotCompile => execute_driver_request(request),
-    }
-}
-
-/// JIT/AOT worker: compiles and executes via the public driver in-process.
-fn execute_driver_request(request: &WorkerRequest) -> Result<WorkerResponse> {
     let (mode, target, output) = match request.operation {
         WorkerOperation::Jit => (Mode::Run, ExecutionTarget::Jit, None),
         WorkerOperation::AotCompile => (
@@ -1132,9 +1346,6 @@ fn execute_driver_request(request: &WorkerRequest) -> Result<WorkerResponse> {
             ExecutionTarget::Aot,
             request.executable.as_deref(),
         ),
-        WorkerOperation::Interpreter => {
-            unreachable!("interpreter requests are handled by execute_interpreter_request")
-        }
     };
     let args = cli_args(
         mode,
@@ -1152,15 +1363,16 @@ fn execute_driver_request(request: &WorkerRequest) -> Result<WorkerResponse> {
                 request.max_output_bytes,
             ))),
             WorkerOperation::AotCompile => {
-                let (stderr, stderr_truncated) =
-                    bounded_output(outcome.stderr, request.max_output_bytes);
+                let driver::CommandOutcome {
+                    stdout: _,
+                    stderr,
+                    exit_code: _,
+                    truncation,
+                } = outcome;
                 Ok(WorkerResponse::Compile {
                     stderr,
-                    stderr_truncated,
+                    stderr_truncated: truncation.is_some(),
                 })
-            }
-            WorkerOperation::Interpreter => {
-                unreachable!("interpreter requests are handled by execute_interpreter_request")
             }
         },
         Err(error) if is_unhandled_driver_throw(&error) => {
@@ -1174,94 +1386,6 @@ fn execute_driver_request(request: &WorkerRequest) -> Result<WorkerResponse> {
             &error,
         ))),
     }
-}
-
-/// Interpreter worker: compiles to bytecode and runs it in-process through
-/// `bamts_runtime::run` against a Node host.  Fuel bounds interpreted loops,
-/// while the enclosing worker process is wall-clock killable by `run_worker`.
-fn execute_interpreter_request(request: &WorkerRequest) -> Result<WorkerResponse> {
-    // Compilation happens inside the worker, so it spends the case's wall-clock
-    // budget; the interpreter run below gets only what is left.
-    let started = Instant::now();
-    let entrypoint = request.root.join(&request.spec.entrypoint);
-    // `compile_program` runs only the frontend, lint, and lowering pipeline —
-    // it never reads `args.target`, so ExecutionTarget is irrelevant to the
-    // bytecode it produces.  There is no ExecutionTarget::Interpreter variant;
-    // the actual interpreter execution happens below via `bamts_runtime::run`,
-    // which interprets the bytecode directly and is distinct from JIT mode's
-    // `bamts_codegen::compile_jit` + native `run_linked_program`.
-    let args = cli_args(
-        Mode::Run,
-        ExecutionTarget::Jit,
-        entrypoint.clone(),
-        None,
-        case_requires_javascript_compatibility(&request.spec),
-        &request.spec.compiler_args,
-    )?;
-    let executable = match driver::compile_program(&args) {
-        Ok(executable) => executable,
-        Err(error) => {
-            return Ok(WorkerResponse::Failure(CorpusFailure::from_driver_error(
-                &error,
-            )));
-        }
-    };
-    let remaining = request.spec.timeout().saturating_sub(started.elapsed());
-    if remaining.is_zero() {
-        return Ok(WorkerResponse::Outcome(timeout_outcome(
-            Vec::new(),
-            request.max_output_bytes,
-        )));
-    }
-
-    let mut host = bamts_node::NodeHost::new();
-    host.set_script_compiler(Box::new(bamts_node::ScriptCompiler));
-    host.set_argv(["bamts".to_owned(), entrypoint.display().to_string()]);
-    let limits = interpreter_limits(remaining);
-    let outcome = match bamts_runtime::run(executable.wire(), &mut host, &limits) {
-        Ok(outcome) => outcome,
-        Err(error)
-            if matches!(
-                &error.kind,
-                bamts_runtime::RuntimeErrorKind::FuelExhausted { .. }
-            ) =>
-        {
-            return Ok(WorkerResponse::Outcome(timeout_outcome(
-                host.stderr().to_vec(),
-                request.max_output_bytes,
-            )));
-        }
-        Err(error)
-            if matches!(
-                &error.kind,
-                bamts_runtime::RuntimeErrorKind::UncaughtThrow { .. }
-            ) =>
-        {
-            return Ok(WorkerResponse::Outcome(process_rejection_outcome(
-                host.stdout().to_vec(),
-                host.stderr().to_vec(),
-                request.max_output_bytes,
-            )));
-        }
-        Err(error) => {
-            return Ok(WorkerResponse::Failure(CorpusFailure::from_facade_error(
-                &bamts::Error::from(error),
-            )));
-        }
-    };
-    let mut stdout = host.stdout().to_vec();
-    stdout.extend_from_slice(&outcome.stdout);
-    let exit_code = host.completion_exit_code(outcome.exit_code);
-    Ok(WorkerResponse::Outcome(driver_outcome(
-        driver::CommandOutcome {
-            stdout,
-            stderr: host.stderr().to_vec(),
-            exit_code,
-            ..driver::CommandOutcome::default()
-        },
-        started.elapsed() >= request.spec.timeout(),
-        request.max_output_bytes,
-    )))
 }
 
 fn run_worker(
@@ -1279,7 +1403,10 @@ fn run_worker(
             format!("cannot resolve corpus worker executable: {error}"),
         )
     })?;
-    let mut environment = worker_env(request.operation);
+    let mut environment = normalized_env();
+    if let Some(path) = env::var_os("PATH") {
+        environment.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
+    }
     environment.push((
         CORPUS_WORKER_REQUEST.to_owned(),
         request_path.to_string_lossy().into_owned(),
@@ -1318,38 +1445,11 @@ fn run_worker(
             ),
         ));
     }
-    if !response_path.exists() {
-        return Err(VerificationError::new(
-            ErrorCode::ToolFailed,
-            format!(
-                "BamTS corpus worker `{}` (test `{}`, entry point `run_corpus_worker_from_env`) exited with code 0 but wrote no response; captured stdout: {}; stderr: {}",
-                current_exe.display(),
-                CORPUS_WORKER_TEST,
-                bounded_text(&String::from_utf8_lossy(&process.stdout)),
-                bounded_text(&String::from_utf8_lossy(&process.stderr))
-            ),
-        ));
-    }
     let response: WorkerResponse = serde_json::from_slice(
         &fs::read(&response_path).map_err(|error| io_error(&response_path, &error))?,
     )
     .map_err(|error| json_error(&response_path, error))?;
     Ok(WorkerRun::Completed(response))
-}
-
-/// Builds the worker process environment, reusing the canonical
-/// [`normalized_env`] as the base.  Only the AOT compile step needs a
-/// discoverable toolchain (the linker); the JIT and interpreter workers
-/// execute the case program in-process and must observe the same
-/// normalized environment as the Node oracle and the AOT executable.
-fn worker_env(operation: WorkerOperation) -> Vec<(String, String)> {
-    let mut environment = normalized_env();
-    if matches!(operation, WorkerOperation::AotCompile)
-        && let Some(path) = env::var_os("PATH")
-    {
-        environment.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
-    }
-    environment
 }
 
 fn interpreter_limits(budget: Duration) -> Limits {
@@ -1378,7 +1478,7 @@ fn process_rejection_outcome(stdout: Vec<u8>, stderr: Vec<u8>, cap: usize) -> Or
             stdout,
             stderr,
             exit_code: 1,
-            ..driver::CommandOutcome::default()
+            truncation: None,
         },
         false,
         cap,
@@ -1422,12 +1522,12 @@ fn aot_execution_limits(timeout: Duration, max_output_bytes: usize) -> OracleLim
 fn with_aot_compile_evidence(
     mut runtime: OracleOutcome,
     compile_stderr: Vec<u8>,
-    compile_stderr_truncated: bool,
+    driver_truncated: bool,
     max_output_bytes: usize,
 ) -> OracleOutcome {
-    let (compile_stderr, truncated_here) = bounded_output(compile_stderr, max_output_bytes);
+    let (compile_stderr, output_truncated) = bounded_output(compile_stderr, max_output_bytes);
     runtime.compile_stderr = compile_stderr;
-    runtime.compile_stderr_truncated = compile_stderr_truncated || truncated_here;
+    runtime.compile_stderr_truncated = output_truncated || driver_truncated;
     runtime
 }
 
@@ -1441,31 +1541,6 @@ fn case_requires_javascript_compatibility(spec: &CaseSpec) -> bool {
         })
 }
 
-fn cli_arg_strings(
-    mode: Mode,
-    target: ExecutionTarget,
-    entrypoint: PathBuf,
-    output: Option<&Path>,
-    javascript_compatibility: bool,
-    compiler_args: &[String],
-) -> Vec<String> {
-    let mut raw = vec![
-        harness_arg(&mode.to_string()),
-        entrypoint.to_string_lossy().into_owned(),
-        harness_arg("--target"),
-        harness_arg(&target.to_string()),
-    ];
-    if javascript_compatibility {
-        raw.push(harness_arg("--js-compat"));
-    }
-    if let Some(path) = output {
-        raw.push(harness_arg("--output"));
-        raw.push(path.to_string_lossy().into_owned());
-    }
-    raw.extend(compiler_args.iter().cloned());
-    raw
-}
-
 pub(crate) fn cli_args(
     mode: Mode,
     target: ExecutionTarget,
@@ -1474,15 +1549,21 @@ pub(crate) fn cli_args(
     javascript_compatibility: bool,
     compiler_args: &[String],
 ) -> Result<CliArgs> {
-    parse_args(cli_arg_strings(
-        mode,
-        target,
-        entrypoint,
-        output,
-        javascript_compatibility,
-        compiler_args,
-    ))
-    .map_err(|error| {
+    let mut raw = vec![
+        mode.to_string(),
+        entrypoint.to_string_lossy().into_owned(),
+        "--target".to_owned(),
+        target.to_string(),
+    ];
+    if javascript_compatibility {
+        raw.push("--js-compat".to_owned());
+    }
+    if let Some(path) = output {
+        raw.push("--output".to_owned());
+        raw.push(path.to_string_lossy().into_owned());
+    }
+    raw.extend(compiler_args.iter().cloned());
+    parse_args(raw).map_err(|error| {
         VerificationError::new(
             ErrorCode::Usage,
             format!("cannot construct corpus CLI invocation: {error}"),
@@ -1490,25 +1571,27 @@ pub(crate) fn cli_args(
     })
 }
 
-fn harness_arg(name: &str) -> String {
-    debug_assert!(
-        HARNESS_OWNED_ARGS.contains(&name),
-        "corpus CLI builder may only emit harness-owned arguments"
-    );
-    name.to_owned()
+fn select_host_exit_code(host_exit: Option<i32>, outcome_exit: i32) -> i32 {
+    host_exit.unwrap_or(outcome_exit)
 }
 
 fn driver_outcome(outcome: driver::CommandOutcome, timed_out: bool, cap: usize) -> OracleOutcome {
-    let (stdout, stdout_truncated) = bounded_output(outcome.stdout, cap);
-    let (stderr, stderr_truncated) = bounded_output(outcome.stderr, cap);
+    let driver::CommandOutcome {
+        stdout,
+        stderr,
+        exit_code,
+        truncation,
+    } = outcome;
+    let (stdout, stdout_truncated) = bounded_output(stdout, cap);
+    let (stderr, output_truncated) = bounded_output(stderr, cap);
     OracleOutcome {
         timed_out,
-        exit_code: Some(outcome.exit_code),
+        exit_code: Some(exit_code),
         signal: None,
         stdout,
         stdout_truncated,
         stderr,
-        stderr_truncated,
+        stderr_truncated: output_truncated || truncation.is_some(),
         compile_stderr: Vec::new(),
         compile_stderr_truncated: false,
     }
@@ -1542,7 +1625,7 @@ impl ArtifactDirectory {
         Ok(Self(path))
     }
 
-    pub(crate) fn executable(&self, spec: &CaseSpec) -> PathBuf {
+    fn executable(&self, spec: &CaseSpec) -> PathBuf {
         self.0
             .join(format!("{}{}", spec.id, env::consts::EXE_SUFFIX))
     }
@@ -1552,6 +1635,18 @@ impl Drop for ArtifactDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn facade_error(spec: &CaseSpec, mode: ExecutionMode, error: &bamts::Error) -> VerificationError {
+    mode_failure(spec, mode, CorpusFailure::from_facade_error(error))
+}
+
+fn driver_error(
+    spec: &CaseSpec,
+    mode: ExecutionMode,
+    error: &driver::DriverError,
+) -> VerificationError {
+    mode_failure(spec, mode, CorpusFailure::from_driver_error(error))
 }
 
 fn mode_failure(spec: &CaseSpec, mode: ExecutionMode, failure: CorpusFailure) -> VerificationError {
@@ -1647,8 +1742,6 @@ pub(crate) fn run_process(
         .stderr(Stdio::piped());
     #[cfg(unix)]
     {
-        // Place the worker in a new process group so `libc::killpg` can
-        // terminate the whole tree on timeout, not just the immediate child.
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
@@ -1708,45 +1801,35 @@ pub(crate) fn run_process(
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code)]
-fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
-    // The child is the group leader because `process_group(0)` was set in
-    // `run_process` before spawning, so `libc::killpg` on the leader's group
-    // ID sends SIGKILL to the whole group, not just the child.
-    let pgid = child.id() as i32;
-    // SAFETY: `killpg` is called with the valid process group ID that this
-    // process just created via `CommandExt::process_group(0)` and the
-    // `SIGKILL` signal constant. It is an ABI call with no pointer arguments,
-    // so there are no aliasing or lifetime concerns.
-    let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    if result == 0 {
+pub(crate) fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
+    let group = format!("-{}", child.id());
+    let status = Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .status()
+        .map_err(|error| {
+            VerificationError::new(
+                ErrorCode::ToolFailed,
+                format!("cannot terminate {label} process group {group}: {error}"),
+            )
+        })?;
+    if status.success() {
         return Ok(());
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        // The process group already exited between `try_wait` and here —
-        // that is success, not a harness failure.
-        Ok(())
-    } else {
-        Err(VerificationError::new(
-            ErrorCode::ToolFailed,
-            format!("cannot terminate {label} process group {pgid}: {error}"),
-        ))
-    }
+    let _ = child.kill();
+    Err(VerificationError::new(
+        ErrorCode::ToolFailed,
+        format!("cannot terminate {label} process group {group}: kill exited with {status}"),
+    ))
 }
 
 #[cfg(not(unix))]
-fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
-    match child.kill() {
-        Ok(()) => Ok(()),
-        // The process already exited between `try_wait` and here — that is
-        // success, not a harness failure.
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(VerificationError::new(
+pub(crate) fn terminate_process_group(child: &mut std::process::Child, label: &str) -> Result<()> {
+    child.kill().map_err(|error| {
+        VerificationError::new(
             ErrorCode::ToolFailed,
             format!("cannot terminate {label}: {error}"),
-        )),
-    }
+        )
+    })
 }
 
 pub(crate) fn drain_stream<R: Read + Send + 'static>(
@@ -1896,6 +1979,27 @@ fn require_commit(path: &Path, id: &str, commit: &str) -> Result<()> {
                 "project `{id}` commit must be a {COMMIT_LEN}-char lowercase hex pin, found `{commit}`"
             ),
         ))
+    }
+}
+
+fn validate_provenance(path: &Path, id: &str, provenance: &Provenance) -> Result<()> {
+    match provenance {
+        Provenance::ExternalGit { repository, commit } => {
+            require_nonempty(path, &format!("project `{id}` repository"), repository)?;
+            require_commit(path, id, commit)
+        }
+        Provenance::LocalContent { digest, .. } => {
+            if is_lower_hex(digest, SHA256_LEN) {
+                Ok(())
+            } else {
+                Err(schema_error(
+                    path,
+                    format!(
+                        "project `{id}` digest must be a {SHA256_LEN}-char lowercase SHA-256 hex value, found `{digest}`"
+                    ),
+                ))
+            }
+        }
     }
 }
 
@@ -2071,16 +2175,9 @@ fn schema_error(path: &Path, detail: impl Into<String>) -> VerificationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamts_runtime::Host;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    #[test]
-    fn exit_code_merge_prefers_host_zero() {
-        let mut host = bamts_node::NodeHost::new();
-        Host::set_exit_code(&mut host, 0);
-        assert_eq!(host.completion_exit_code(7), 0);
-    }
 
     fn repo_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2100,11 +2197,17 @@ mod tests {
         dir
     }
 
+    fn git_provenance(repository: impl Into<String>, commit: impl Into<String>) -> Provenance {
+        Provenance::ExternalGit {
+            repository: repository.into(),
+            commit: commit.into(),
+        }
+    }
+
     fn aot_case(id: &str, expected_timeout_ms: u64) -> CaseSpec {
         CaseSpec {
             id: id.to_owned(),
-            repository: format!("https://example.com/{id}"),
-            commit: "a".repeat(40),
+            provenance: git_provenance(format!("https://example.com/{id}"), "a".repeat(40)),
             license: "MIT".into(),
             source_dir: format!("corpus/projects/{id}"),
             entrypoint: format!("corpus/cases/{id}.ts"),
@@ -2146,6 +2249,59 @@ mod tests {
             .map(|mode| mode.as_str())
             .collect();
         assert_eq!(names, BTreeSet::from(["interpreter", "jit", "aot"]));
+    }
+    #[test]
+    fn cancellation_errors_report_observed_stages_with_stable_evidence() {
+        let cases = [
+            (
+                driver::DriverError::Cancelled,
+                CorpusStage::Load,
+                "command cancelled",
+            ),
+            (
+                driver::DriverError::Jit(bamts_codegen::JitError::Cancelled),
+                CorpusStage::Instantiate,
+                "JIT compilation failed: operation cancelled",
+            ),
+            (
+                driver::DriverError::Aot(bamts_codegen::AotError::Cancelled),
+                CorpusStage::Instantiate,
+                "AOT object emission failed: operation cancelled",
+            ),
+            (
+                driver::DriverError::Native(bamts_runtime::NativeError::Cancelled),
+                CorpusStage::Evaluate,
+                "program execution failed: operation cancelled",
+            ),
+        ];
+
+        for (error, expected_stage, expected_evidence) in cases {
+            let failure = CorpusFailure::from_driver_error(&error);
+            assert_eq!(failure.stage, expected_stage);
+            assert_eq!(failure.evidence, expected_evidence);
+            assert_eq!(CorpusFailure::from_driver_error(&error), failure);
+        }
+
+        let cancelled_facade =
+            CorpusFailure::from_facade_error(&bamts::Error::from(bamts_compiler::Cancelled));
+        assert_eq!(cancelled_facade.stage, CorpusStage::Load);
+        assert_eq!(cancelled_facade.evidence, "operation cancelled");
+
+        let aot_facade = CorpusFailure::from_facade_error(&bamts::Error::from(
+            bamts_codegen::AotError::Cancelled,
+        ));
+        assert_eq!(aot_facade.stage, CorpusStage::Instantiate);
+        assert_eq!(
+            aot_facade.evidence,
+            "could not emit native object: operation cancelled"
+        );
+    }
+
+    #[test]
+    fn host_exit_option_precedes_interpreter_outcome_without_sentinels() {
+        assert_eq!(select_host_exit_code(Some(0), 7), 0);
+        assert_eq!(select_host_exit_code(Some(9), 0), 9);
+        assert_eq!(select_host_exit_code(None, 7), 7);
     }
 
     #[test]
@@ -2211,22 +2367,15 @@ mod tests {
     fn load_corpus_accepts_the_real_repository() {
         let corpus = load_corpus(&repo_root()).expect("real corpus validates");
         assert_eq!(corpus.cases.len(), corpus.manifest.projects.len());
-        let manifest_ids: Vec<&str> = corpus
-            .manifest
-            .projects
-            .iter()
-            .map(|project| project.id.as_str())
-            .collect();
-        assert_eq!(manifest_ids, PINNED_CASE_IDS);
-        let pinned: BTreeSet<&str> = PINNED_CASE_IDS.into_iter().collect();
-        for (name, subset) in [
-            ("synchronous", TASK_106_SYNC_CASE_IDS.as_slice()),
-            ("node", TASK_107_NODE_CASE_IDS.as_slice()),
-        ] {
-            assert!(
-                subset.iter().all(|id| pinned.contains(id)),
-                "{name} case IDs must be a subset of PINNED_CASE_IDS"
-            );
+        assert!(corpus.cases.len() >= 20);
+        assert_eq!(corpus.manifest.node_version, NODE_VERSION);
+        for (project, case) in corpus.manifest.projects.iter().zip(&corpus.cases) {
+            assert_eq!(project.id, case.id);
+            assert_eq!(project.provenance, case.provenance);
+            if let Provenance::ExternalGit { commit, .. } = &case.provenance {
+                assert!(is_lower_hex(commit, COMMIT_LEN));
+            }
+            assert!(case.entrypoint.ends_with(".ts"));
         }
         assert!(corpus.case("tiny-invariant").is_some());
     }
@@ -2239,8 +2388,7 @@ mod tests {
             compare: COMPARE_KEYS.iter().map(|s| s.to_string()).collect(),
             projects: vec![ManifestProject {
                 id: "only".into(),
-                repository: "https://example.com/only".into(),
-                commit: "a".repeat(40),
+                provenance: git_provenance("https://example.com/only", "a".repeat(40)),
                 spec: "corpus/specs/only.toml".into(),
                 entrypoint: "corpus/cases/only.ts".into(),
             }],
@@ -2264,7 +2412,7 @@ mod tests {
     #[test]
     fn manifest_rejects_unknown_field() {
         let manifest = format!(
-            "schema = 1\nnode_version = \"{NODE_VERSION}\"\nenvironment = {env:?}\ncompare = {cmp:?}\nrogue = true\n[[projects]]\nid=\"a\"\nrepository=\"r\"\ncommit=\"{c}\"\nspec=\"corpus/specs/a.toml\"\nentrypoint=\"corpus/cases/a.ts\"\n",
+            "schema = 1\nnode_version = \"{NODE_VERSION}\"\nenvironment = {env:?}\ncompare = {cmp:?}\nrogue = true\n[[projects]]\nid=\"a\"\nsource_kind=\"git\"\nrepository=\"r\"\ncommit=\"{c}\"\nspec=\"corpus/specs/a.toml\"\nentrypoint=\"corpus/cases/a.ts\"\n",
             env = NORMALIZED_ENV,
             cmp = COMPARE_KEYS,
             c = "a".repeat(40),
@@ -2276,6 +2424,84 @@ mod tests {
     }
 
     #[test]
+    fn local_provenance_rejects_commit_and_mixed_variant_fields() {
+        let fake_commit = format!(
+            "id = \"local\"\nsource_kind = \"local\"\ndigest_algorithm = \"sha256\"\ndigest = \"{}\"\ncommit = \"{}\"\nspec = \"corpus/specs/local.toml\"\nentrypoint = \"corpus/cases/local.ts\"\n",
+            "a".repeat(SHA256_LEN),
+            "b".repeat(COMMIT_LEN),
+        );
+        assert!(toml::from_str::<RawProject>(&fake_commit).is_err());
+        let fake_spec_commit = format!(
+            "schema = 1\nid = \"local\"\nsource_kind = \"local\"\ndigest_algorithm = \"sha256\"\ndigest = \"{}\"\ncommit = \"{}\"\nlicense = \"UNLICENSED\"\nsource_dir = \"corpus/cases\"\nentrypoint = \"corpus/cases/local.ts\"\nnode_args = []\nexpected_timeout_ms = 5000\nconstructs = [\"local-content\"]\nsource_files = [\"corpus/cases/local.ts\"]\n",
+            "a".repeat(SHA256_LEN),
+            "b".repeat(COMMIT_LEN),
+        );
+        assert!(toml::from_str::<RawSpec>(&fake_spec_commit).is_err());
+
+        let local_with_repository = format!(
+            "id = \"local\"\nsource_kind = \"local\"\ndigest_algorithm = \"sha256\"\ndigest = \"{}\"\nrepository = \"https://example.com/local\"\nspec = \"corpus/specs/local.toml\"\nentrypoint = \"corpus/cases/local.ts\"\n",
+            "a".repeat(SHA256_LEN),
+        );
+        assert!(toml::from_str::<RawProject>(&local_with_repository).is_err());
+
+        let git_with_digest = format!(
+            "id = \"git\"\nsource_kind = \"git\"\nrepository = \"https://example.com/git\"\ncommit = \"{}\"\ndigest_algorithm = \"sha256\"\ndigest = \"{}\"\nspec = \"corpus/specs/git.toml\"\nentrypoint = \"corpus/cases/git.ts\"\n",
+            "a".repeat(COMMIT_LEN),
+            "b".repeat(SHA256_LEN),
+        );
+        assert!(toml::from_str::<RawProject>(&git_with_digest).is_err());
+    }
+
+    #[test]
+    fn valid_external_git_pins_deserialize_and_cross_check() {
+        let raw_project: RawProject = toml::from_str(&format!(
+            "id = \"sample\"\nsource_kind = \"git\"\nrepository = \"https://example.com/sample\"\ncommit = \"{}\"\nspec = \"corpus/specs/sample.toml\"\nentrypoint = \"corpus/cases/sample.ts\"\n",
+            "a".repeat(COMMIT_LEN),
+        ))
+        .expect("valid Git project");
+        assert!(validate_project(Path::new("manifest.toml"), &raw_project).is_ok());
+
+        let raw_spec: RawSpec = toml::from_str(&format!(
+            "schema = 1\nid = \"sample\"\nsource_kind = \"git\"\nrepository = \"https://example.com/sample\"\ncommit = \"{}\"\nlicense = \"MIT\"\nsource_dir = \"corpus/projects/sample\"\nentrypoint = \"corpus/cases/sample.ts\"\nnode_args = []\nexpected_timeout_ms = 5000\nconstructs = [\"external-git\"]\nsource_files = [\"corpus/projects/sample/index.ts\"]\n",
+            "a".repeat(COMMIT_LEN),
+        ))
+        .expect("valid Git spec");
+        assert!(
+            validate_spec(
+                Path::new("corpus/specs/sample.toml"),
+                raw_spec,
+                &valid_project(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn local_source_mutation_fails_content_digest_validation() {
+        let root = scratch("local-digest");
+        fs::create_dir_all(root.join("corpus/specs")).unwrap();
+        fs::create_dir_all(root.join("corpus/cases")).unwrap();
+        let manifest = format!(
+            "schema = 1\nnode_version = \"{NODE_VERSION}\"\nenvironment = {env:?}\ncompare = {cmp:?}\n[[projects]]\nid = \"local\"\nsource_kind = \"local\"\ndigest_algorithm = \"sha256\"\ndigest = \"{digest}\"\nspec = \"corpus/specs/local.toml\"\nentrypoint = \"corpus/cases/local.ts\"\n",
+            env = NORMALIZED_ENV,
+            cmp = COMPARE_KEYS,
+            digest = "715178669bf0b1f1a928774a66f3988d401010a05a08e824654e294c2c1b7793",
+        );
+        let spec = format!(
+            "schema = 1\nid = \"local\"\nsource_kind = \"local\"\ndigest_algorithm = \"sha256\"\ndigest = \"{digest}\"\nlicense = \"UNLICENSED\"\nsource_dir = \"corpus/cases\"\nentrypoint = \"corpus/cases/local.ts\"\nnode_args = []\nexpected_timeout_ms = 5000\nconstructs = [\"local-content\"]\nsource_files = [\"corpus/cases/local.ts\"]\n",
+            digest = "715178669bf0b1f1a928774a66f3988d401010a05a08e824654e294c2c1b7793",
+        );
+        fs::write(root.join(MANIFEST_PATH), manifest).unwrap();
+        fs::write(root.join("corpus/specs/local.toml"), spec).unwrap();
+        fs::write(root.join("corpus/cases/local.ts"), b"original\n").unwrap();
+        assert!(load_corpus(&root).is_ok());
+
+        fs::write(root.join("corpus/cases/local.ts"), b"mutated\n").unwrap();
+        assert_eq!(load_corpus(&root).unwrap_err().code(), ErrorCode::Digest);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn manifest_rejects_wrong_schema_and_node_version() {
         let base = |schema: u32, version: &str| RawManifest {
             schema,
@@ -2284,8 +2510,7 @@ mod tests {
             compare: COMPARE_KEYS.iter().map(|s| s.to_string()).collect(),
             projects: vec![RawProject {
                 id: "a".into(),
-                repository: "r".into(),
-                commit: "a".repeat(40),
+                provenance: git_provenance("r", "a".repeat(40)),
                 spec: "corpus/specs/a.toml".into(),
                 entrypoint: "corpus/cases/a.ts".into(),
             }],
@@ -2314,8 +2539,7 @@ mod tests {
             compare,
             projects: vec![RawProject {
                 id: "a".into(),
-                repository: "r".into(),
-                commit: "a".repeat(40),
+                provenance: git_provenance("r", "a".repeat(40)),
                 spec: "corpus/specs/a.toml".into(),
                 entrypoint: "corpus/cases/a.ts".into(),
             }],
@@ -2366,8 +2590,7 @@ mod tests {
     fn manifest_rejects_bad_pins_and_paths_and_duplicates() {
         let project = |id: &str, commit: &str, spec: &str, entry: &str| RawProject {
             id: id.into(),
-            repository: "r".into(),
-            commit: commit.into(),
+            provenance: git_provenance("r", commit),
             spec: spec.into(),
             entrypoint: entry.into(),
         };
@@ -2459,8 +2682,7 @@ mod tests {
     fn valid_project() -> ManifestProject {
         ManifestProject {
             id: "sample".into(),
-            repository: "https://example.com/sample".into(),
-            commit: "a".repeat(40),
+            provenance: git_provenance("https://example.com/sample", "a".repeat(40)),
             spec: "corpus/specs/sample.toml".into(),
             entrypoint: "corpus/cases/sample.ts".into(),
         }
@@ -2470,8 +2692,7 @@ mod tests {
         RawSpec {
             schema: 1,
             id: "sample".into(),
-            repository: "https://example.com/sample".into(),
-            commit: "a".repeat(40),
+            provenance: git_provenance("https://example.com/sample", "a".repeat(40)),
             license: "MIT".into(),
             source_dir: "corpus/projects/sample".into(),
             entrypoint: "corpus/cases/sample.ts".into(),
@@ -2498,9 +2719,9 @@ mod tests {
             ErrorCode::Schema
         );
 
-        // commit mismatch.
+        // Provenance mismatch.
         let mut raw = valid_raw_spec();
-        raw.commit = "b".repeat(40);
+        raw.provenance = git_provenance("https://example.com/sample", "b".repeat(40));
         assert_eq!(
             validate_spec(path, raw, &project).unwrap_err().code(),
             ErrorCode::Schema
@@ -2569,33 +2790,6 @@ mod tests {
             validate_spec(path, raw, &project).unwrap_err().code(),
             ErrorCode::Schema
         );
-    }
-
-    #[test]
-    fn spec_rejects_harness_owned_compiler_args() {
-        let path = Path::new("spec.toml");
-        let project = valid_project();
-
-        for argument in HARNESS_OWNED_ARGS
-            .iter()
-            .flat_map(|argument| [(*argument).to_owned(), format!("{argument}=value")])
-            .chain([String::new(), " \t".to_owned()])
-        {
-            let mut raw = valid_raw_spec();
-            raw.compiler_args = vec![argument.clone()];
-            let error = validate_spec(path, raw, &project).unwrap_err();
-            assert_eq!(error.code(), ErrorCode::Schema);
-            assert!(
-                error.to_string().contains(&format!("`{argument}`"))
-                    || argument.trim().is_empty() && error.to_string().contains("empty"),
-                "{error}"
-            );
-        }
-
-        let mut raw = valid_raw_spec();
-        raw.compiler_args = vec!["-A".into(), "no-with".into()];
-        let spec = validate_spec(path, raw, &project).expect("unowned compiler args");
-        assert_eq!(spec.compiler_args, ["-A", "no-with"]);
     }
 
     // ---- oracle behavior --------------------------------------------------
@@ -2677,77 +2871,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn terminate_process_group_kills_grandchild() {
-        let dir = scratch("killpg-grandchild");
-        let script = "echo $$ > child.pid\n\
-                      sh -c 'while :; do sleep 0.1; done' &\n\
-                      echo $! > grandchild.pid\n\
-                      while :; do sleep 0.1; done\n";
-        fs::write(dir.join("child.sh"), script).expect("write child script");
-
-        let outcome = run_process(
-            "killpg test",
-            Path::new("/bin/sh"),
-            &dir,
-            &[("PATH".to_string(), "/usr/bin:/bin".to_string())],
-            &[OsString::from("child.sh")],
-            &OracleLimits {
-                timeout: Duration::from_millis(1000),
-                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
-            },
-        )
-        .expect("run process");
-
-        assert!(outcome.timed_out, "process group should time out");
-        assert_eq!(outcome.signal, Some(9), "process group should be SIGKILLed");
-
-        let child_pid = fs::read_to_string(dir.join("child.pid"))
-            .expect("child pid file")
-            .trim()
-            .parse::<i32>()
-            .expect("child pid is numeric");
-        let grandchild_pid = fs::read_to_string(dir.join("grandchild.pid"))
-            .expect("grandchild pid file")
-            .trim()
-            .parse::<i32>()
-            .expect("grandchild pid is numeric");
-
-        fn process_exists(pid: i32) -> bool {
-            std::process::Command::new("kill")
-                .arg("-0")
-                .arg(pid.to_string())
-                .status()
-                .expect("kill -0")
-                .success()
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut child_gone = false;
-        let mut grandchild_gone = false;
-        while Instant::now() < deadline {
-            if !child_gone && !process_exists(child_pid) {
-                child_gone = true;
-            }
-            if !grandchild_gone && !process_exists(grandchild_pid) {
-                grandchild_gone = true;
-            }
-            if child_gone && grandchild_gone {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        assert!(child_gone, "child {child_pid} should be dead");
-        assert!(
-            grandchild_gone,
-            "grandchild {grandchild_pid} should be dead"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn interpreter_fuel_tracks_the_selected_wall_time_budget() {
         let short = interpreter_limits(Duration::from_millis(25));
         let long = interpreter_limits(Duration::from_millis(250));
@@ -2755,26 +2878,6 @@ mod tests {
         assert_eq!(short.fuel, 25 * INTERPRETER_FUEL_PER_MILLISECOND);
         assert_eq!(long.fuel, 250 * INTERPRETER_FUEL_PER_MILLISECOND);
         assert_eq!(long.fuel, short.fuel * 10);
-    }
-
-    #[test]
-    fn worker_env_excludes_path_for_in_process_modes() {
-        // JIT and Interpreter execute the case program in-process, so they
-        // must not inherit PATH — only the AOT compile step needs a
-        // discoverable toolchain for the linker.
-        let has_path = |env: &[(String, String)]| env.iter().any(|(key, _)| key == "PATH");
-        assert!(
-            !has_path(&worker_env(WorkerOperation::Jit)),
-            "JIT worker must not expose PATH to the case program"
-        );
-        assert!(
-            !has_path(&worker_env(WorkerOperation::Interpreter)),
-            "interpreter worker must not expose PATH to the case program"
-        );
-        assert!(
-            has_path(&worker_env(WorkerOperation::AotCompile)),
-            "AOT compile worker needs PATH for the linker"
-        );
     }
 
     #[test]
@@ -2930,160 +3033,5 @@ mod tests {
             outcome.stdout.windows(6).any(|window| window == b"truthy"),
             "stdout should contain project-derived output"
         );
-    }
-
-    #[test]
-    fn worker_exit_zero_without_response_fails_with_tool_failed() {
-        let root = repo_root();
-        let spec = aot_case("missing-response", 10_000);
-        let artifacts = ArtifactDirectory::create(&root, &spec, ExecutionMode::Jit)
-            .expect("create scratch artifacts");
-        let request = WorkerRequest {
-            root,
-            spec,
-            operation: WorkerOperation::Jit,
-            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
-            executable: None,
-        };
-        let error = match run_worker(&artifacts, &request, Duration::from_secs(5)) {
-            Err(error) => error,
-            Ok(_) => panic!("worker without response must fail"),
-        };
-        assert_eq!(error.code(), ErrorCode::ToolFailed);
-        let message = error.to_string();
-        assert!(
-            message.contains("wrote no response"),
-            "error should report missing response: {message}"
-        );
-        assert!(
-            message.contains(CORPUS_WORKER_TEST),
-            "error should name the worker test: {message}"
-        );
-        assert!(
-            message.contains("run_corpus_worker_from_env"),
-            "error should name the worker entry point: {message}"
-        );
-        assert!(
-            !message.contains("No such file or directory"),
-            "error must not leak a filesystem I/O message: {message}"
-        );
-    }
-
-    #[test]
-    fn aot_compile_evidence_preserves_worker_truncation() {
-        let runtime = timeout_outcome(Vec::new(), 4);
-        let outcome = with_aot_compile_evidence(runtime, b"warn".to_vec(), true, 4);
-        assert_eq!(outcome.compile_stderr, b"warn");
-        assert!(outcome.compile_stderr_truncated);
-    }
-
-    #[test]
-    fn manifest_pinned_ids_and_subsets() {
-        let path = Path::new("manifest.toml");
-        let project = |id: &str| ManifestProject {
-            id: id.into(),
-            repository: "https://example.com".into(),
-            commit: "a".repeat(40),
-            spec: "corpus/specs/x.toml".into(),
-            entrypoint: "corpus/cases/x.ts".into(),
-        };
-        let projects: Vec<_> = PINNED_CASE_IDS.iter().copied().map(project).collect();
-        assert!(verify_pinned_case_ids(path, &projects).is_ok());
-
-        let mut wrong_order = projects.clone();
-        if wrong_order.len() >= 2 {
-            wrong_order.swap(0, 1);
-        }
-        assert_eq!(
-            verify_pinned_case_ids(path, &wrong_order)
-                .unwrap_err()
-                .code(),
-            ErrorCode::SetMismatch
-        );
-
-        let mut extra = projects;
-        extra.push(project("extra"));
-        assert_eq!(
-            verify_pinned_case_ids(path, &extra).unwrap_err().code(),
-            ErrorCode::SetMismatch
-        );
-    }
-
-    #[test]
-    fn cli_arg_strings_are_harness_owned() {
-        let entrypoint = PathBuf::from("corpus/cases/sample.ts");
-        let output = Path::new("target/corpus-differential/sample");
-        for mode in [Mode::Check, Mode::Compile, Mode::Run, Mode::Explain] {
-            for target in [ExecutionTarget::Aot, ExecutionTarget::Jit] {
-                for js in [false, true] {
-                    for out in [None, Some(output)] {
-                        let strings =
-                            cli_arg_strings(mode, target, entrypoint.clone(), out, js, &[]);
-                        let entrypoint_str = entrypoint.to_string_lossy().into_owned();
-                        let output_str = out.map(|p| p.to_string_lossy().into_owned());
-                        for token in &strings {
-                            if token == &entrypoint_str || output_str.as_ref() == Some(token) {
-                                continue;
-                            }
-                            assert!(
-                                HARNESS_OWNED_ARGS.contains(&token.as_str()),
-                                "`{token}` emitted by cli_arg_strings is not in HARNESS_OWNED_ARGS"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn compiler_args_reject_emitted_flags_and_whitespace() {
-        let path = Path::new("spec.toml");
-        for token in [
-            "run",
-            "compile",
-            "aot",
-            "jit",
-            "--target",
-            "--output",
-            "--js-compat",
-        ] {
-            assert_eq!(
-                validate_compiler_args(path, &[token.to_owned()])
-                    .unwrap_err()
-                    .code(),
-                ErrorCode::Schema
-            );
-            assert_eq!(
-                validate_compiler_args(path, &[format!("{token}=value")])
-                    .unwrap_err()
-                    .code(),
-                ErrorCode::Schema
-            );
-        }
-        assert_eq!(
-            validate_compiler_args(path, &[" \t".to_owned()])
-                .unwrap_err()
-                .code(),
-            ErrorCode::Schema
-        );
-        assert_eq!(
-            validate_compiler_args(path, &["  --target  ".to_owned()])
-                .unwrap_err()
-                .code(),
-            ErrorCode::Schema
-        );
-        assert!(validate_compiler_args(path, &["--strict".to_owned()]).is_ok());
-    }
-
-    #[test]
-    fn bounded_output_caps_and_flags_truncation() {
-        let (out, truncated) = bounded_output(vec![0, 1, 2, 3, 4], 3);
-        assert_eq!(out, vec![0, 1, 2]);
-        assert!(truncated);
-
-        let (out, truncated) = bounded_output(vec![0, 1, 2], 5);
-        assert_eq!(out, vec![0, 1, 2]);
-        assert!(!truncated);
     }
 }

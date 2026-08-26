@@ -1,11 +1,11 @@
 # bamti
 
-`bamti` is the in-process Node.js interface for the BamTS compiler. It embeds the compiler directly into Node.js 24 or later via native Node-API bindings (`bamts-napi`) and atomic cancellation (`bamts-cancel`), returning a promise with the CLI exit code.
+`bamti` is the Node.js 24 interface for the BamTS compiler. The package root runs CLI invocations in-process through the native Node-API addon. Persistent TypeScript service and public AST requests share one framed `bamti-cli --api` child process so project state survives across requests.
 
 ```js
 import { run } from "bamti";
 
-const exitCode = await run(["check", "input.ts"], {
+const exitCode = await run(["--noEmit", "input.ts"], {
   cwd: process.cwd(),
   env: process.env,
   stdio: "inherit",
@@ -14,13 +14,25 @@ const exitCode = await run(["check", "input.ts"], {
 
 `stdio` accepts `"inherit"`, `"ignore"`, or `"pipe"`. The public API returns only the exit code, so `"pipe"` captures and discards compiler output.
 
+For persistent compiler state, create a session and dispose it when finished:
+
+```js
+import { createSession } from "bamti";
+
+await using session = createSession({ root: process.cwd() });
+await session.open({ path: "input.ts", text: "const answer = 42;", version: 1 });
+const diagnostics = await session.diagnostics({ path: "input.ts" });
+```
+
+The package exports the root, `unstable/sync`, `unstable/async`, `unstable/fs`, `unstable/proto`, `unstable/ast`, six AST operation subpaths, and `package.json`.
+
 ## Architecture and target design
 
-- **In-process job vs standalone CLI**: `bamti` runs the compiler in-process via Node-API bindings. Use `bamti-cli` when you need the standalone `bamts` executable binary or resolution.
+- **Native execution vs persistent service**: root `run()` uses the direct native addon loader. Session and unstable service/AST exports use the standalone `bamts --api` protocol through `bamti-cli`; they do not add a second native loader or fall back from native execution.
 - **Node.js requirement**: Requires Node.js 24 or later.
-- **Five target platform packages**: Designed to load optional platform packages (`@bamti/bamti-linux-x64-gnu`, `@bamti/bamti-linux-arm64-gnu`, `@bamti/bamti-darwin-x64`, `@bamti/bamti-darwin-arm64`, `@bamti/bamti-win32-x64-msvc`).
-- **Fail-closed optional artifact loading**: Inspects host parameters, resolves the optional target package, and verifies manifest structure, binary SHA-256 digest, and release metadata. If missing or invalid, loading fails closed with `NativeArtifactNotFoundError` or `NativeArtifactLoadError`. It never downloads binaries, compiles from source, or falls back to the CLI executable at runtime.
-- **Cancellation and teardown ownership**: Atomic cancellation token handling is owned by `bamts-cancel`. Native N-API environment isolate boundary and memory teardown are owned by private crate `bamts-napi`.
+- **Five target platform packages**: Loads optional platform packages (`@bamti/bamti-linux-x64-gnu`, `@bamti/bamti-linux-arm64-gnu`, `@bamti/bamti-darwin-x64`, `@bamti/bamti-darwin-arm64`, `@bamti/bamti-win32-x64-msvc`).
+- **Fail-closed native loading**: Inspects host parameters, resolves the target package, and verifies manifest structure, binary SHA-256 digest, and release metadata. If missing or invalid, loading fails closed with `NativeArtifactNotFoundError` or `NativeArtifactLoadError`. It never downloads binaries, compiles from source, or falls back to the CLI executable.
+- **Cancellation and teardown**: Root invocations and persistent requests accept `AbortSignal`. Persistent requests forward cancellation over the API protocol and dispose their child process when the session closes.
 
 ## Release status note
 

@@ -7,6 +7,8 @@ publish = false
 license.workspace = true
 repository.workspace = true
 description = "Verification and compliance test suite for BamTS"
+autobins = false
+default-run = "bamts-verification"
 
 [dependencies]
 bamts = { workspace = true, features = ["aot"] }
@@ -17,15 +19,22 @@ bamts-compiler.workspace = true
 bamts-native.workspace = true
 bamts-node = { workspace = true, features = ["script-compiler"] }
 bamts-runtime.workspace = true
+libc.workspace = true
 anyhow = "=1.0.104"
 quint-connect = "=0.1.2"
 serde = { version = "=1.0.229", features = ["derive"] }
+serde-saphyr = "=1.1.0"
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
 toml = "=0.9.12"
 
-[target.'cfg(unix)'.dependencies]
-libc = "=0.2.189"
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[[bin]]
+name = "bamts-verification"
+path = "src/main.rs"
 
 [[bin]]
 name = "ts_conformance"
@@ -38,9 +47,3 @@ path = "src/bin/perf_budget.rs"
 [[bin]]
 name = "bh1_jit"
 path = "src/bin/bh1_jit.rs"
-
-[lints.rust]
-# `unsafe_code` is downgraded from the workspace `forbid` to `deny` so narrow
-# `#[allow(unsafe_code)]` blocks may call `killpg` for namespace teardown and
-# `prctl(PR_SET_DUMPABLE)` before the JIT secret enters the launcher argv.
-unsafe_code = "deny"

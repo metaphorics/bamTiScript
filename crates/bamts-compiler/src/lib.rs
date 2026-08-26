@@ -1,7 +1,10 @@
+pub mod binder;
 pub mod checker;
 pub mod diagnostic;
+pub mod diagnostics_parser;
 pub mod emitter;
 pub mod enum_plan;
+pub(crate) mod jsx_desugar;
 pub mod lint;
 mod literal;
 pub mod lower;
@@ -10,12 +13,15 @@ pub mod parser;
 pub mod pipeline;
 pub mod program;
 pub mod project;
+pub mod public_ast;
 pub mod rules;
 pub mod scanner;
 pub mod script;
+pub mod service;
 pub mod source;
 pub mod syntax;
 pub mod telemetry;
+pub mod tsc_directives;
 pub mod warning;
 
 pub use bamts_cancel::{CancellationToken, Cancelled};

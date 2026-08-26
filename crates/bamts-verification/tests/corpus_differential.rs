@@ -1,13 +1,52 @@
 use std::{fs, path::Path, process};
 
 use bamts_verification::corpus::{
-    BamtsRunner, CaseSpec, CorpusFailure, CorpusStage, ExecutionMode, NodeOracle, OracleOutcome,
-    PINNED_CASE_IDS, TASK_106_SYNC_CASE_IDS, TASK_107_NODE_CASE_IDS, load_corpus,
-    run_corpus_worker_from_env,
+    BamtsRunner, CaseSpec, CorpusFailure, CorpusStage, DigestAlgorithm, ExecutionMode, NodeOracle,
+    OracleOutcome, PINNED_CASE_IDS, Provenance, TASK_106_SYNC_CASE_IDS, TASK_107_NODE_CASE_IDS,
+    load_corpus, run_corpus_worker_from_env,
 };
+use sha2::{Digest, Sha256};
+
+fn local_test_provenance(root: &Path, source_dir: &str) -> Provenance {
+    fn collect(dir: &Path, prefix: &str, records: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).expect("read source_dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("file type");
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                collect(&path, &format!("{prefix}{name}/"), records);
+            } else if file_type.is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rel = format!("{prefix}{name}");
+                let bytes = fs::read(&path).expect("read fixture file");
+                records.push((rel, bytes));
+            }
+        }
+    }
+
+    let mut records = Vec::new();
+    collect(
+        &root.join(source_dir),
+        &format!("{source_dir}/"),
+        &mut records,
+    );
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (path, bytes) in records {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&bytes);
+        hasher.update(b"\n");
+    }
+    Provenance::LocalContent {
+        digest_algorithm: DigestAlgorithm::Sha256,
+        digest: format!("{:x}", hasher.finalize()),
+    }
+}
 
 #[test]
-#[ignore = "spawned by BamtsRunner as a killable JIT/AOT boundary"]
+#[ignore = "subprocess worker invoked by the differential harness"]
 fn corpus_differential_worker() {
     if std::env::var_os("BAMTS_CORPUS_WORKER_REQUEST").is_none() {
         return;
@@ -19,15 +58,16 @@ fn corpus_differential_worker() {
 fn every_execution_mode_enforces_the_case_timeout() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("corpus-timeout-{}", process::id());
-    let entrypoint = format!("target/{id}.ts");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.ts");
     let path = root.join(&entrypoint);
     fs::write(&path, "while (true) {}\n").expect("write timeout fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 100,
@@ -47,7 +87,7 @@ fn every_execution_mode_enforces_the_case_timeout() {
             evidence(&outcome)
         );
     }
-    fs::remove_file(path).expect("remove timeout fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
 }
 
 #[test]
@@ -61,7 +101,7 @@ fn all_pinned_cases_match_node_in_every_execution_mode() {
         .collect::<Vec<_>>();
     assert_eq!(
         ids, PINNED_CASE_IDS,
-        "the differential harness must cover exactly the 20 pinned cases in manifest order"
+        "the differential harness must cover exactly the 27 pinned cases in manifest order"
     );
 
     let oracle = NodeOracle::discover(&root).expect("the pinned Node oracle must be available");
@@ -109,7 +149,9 @@ fn p_map_matches_node_in_every_execution_mode() {
 fn for_await_sync_thenable_unwrap_and_iterator_result_not_assimilated() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("for-await-sync-thenable-{}", process::id());
-    let entrypoint = format!("target/{id}.ts");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.ts");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -200,10 +242,9 @@ fn for_await_sync_thenable_unwrap_and_iterator_result_not_assimilated() {
     .expect("write for-await thenable fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -219,7 +260,7 @@ fn for_await_sync_thenable_unwrap_and_iterator_result_not_assimilated() {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove for-await thenable fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "for-await sync thenable differential failures:\n{}",
@@ -231,7 +272,9 @@ fn for_await_sync_thenable_unwrap_and_iterator_result_not_assimilated() {
 fn iterator_close_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("iterator-close-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -394,10 +437,9 @@ fn iterator_close_matches_node_in_every_execution_mode() {
     .expect("write iterator-close fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -413,7 +455,7 @@ fn iterator_close_matches_node_in_every_execution_mode() {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove iterator-close fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "iterator-close differential failures:\n{}",
@@ -425,7 +467,9 @@ fn iterator_close_matches_node_in_every_execution_mode() {
 fn derived_constructor_super_flow_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("derived-constructor-super-flow-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -509,10 +553,9 @@ capture("state-u-undefined", () => new class extends Base {
     .expect("write derived-constructor super-flow fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -528,7 +571,7 @@ capture("state-u-undefined", () => new class extends Base {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove derived-constructor super-flow fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "derived-constructor super-flow differential failures:\n{}",
@@ -540,7 +583,9 @@ capture("state-u-undefined", () => new class extends Base {
 fn derived_constructor_returns_match_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("derived-constructor-returns-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -615,10 +660,9 @@ capture("finally", () => new class extends Base {
     .expect("write derived-constructor return fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -634,7 +678,7 @@ capture("finally", () => new class extends Base {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove derived-constructor return fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "derived-constructor return differential failures:\n{}",
@@ -646,7 +690,9 @@ capture("finally", () => new class extends Base {
 fn default_derived_construction_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("default-derived-construction-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -713,10 +759,9 @@ try {
     .expect("write default derived construction fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -732,7 +777,7 @@ try {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove default derived construction fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "default derived construction differential failures:\n{}",
@@ -744,7 +789,9 @@ try {
 fn explicit_new_target_construction_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("explicit-new-target-construction-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -778,10 +825,9 @@ capture("explicit-as-leaf", () => new ExplicitMiddle(8, 9, 10));
     .expect("write explicit new.target construction fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -797,7 +843,7 @@ capture("explicit-as-leaf", () => new ExplicitMiddle(8, 9, 10));
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove explicit new.target construction fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "explicit new.target construction differential failures:\n{}",
@@ -809,7 +855,9 @@ capture("explicit-as-leaf", () => new ExplicitMiddle(8, 9, 10));
 fn import_meta_identity_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("import-meta-{}", process::id());
-    let entrypoint = format!("target/{id}.mjs");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.mjs");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -822,10 +870,9 @@ console.log(typeof import.meta.url === 'string' && import.meta.url.length > 0);
     .expect("write import-meta fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -841,7 +888,7 @@ console.log(typeof import.meta.url === 'string' && import.meta.url.length > 0);
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove import-meta fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "import-meta differential failures:
@@ -858,7 +905,9 @@ console.log(typeof import.meta.url === 'string' && import.meta.url.length > 0);
 fn declaration_owned_self_captures_match_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-106-self-captures-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -881,10 +930,9 @@ run();
     .expect("write self-capture fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -900,7 +948,7 @@ run();
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove self-capture fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "declaration-owned self-capture differential failures:\n{}",
@@ -912,7 +960,9 @@ run();
 fn local_lexical_tdz_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-106-local-tdz-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -970,10 +1020,9 @@ process.stdout.write([
     .expect("write local TDZ fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -989,7 +1038,7 @@ process.stdout.write([
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove local TDZ fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "local lexical TDZ differential failures:\n{}",
@@ -1067,7 +1116,9 @@ fn task_107_node_cases_match_node_in_every_execution_mode() {
 fn task_110_event_loop_drives_to_quiescence_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-110-event-loop-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -1082,10 +1133,9 @@ setTimeout(() => {
     .expect("write event-loop fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -1101,7 +1151,7 @@ setTimeout(() => {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove event-loop fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "Task 110 event-loop differential failures:\n{}",
@@ -1113,10 +1163,12 @@ setTimeout(() => {
 fn first_tla_rejection_aborts_root_body_before_pending_dependency_completes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("tla-reject-{}", process::id());
-    let entrypoint = format!("target/{id}.ts");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.ts");
     let root_path = root.join(&entrypoint);
-    let rejecting_path = root.join(format!("target/{id}-rejecting.ts"));
-    let pending_path = root.join(format!("target/{id}-pending.ts"));
+    let rejecting_path = root.join(format!("{source_dir}/{id}-rejecting.ts"));
+    let pending_path = root.join(format!("{source_dir}/{id}-pending.ts"));
 
     fs::write(
         &rejecting_path,
@@ -1135,13 +1187,11 @@ fn first_tla_rejection_aborts_root_body_before_pending_dependency_completes() {
         ),
     )
     .expect("write root fixture");
-
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -1172,9 +1222,7 @@ fn first_tla_rejection_aborts_root_body_before_pending_dependency_completes() {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(root_path).expect("remove root fixture");
-    fs::remove_file(rejecting_path).expect("remove rejecting fixture");
-    fs::remove_file(pending_path).expect("remove pending fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "TLA first-rejection differential failures:\n{}",
@@ -1186,15 +1234,16 @@ fn first_tla_rejection_aborts_root_body_before_pending_dependency_completes() {
 fn top_level_throws_are_comparable_process_outcomes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-113-top-level-throw-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(&path, "throw new Error('boom');\n").expect("write top-level throw fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -1210,7 +1259,7 @@ fn top_level_throws_are_comparable_process_outcomes() {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove top-level throw fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "top-level throw differential failures:\n{}",
@@ -1220,6 +1269,15 @@ fn top_level_throws_are_comparable_process_outcomes() {
 
 #[test]
 fn class_decorators_match_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("class-decorators-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Strengthened class-decorator ordering: static computed keys evaluate before
     // application; static field/auto-accessor/block drain in source order after
     // replacement on the raw constructor; final `this` diverges from raw
@@ -1280,18 +1338,77 @@ log(`sameRef:${Owned === capturedRawOwned}`);
 log(`prototypeConstructorEnumerable:${Object.getOwnPropertyDescriptor(capturedRawOwned.prototype, 'constructor').enumerable}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "class-decorators",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "class decorator",
+    fs::write(&source_path, source).expect("write class decorator fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript decorator oracle");
+    assert!(
+        status.success(),
+        "TypeScript decorator oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "class decorator differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn class_decorator_initializer_state_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("class-decorator-state-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Open during decorator application: enqueue two callbacks. Closed after
     // evaluation: escaped addInitializer throws TypeError and the rejected
     // callback never runs. FIFO extras and the final binding observe the exact
@@ -1318,18 +1435,77 @@ try {
 }
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "class-decorator-state",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "class decorator state",
+    fs::write(&source_path, source).expect("write class decorator state fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript decorator state oracle");
+    assert!(
+        status.success(),
+        "TypeScript decorator state oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "class decorator state differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn invalid_class_decorator_return_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("class-decorator-invalid-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     let source = r#"function invalid(value, context) { return 42; }
 function invalidClass() {
   @invalid
@@ -1344,18 +1520,77 @@ try {
   console.log(`invalid:${error instanceof TypeError}`);
 }
 "#;
-    assert_tsc_oracle_parity(
-        "class-decorator-invalid",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "invalid class decorator",
+    fs::write(&source_path, source).expect("write invalid class decorator fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript invalid decorator oracle");
+    assert!(
+        status.success(),
+        "TypeScript invalid decorator oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "invalid class decorator differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn invalid_auto_accessor_decorator_return_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("auto-accessor-decorator-invalid-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     let source = r#"let sideEffects = 0;
 function invalid(_target, _context) {
   return function () {
@@ -1378,13 +1613,63 @@ try {
   console.log(`sideEffects:${sideEffects}`);
 }
 "#;
-    assert_tsc_oracle_parity(
-        "auto-accessor-decorator-invalid",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "invalid auto-accessor decorator",
+    fs::write(&source_path, source).expect("write invalid auto-accessor decorator fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript invalid auto-accessor decorator oracle");
+    assert!(
+        status.success(),
+        "TypeScript invalid auto-accessor decorator oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "invalid auto-accessor decorator differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
@@ -1392,13 +1677,15 @@ try {
 fn interpreter_failure_text_names_mode_stage_and_evidence() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("task-113-interpreter-missing-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+
     let spec = CaseSpec {
         id: id.clone(),
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
-        entrypoint: format!("target/{id}.js"),
+        source_dir: source_dir.clone(),
+        entrypoint: format!("{source_dir}/{id}.js"),
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
         constructs: Vec::new(),
@@ -1418,6 +1705,7 @@ fn interpreter_failure_text_names_mode_stage_and_evidence() {
         text.contains("stage=load"),
         "a missing entrypoint must classify as load: {text}"
     );
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         text.contains("could not read"),
         "failure must carry the observed evidence: {text}"
@@ -1481,54 +1769,108 @@ fn compare_case(
     }
 }
 
-/// Writes `source` to `target/{id_prefix}-{pid}.{extension}`, transpiles it with
-/// `tsc` using the pinned flags plus `extra_tsc_args` into
-/// `target/{out_dir}/{id}.js`, then asserts BamTS parity with the Node oracle
-/// across every execution mode. Both fixtures are removed before returning.
-fn assert_tsc_oracle_parity(
-    id_prefix: &str,
-    extension: &str,
-    out_dir: &str,
-    extra_tsc_args: &[&str],
-    source: &str,
-    label: &str,
-) {
+#[test]
+fn namespace_export_star_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let id = format!("{id_prefix}-{}", process::id());
-    let source_relative = format!("target/{id}.{extension}");
-    let source_path = root.join(&source_relative);
-    let transpiled_relative = format!("target/{out_dir}/{id}.js");
-    let transpiled_path = root.join(&transpiled_relative);
+    let id = format!("namespace-export-star-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.ts");
+    let source_path = root.join(format!("{source_dir}/{id}-source.ts"));
+    let root_path = root.join(&entrypoint);
 
-    fs::write(&source_path, source).expect("write tsc oracle fixture");
+    fs::write(&source_path, "export const value = 7;\n").expect("write namespace source fixture");
+    fs::write(
+        &root_path,
+        format!(
+            r#"export * as ns from './{id}-source.ts';
+import {{ ns }} from './{id}.ts';
+console.log(`identity:${{ns === ns}}`);
+console.log(`live:${{ns.value}}`);
+"#
+        ),
+    )
+    .expect("write namespace root fixture");
+    let spec = CaseSpec {
+        id,
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let bamts = BamtsRunner::new(&root);
+    let mut failures = Vec::new();
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "namespace export-star differential failures:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+#[test]
+fn merged_namespace_function_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("merged-namespace-function-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.ts");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
+    let source = r#"function Item(x: number) {
+  return x * 2;
+}
+namespace Item {
+  export const label = "item";
+  export function tag() {
+    return "ns";
+  }
+}
+console.log(`fn:${Item(5)};ns:${Item.label};tag:${Item.tag()}`);
+"#;
+    fs::write(&source_path, source).expect("write merged namespace function fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+    ];
     let status = process::Command::new(root.join("node_modules/.bin/tsc"))
         .arg(&source_path)
-        .args([
-            "--target",
-            "es2022",
-            "--module",
-            "commonjs",
-            "--strict",
-            "false",
-            "--esModuleInterop",
-            "--skipLibCheck",
-        ])
-        .args(extra_tsc_args)
-        .args(["--rootDir", "target", "--outDir"])
-        .arg(format!("target/{out_dir}"))
+        .args(&tsc_args)
         .current_dir(&root)
         .status()
-        .expect("run tsc oracle");
+        .expect("run TypeScript merged-namespace oracle");
     assert!(
         status.success(),
-        "TypeScript oracle transpilation failed with {status}"
+        "TypeScript merged-namespace oracle failed with {status}"
     );
     let spec = CaseSpec {
         id: id.clone(),
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint: transpiled_relative,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -1548,91 +1890,25 @@ fn assert_tsc_oracle_parity(
         let actual = bamts.run_case(&actual_spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(&source_path).expect("remove tsc oracle source fixture");
-    fs::remove_file(&transpiled_path).expect("remove tsc oracle transpiled fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
-        "{label} differential failures:\n{}",
+        "merged namespace function differential failures:\n{}",
         failures.join("\n\n")
-    );
-}
-
-#[test]
-fn namespace_export_star_matches_node_in_every_execution_mode() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let id = format!("namespace-export-star-{}", process::id());
-    let entrypoint = format!("target/{id}.ts");
-    let source_path = root.join(format!("target/{id}-source.ts"));
-    let root_path = root.join(&entrypoint);
-
-    fs::write(&source_path, "export const value = 7;\n").expect("write namespace source fixture");
-    fs::write(
-        &root_path,
-        format!(
-            r#"export * as ns from './{id}-source.ts';
-import {{ ns }} from './{id}.ts';
-console.log(`identity:${{ns === ns}}`);
-console.log(`live:${{ns.value}}`);
-"#
-        ),
-    )
-    .expect("write namespace root fixture");
-
-    let spec = CaseSpec {
-        id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
-        license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
-        entrypoint,
-        node_args: Vec::new(),
-        expected_timeout_ms: 10_000,
-        constructs: Vec::new(),
-        source_files: Vec::new(),
-        compiler_args: Vec::new(),
-    };
-    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
-    let expected = oracle.run_case(&spec);
-    let bamts = BamtsRunner::new(&root);
-    let mut failures = Vec::new();
-    for mode in ExecutionMode::ALL {
-        let actual = bamts.run_case(&spec, mode);
-        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
-    }
-    fs::remove_file(root_path).expect("remove namespace root fixture");
-    fs::remove_file(source_path).expect("remove namespace source fixture");
-    assert!(
-        failures.is_empty(),
-        "namespace export-star differential failures:\n{}",
-        failures.join("\n\n")
-    );
-}
-
-#[test]
-fn merged_namespace_function_matches_tsc_oracle_in_every_execution_mode() {
-    let source = r#"function Item(x: number) {
-  return x * 2;
-}
-namespace Item {
-  export const label = "item";
-  export function tag() {
-    return "ns";
-  }
-}
-console.log(`fn:${Item(5)};ns:${Item.label};tag:${Item.tag()}`);
-"#;
-    assert_tsc_oracle_parity(
-        "merged-namespace-function",
-        "ts",
-        "namespace-oracles",
-        &[],
-        source,
-        "merged namespace function",
     );
 }
 
 #[test]
 fn standard_member_decorators_match_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("standard-member-decorators-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     let source = r#"const trace = [];
 function log(value) { trace.push(value); }
 function tap(label) {
@@ -1714,18 +1990,77 @@ log(`smethod:${Fixture["smethod"](3)}`);
 log(`level:${Fixture.level}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "standard-member-decorators",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "standard member decorator",
+    fs::write(&source_path, source).expect("write standard member decorator fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript standard decorator oracle");
+    assert!(
+        status.success(),
+        "TypeScript standard decorator oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "standard member decorator differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn callable_decorator_initializers_precede_fields_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("callable-decorator-initializers-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Method extras are independent of source position: an instance field before a
     // decorated method still sees FIFO extras first; a static field/block before a
     // decorated static method still sees FIFO extras first on the final class.
@@ -1759,18 +2094,77 @@ log(`method:${instance.method()}`);
 log(`sMethod:${Fixture.sMethod()}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "callable-decorator-initializers",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "callable decorator initializer",
+    fs::write(&source_path, source).expect("write callable decorator initializer fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript callable decorator initializer oracle");
+    assert!(
+        status.success(),
+        "TypeScript callable decorator initializer oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "callable decorator initializer differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn member_decorator_application_stages_match_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("member-decorator-application-stages-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Static members first in source so evaluation order cannot be mistaken for the
     // four application stages: static callable/accessor → instance callable/accessor →
     // static field → instance field. evaluate:/key: stay on the evaluation timeline;
@@ -1805,18 +2199,77 @@ class Fixture {
 }
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "member-decorator-application-stages",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "member decorator application-stage",
+    fs::write(&source_path, source).expect("write member decorator application-stage fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript member decorator application-stage oracle");
+    assert!(
+        status.success(),
+        "TypeScript member decorator application-stage oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "member decorator application-stage differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn auto_accessor_decorator_call_depth_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("auto-accessor-decorator-call-depth-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     let source = r#"const trace = [];
 let applyCount = 0;
 let getCount = 0;
@@ -1851,18 +2304,77 @@ log(`read:${instance.value}`);
 log(`final:apply=${applyCount}:get=${getCount}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "auto-accessor-decorator-call-depth",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "auto-accessor decorator call-depth",
+    fs::write(&source_path, source).expect("write auto-accessor decorator call-depth fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript auto-accessor decorator oracle");
+    assert!(
+        status.success(),
+        "TypeScript auto-accessor decorator oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "auto-accessor decorator call-depth differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn stacked_auto_accessor_decorators_match_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("stacked-auto-accessor-decorators-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     let source = r#"const trace = [];
 const applyCount = { outer: 0, inner: 0 };
 const getCount = { outer: 0, inner: 0 };
@@ -1900,18 +2412,77 @@ log(`read:${instance.value}`);
 log(`final:outerApply=${applyCount.outer}:innerApply=${applyCount.inner}:outerGet=${getCount.outer}:innerGet=${getCount.inner}:outerSet=${setCount.outer}:innerSet=${setCount.inner}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "stacked-auto-accessor-decorators",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "stacked auto-accessor decorator",
+    fs::write(&source_path, source).expect("write stacked auto-accessor decorator fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript stacked auto-accessor decorator oracle");
+    assert!(
+        status.success(),
+        "TypeScript stacked auto-accessor decorator oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "stacked auto-accessor decorator differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn stacked_field_accessor_initializers_match_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("stacked-field-accessor-initializers-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Non-commutative transforms: reversed/duplicated/skipped init order cannot
     // accidentally produce the same final values or log timeline.
     let source = r#"const trace = [];
@@ -1959,18 +2530,77 @@ log(`sValue:${Fixture.sValue}`);
 log(`acc:${instance.acc}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "stacked-field-accessor-initializers",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "stacked field/accessor initializer",
+    fs::write(&source_path, source).expect("write stacked field/accessor initializer fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript stacked field/accessor initializer oracle");
+    assert!(
+        status.success(),
+        "TypeScript stacked field/accessor initializer oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "stacked field/accessor initializer differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn undecorated_auto_accessor_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("undecorated-auto-accessor-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     let source = r#"const trace = [];
 function log(value) { trace.push(value); }
 class C {
@@ -1982,19 +2612,81 @@ instance.value = 2;
 log(`read:${instance.value}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "undecorated-auto-accessor",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "undecorated auto-accessor",
+    fs::write(&source_path, source).expect("write undecorated auto-accessor fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript undecorated auto-accessor oracle");
+    assert!(
+        status.success(),
+        "TypeScript undecorated auto-accessor oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "undecorated auto-accessor differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn class_decorator_replacement_static_field_and_auto_accessor_match_tsc_oracle_in_every_execution_mode()
  {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!(
+        "class-decorator-replacement-static-accessor-{}",
+        process::id()
+    );
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     let source = r#"const trace = [];
 function log(value) { trace.push(value); }
 function replace(value, context) {
@@ -2026,18 +2718,78 @@ const instance = new Fixture();
 log(`total:${instance.total}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "class-decorator-replacement-static-accessor",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "class decorator replacement static/accessor",
+    fs::write(&source_path, source)
+        .expect("write class decorator replacement static/accessor fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript class decorator replacement static/accessor oracle");
+    assert!(
+        status.success(),
+        "TypeScript class decorator replacement static/accessor oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "class decorator replacement static/accessor differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn decorated_member_same_key_last_definition_wins_match_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("decorated-member-same-key-last-wins-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // The staged decorator observes/wraps the later live descriptor, then call returns
     // the later method's result.
     let source = r#"const trace = [];
@@ -2058,19 +2810,82 @@ const instance = new Fixture();
 log(`result:${instance.method()}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "decorated-member-same-key-last-wins",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "decorated member same-key last-definition-wins",
+    fs::write(&source_path, source)
+        .expect("write decorated member same-key last-definition-wins fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript decorated member same-key last-definition-wins oracle");
+    assert!(
+        status.success(),
+        "TypeScript decorated member same-key last-definition-wins oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "decorated member same-key last-definition-wins differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn decorated_member_distinct_computed_keys_same_runtime_key_match_tsc_oracle_in_every_execution_mode()
  {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!(
+        "decorated-member-distinct-computed-same-runtime-key-{}",
+        process::id()
+    );
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Distinct computed key expressions resolve to the same runtime property key in
     // source order. The staged decorator observes the later live descriptor, then
     // call/result use the later undecorated method.
@@ -2093,19 +2908,82 @@ const instance = new Fixture();
 log(`result:${instance.method()}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "decorated-member-distinct-computed-same-runtime-key",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "decorated member distinct computed same-runtime-key",
+    fs::write(&source_path, source)
+        .expect("write decorated member distinct computed same-runtime-key fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript decorated member distinct computed same-runtime-key oracle");
+    assert!(
+        status.success(),
+        "TypeScript decorated member distinct computed same-runtime-key oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "decorated member distinct computed same-runtime-key differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn computed_member_source_order_key_once_and_accessor_init_match_tsc_oracle_in_every_execution_mode()
  {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!(
+        "computed-member-source-order-key-once-accessor-init-{}",
+        process::id()
+    );
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.js");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Undecorated computed members must evaluate/install before later decorated
     // computed members in source order; plain computed instance fields must
     // capture their key once at class definition while initializer runs per
@@ -2157,18 +3035,78 @@ log(`accProp:${first.accProp}`);
 log(`keyCounts:plain=${keyCounts.plain}:decorated=${keyCounts.decorated}:field=${keyCounts.field}:acc=${keyCounts.acc}`);
 console.log(trace.join('\n'));
 "#;
-    assert_tsc_oracle_parity(
-        "computed-member-source-order-key-once-accessor-init",
-        "js",
-        "decorator-oracles",
-        &["--allowJs", "--checkJs", "false"],
-        source,
-        "computed member source-order/key-once/accessor-init",
+    fs::write(&source_path, source)
+        .expect("write computed member source-order/key-once/accessor-init fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+        "--allowJs".into(),
+        "--checkJs".into(),
+        "false".into(),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript computed member source-order/key-once/accessor-init oracle");
+    assert!(
+        status.success(),
+        "TypeScript computed member source-order/key-once/accessor-init oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "computed member source-order/key-once/accessor-init differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn sync_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("sync-explicit-resource-management-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.ts");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Observable trace: declaration/use order, sibling and nested LIFO disposal,
     // and per-iteration disposal via loop-head `for (using r of ...)`.
     let source = r#"(() => {
@@ -2208,18 +3146,76 @@ fn sync_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode(
   console.log(out.join("\n"));
 })();
 "#;
-    assert_tsc_oracle_parity(
-        "sync-explicit-resource-management",
-        "ts",
-        "erm-oracles",
-        &["--lib", "es2022,dom,esnext.disposable"],
-        source,
-        "sync explicit resource management",
+    fs::write(&source_path, source).expect("write sync explicit resource management fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--lib".into(),
+        "es2022,dom,esnext.disposable".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript sync explicit resource management oracle");
+    assert!(
+        status.success(),
+        "TypeScript sync explicit resource management oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "sync explicit resource management differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn async_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("async-explicit-resource-management-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.ts");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Observable trace: declaration/use order, sibling and nested LIFO disposal,
     // and per-iteration disposal via loop-head `for (await using r of ...)`.
     let source = r#"(async () => {
@@ -2284,18 +3280,79 @@ fn async_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode
   console.log(out.join("\n"));
 })();
 "#;
-    assert_tsc_oracle_parity(
-        "async-explicit-resource-management",
-        "ts",
-        "erm-oracles",
-        &["--lib", "es2022,dom,esnext.disposable"],
-        source,
-        "async explicit resource management",
+    fs::write(&source_path, source).expect("write async explicit resource management fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--lib".into(),
+        "es2022,dom,esnext.disposable".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript async explicit resource management oracle");
+    assert!(
+        status.success(),
+        "TypeScript async explicit resource management oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "async explicit resource management differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn sync_explicit_resource_management_suppression_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!(
+        "sync-explicit-resource-management-suppression-{}",
+        process::id()
+    );
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.ts");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Observable trace: when body and every LIFO disposer throw, the catch receives a
     // nested SuppressedError chain exposing outer disposal, inner disposal, and body.
     let source = r#"(() => {
@@ -2320,18 +3377,77 @@ fn sync_explicit_resource_management_suppression_matches_tsc_oracle_in_every_exe
   console.log(out.join("\n"));
 })();
 "#;
-    assert_tsc_oracle_parity(
-        "sync-explicit-resource-management-suppression",
-        "ts",
-        "erm-oracles",
-        &["--lib", "es2022,dom,esnext.disposable"],
-        source,
-        "sync explicit resource management suppression",
+    fs::write(&source_path, source)
+        .expect("write sync explicit resource management suppression fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--lib".into(),
+        "es2022,dom,esnext.disposable".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript sync explicit resource management suppression oracle");
+    assert!(
+        status.success(),
+        "TypeScript sync explicit resource management suppression oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "sync explicit resource management suppression differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn resource_management_abrupt_completion_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!("resource-management-abrupt-completion-{}", process::id());
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.ts");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Observable chronological trace over custom iterators: return through enclosing
     // finally, same-loop continue without iterator.return, break with user-finally ->
     // dispose -> iterator.return, and labeled continue outer closing the inner iterator.
@@ -2430,18 +3546,79 @@ fn resource_management_abrupt_completion_matches_tsc_oracle_in_every_execution_m
   console.log(out.join("\n"));
 })();
 "#;
-    assert_tsc_oracle_parity(
-        "resource-management-abrupt-completion",
-        "ts",
-        "erm-oracles",
-        &["--lib", "es2022,dom,esnext.disposable"],
-        source,
-        "resource management abrupt completion",
+    fs::write(&source_path, source).expect("write resource management abrupt completion fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--lib".into(),
+        "es2022,dom,esnext.disposable".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript resource management abrupt completion oracle");
+    assert!(
+        status.success(),
+        "TypeScript resource management abrupt completion oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "resource management abrupt completion differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
 #[test]
 fn async_explicit_resource_management_suppression_matches_tsc_oracle_in_every_execution_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let id = format!(
+        "async-explicit-resource-management-suppression-{}",
+        process::id()
+    );
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let source_relative = format!("{source_dir}/{id}.ts");
+    let source_path = root.join(&source_relative);
+    let transpiled_relative = format!("{source_dir}/oracles/{id}.js");
+    let _transpiled_path = root.join(&transpiled_relative);
+
     // Observable trace: each async disposer queues a microtask before Await, then throws.
     // The chain includes both SuppressedError nodes.
     let source = r#"(async () => {
@@ -2470,13 +3647,63 @@ fn async_explicit_resource_management_suppression_matches_tsc_oracle_in_every_ex
   console.log(out.join("\n"));
 })();
 "#;
-    assert_tsc_oracle_parity(
-        "async-explicit-resource-management-suppression",
-        "ts",
-        "erm-oracles",
-        &["--lib", "es2022,dom,esnext.disposable"],
-        source,
-        "async explicit resource management suppression",
+    fs::write(&source_path, source)
+        .expect("write async explicit resource management suppression fixture");
+    let tsc_args: Vec<String> = vec![
+        "--target".into(),
+        "es2022".into(),
+        "--module".into(),
+        "commonjs".into(),
+        "--strict".into(),
+        "false".into(),
+        "--esModuleInterop".into(),
+        "--skipLibCheck".into(),
+        "--lib".into(),
+        "es2022,dom,esnext.disposable".into(),
+        "--rootDir".into(),
+        source_dir.clone(),
+        "--outDir".into(),
+        format!("{source_dir}/oracles"),
+    ];
+    let status = process::Command::new(root.join("node_modules/.bin/tsc"))
+        .arg(&source_path)
+        .args(&tsc_args)
+        .current_dir(&root)
+        .status()
+        .expect("run TypeScript async explicit resource management suppression oracle");
+    assert!(
+        status.success(),
+        "TypeScript async explicit resource management suppression oracle failed with {status}"
+    );
+    let spec = CaseSpec {
+        id: id.clone(),
+        provenance: local_test_provenance(&root, &source_dir),
+        license: "UNLICENSED".to_owned(),
+        source_dir: source_dir.clone(),
+        entrypoint: transpiled_relative,
+        node_args: Vec::new(),
+        expected_timeout_ms: 10_000,
+        constructs: Vec::new(),
+        source_files: Vec::new(),
+        compiler_args: Vec::new(),
+    };
+    let bamts = BamtsRunner::new(&root);
+    let oracle = NodeOracle::discover(&root).expect("Node oracle available");
+    let expected = oracle.run_case(&spec);
+    let mut failures = Vec::new();
+    let actual_spec = CaseSpec {
+        entrypoint: source_relative,
+        ..spec.clone()
+    };
+    for mode in ExecutionMode::ALL {
+        let actual = bamts.run_case(&actual_spec, mode);
+        compare_case(&spec.id, mode, &expected, &actual, &mut failures);
+    }
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
+    assert!(
+        failures.is_empty(),
+        "async explicit resource management suppression differential failures:\n{}",
+        failures.join("\n\n")
     );
 }
 
@@ -2484,7 +3711,9 @@ fn async_explicit_resource_management_suppression_matches_tsc_oracle_in_every_ex
 fn with_statement_semantics_matches_node_in_every_execution_mode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let id = format!("with-statement-{}", process::id());
-    let entrypoint = format!("target/{id}.js");
+    let source_dir = format!("target/{id}");
+    fs::create_dir_all(root.join(&source_dir)).expect("create fixture directory");
+    let entrypoint = format!("{source_dir}/{id}.js");
     let path = root.join(&entrypoint);
     fs::write(
         &path,
@@ -2574,10 +3803,9 @@ fn with_statement_semantics_matches_node_in_every_execution_mode() {
     .expect("write with-statement fixture");
     let spec = CaseSpec {
         id,
-        repository: "local".to_owned(),
-        commit: "0".repeat(40),
+        provenance: local_test_provenance(&root, &source_dir),
         license: "UNLICENSED".to_owned(),
-        source_dir: "target".to_owned(),
+        source_dir: source_dir.clone(),
         entrypoint,
         node_args: Vec::new(),
         expected_timeout_ms: 10_000,
@@ -2593,7 +3821,7 @@ fn with_statement_semantics_matches_node_in_every_execution_mode() {
         let actual = bamts.run_case(&spec, mode);
         compare_case(&spec.id, mode, &expected, &actual, &mut failures);
     }
-    fs::remove_file(path).expect("remove with-statement fixture");
+    fs::remove_dir_all(root.join(&source_dir)).expect("remove fixture directory");
     assert!(
         failures.is_empty(),
         "with-statement differential failures:\n{}",

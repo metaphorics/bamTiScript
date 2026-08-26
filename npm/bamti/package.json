@@ -12,24 +12,70 @@
   },
   "type": "module",
   "main": "./index.js",
-  "exports": "./index.js",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    },
+    "./unstable/sync": {
+      "types": "./unstable/sync.d.ts",
+      "import": "./unstable/sync.js"
+    },
+    "./unstable/async": {
+      "types": "./unstable/async.d.ts",
+      "import": "./unstable/async.js"
+    },
+    "./unstable/fs": {
+      "types": "./unstable/fs.d.ts",
+      "import": "./unstable/fs.js"
+    },
+    "./unstable/proto": {
+      "types": "./unstable/proto.d.ts",
+      "import": "./unstable/proto.js"
+    },
+    "./unstable/ast": {
+      "types": "./unstable/ast/index.d.ts",
+      "import": "./unstable/ast/index.js"
+    },
+    "./unstable/ast/is": {
+      "types": "./unstable/ast/is.d.ts",
+      "import": "./unstable/ast/is.js"
+    },
+    "./unstable/ast/factory": {
+      "types": "./unstable/ast/factory.d.ts",
+      "import": "./unstable/ast/factory.js"
+    },
+    "./unstable/ast/utils": {
+      "types": "./unstable/ast/utils.d.ts",
+      "import": "./unstable/ast/utils.js"
+    },
+    "./unstable/ast/scanner": {
+      "types": "./unstable/ast/scanner.d.ts",
+      "import": "./unstable/ast/scanner.js"
+    },
+    "./unstable/ast/visitor": {
+      "types": "./unstable/ast/visitor.d.ts",
+      "import": "./unstable/ast/visitor.js"
+    },
+    "./unstable/ast/clone": {
+      "types": "./unstable/ast/clone.d.ts",
+      "import": "./unstable/ast/clone.js"
+    },
+    "./package.json": "./package.json"
+  },
   "types": "./index.d.ts",
-  "scripts": {
-    "prepublishOnly": "node --input-type=module -e \"import { accessSync } from 'node:fs'; accessSync('native-release-table.json')\""
+  "bin": {
+    "tsc": "native-runner.js"
   },
   "files": [
     "README.md",
     "index.d.ts",
     "index.js",
-    "native-loader.js",
-    "native-release-table.json",
+    "internal/",
+    "unstable/",
     "native-runner.js"
   ],
-  "optionalDependencies": {
-    "@bamti/bamti-linux-x64-gnu": "0.2.0",
-    "@bamti/bamti-linux-arm64-gnu": "0.2.0",
-    "@bamti/bamti-darwin-x64": "0.2.0",
-    "@bamti/bamti-darwin-arm64": "0.2.0",
-    "@bamti/bamti-win32-x64-msvc": "0.2.0"
+  "dependencies": {
+    "bamti-cli": "0.2.0"
   }
 }

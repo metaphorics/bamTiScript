@@ -1,0 +1,18 @@
+schema = 1
+id = "derived-construction"
+repository = "local"
+commit = "2f0fd8c308717c827e30b19684fa114f7c5a2036"
+license = "UNLICENSED"
+source_dir = "corpus/cases"
+entrypoint = "corpus/cases/derived-construction.ts"
+node_args = []
+expected_timeout_ms = 10000
+constructs = [
+  "derived-super-control-flow",
+  "derived-constructor-return-override",
+  "default-derived-field-init",
+  "new-target-most-derived",
+]
+source_files = [
+  "corpus/cases/derived-construction.ts",
+]

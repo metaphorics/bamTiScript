@@ -343,7 +343,7 @@ fn is_line_terminator(c: char) -> bool {
 }
 
 fn is_id_continue(c: char) -> bool {
-    c == '$' || c == '_' || c == '\u{200C}' || c == '\u{200D}' || c.is_alphanumeric()
+    c == '$' || c == '\u{200C}' || c == '\u{200D}' || unicode_id_start::is_id_continue(c)
 }
 
 /// Returns whether a token may serve as an identifier reference or binding
@@ -863,7 +863,7 @@ impl Parser {
             Some(c)
         };
         let _slash = take(&mut chars, &mut consumed);
-        let mut in_class = false;
+        let mut class_depth = 0usize;
         let mut terminated = false;
         loop {
             let mut peek = chars.clone();
@@ -882,14 +882,14 @@ impl Parser {
                     }
                 }
                 Some('[') => {
-                    in_class = true;
+                    class_depth += 1;
                     take(&mut chars, &mut consumed);
                 }
                 Some(']') => {
-                    in_class = false;
+                    class_depth = class_depth.saturating_sub(1);
                     take(&mut chars, &mut consumed);
                 }
-                Some('/') if !in_class => {
+                Some('/') if class_depth == 0 => {
                     take(&mut chars, &mut consumed);
                     terminated = true;
                     break;
@@ -2844,11 +2844,10 @@ impl Parser {
     }
 
     fn parse_optional_import_attributes(&mut self) -> Option<ImportAttributes> {
-        let is_with = self.at(TokenKind::KwWith);
+        let is_with = self.at(TokenKind::KwWith) && self.nth_kind(1) == TokenKind::LBrace;
         let is_assert = is_identifier_like(self.kind())
             && self.cur_lexeme() == "assert"
-            && self.nth_kind(1) == TokenKind::LBrace
-            && !self.has_newline_before();
+            && self.nth_kind(1) == TokenKind::LBrace;
         if !is_with && !is_assert {
             return None;
         }
@@ -3060,9 +3059,20 @@ impl Parser {
             TokenKind::KwInterface => ExportDefaultValue::Interface(self.parse_interface()),
             TokenKind::At => {
                 let decorators = self.parse_decorators();
+                let modifiers =
+                    if self.at(TokenKind::KwAbstract) && self.nth_kind(1) == TokenKind::KwClass {
+                        let range = self.cur().range();
+                        self.note_typescript_syntax(range);
+                        self.bump();
+                        DeclarationModifiers {
+                            is_abstract: true,
+                            ..DeclarationModifiers::default()
+                        }
+                    } else {
+                        DeclarationModifiers::default()
+                    };
                 if self.at(TokenKind::KwClass) {
-                    let class =
-                        self.parse_class(decorators, DeclarationModifiers::default(), false);
+                    let class = self.parse_class(decorators, modifiers, false);
                     ExportDefaultValue::Class(class)
                 } else {
                     self.error_here(EXPECTED_TOKEN, "decorators must precede a class");
@@ -6103,12 +6113,14 @@ impl Parser {
             if self.at(TokenKind::LBrace) {
                 self.bump();
                 let attrs = if self.at(TokenKind::KwWith)
-                    || (is_identifier_like(self.kind()) && self.cur_lexeme() == "with")
+                    || is_identifier_like(self.kind())
+                        && matches!(self.cur_lexeme(), "with" | "assert")
                 {
                     self.bump();
-                    self.expect(TokenKind::Colon, "expected `:`");
+                    self.expect(TokenKind::Colon, "expected colon");
                     self.parse_attribute_object()
                 } else {
+                    self.error_here(EXPECTED_TOKEN, "expected with or assert");
                     ImportAttributes::default()
                 };
                 while !self.at_eof() && !self.at(TokenKind::RBrace) {
@@ -8258,5 +8270,128 @@ mod tests {
             matches!(result, Err(ParseError::Cancelled(_))),
             "cancelled parse must return ParseError::Cancelled"
         );
+    }
+    #[test]
+    fn parses_static_import_attributes_across_module_forms() {
+        let recovered = assert_clean(
+            "import 'side' with { 'type': 'json', mode: 'lazy' };\n\
+             import data from 'legacy' assert { type: 'json' };\n\
+             export { value } from 'named' with { type: 'json' };\n\
+             export * as ns from 'all' with { type: 'json' };",
+        );
+        let statements = recovered.product().statements();
+        let Statement::Import(side_effect) = statements[0].data() else {
+            panic!("expected side-effect import")
+        };
+        assert_eq!(side_effect.attributes.as_ref().unwrap().entries.len(), 2);
+        let Statement::Import(legacy) = statements[1].data() else {
+            panic!("expected legacy asserted import")
+        };
+        assert_eq!(legacy.attributes.as_ref().unwrap().entries.len(), 1);
+        let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            attributes,
+            ..
+        })) = statements[2].data()
+        else {
+            panic!("expected named re-export")
+        };
+        assert_eq!(attributes.as_ref().unwrap().entries.len(), 1);
+        let Statement::Export(ExportDeclaration::All(export_all)) = statements[3].data() else {
+            panic!("expected namespace re-export")
+        };
+        assert_eq!(export_all.attributes.as_ref().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn static_import_attributes_survive_line_terminators() {
+        let recovered = assert_clean(
+            "import 'mod'\nwith { type: 'json' };\n\
+             import data from 'legacy'\nassert { type: 'json' };\n\
+             export { value } from 'out'\nwith { type: 'json' };",
+        );
+        let statements = recovered.product().statements();
+        let Statement::Import(side_effect) = statements[0].data() else {
+            panic!("expected side-effect import")
+        };
+        assert!(side_effect.attributes.is_some());
+        let Statement::Import(legacy) = statements[1].data() else {
+            panic!("expected asserted import")
+        };
+        assert!(legacy.attributes.is_some());
+        let Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            attributes,
+            ..
+        })) = statements[2].data()
+        else {
+            panic!("expected re-export")
+        };
+        assert!(attributes.is_some());
+
+        let disambiguated = assert_clean("import 'scope'\nwith (scope) { value; }");
+        let Statement::Import(import) = disambiguated.product().statements()[0].data() else {
+            panic!("expected import declaration")
+        };
+        assert!(import.attributes.is_none());
+        assert_eq!(disambiguated.product().statements().len(), 2);
+    }
+
+    #[test]
+    fn parses_dynamic_and_import_type_attribute_options() {
+        let recovered = assert_clean(
+            "const promise = import('mod', { with: { type: 'json' } },);\n\
+             type Payload = import('legacy', { assert: { type: 'json' } });",
+        );
+        let Statement::Variable(declaration) = recovered.product().statements()[0].data() else {
+            panic!("expected dynamic import declaration")
+        };
+        let Expression::Import(import) = declaration.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer")
+            .data()
+        else {
+            panic!("expected import expression")
+        };
+        assert!(import.options.is_some());
+
+        let Statement::TypeAlias(alias) = recovered.product().statements()[1].data() else {
+            panic!("expected type alias")
+        };
+        let TypeNode::Import(import_type) = alias.type_node.data() else {
+            panic!("expected import type")
+        };
+        assert_eq!(import_type.attributes.as_ref().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn parses_decorated_abstract_default_export() {
+        let recovered = assert_clean("export default @sealed abstract class C {}");
+        let Statement::Export(ExportDeclaration::Default(export)) =
+            recovered.product().statements()[0].data()
+        else {
+            panic!("expected default export")
+        };
+        let ExportDefaultValue::Class(class) = &export.value else {
+            panic!("expected exported class")
+        };
+        assert_eq!(class.decorators.len(), 1);
+        assert!(class.modifiers.is_abstract);
+    }
+
+    #[test]
+    fn regex_v_rescan_keeps_slashes_inside_nested_classes() {
+        let recovered = assert_clean("const pattern = /[[a]/]/v;");
+        let regex = recovered
+            .product()
+            .tokens()
+            .iter()
+            .find(|token| token.kind() == TokenKind::RegularExpressionLiteral)
+            .expect("regex token");
+        assert_eq!(
+            regex.range().end().get() - regex.range().start().get(),
+            "/[[a]/]/v".len()
+        );
+        assert_tokens_tile(&recovered);
     }
 }

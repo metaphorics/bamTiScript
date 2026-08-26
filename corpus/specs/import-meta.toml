@@ -1,0 +1,17 @@
+schema = 1
+id = "import-meta"
+repository = "local"
+commit = "4fa3e55353469b874c705d2cd0745f6cf5e218e8"
+license = "UNLICENSED"
+source_dir = "corpus/cases"
+entrypoint = "corpus/cases/import-meta.ts"
+node_args = []
+expected_timeout_ms = 10000
+constructs = [
+  "import-meta-identity",
+  "import-meta-mutation",
+  "import-meta-url",
+]
+source_files = [
+  "corpus/cases/import-meta.ts",
+]

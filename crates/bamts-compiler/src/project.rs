@@ -1,4 +1,14 @@
-use crate::lint::{LintConfig, LintLevel, LintSetting};
+pub mod build_mode;
+pub mod effective;
+pub mod output;
+pub mod references;
+pub mod resolution;
+pub mod tsconfig;
+
+use crate::{
+    lint::{LintConfig, LintLevel, LintSetting},
+    source::JsxEmit,
+};
 
 use std::{
     fmt,
@@ -201,6 +211,13 @@ pub struct JsonObject {
 }
 
 impl JsonObject {
+    #[must_use]
+    pub fn from_entries(entries: Vec<(Arc<str>, JsonValue)>) -> Self {
+        Self {
+            entries: Arc::from(entries),
+        }
+    }
+
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
         self.entries
@@ -905,14 +922,29 @@ pub struct CompilerOptions {
     target: Option<Arc<str>>,
     module: Option<Arc<str>>,
     module_resolution: Option<Arc<str>>,
-    jsx: Option<Arc<str>>,
+    jsx: Option<JsxEmit>,
+    jsx_factory: Option<Arc<str>>,
+    jsx_fragment_factory: Option<Arc<str>>,
+    jsx_import_source: Option<Arc<str>>,
     strict: bool,
-    strict_null_checks: bool,
-    no_implicit_any: bool,
-    always_strict: bool,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
+    declaration: bool,
+    declaration_map: bool,
+    declaration_dir: Option<PathBuf>,
+    source_map: bool,
+    inline_source_map: bool,
+    map_root: Option<PathBuf>,
+    source_root: Option<PathBuf>,
+    no_emit: bool,
+    no_emit_on_error: bool,
+    emit_declaration_only: bool,
+    incremental: bool,
+    composite: bool,
+    ts_build_info_file: Option<PathBuf>,
+    new_line: Option<Arc<str>>,
+    out_file: Option<PathBuf>,
     base_url: PathBuf,
     root_dir: Option<PathBuf>,
     out_dir: Option<PathBuf>,
@@ -936,28 +968,28 @@ impl CompilerOptions {
     }
 
     #[must_use]
-    pub fn jsx(&self) -> Option<&str> {
-        self.jsx.as_deref()
+    pub const fn jsx(&self) -> Option<JsxEmit> {
+        self.jsx
+    }
+
+    #[must_use]
+    pub fn jsx_factory(&self) -> Option<&str> {
+        self.jsx_factory.as_deref()
+    }
+
+    #[must_use]
+    pub fn jsx_fragment_factory(&self) -> Option<&str> {
+        self.jsx_fragment_factory.as_deref()
+    }
+
+    #[must_use]
+    pub fn jsx_import_source(&self) -> Option<&str> {
+        self.jsx_import_source.as_deref()
     }
 
     #[must_use]
     pub const fn strict(&self) -> bool {
         self.strict
-    }
-
-    #[must_use]
-    pub const fn strict_null_checks(&self) -> bool {
-        self.strict_null_checks
-    }
-
-    #[must_use]
-    pub const fn no_implicit_any(&self) -> bool {
-        self.no_implicit_any
-    }
-
-    #[must_use]
-    pub const fn always_strict(&self) -> bool {
-        self.always_strict
     }
 
     #[must_use]
@@ -973,6 +1005,80 @@ impl CompilerOptions {
     #[must_use]
     pub const fn resolve_json_module(&self) -> bool {
         self.resolve_json_module
+    }
+    #[must_use]
+    pub const fn declaration(&self) -> bool {
+        self.declaration
+    }
+
+    #[must_use]
+    pub const fn declaration_map(&self) -> bool {
+        self.declaration_map
+    }
+
+    #[must_use]
+    pub fn declaration_dir(&self) -> Option<&Path> {
+        self.declaration_dir.as_deref()
+    }
+
+    #[must_use]
+    pub const fn source_map(&self) -> bool {
+        self.source_map
+    }
+
+    #[must_use]
+    pub const fn inline_source_map(&self) -> bool {
+        self.inline_source_map
+    }
+
+    #[must_use]
+    pub fn map_root(&self) -> Option<&Path> {
+        self.map_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
+    }
+
+    #[must_use]
+    pub const fn no_emit(&self) -> bool {
+        self.no_emit
+    }
+
+    #[must_use]
+    pub const fn no_emit_on_error(&self) -> bool {
+        self.no_emit_on_error
+    }
+
+    #[must_use]
+    pub const fn emit_declaration_only(&self) -> bool {
+        self.emit_declaration_only
+    }
+
+    #[must_use]
+    pub const fn incremental(&self) -> bool {
+        self.incremental
+    }
+
+    #[must_use]
+    pub const fn composite(&self) -> bool {
+        self.composite
+    }
+
+    #[must_use]
+    pub fn ts_build_info_file(&self) -> Option<&Path> {
+        self.ts_build_info_file.as_deref()
+    }
+
+    #[must_use]
+    pub fn new_line(&self) -> Option<&str> {
+        self.new_line.as_deref()
+    }
+
+    #[must_use]
+    pub fn out_file(&self) -> Option<&Path> {
+        self.out_file.as_deref()
     }
 
     #[must_use]
@@ -1016,15 +1122,24 @@ impl ProjectConfig {
         config_path: impl AsRef<Path>,
         source: &str,
     ) -> Result<Self, ConfigError> {
-        let path = root.confine(config_path)?;
-        let directory = path
-            .parent()
-            .ok_or_else(|| PathError::PathHasNoParent { path: path.clone() })?;
         let value = parse_jsonc(source)?;
         let raw = value
             .as_object()
             .ok_or(ConfigError::RootMustBeObject)?
             .clone();
+        Self::parse_value(root, config_path, raw)
+    }
+
+    /// Parses an already-decoded tsconfig object.
+    pub fn parse_value(
+        root: &ProjectRoot,
+        config_path: impl AsRef<Path>,
+        raw: JsonObject,
+    ) -> Result<Self, ConfigError> {
+        let path = root.confine(config_path)?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| PathError::PathHasNoParent { path: path.clone() })?;
         let extends = optional_string(&raw, "extends")?;
         let files = path_list(root, directory, &raw, "files")?;
         let include = string_list(&raw, "include")?;
@@ -1042,22 +1157,33 @@ impl ProjectConfig {
         let base_url = optional_path(root, directory, compiler, "baseUrl")?
             .unwrap_or_else(|| directory.to_path_buf());
         let paths = parse_path_mappings(root, &base_url, compiler)?;
-        let strict = optional_bool(compiler, "strict")?.unwrap_or(false);
-        let strict_null_checks = optional_bool(compiler, "strictNullChecks")?.unwrap_or(strict);
-        let no_implicit_any = optional_bool(compiler, "noImplicitAny")?.unwrap_or(strict);
-        let always_strict = optional_bool(compiler, "alwaysStrict")?.unwrap_or(strict);
         let options = CompilerOptions {
             target: optional_nested_string(compiler, "target")?,
             module: optional_nested_string(compiler, "module")?,
             module_resolution: optional_nested_string(compiler, "moduleResolution")?,
-            jsx: optional_nested_string(compiler, "jsx")?,
-            strict,
-            strict_null_checks,
-            no_implicit_any,
-            always_strict,
+            jsx: optional_jsx_emit(compiler)?,
+            jsx_factory: optional_nested_string(compiler, "jsxFactory")?,
+            jsx_fragment_factory: optional_nested_string(compiler, "jsxFragmentFactory")?,
+            jsx_import_source: optional_nested_string(compiler, "jsxImportSource")?,
+            strict: optional_bool(compiler, "strict")?.unwrap_or(false),
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
             resolve_json_module: optional_bool(compiler, "resolveJsonModule")?.unwrap_or(false),
+            declaration: optional_bool(compiler, "declaration")?.unwrap_or(false),
+            declaration_map: optional_bool(compiler, "declarationMap")?.unwrap_or(false),
+            declaration_dir: optional_path(root, directory, compiler, "declarationDir")?,
+            source_map: optional_bool(compiler, "sourceMap")?.unwrap_or(false),
+            inline_source_map: optional_bool(compiler, "inlineSourceMap")?.unwrap_or(false),
+            map_root: optional_path(root, directory, compiler, "mapRoot")?,
+            source_root: optional_path(root, directory, compiler, "sourceRoot")?,
+            no_emit: optional_bool(compiler, "noEmit")?.unwrap_or(false),
+            no_emit_on_error: optional_bool(compiler, "noEmitOnError")?.unwrap_or(false),
+            emit_declaration_only: optional_bool(compiler, "emitDeclarationOnly")?.unwrap_or(false),
+            incremental: optional_bool(compiler, "incremental")?.unwrap_or(false),
+            composite: optional_bool(compiler, "composite")?.unwrap_or(false),
+            ts_build_info_file: optional_path(root, directory, compiler, "tsBuildInfoFile")?,
+            new_line: optional_nested_string(compiler, "newLine")?,
+            out_file: optional_path(root, directory, compiler, "outFile")?,
             base_url,
             root_dir: optional_path(root, directory, compiler, "rootDir")?,
             out_dir: optional_path(root, directory, compiler, "outDir")?,
@@ -1137,6 +1263,19 @@ fn optional_nested_string(
     key: &'static str,
 ) -> Result<Option<Arc<str>>, ConfigError> {
     object.map_or(Ok(None), |object| optional_string(object, key))
+}
+
+fn optional_jsx_emit(object: Option<&JsonObject>) -> Result<Option<JsxEmit>, ConfigError> {
+    optional_nested_string(object, "jsx")?
+        .map(|value| {
+            value.parse().map_err(|()| {
+                invalid_field(
+                    "jsx",
+                    r#"one of "preserve", "react", "react-native", "react-jsx", or "react-jsxdev""#,
+                )
+            })
+        })
+        .transpose()
 }
 
 fn optional_bool(
@@ -2059,6 +2198,7 @@ mod tests {
         PackageJson, PackageMode, PackageTarget, ProjectConfig, ProjectRoot, ResolutionConditions,
         ResolutionFlavor, parse_bamts_toml, parse_jsonc, plan_relative_module,
     };
+    use crate::source::JsxEmit;
     use std::path::{Path, PathBuf};
 
     fn root() -> ProjectRoot {
@@ -2190,6 +2330,10 @@ mod tests {
                     "moduleResolution": "NodeNext",
                     "strict": true,
                     "resolveJsonModule": true,
+                    "jsx": "react-jsx",
+                    "jsxFactory": "h",
+                    "jsxFragmentFactory": "Fragment",
+                    "jsxImportSource": "@scope/runtime",
                     "baseUrl": ".",
                     "paths": { "#src/*": ["src/*"] },
                 },
@@ -2200,6 +2344,10 @@ mod tests {
         assert_eq!(config.options().module(), Some("NodeNext"));
         assert!(config.options().strict());
         assert!(config.options().resolve_json_module());
+        assert_eq!(config.options().jsx(), Some(JsxEmit::ReactJsx));
+        assert_eq!(config.options().jsx_factory(), Some("h"));
+        assert_eq!(config.options().jsx_fragment_factory(), Some("Fragment"));
+        assert_eq!(config.options().jsx_import_source(), Some("@scope/runtime"));
         assert_eq!(
             config.options().base_url(),
             Path::new("/workspace/corpus/projects/hookable")
@@ -2220,6 +2368,17 @@ mod tests {
         )
         .expect_err("wrong type");
         assert!(matches!(wrong, ConfigError::InvalidField { .. }));
+
+        let jsx = ProjectConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{"compilerOptions":{"jsx":"React"}}"#,
+        )
+        .expect_err("jsx values use the canonical closed set");
+        assert!(matches!(
+            jsx,
+            ConfigError::InvalidField { field, .. } if field.as_ref() == "jsx"
+        ));
 
         let escape = ProjectConfig::parse(
             &root(),

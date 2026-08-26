@@ -1,0 +1,18 @@
+schema = 1
+id = "lexical-environment"
+repository = "local"
+commit = "87d9ea925a30b200968a20327b3a874bcfdc945f"
+license = "UNLICENSED"
+source_dir = "corpus/cases"
+entrypoint = "corpus/cases/lexical-environment.ts"
+node_args = []
+expected_timeout_ms = 10000
+constructs = [
+  "declaration-owned-self-capture",
+  "lexical-tdz",
+  "class-name-tdz",
+  "block-shadow-tdz",
+]
+source_files = [
+  "corpus/cases/lexical-environment.ts",
+]

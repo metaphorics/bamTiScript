@@ -1347,7 +1347,7 @@ mod tests {
     fn load_error_message_attaches_budget_codes() {
         let oversized = ProgramLoadError::SourceTooLarge {
             path: std::path::PathBuf::from("huge.ts"),
-            len: 16 * 1024 * 1024 + 1,
+            len: MAX_SOURCE_BYTES + 1,
         };
         let message = load_error_message(&oversized);
         assert!(message.starts_with("error[BAMTS-R001]: "));
@@ -1355,7 +1355,7 @@ mod tests {
 
         let session = ProgramLoadError::SessionTooLarge {
             path: std::path::PathBuf::from("next.ts"),
-            total: 256 * 1024 * 1024 + 1,
+            total: MAX_SESSION_SOURCE_BYTES + 1,
         };
         let message = load_error_message(&session);
         assert!(message.starts_with("error[BAMTS-R002]: "));

@@ -22,9 +22,13 @@ pub(super) fn install<H: Host>(
     let species = symbol(heap, "Symbol.species");
     let dispose = symbol(heap, "Symbol.dispose");
     let async_dispose = symbol(heap, "Symbol.asyncDispose");
+    let match_symbol = symbol(heap, "Symbol.match");
+    let replace_symbol = symbol(heap, "Symbol.replace");
     let unscopables = symbol(heap, "Symbol.unscopables");
     builtins.set_symbol_iterator(iterator);
     builtins.set_symbol_async_iterator(async_iterator);
+    builtins.set_symbol_match(match_symbol);
+    builtins.set_symbol_replace(replace_symbol);
     builtins.set_symbol_to_string_tag(to_string_tag);
     builtins.set_symbol_species(species);
     builtins.set_symbol_dispose(dispose);
@@ -40,6 +44,8 @@ pub(super) fn install<H: Host>(
         ("iterator", iterator),
         ("asyncIterator", async_iterator),
         ("hasInstance", has_instance),
+        ("match", match_symbol),
+        ("replace", replace_symbol),
         ("toStringTag", to_string_tag),
         ("species", species),
         ("dispose", dispose),
@@ -243,6 +249,8 @@ mod tests {
             "iterator" => Some(builtins.symbol_iterator()),
             "asyncIterator" => Some(builtins.symbol_async_iterator()),
             "hasInstance" => None,
+            "match" => Some(builtins.symbol_match()),
+            "replace" => Some(builtins.symbol_replace()),
             "toStringTag" => Some(builtins.symbol_to_string_tag()),
             "species" => Some(builtins.symbol_species()),
             "dispose" => Some(builtins.symbol_dispose()),

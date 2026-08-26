@@ -1,0 +1,186 @@
+use std::collections::BTreeMap;
+
+use bamts_bytecode::{DisposeHint, EcmaString};
+use bamts_native::Value;
+
+use super::{builtin_property, define_data, define_to_string_tag, heap_index, install_function};
+use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::vm::explicit_resource::{
+    ASYNC_DISPOSABLE_STACK_CONSTRUCTOR, ASYNC_DISPOSABLE_STACK_INSTALLS,
+    ASYNC_DISPOSABLE_STACK_METHODS, DISPOSABLE_STACK_CONSTRUCTOR, DISPOSABLE_STACK_INSTALLS,
+    DISPOSABLE_STACK_METHODS, StackInstall, StackMethodKind,
+    async_disposable_stack_disposed_getter, async_disposable_stack_method_handler,
+    disposable_stack_disposed_getter, disposable_stack_method_handler, stack_constructor_handler,
+};
+use crate::{
+    EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ThrowOrigin,
+};
+
+fn disposed_stack<H: Host>(
+    machine: &Machine<'_, H>,
+    this: Value,
+    expected_hint: DisposeHint,
+) -> Result<bool, EvalFailure> {
+    let index = machine
+        .runtime_slot(this)
+        .map_err(EvalFailure::Runtime)?
+        .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "DisposableStack method called on incompatible receiver",
+        }))?;
+    match &machine.heap[index] {
+        HeapEntry::DisposableStack { state, hint, .. } if *hint == expected_hint => {
+            Ok(state.is_disposed())
+        }
+        _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+            operation: "DisposableStack method called on incompatible receiver",
+        })),
+    }
+}
+
+fn disposable_stack_public_method<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let dispose = machine
+        .current_builtin_id()
+        .is_some_and(|id| machine.intrinsics.builtins.get(id).name == "dispose");
+    if dispose && disposed_stack(machine, this, DisposeHint::Sync)? {
+        return Ok(BuiltinOutcome::Value(Value::UNDEFINED));
+    }
+    disposable_stack_method_handler(machine, this, args, constructing)
+}
+
+fn async_disposable_stack_public_method<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let dispose = machine
+        .current_builtin_id()
+        .is_some_and(|id| machine.intrinsics.builtins.get(id).name == "disposeAsync");
+    if dispose && disposed_stack(machine, this, DisposeHint::Async)? {
+        let promise = machine.create_promise()?;
+        machine
+            .fulfill_promise(promise, Value::UNDEFINED)
+            .map_err(EvalFailure::Runtime)?;
+        return Ok(BuiltinOutcome::Value(promise));
+    }
+    async_disposable_stack_method_handler(machine, this, args, constructing)
+}
+
+pub(super) fn install<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    globals: &mut BTreeMap<EcmaString, Value>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    for descriptor in [
+        DISPOSABLE_STACK_CONSTRUCTOR,
+        ASYNC_DISPOSABLE_STACK_CONSTRUCTOR,
+    ] {
+        let prototype = ordinary(heap, Some(builtins.object_prototype()));
+        let (methods, installs, method_handler, disposed_getter) = match descriptor.hint {
+            DisposeHint::Sync => {
+                builtins.set_disposable_stack_prototype(prototype);
+                (
+                    DISPOSABLE_STACK_METHODS.as_slice(),
+                    DISPOSABLE_STACK_INSTALLS.as_slice(),
+                    disposable_stack_public_method::<H> as BuiltinHandler<H>,
+                    disposable_stack_disposed_getter::<H> as BuiltinHandler<H>,
+                )
+            }
+            DisposeHint::Async => {
+                builtins.set_async_disposable_stack_prototype(prototype);
+                (
+                    ASYNC_DISPOSABLE_STACK_METHODS.as_slice(),
+                    ASYNC_DISPOSABLE_STACK_INSTALLS.as_slice(),
+                    async_disposable_stack_public_method::<H> as BuiltinHandler<H>,
+                    async_disposable_stack_disposed_getter::<H> as BuiltinHandler<H>,
+                )
+            }
+        };
+        let constructor = install_function(
+            heap,
+            builtins,
+            descriptor.name,
+            descriptor.length,
+            stack_constructor_handler::<H>,
+        );
+        builtins.set_constructor_prototype(heap, constructor, prototype);
+
+        let mut disposal_method = None;
+        for method in methods {
+            let function =
+                install_function(heap, builtins, method.name, method.length, method_handler);
+            if matches!(
+                method.kind,
+                StackMethodKind::Dispose | StackMethodKind::DisposeAsync
+            ) {
+                disposal_method = Some(function);
+            }
+            define_data(heap, prototype, method.name, function);
+        }
+        let disposal_method = disposal_method.expect("stack method table includes disposal");
+        for install in installs {
+            match *install {
+                StackInstall::DisposedAccessor => {
+                    let getter =
+                        install_function(heap, builtins, "get disposed", 0, disposed_getter);
+                    define_getter(heap, prototype, "disposed", getter);
+                }
+                StackInstall::DisposeAlias => {
+                    define_symbol(heap, prototype, builtins.symbol_dispose(), disposal_method)
+                }
+                StackInstall::AsyncDisposeAlias => define_symbol(
+                    heap,
+                    prototype,
+                    builtins.symbol_async_dispose(),
+                    disposal_method,
+                ),
+                StackInstall::ToStringTag(tag) => {
+                    define_to_string_tag(heap, prototype, builtins.symbol_to_string_tag(), tag)
+                }
+            }
+        }
+        globals.insert(EcmaString::encode(descriptor.name), constructor);
+    }
+}
+
+fn ordinary(heap: &mut Vec<HeapEntry>, prototype: Option<Value>) -> Value {
+    super::super::push(
+        heap,
+        HeapEntry::Object {
+            properties: PropertyMap::default(),
+            prototype,
+            boxed_primitive: None,
+            extensible: true,
+        },
+    )
+}
+
+fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Value) {
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
+        unreachable!("DisposableStack prototype is an ordinary object")
+    };
+    properties.insert(
+        PropertyKey::Named(EcmaString::encode(name)),
+        Property::Accessor {
+            getter: Some(getter),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        },
+    );
+}
+
+fn define_symbol(heap: &mut [HeapEntry], object: Value, symbol: Value, value: Value) {
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(object)] else {
+        unreachable!("DisposableStack prototype is an ordinary object")
+    };
+    properties.insert(
+        PropertyKey::Symbol(heap_index(symbol) as u32),
+        builtin_property(value),
+    );
+}

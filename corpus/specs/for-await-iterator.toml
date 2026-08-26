@@ -1,0 +1,18 @@
+schema = 1
+id = "for-await-iterator"
+repository = "local"
+commit = "006f26757ea92e6517cc80c1ed9bca7075bb9ee7"
+license = "UNLICENSED"
+source_dir = "corpus/cases"
+entrypoint = "corpus/cases/for-await-iterator.ts"
+node_args = []
+expected_timeout_ms = 15000
+constructs = [
+  "for-await-promise-unwrap",
+  "iterator-result-thenable-not-assimilated",
+  "iterator-return-on-break",
+  "async-iterator-close",
+]
+source_files = [
+  "corpus/cases/for-await-iterator.ts",
+]

@@ -182,10 +182,16 @@
 #![deny(unsafe_code)]
 
 #[cfg(feature = "host-jit")]
+#[path = "jit/helpers.rs"]
+pub mod helpers;
+#[cfg(feature = "host-jit")]
 mod jit;
 #[cfg(feature = "host-jit")]
 #[allow(unsafe_code)]
 mod jit_memory;
+#[cfg(feature = "host-jit")]
+#[path = "jit/tiering.rs"]
+pub mod tiering;
 #[cfg(feature = "host-jit")]
 pub use jit::{
     JitError, JitProgram, JitTelemetry, compile_jit, compile_jit_with_cancel,
@@ -196,7 +202,13 @@ pub use jit::{
 mod aot;
 #[cfg(feature = "aot")]
 pub use aot::{
-    AotError, AotObject, PROGRAM_DESCRIPTOR_SYMBOL, compile_aot, compile_aot_with_cancel,
+    AotError, AotObject, BuildCacheKey, EmissionError, EmittedObject, LinkCacheKey, LinkError,
+    LinkFlags, LinkInput, LinkInputRole, LinkPlan, LinkProvenance, PROGRAM_DESCRIPTOR_SYMBOL,
+    REPRODUCIBLE_FILE_NAME, ReproducibleArtifact, ReproducibleError, SUPPORTED_TARGET_TRIPLES,
+    TargetDescriptor, TargetFormat, canonical_object_metadata, compile_aot,
+    compile_aot_with_cancel, content_digest, emit_for_target, emit_for_target_with_cancel,
+    emit_for_targets, emit_reproducible, plan_link, require_matching_target, resolve_symbols,
+    validate_linked_image,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

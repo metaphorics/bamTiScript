@@ -7,9 +7,11 @@ use super::{
     allocate_array, builtin_property, define_data, heap_index, install_function, type_error,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
+use crate::vm::async_iterators::{ASYNC_FROM_SYNC_METHODS, ASYNC_GENERATOR_METHODS};
+use crate::vm::generator_async::{GENERATOR_METHODS, GeneratorCompletion, GeneratorOperation};
 use crate::{
     CollectionKind, EvalFailure, HeapEntry, Host, IterationKind, Machine, Property, PropertyKey,
-    PropertyMap, ResumeCompletion,
+    PropertyMap, ThrowOrigin,
 };
 use bamts_bytecode::IteratorKind;
 
@@ -63,6 +65,7 @@ fn install_set<H: Host>(
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_set_prototype(prototype);
+    super::set_methods::install(heap, builtins, prototype);
     let constructor = install_function(heap, builtins, "Set", 0, set_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
@@ -167,13 +170,14 @@ pub(super) fn install_generator_prototype<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.iterator_prototype()));
-    for (name, handler) in [
-        ("next", generator_next::<H> as BuiltinHandler<H>),
-        ("return", generator_return::<H> as BuiltinHandler<H>),
-        ("throw", generator_throw::<H> as BuiltinHandler<H>),
-    ] {
-        let function = install_function(heap, builtins, name, 1, handler);
-        define_data(heap, prototype, name, function);
+    let handlers = [
+        generator_next::<H> as BuiltinHandler<H>,
+        generator_return::<H> as BuiltinHandler<H>,
+        generator_throw::<H> as BuiltinHandler<H>,
+    ];
+    for (method, handler) in GENERATOR_METHODS.into_iter().zip(handlers) {
+        let function = install_function(heap, builtins, method.name, method.length, handler);
+        define_data(heap, prototype, method.name, function);
     }
     builtins.set_generator_prototype(prototype);
 }
@@ -183,14 +187,26 @@ pub(super) fn install_async_generator_prototype<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
-    for (name, handler) in [
-        ("next", async_generator_next::<H> as BuiltinHandler<H>),
-        ("return", async_generator_return::<H> as BuiltinHandler<H>),
-        ("throw", async_generator_throw::<H> as BuiltinHandler<H>),
-    ] {
-        let function = install_function(heap, builtins, name, 1, handler);
-        define_data(heap, prototype, name, function);
+    let handlers = [
+        async_generator_next::<H> as BuiltinHandler<H>,
+        async_generator_return::<H> as BuiltinHandler<H>,
+        async_generator_throw::<H> as BuiltinHandler<H>,
+    ];
+    for (method, handler) in ASYNC_GENERATOR_METHODS.into_iter().zip(handlers) {
+        let function = install_function(heap, builtins, method.name, method.length, handler);
+        define_data(heap, prototype, method.name, function);
     }
+    let adapter_prototype = ordinary(heap, Some(builtins.async_iterator_prototype()));
+    let adapter_handlers = [
+        async_from_sync_next::<H> as BuiltinHandler<H>,
+        async_from_sync_return::<H> as BuiltinHandler<H>,
+        async_from_sync_throw::<H> as BuiltinHandler<H>,
+    ];
+    for (method, handler) in ASYNC_FROM_SYNC_METHODS.into_iter().zip(adapter_handlers) {
+        let function = install_function(heap, builtins, method.name, method.length, handler);
+        define_data(heap, adapter_prototype, method.name, function);
+    }
+    builtins.set_async_from_sync_iterator_prototype(adapter_prototype);
     builtins.set_async_generator_prototype(prototype);
 }
 
@@ -206,7 +222,7 @@ fn async_generator_next<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     Ok(BuiltinOutcome::AsyncGeneratorResume {
         generator: this,
-        completion: ResumeCompletion::Next(resume_value(args)),
+        completion: GeneratorCompletion::Normal(resume_value(args)),
     })
 }
 
@@ -218,7 +234,7 @@ fn async_generator_return<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     Ok(BuiltinOutcome::AsyncGeneratorResume {
         generator: this,
-        completion: ResumeCompletion::Return(resume_value(args)),
+        completion: GeneratorCompletion::Return(resume_value(args)),
     })
 }
 
@@ -230,8 +246,43 @@ fn async_generator_throw<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     Ok(BuiltinOutcome::AsyncGeneratorResume {
         generator: this,
-        completion: ResumeCompletion::Throw(resume_value(args)),
+        completion: GeneratorCompletion::Throw {
+            value: resume_value(args),
+            origin: ThrowOrigin::Bytecode,
+        },
     })
+}
+fn async_from_sync_next<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    machine
+        .async_from_sync_iterator_method(this, GeneratorOperation::Next, resume_value(args))
+        .map(BuiltinOutcome::Value)
+}
+
+fn async_from_sync_return<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    machine
+        .async_from_sync_iterator_method(this, GeneratorOperation::Return, resume_value(args))
+        .map(BuiltinOutcome::Value)
+}
+
+fn async_from_sync_throw<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    machine
+        .async_from_sync_iterator_method(this, GeneratorOperation::Throw, resume_value(args))
+        .map(BuiltinOutcome::Value)
 }
 
 fn generator_next<H: Host>(
@@ -242,7 +293,7 @@ fn generator_next<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     Ok(BuiltinOutcome::GeneratorResume {
         generator: this,
-        completion: ResumeCompletion::Next(resume_value(args)),
+        completion: GeneratorCompletion::Normal(resume_value(args)),
     })
 }
 
@@ -254,7 +305,7 @@ fn generator_return<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     Ok(BuiltinOutcome::GeneratorResume {
         generator: this,
-        completion: ResumeCompletion::Return(resume_value(args)),
+        completion: GeneratorCompletion::Return(resume_value(args)),
     })
 }
 
@@ -266,7 +317,10 @@ fn generator_throw<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     Ok(BuiltinOutcome::GeneratorResume {
         generator: this,
-        completion: ResumeCompletion::Throw(resume_value(args)),
+        completion: GeneratorCompletion::Throw {
+            value: resume_value(args),
+            origin: ThrowOrigin::Bytecode,
+        },
     })
 }
 
@@ -321,55 +375,60 @@ fn iterator_next<H: Host>(
                 .runtime_slot(source)
                 .map_err(EvalFailure::Runtime)?
                 .ok_or_else(|| type_error("iterator next called on incompatible receiver"))?;
-            let item = match &machine.heap[source_index] {
-                HeapEntry::Array { elements, .. } => {
-                    usize::try_from(cursor).ok().and_then(|index| {
-                        elements.get(index).map(|element| {
-                            let value = if *element == Value::HOLE {
-                                Value::UNDEFINED
-                            } else {
-                                *element
-                            };
-                            let next = cursor
-                                .checked_add(1)
-                                .expect("array bounds keep iterator positions below u64::MAX");
-                            (next, crate::number_value(index as f64), value)
-                        })
-                    })
+            let item = if matches!(&machine.heap[source_index], HeapEntry::TypedArray { .. }) {
+                let bounds = crate::intrinsics::builtins::typedarray_all::typed_array_bounds(
+                    machine, source,
+                )?;
+                match usize::try_from(cursor) {
+                    Ok(index) if !bounds.out_of_bounds && index < bounds.element_length => {
+                        let value = crate::intrinsics::builtins::typedarray_all::read_element(
+                            machine, source, index,
+                        )?;
+                        let next = cursor
+                            .checked_add(1)
+                            .expect("typed-array bounds keep iterator positions below u64::MAX");
+                        Some((next, crate::number_value(index as f64), value))
+                    }
+                    _ => None,
                 }
-                HeapEntry::Uint8Array { bytes, .. } => {
-                    usize::try_from(cursor).ok().and_then(|index| {
-                        bytes.get(index).map(|byte| {
-                            let next = cursor
-                                .checked_add(1)
-                                .expect("typed-array bounds keep positions below u64::MAX");
-                            (
-                                next,
-                                crate::number_value(index as f64),
-                                Value::int32(u32::from(*byte)),
-                            )
+            } else {
+                match &machine.heap[source_index] {
+                    HeapEntry::Array { elements, .. } => {
+                        usize::try_from(cursor).ok().and_then(|index| {
+                            elements.get(index).map(|element| {
+                                let value = if *element == Value::HOLE {
+                                    Value::UNDEFINED
+                                } else {
+                                    *element
+                                };
+                                let next = cursor
+                                    .checked_add(1)
+                                    .expect("array bounds keep iterator positions below u64::MAX");
+                                (next, crate::number_value(index as f64), value)
+                            })
                         })
-                    })
-                }
-                HeapEntry::Collection { entries, .. } => {
-                    debug_assert!(
-                        entries.windows(2).all(|w| w[0].order <= w[1].order),
-                        "collection entries must stay sorted ascending by order"
-                    );
-                    let index = entries.partition_point(|entry| entry.order < cursor);
-                    entries[index..]
-                        .iter()
-                        .find(|entry| entry.live)
-                        .map(|entry| {
-                            let next = entry
-                                .order
-                                .checked_add(1)
-                                .expect("heap limits keep collection order below u64::MAX");
-                            (next, entry.key, entry.value)
-                        })
-                }
-                _ => {
-                    return Err(type_error("iterator next called on incompatible receiver"));
+                    }
+                    HeapEntry::TypedArray { .. } => unreachable!("typed arrays handled above"),
+                    HeapEntry::Collection { entries, .. } => {
+                        debug_assert!(
+                            entries.windows(2).all(|w| w[0].order <= w[1].order),
+                            "collection entries must stay sorted ascending by order"
+                        );
+                        let index = entries.partition_point(|entry| entry.order < cursor);
+                        entries[index..]
+                            .iter()
+                            .find(|entry| entry.live)
+                            .map(|entry| {
+                                let next = entry
+                                    .order
+                                    .checked_add(1)
+                                    .expect("heap limits keep collection order below u64::MAX");
+                                (next, entry.key, entry.value)
+                            })
+                    }
+                    _ => {
+                        return Err(type_error("iterator next called on incompatible receiver"));
+                    }
                 }
             };
             match item {
@@ -440,19 +499,33 @@ fn map_like_constructor<H: Host>(
     if !constructing {
         return Err(type_error("collection constructor requires 'new'"));
     }
-    let object = collection(machine, constructor_prototype(machine, kind)?, kind)?;
-    if let Some(source) = args
+    let prototype = constructor_prototype(machine, kind)?;
+    let source = args
         .first()
         .copied()
-        .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)))
-    {
-        let depth = machine.native_roots.len();
-        machine.push_native_roots(depth, &[object, source]);
+        .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)));
+    let depth = machine.native_roots.len();
+    if let Some(source) = source {
+        machine.push_native_roots(depth, &[source]);
+    }
+    let object = match collection(machine, prototype, kind) {
+        Ok(object) => object,
+        Err(failure) => {
+            if source.is_some() {
+                machine.pop_native_roots(depth);
+            }
+            return Err(failure);
+        }
+    };
+    if let Some(source) = source {
+        machine.refresh_native_roots(depth, &[object, source]);
         let result: Result<(), EvalFailure> = (|| {
             let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
             loop {
                 machine.refresh_native_roots(depth, &[object, iterator]);
-                let (done, entry) = machine.iterator_next(iterator)?;
+                let result = machine.iterator_step(iterator)?;
+                machine.refresh_native_roots(depth, &[object, iterator, result]);
+                let (done, entry) = machine.iterator_result_parts(result)?;
                 if done {
                     break;
                 }
@@ -523,19 +596,33 @@ fn set_like_constructor<H: Host>(
     if !constructing {
         return Err(type_error("collection constructor requires 'new'"));
     }
-    let object = collection(machine, constructor_prototype(machine, kind)?, kind)?;
-    if let Some(source) = args
+    let prototype = constructor_prototype(machine, kind)?;
+    let source = args
         .first()
         .copied()
-        .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)))
-    {
-        let depth = machine.native_roots.len();
-        machine.push_native_roots(depth, &[object, source]);
+        .filter(|value| !matches!(value.decode(), Some(Decoded::Null | Decoded::Undefined)));
+    let depth = machine.native_roots.len();
+    if let Some(source) = source {
+        machine.push_native_roots(depth, &[source]);
+    }
+    let object = match collection(machine, prototype, kind) {
+        Ok(object) => object,
+        Err(failure) => {
+            if source.is_some() {
+                machine.pop_native_roots(depth);
+            }
+            return Err(failure);
+        }
+    };
+    if let Some(source) = source {
+        machine.refresh_native_roots(depth, &[object, source]);
         let result: Result<(), EvalFailure> = (|| {
             let iterator = machine.create_iterator(source, IteratorKind::Sync)?;
             loop {
                 machine.refresh_native_roots(depth, &[object, iterator]);
-                let (done, value) = machine.iterator_next(iterator)?;
+                let result = machine.iterator_step(iterator)?;
+                machine.refresh_native_roots(depth, &[object, iterator, result]);
+                let (done, value) = machine.iterator_result_parts(result)?;
                 if done {
                     break;
                 }
@@ -1190,13 +1277,20 @@ fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(),
         | HeapEntry::RegExp { .. }
         | HeapEntry::Date { .. }
         | HeapEntry::Collection { .. }
-        | HeapEntry::Uint8Array { .. }
+        | HeapEntry::TypedArray { .. }
+        | HeapEntry::ArrayBuffer { .. }
+        | HeapEntry::SharedArrayBuffer { .. }
+        | HeapEntry::DataView { .. }
         | HeapEntry::BuiltinIterator { .. }
         | HeapEntry::Generator { .. }
         | HeapEntry::AsyncGenerator { .. }
+        | HeapEntry::AsyncFromSync { .. }
         | HeapEntry::ProcessEnv { .. }
         | HeapEntry::Promise { .. }
+        | HeapEntry::DisposableStack { .. }
         | HeapEntry::Timeout { .. }
+        | HeapEntry::WeakRef { .. }
+        | HeapEntry::FinalizationRegistry { .. }
         | HeapEntry::NativeFunction { .. } => true,
         // Primitives and internal bookkeeping entries are not valid keys.
         HeapEntry::Vacant
@@ -1749,7 +1843,7 @@ mod tests {
     fn generator_method_surface_has_expected_metadata_and_descriptors() {
         let module = blank_program("<test>");
         let mut host = TestHost;
-        let machine = Machine::new(&module, &mut host, Limits::default());
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
 
         for (label, prototype) in [
             (
@@ -1890,9 +1984,15 @@ mod tests {
         let resume = Value::int32(42);
 
         for (name, expected) in [
-            ("next", ResumeCompletion::Next(resume)),
-            ("return", ResumeCompletion::Return(resume)),
-            ("throw", ResumeCompletion::Throw(resume)),
+            ("next", GeneratorCompletion::Normal(resume)),
+            ("return", GeneratorCompletion::Return(resume)),
+            (
+                "throw",
+                GeneratorCompletion::Throw {
+                    value: resume,
+                    origin: ThrowOrigin::Bytecode,
+                },
+            ),
         ] {
             let method = machine
                 .get_named_property(machine.intrinsics.builtins.generator_prototype(), name)
@@ -1936,9 +2036,15 @@ mod tests {
         let resume = Value::int32(42);
 
         for (name, expected) in [
-            ("next", ResumeCompletion::Next(resume)),
-            ("return", ResumeCompletion::Return(resume)),
-            ("throw", ResumeCompletion::Throw(resume)),
+            ("next", GeneratorCompletion::Normal(resume)),
+            ("return", GeneratorCompletion::Return(resume)),
+            (
+                "throw",
+                GeneratorCompletion::Throw {
+                    value: resume,
+                    origin: ThrowOrigin::Bytecode,
+                },
+            ),
         ] {
             let method = machine
                 .get_named_property(

@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_lines)]
 use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar, EnumValue};
+use crate::jsx_desugar::JsxSourceDesugarPlan;
 use crate::literal::{
     BigIntTextError, MAX_BIGINT_CONVERSION_LIMB_OPS, canonical_bigint_text, cook_escapes,
     number_value, string_value,
@@ -277,6 +278,7 @@ pub(crate) fn assemble_checked(
         file,
         options,
         &[],
+        None,
         LoweringGoal::Module,
         enum_facts,
         namespace_facts,
@@ -286,6 +288,7 @@ pub(crate) fn assemble_program_module(
     file: &SourceFile,
     options: LowerOptions,
     linkage_strings: &[String],
+    jsx_plan: Option<&JsxSourceDesugarPlan>,
     enum_facts: &EnumFacts,
     namespace_facts: &NamespaceFacts,
 ) -> Result<Module<bamts_bytecode::Unverified>, LowerError> {
@@ -293,6 +296,7 @@ pub(crate) fn assemble_program_module(
         file,
         options,
         linkage_strings,
+        jsx_plan,
         LoweringGoal::ProgramModule,
         enum_facts,
         namespace_facts,
@@ -310,6 +314,7 @@ pub(crate) fn assemble_classic_script_named(
         file,
         options,
         &[module_name.to_owned()],
+        None,
         LoweringGoal::ClassicScript,
         enum_facts,
         namespace_facts,
@@ -319,6 +324,7 @@ fn assemble_with_linkage_strings(
     file: &SourceFile,
     options: LowerOptions,
     linkage_strings: &[String],
+    jsx_plan: Option<&JsxSourceDesugarPlan>,
     goal: LoweringGoal,
     enum_facts: &EnumFacts,
     namespace_facts: &NamespaceFacts,
@@ -335,6 +341,7 @@ fn assemble_with_linkage_strings(
     let entry = builder.reserve_function(file.range())?;
     let mut context = FunctionContext::new_top_level(
         file,
+        jsx_plan,
         goal,
         enum_facts,
         namespace_facts,
@@ -730,6 +737,7 @@ enum StaticInit {
 }
 struct FunctionContext<'a> {
     file: &'a SourceFile,
+    jsx_plan: Option<&'a JsxSourceDesugarPlan>,
     enum_facts: &'a EnumFacts,
     namespace_facts: &'a NamespaceFacts,
     symbols: &'a [crate::checker::Symbol],
@@ -779,13 +787,15 @@ struct FunctionContext<'a> {
 impl<'a> FunctionContext<'a> {
     fn new_top_level(
         file: &'a SourceFile,
+        jsx_plan: Option<&'a JsxSourceDesugarPlan>,
         goal: LoweringGoal,
         enum_facts: &'a EnumFacts,
         namespace_facts: &'a NamespaceFacts,
         symbols: &'a [crate::checker::Symbol],
     ) -> Self {
-        let capture_plan = CapturePlan::for_statements(file, file.statements());
+        let capture_plan = CapturePlan::for_statements(file, jsx_plan, file.statements());
         Self {
+            jsx_plan,
             file,
             enum_facts,
             namespace_facts,
@@ -1000,7 +1010,13 @@ impl<'a> FunctionContext<'a> {
         };
         scope.insert(name, binding);
     }
+    fn generated_text(&self, id: NodeId) -> Option<&str> {
+        self.jsx_plan.and_then(|plan| plan.generated_text.get(id))
+    }
     fn identifier_text(&self, identifier: &IdentifierNode) -> Result<String, LowerError> {
+        if let Some(text) = self.generated_text(identifier.id()) {
+            return Ok(text.to_owned());
+        }
         let token = identifier.data().token();
         if token.is_missing() {
             return Err(self.missing(identifier.range(), NodeKind::Identifier));
@@ -3596,6 +3612,13 @@ impl<'a> FunctionContext<'a> {
         expression: &Expr,
     ) -> Result<Register, LowerError> {
         let range = expression.range();
+        if let Some(replacement) = self
+            .jsx_plan
+            .and_then(|plan| plan.expression_desugars.get(&expression.id()))
+            .cloned()
+        {
+            return self.lower_expression(builder, &replacement);
+        }
         if let Some(scalar) = self.enum_facts.const_use(expression.id()).cloned() {
             if matches!(expression.data(), Expression::Member(member) if member.optional) {
                 return Err(self.const_enum_operation(range, ConstEnumOperation::OptionalAccess));
@@ -5560,16 +5583,19 @@ impl<'a> FunctionContext<'a> {
             return Err(self.missing(range, NodeKind::NumericLiteral));
         }
         let lexeme = self
-            .file
-            .token_text(token)
-            .filter(|text| !text.is_empty())
-            .ok_or_else(|| self.error(range, LowerErrorKind::InvalidNumericLiteral))?;
+            .generated_text(number.id())
+            .or_else(|| self.file.token_text(token).filter(|text| !text.is_empty()));
+        let lexeme =
+            lexeme.ok_or_else(|| self.error(range, LowerErrorKind::InvalidNumericLiteral))?;
         let value = number_value(lexeme)
             .ok_or_else(|| self.error(range, LowerErrorKind::InvalidNumericLiteral))?;
         self.load_constant(builder, number_constant(value), range)
     }
     fn string_literal_value(&self, string: &StringLiteralNode) -> Result<EcmaString, LowerError> {
         let range = string.range();
+        if let Some(text) = self.generated_text(string.id()) {
+            return Ok(EcmaString::encode(text));
+        }
         let token = string.data().token();
         let missing = || self.missing(range, NodeKind::StringLiteral);
         if token.is_missing() {
@@ -6444,9 +6470,10 @@ impl<'a> FunctionContext<'a> {
         is_arrow: bool,
     ) -> Result<(), LowerError> {
         self.reject_parameter_decorators(parameters)?;
-        let capture_plan = CapturePlan::for_function(self.file, parameters, body);
+        let capture_plan = CapturePlan::for_function(self.file, self.jsx_plan, parameters, body);
         let mut inner = FunctionContext {
             file: self.file,
+            jsx_plan: self.jsx_plan,
             enum_facts: self.enum_facts,
             namespace_facts: self.namespace_facts,
             symbols: self.symbols,
@@ -6580,6 +6607,7 @@ impl<'a> FunctionContext<'a> {
         let id = builder.reserve_function(range)?;
         let mut inner = FunctionContext {
             file: self.file,
+            jsx_plan: self.jsx_plan,
             enum_facts: self.enum_facts,
             namespace_facts: self.namespace_facts,
             symbols: self.symbols,
@@ -6986,7 +7014,7 @@ impl<'a> FunctionContext<'a> {
         body: LoweredBody<'_>,
         is_arrow: bool,
     ) -> Vec<CaptureKey> {
-        let mut scanner = FreeVarScanner::new(self.file);
+        let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
         scanner.scan_function(parameters, body, is_arrow);
         let mut captures = Vec::new();
         for name in &scanner.free {
@@ -7762,7 +7790,7 @@ impl<'a> FunctionContext<'a> {
         parent: Option<Register>,
         class_elements: Option<Register>,
     ) -> Vec<CaptureKey> {
-        let mut scanner = FreeVarScanner::new(self.file);
+        let mut scanner = FreeVarScanner::new(self.file, self.jsx_plan);
         scanner.preseed_parameters(parameters);
         if let Some(block) = body {
             scanner.preseed_vars(&block.statements);
@@ -8052,10 +8080,16 @@ impl<'a> FunctionContext<'a> {
         instance_steps: &[InstanceInit],
         source_name: Option<&str>,
     ) -> Result<(), LowerError> {
-        let capture_plan =
-            CapturePlan::for_constructor(self.file, parameters, body, instance_steps);
+        let capture_plan = CapturePlan::for_constructor(
+            self.file,
+            self.jsx_plan,
+            parameters,
+            body,
+            instance_steps,
+        );
         let mut inner = FunctionContext {
             file: self.file,
+            jsx_plan: self.jsx_plan,
             enum_facts: self.enum_facts,
             namespace_facts: self.namespace_facts,
             symbols: self.symbols,
@@ -8839,6 +8873,7 @@ struct ScannedBinding {
 }
 struct FreeVarScanner<'a> {
     file: &'a SourceFile,
+    jsx_plan: Option<&'a JsxSourceDesugarPlan>,
     bound: Vec<HashMap<String, ScannedBinding>>,
     function_roots: Vec<usize>,
     free: BTreeSet<String>,
@@ -8852,8 +8887,12 @@ struct FreeVarScanner<'a> {
     function_depth: u32,
 }
 impl CapturePlan {
-    fn for_statements(file: &SourceFile, statements: &[Stmt]) -> Self {
-        let mut scanner = FreeVarScanner::new(file);
+    fn for_statements(
+        file: &SourceFile,
+        jsx_plan: Option<&JsxSourceDesugarPlan>,
+        statements: &[Stmt],
+    ) -> Self {
+        let mut scanner = FreeVarScanner::new(file, jsx_plan);
         scanner.preseed_vars(statements);
         scanner.predeclare_immediate(statements, false);
         for statement in statements {
@@ -8866,10 +8905,11 @@ impl CapturePlan {
     }
     fn for_function(
         file: &SourceFile,
+        jsx_plan: Option<&JsxSourceDesugarPlan>,
         parameters: &[ParameterNode],
         body: LoweredBody<'_>,
     ) -> Self {
-        let mut scanner = FreeVarScanner::new(file);
+        let mut scanner = FreeVarScanner::new(file, jsx_plan);
         scanner.scan_function(parameters, body, false);
         Self {
             captured: scanner.captured,
@@ -8878,11 +8918,12 @@ impl CapturePlan {
     }
     fn for_constructor(
         file: &SourceFile,
+        jsx_plan: Option<&JsxSourceDesugarPlan>,
         parameters: &[ParameterNode],
         body: Option<&Block>,
         instance_steps: &[InstanceInit],
     ) -> Self {
-        let mut scanner = FreeVarScanner::new(file);
+        let mut scanner = FreeVarScanner::new(file, jsx_plan);
         scanner.preseed_parameters(parameters);
         if let Some(block) = body {
             scanner.preseed_vars(&block.statements);
@@ -8902,9 +8943,10 @@ impl CapturePlan {
     }
 }
 impl<'a> FreeVarScanner<'a> {
-    fn new(file: &'a SourceFile) -> Self {
+    fn new(file: &'a SourceFile, jsx_plan: Option<&'a JsxSourceDesugarPlan>) -> Self {
         Self {
             file,
+            jsx_plan,
             bound: vec![HashMap::new()],
             function_roots: vec![0],
             free: BTreeSet::new(),
@@ -9526,12 +9568,25 @@ impl<'a> FreeVarScanner<'a> {
         self.pop();
     }
     fn scan_expression(&mut self, expression: &Expr) {
+        if let Some(replacement) = self
+            .jsx_plan
+            .and_then(|plan| plan.expression_desugars.get(&expression.id()))
+            .cloned()
+        {
+            self.scan_expression(&replacement);
+            return;
+        }
         match expression.data() {
             Expression::JsxElement(_)
             | Expression::JsxFragment(_)
             | Expression::JsxSelfClosingElement(_) => {}
             Expression::Identifier(identifier) => {
-                if let Some(name) = identifier_name(self.file, identifier) {
+                if let Some(name) = self
+                    .jsx_plan
+                    .and_then(|plan| plan.generated_text.get(identifier.id()))
+                    .map(str::to_owned)
+                    .or_else(|| identifier_name(self.file, identifier))
+                {
                     self.use_name(&name);
                 }
             }
@@ -10236,10 +10291,25 @@ mod tests {
                 sources.insert(value.to_owned());
             }
         }
+        for local_case in [
+            "corpus/cases/derived-construction.ts",
+            "corpus/cases/event-loop.ts",
+            "corpus/cases/explicit-resource.ts",
+            "corpus/cases/for-await-iterator.ts",
+            "corpus/cases/import-meta.ts",
+            "corpus/cases/lexical-environment.ts",
+            "corpus/cases/top-level-throw.ts",
+        ] {
+            assert!(
+                sources.contains(local_case),
+                "local corpus case {local_case} is a declared corpus member"
+            );
+        }
         assert_eq!(
             sources.len(),
-            63,
-            "the checked corpus contract is 63 sources"
+            70,
+            "the checked corpus contract is 70 sources: upstream entrypoints and \
+             spec-declared project files plus the seven named local cases"
         );
         sources.into_iter().collect()
     }
@@ -14756,6 +14826,7 @@ mod tests {
         };
         let mut context = FunctionContext::new_top_level(
             file,
+            None,
             super::LoweringGoal::Module,
             &enum_facts,
             &namespace_facts,

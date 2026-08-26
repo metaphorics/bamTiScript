@@ -4,7 +4,11 @@ use std::ops::Range;
 use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
-use super::{allocate_array, allocate_string, define_data, install_function, type_error};
+use super::annex_b::record_legacy_match;
+use super::{
+    allocate_array, allocate_string, builtin_property, define_data, heap_index, install_function,
+    type_error,
+};
 use crate::intrinsics::regexp::{Match, Regex, RegexErrorKind, STEP_BUDGET, canonical_flags};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
@@ -29,6 +33,20 @@ pub(super) fn install<H: Host>(
     define_getter(heap, prototype, "source", source_get);
     let flags_get = install_function(heap, builtins, "get flags", 0, flags_getter::<H>);
     define_getter(heap, prototype, "flags", flags_get);
+    let symbol_replace_fn = install_function(
+        heap,
+        builtins,
+        "[Symbol.replace]",
+        2,
+        symbol_replace::<H> as BuiltinHandler<H>,
+    );
+    let HeapEntry::Object { properties, .. } = &mut heap[heap_index(prototype)] else {
+        panic!("RegExp prototype must be an ordinary object");
+    };
+    properties.insert(
+        PropertyKey::Symbol(heap_index(builtins.symbol_replace()) as u32),
+        builtin_property(symbol_replace_fn),
+    );
     builtins.set_regexp_prototype(prototype);
     globals.insert(EcmaString::encode("RegExp"), constructor);
 }
@@ -84,11 +102,33 @@ fn constructor<H: Host>(
     Ok(BuiltinOutcome::Value(value))
 }
 
+fn uses_extended_flags(flags: &EcmaString) -> bool {
+    flags
+        .as_units()
+        .iter()
+        .any(|&unit| matches!(unit, 0x0064 | 0x0075 | 0x0076))
+}
+
+pub(crate) fn canonical_regexp_flags(flags: &EcmaString) -> EcmaString {
+    if uses_extended_flags(flags) {
+        super::regexp_v::VFlags::parse(flags)
+            .map(|parsed| parsed.canonical())
+            .unwrap_or_else(|_| flags.clone())
+    } else {
+        canonical_flags(flags)
+    }
+}
+
 pub(super) fn compile<H: Host>(
     machine: &mut Machine<'_, H>,
     pattern: &EcmaString,
     flags: &EcmaString,
 ) -> Result<Regex, EvalFailure> {
+    if uses_extended_flags(flags) {
+        return Ok(super::regexp_v::compile(machine, pattern, flags)?
+            .engine_regex()
+            .clone());
+    }
     Regex::compile(pattern, flags).map_err(|error| {
         let id = machine
             .intrinsics
@@ -135,6 +175,14 @@ pub(super) fn execute<H: Host>(
 ) -> Result<Option<Match>, EvalFailure> {
     let (pattern, flags) = regexp_parts(machine, regexp)
         .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
+    if uses_extended_flags(&flags) {
+        let (_compiled, matched) =
+            super::regexp_v::execute(machine, regexp, &pattern, &flags, input)?;
+        if let Some(ref matched) = matched {
+            record_legacy_match(machine, input, matched)?;
+        }
+        return Ok(matched);
+    }
     let regex = compile(machine, &pattern, &flags)?;
     let uses_last_index = regex.flags().global || regex.flags().sticky;
     let start = if uses_last_index {
@@ -157,11 +205,51 @@ pub(super) fn execute<H: Host>(
             RegexErrorKind::Compile => unreachable!("regex already compiled successfully"),
         }
     })?;
+    if let Some(ref matched) = matched {
+        record_legacy_match(machine, input, matched)?;
+    }
     if uses_last_index {
         let next = matched.as_ref().map_or(0, |value| value.range.end);
         machine.set_data_property(regexp, "lastIndex", crate::number_value(next as f64))?;
     }
     Ok(matched)
+}
+
+/// RegExpExec for consumers (`test`, String methods). The builtin `exec` method
+/// calls `execute` directly and must not dispatch through this path.
+pub(super) fn regexp_exec<H: Host>(
+    machine: &mut Machine<'_, H>,
+    regexp: Value,
+    input: &EcmaString,
+) -> Result<Value, EvalFailure> {
+    let input_value = allocate_string(machine, input.clone())?;
+    if let Some(result) = super::regexp_v::call_exec_override(machine, regexp, input_value)? {
+        return Ok(result);
+    }
+    let Some(matched) = execute(machine, regexp, input)? else {
+        return Ok(Value::NULL);
+    };
+    match_array_for(machine, Some(regexp), input, matched)
+}
+
+fn symbol_replace<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    regexp_parts(machine, this).ok_or_else(|| {
+        type_error("RegExp.prototype[Symbol.replace] called on incompatible receiver")
+    })?;
+    let string = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let replace =
+        machine.get_named_property(machine.intrinsics.builtins.string_prototype(), "replace")?;
+    Ok(BuiltinOutcome::Value(machine.call_value(
+        replace,
+        string,
+        &[this, replacer],
+    )?))
 }
 
 fn exec<H: Host>(
@@ -170,12 +258,17 @@ fn exec<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    regexp_parts(machine, this)
+        .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
     let input = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let Some(matched) = execute(machine, this, &input)? else {
         return Ok(BuiltinOutcome::Value(Value::NULL));
     };
-    Ok(BuiltinOutcome::Value(match_array(
-        machine, &input, matched,
+    Ok(BuiltinOutcome::Value(match_array_for(
+        machine,
+        Some(this),
+        &input,
+        matched,
     )?))
 }
 
@@ -185,9 +278,11 @@ fn test<H: Host>(
     args: &[Value],
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
+    regexp_parts(machine, this)
+        .ok_or_else(|| type_error("RegExp method called on incompatible receiver"))?;
     let input = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
     Ok(BuiltinOutcome::Value(Value::boolean(
-        execute(machine, this, &input)?.is_some(),
+        regexp_exec(machine, this, &input)? != Value::NULL,
     )))
 }
 
@@ -203,7 +298,7 @@ fn to_string<H: Host>(
     output.push_unit(u16::from(b'/'));
     append_canonical_source(&pattern, &mut output);
     output.push_unit(u16::from(b'/'));
-    let flags = canonical_flags(&flags);
+    let flags = canonical_regexp_flags(&flags);
     for &unit in flags.as_units() {
         output.push_unit(unit);
     }
@@ -239,7 +334,7 @@ fn flags_getter<H: Host>(
     })?;
     Ok(BuiltinOutcome::Value(allocate_string(
         machine,
-        canonical_flags(&flags),
+        canonical_regexp_flags(&flags),
     )?))
 }
 
@@ -256,6 +351,22 @@ fn define_getter(heap: &mut [HeapEntry], object: Value, name: &str, getter: Valu
             configurable: true,
         },
     );
+}
+
+pub(super) fn match_array_for<H: Host>(
+    machine: &mut Machine<'_, H>,
+    regexp: Option<Value>,
+    input: &EcmaString,
+    matched: Match,
+) -> Result<Value, EvalFailure> {
+    if let Some(regexp) = regexp
+        && let Some((pattern, flags)) = regexp_parts(machine, regexp)
+        && uses_extended_flags(&flags)
+    {
+        let compiled = super::regexp_v::compile(machine, &pattern, &flags)?;
+        return super::regexp_v::match_array(machine, input, &compiled, &matched);
+    }
+    match_array(machine, input, matched)
 }
 
 pub(super) fn match_array<H: Host>(
@@ -359,6 +470,7 @@ mod tests {
     use super::super::test_support::{TestHost, blank_program};
     use super::*;
     use crate::Limits;
+    use crate::intrinsics::{BuiltinDef, native_function};
 
     fn construct_regexp(machine: &mut Machine<'_, TestHost>, pattern: &str, flags: &str) -> Value {
         let constructor = machine.intrinsics.global("RegExp").expect("RegExp exists");
@@ -905,6 +1017,121 @@ mod tests {
         assert!(
             matches!(result, Err(EvalFailure::Throw(_))),
             "throwing newTarget.prototype getter must propagate"
+        );
+    }
+
+    fn call_regexp_method(
+        machine: &mut Machine<'_, TestHost>,
+        regexp: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Value {
+        let method = machine
+            .get_named_property(machine.intrinsics.regexp_prototype(), name)
+            .unwrap_or_else(|_| panic!("{name} is installed"));
+        machine
+            .call_value(method, regexp, args)
+            .unwrap_or_else(|error| panic!("{name} call failed: {error:?}"))
+    }
+
+    fn test_function(
+        machine: &mut Machine<'_, TestHost>,
+        name: &'static str,
+        handler: BuiltinHandler<TestHost>,
+    ) -> Value {
+        let id = machine.intrinsics.builtins.register(BuiltinDef {
+            name,
+            length: 1,
+            handler,
+        });
+        native_function(&mut machine.heap, id, name, 1)
+    }
+
+    fn counting_exec_override(
+        machine: &mut Machine<'_, TestHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.set_data_property(this, "overrideSeen", Value::boolean(true))?;
+        Ok(BuiltinOutcome::Value(Value::NULL))
+    }
+
+    #[test]
+    fn builtin_exec_does_not_reenter_through_prototype_exec() {
+        let module = blank_program("<exec no recurse>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "a", "");
+        let input = machine
+            .allocate(HeapEntry::String(EcmaString::encode("a")))
+            .unwrap();
+        let result = call_regexp_method(&mut machine, regexp, "exec", &[input]);
+        assert_ne!(result, Value::NULL);
+        let capture = machine.get_named_property(result, "0").expect("capture 0");
+        assert_eq!(machine.to_string(capture).unwrap(), EcmaString::encode("a"));
+    }
+
+    #[test]
+    fn test_honours_own_exec_override() {
+        let module = blank_program("<test exec override>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let regexp = construct_regexp(&mut machine, "a", "");
+        let override_fn = test_function(
+            &mut machine,
+            "counting exec override",
+            counting_exec_override,
+        );
+        machine
+            .set_data_property(regexp, "exec", override_fn)
+            .expect("override installed");
+        let input = machine
+            .allocate(HeapEntry::String(EcmaString::encode("a")))
+            .unwrap();
+        let result = call_regexp_method(&mut machine, regexp, "test", &[input]);
+        assert_eq!(result, Value::boolean(false));
+        assert_eq!(
+            machine.get_named_property(regexp, "overrideSeen").unwrap(),
+            Value::boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_honours_subclass_prototype_exec_override() {
+        let module = blank_program("<subclass exec override>");
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let regexp_prototype = machine.intrinsics.regexp_prototype();
+        let custom_prototype =
+            super::super::ordinary_runtime(&mut machine, Some(regexp_prototype)).unwrap();
+        let override_fn = test_function(
+            &mut machine,
+            "subclass exec override",
+            counting_exec_override,
+        );
+        machine
+            .set_data_property(custom_prototype, "exec", override_fn)
+            .expect("prototype override installed");
+        let new_target = super::super::ordinary_runtime(&mut machine, None).unwrap();
+        machine
+            .set_data_property(new_target, "prototype", custom_prototype)
+            .expect("subclass prototype wired");
+        let regexp_id = machine.intrinsics.builtins.id_named("RegExp").unwrap();
+        let BuiltinOutcome::Value(regexp) = machine
+            .call_builtin_with_new_target(regexp_id, Value::UNDEFINED, &[], true, new_target)
+            .expect("subclass construct succeeds")
+        else {
+            panic!("expected RegExp instance");
+        };
+        let input = machine
+            .allocate(HeapEntry::String(EcmaString::encode("a")))
+            .unwrap();
+        let result = call_regexp_method(&mut machine, regexp, "test", &[input]);
+        assert_eq!(result, Value::boolean(false));
+        assert_eq!(
+            machine.get_named_property(regexp, "overrideSeen").unwrap(),
+            Value::boolean(true)
         );
     }
 }

@@ -190,7 +190,9 @@ index_type!(
 
 mod string;
 
+mod isa;
 mod program;
+mod verifier;
 
 pub use string::{EcmaString, EcmaStringBuilder, IllFormedUtf16, InvalidCodePoint};
 
@@ -916,11 +918,166 @@ pub enum Instruction {
     ImportDynamic { dst: Register, specifier: Register },
     /// Export the local value in `src` under the string constant `name`.
     Export { name: ConstantId, src: Register },
+    /// `dst = home.[[Prototype]][key]`, invoked with `receiver` as `this`.
+    GetSuper {
+        dst: Register,
+        home: Register,
+        receiver: Register,
+        key: Register,
+    },
+    /// Set `home.[[Prototype]][key]` using `receiver` as the receiver.
+    SetSuper {
+        home: Register,
+        receiver: Register,
+        key: Register,
+        value: Register,
+    },
+    /// Static import carrying an attributes object.
+    ImportAttributes {
+        dst: Register,
+        specifier: ConstantId,
+        attributes: Register,
+    },
+    /// Dynamic import carrying an attributes/options object.
+    ImportDynamicAttributes {
+        dst: Register,
+        specifier: Register,
+        attributes: Register,
+    },
+    /// Copy enumerable own properties while excluding the listed keys.
+    CopyDataProperties {
+        target: Register,
+        source: Register,
+        excluded: Register,
+    },
+    /// Load the interned template object for one tagged-template site.
+    GetTemplateObject {
+        dst: Register,
+        cooked: Register,
+        raw: Register,
+    },
     /// Terminate the current activation (identical to the formal `Halt`).
     Halt,
 }
 
+impl From<isa::Instruction> for Instruction {
+    fn from(instruction: isa::Instruction) -> Self {
+        match instruction {
+            isa::Instruction::GetSuper {
+                dst,
+                home,
+                receiver,
+                key,
+            } => Self::GetSuper {
+                dst,
+                home,
+                receiver,
+                key,
+            },
+            isa::Instruction::SetSuper {
+                home,
+                receiver,
+                key,
+                value,
+            } => Self::SetSuper {
+                home,
+                receiver,
+                key,
+                value,
+            },
+            isa::Instruction::ImportAttributes {
+                dst,
+                specifier,
+                attributes,
+            } => Self::ImportAttributes {
+                dst,
+                specifier,
+                attributes,
+            },
+            isa::Instruction::ImportDynamicAttributes {
+                dst,
+                specifier,
+                attributes,
+            } => Self::ImportDynamicAttributes {
+                dst,
+                specifier,
+                attributes,
+            },
+            isa::Instruction::CopyDataProperties {
+                target,
+                source,
+                excluded,
+            } => Self::CopyDataProperties {
+                target,
+                source,
+                excluded,
+            },
+            isa::Instruction::GetTemplateObject { dst, cooked, raw } => {
+                Self::GetTemplateObject { dst, cooked, raw }
+            }
+        }
+    }
+}
+
 impl Instruction {
+    fn extension(self) -> Option<isa::Instruction> {
+        Some(match self {
+            Self::GetSuper {
+                dst,
+                home,
+                receiver,
+                key,
+            } => isa::Instruction::GetSuper {
+                dst,
+                home,
+                receiver,
+                key,
+            },
+            Self::SetSuper {
+                home,
+                receiver,
+                key,
+                value,
+            } => isa::Instruction::SetSuper {
+                home,
+                receiver,
+                key,
+                value,
+            },
+            Self::ImportAttributes {
+                dst,
+                specifier,
+                attributes,
+            } => isa::Instruction::ImportAttributes {
+                dst,
+                specifier,
+                attributes,
+            },
+            Self::ImportDynamicAttributes {
+                dst,
+                specifier,
+                attributes,
+            } => isa::Instruction::ImportDynamicAttributes {
+                dst,
+                specifier,
+                attributes,
+            },
+            Self::CopyDataProperties {
+                target,
+                source,
+                excluded,
+            } => isa::Instruction::CopyDataProperties {
+                target,
+                source,
+                excluded,
+            },
+            Self::GetTemplateObject { dst, cooked, raw } => {
+                isa::Instruction::GetTemplateObject { dst, cooked, raw }
+            }
+            _ => return None,
+        })
+    }
+
     /// Visits every register this instruction reads before executing.
     fn visit_reads(self, mut visit: impl FnMut(Register)) {
         match self {
@@ -1032,6 +1189,49 @@ impl Instruction {
             }
             Self::Suspend { src, .. } | Self::Await { src, .. } => visit(src),
             Self::ImportDynamic { specifier, .. } => visit(specifier),
+            Self::GetSuper {
+                home,
+                receiver,
+                key,
+                ..
+            } => {
+                visit(home);
+                visit(receiver);
+                visit(key);
+            }
+            Self::SetSuper {
+                home,
+                receiver,
+                key,
+                value,
+            } => {
+                visit(home);
+                visit(receiver);
+                visit(key);
+                visit(value);
+            }
+            Self::ImportAttributes { attributes, .. } => visit(attributes),
+            Self::ImportDynamicAttributes {
+                specifier,
+                attributes,
+                ..
+            } => {
+                visit(specifier);
+                visit(attributes);
+            }
+            Self::CopyDataProperties {
+                target,
+                source,
+                excluded,
+            } => {
+                visit(target);
+                visit(source);
+                visit(excluded);
+            }
+            Self::GetTemplateObject { cooked, raw, .. } => {
+                visit(cooked);
+                visit(raw);
+            }
             Self::LoadConst { .. }
             | Self::CreateObject { .. }
             | Self::CreateArray { .. }
@@ -1085,6 +1285,10 @@ impl Instruction {
             | Self::Await { dst, .. }
             | Self::Import { dst, .. }
             | Self::ImportDynamic { dst, .. }
+            | Self::GetSuper { dst, .. }
+            | Self::ImportAttributes { dst, .. }
+            | Self::ImportDynamicAttributes { dst, .. }
+            | Self::GetTemplateObject { dst, .. }
             | Self::SuppressError { dst, .. } => visit(dst),
             Self::Suspend { dst, mode, .. } => {
                 visit(dst);
@@ -1109,6 +1313,8 @@ impl Instruction {
             | Self::StoreGlobal { .. }
             | Self::ArrayPush { .. }
             | Self::ArrayExtend { .. }
+            | Self::SetSuper { .. }
+            | Self::CopyDataProperties { .. }
             | Self::ObjectSpread { .. }
             | Self::SetPrototype { .. }
             | Self::Export { .. }
@@ -1177,6 +1383,12 @@ impl Instruction {
             | Self::SuppressError { .. }
             | Self::Import { .. }
             | Self::ImportDynamic { .. }
+            | Self::GetSuper { .. }
+            | Self::SetSuper { .. }
+            | Self::ImportAttributes { .. }
+            | Self::ImportDynamicAttributes { .. }
+            | Self::CopyDataProperties { .. }
+            | Self::GetTemplateObject { .. }
             | Self::Export { .. } => visit(Pc::new(pc + 1)),
         }
     }
@@ -1569,6 +1781,9 @@ pub enum VerifyErrorKind {
     AliasedDisposeCaptureOutputs {
         register: Register,
     },
+    AliasedCopyDataProperties {
+        register: Register,
+    },
     ConstantOutOfBounds {
         constant: ConstantId,
         constant_count: usize,
@@ -1703,6 +1918,11 @@ impl fmt::Display for VerifyError {
             VerifyErrorKind::AliasedDisposeCaptureOutputs { register } => write!(
                 formatter,
                 "dispose capture method and kind outputs alias register {}",
+                register.get()
+            ),
+            VerifyErrorKind::AliasedCopyDataProperties { register } => write!(
+                formatter,
+                "copy-data-properties target aliases input register {}",
                 register.get()
             ),
             VerifyErrorKind::ConstantOutOfBounds {
@@ -2020,6 +2240,49 @@ fn verify_instruction(
     let constant_count = module.constants.len();
     let function_count = module.functions.len();
     let code_len = function.code.len();
+    if let Some(extension) = instruction.extension() {
+        verifier::verify_extension(
+            function_index,
+            pc,
+            extension,
+            register_count,
+            &module.constants,
+            code_len,
+        )
+        .map_err(|error| VerifyError {
+            function: error.function,
+            instruction: error.instruction,
+            kind: match error.kind {
+                verifier::Kind::RegisterOutOfBounds {
+                    register,
+                    register_count,
+                } => VerifyErrorKind::RegisterOutOfBounds {
+                    register,
+                    register_count,
+                },
+                verifier::Kind::JumpOutOfBounds {
+                    target,
+                    instruction_count,
+                } => VerifyErrorKind::JumpOutOfBounds {
+                    target,
+                    instruction_count,
+                },
+                verifier::Kind::ConstantOutOfBounds {
+                    constant,
+                    constant_count,
+                } => VerifyErrorKind::ConstantOutOfBounds {
+                    constant,
+                    constant_count,
+                },
+                verifier::Kind::StringConstantExpected { constant } => {
+                    VerifyErrorKind::StringConstantExpected { constant }
+                }
+                verifier::Kind::AliasedCopyDataProperties { register } => {
+                    VerifyErrorKind::AliasedCopyDataProperties { register }
+                }
+            },
+        })?;
+    }
 
     let check_register = |register: Register| -> Result<(), VerifyError> {
         if register.get() >= register_count {
@@ -2344,6 +2607,12 @@ fn verify_instruction(
             check_string_constant(name)?;
             check_register(src)?;
         }
+        Instruction::GetSuper { .. }
+        | Instruction::SetSuper { .. }
+        | Instruction::ImportAttributes { .. }
+        | Instruction::ImportDynamicAttributes { .. }
+        | Instruction::CopyDataProperties { .. }
+        | Instruction::GetTemplateObject { .. } => {}
         Instruction::Halt => {}
     }
 
@@ -3057,6 +3326,11 @@ impl<'a> Decoder<'a> {
                 object: Register::new(self.leb128()?),
                 key: Register::new(self.leb128()?),
             }),
+            opcode if (isa::FIRST_EXTENSION_TAG..isa::EXTENSION_TAG_END).contains(&opcode) => {
+                let (instruction, next) = isa::decode_from_tag(opcode, self.bytes, self.offset)?;
+                self.offset = next;
+                Ok(instruction.into())
+            }
             opcode => Err(self.error(opcode_at, DecodeErrorKind::InvalidOpcode { opcode })),
         }
     }
@@ -3258,6 +3532,10 @@ fn encode_function(function: &Function, output: &mut Vec<u8>) {
 }
 
 fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
+    if let Some(extension) = instruction.extension() {
+        extension.encode(output);
+        return;
+    }
     match instruction {
         Instruction::LoadConst { dst, constant } => {
             output.push(0);
@@ -3606,6 +3884,12 @@ fn encode_instruction(instruction: Instruction, output: &mut Vec<u8>) {
             write_u32(object.get(), output);
             write_u32(key.get(), output);
         }
+        Instruction::GetSuper { .. }
+        | Instruction::SetSuper { .. }
+        | Instruction::ImportAttributes { .. }
+        | Instruction::ImportDynamicAttributes { .. }
+        | Instruction::CopyDataProperties { .. }
+        | Instruction::GetTemplateObject { .. } => unreachable!("handled above"),
     }
 }
 
@@ -6925,6 +7209,225 @@ mod tests {
                 kind: VerifyErrorKind::RegisterOutOfBounds { register, .. },
                 ..
             }) if register == Register::new(2)
+        ));
+    }
+    #[test]
+    fn extension_opcodes_round_trip_through_root_codec_and_verify() {
+        let instructions = [
+            Instruction::GetSuper {
+                dst: Register::new(0),
+                home: Register::new(1),
+                receiver: Register::new(2),
+                key: Register::new(3),
+            },
+            Instruction::SetSuper {
+                home: Register::new(0),
+                receiver: Register::new(1),
+                key: Register::new(2),
+                value: Register::new(3),
+            },
+            Instruction::ImportAttributes {
+                dst: Register::new(0),
+                specifier: ConstantId::new(0),
+                attributes: Register::new(1),
+            },
+            Instruction::ImportDynamicAttributes {
+                dst: Register::new(0),
+                specifier: Register::new(1),
+                attributes: Register::new(2),
+            },
+            Instruction::CopyDataProperties {
+                target: Register::new(0),
+                source: Register::new(1),
+                excluded: Register::new(2),
+            },
+            Instruction::GetTemplateObject {
+                dst: Register::new(0),
+                cooked: Register::new(1),
+                raw: Register::new(2),
+            },
+        ];
+        let limits = DecodeLimits::default();
+        for instruction in instructions {
+            let mut bytes = Vec::new();
+            encode_instruction(instruction, &mut bytes);
+            let mut decoder = Decoder {
+                bytes: &bytes,
+                offset: 0,
+                limits: &limits,
+                total_instructions: 0,
+            };
+            assert_eq!(
+                decoder.instruction().expect("extension decodes"),
+                instruction
+            );
+            assert_eq!(decoder.offset, bytes.len());
+
+            Module::new(
+                vec![Constant::String(EcmaString::from("dep"))],
+                vec![Function::new(
+                    None,
+                    0,
+                    4,
+                    4,
+                    flags(),
+                    vec![instruction, Instruction::Halt],
+                    Vec::new(),
+                )],
+                FunctionId::new(0),
+            )
+            .verify()
+            .expect("extension verifies through the root contract");
+        }
+    }
+
+    #[test]
+    fn root_decoder_rejects_truncated_and_unknown_extension_bytes() {
+        let limits = DecodeLimits::default();
+        for bytes in [&[52_u8][..], &[54, 0, 0][..], &[57, 0, 0][..]] {
+            let mut decoder = Decoder {
+                bytes,
+                offset: 0,
+                limits: &limits,
+                total_instructions: 0,
+            };
+            assert!(matches!(
+                decoder.instruction(),
+                Err(DecodeError {
+                    kind: DecodeErrorKind::UnexpectedEof,
+                    ..
+                })
+            ));
+        }
+
+        let mut decoder = Decoder {
+            bytes: &[58],
+            offset: 0,
+            limits: &limits,
+            total_instructions: 0,
+        };
+        assert!(matches!(
+            decoder.instruction(),
+            Err(DecodeError {
+                kind: DecodeErrorKind::InvalidOpcode { opcode: 58 },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn extension_verifier_rejects_alias_type_bounds_and_uninitialized_reads() {
+        let alias = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                3,
+                3,
+                flags(),
+                vec![
+                    Instruction::CopyDataProperties {
+                        target: Register::new(0),
+                        source: Register::new(0),
+                        excluded: Register::new(2),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            alias.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::AliasedCopyDataProperties { register },
+                ..
+            }) if register == Register::new(0)
+        ));
+
+        let wrong_constant_type = Module::new(
+            vec![Constant::Int32(1)],
+            vec![Function::new(
+                None,
+                0,
+                1,
+                2,
+                flags(),
+                vec![
+                    Instruction::ImportAttributes {
+                        dst: Register::new(1),
+                        specifier: ConstantId::new(0),
+                        attributes: Register::new(0),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            wrong_constant_type.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::StringConstantExpected { .. },
+                ..
+            })
+        ));
+
+        let out_of_bounds = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                1,
+                1,
+                flags(),
+                vec![
+                    Instruction::GetTemplateObject {
+                        dst: Register::new(0),
+                        cooked: Register::new(0),
+                        raw: Register::new(1),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            out_of_bounds.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::RegisterOutOfBounds { register, .. },
+                ..
+            }) if register == Register::new(1)
+        ));
+
+        let uninitialized = Module::new(
+            Vec::new(),
+            vec![Function::new(
+                None,
+                0,
+                0,
+                4,
+                flags(),
+                vec![
+                    Instruction::GetSuper {
+                        dst: Register::new(0),
+                        home: Register::new(1),
+                        receiver: Register::new(2),
+                        key: Register::new(3),
+                    },
+                    Instruction::Halt,
+                ],
+                Vec::new(),
+            )],
+            FunctionId::new(0),
+        );
+        assert!(matches!(
+            uninitialized.verify(),
+            Err(VerifyError {
+                kind: VerifyErrorKind::ReadBeforeWrite { .. },
+                ..
+            })
         ));
     }
 }

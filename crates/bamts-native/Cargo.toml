@@ -9,6 +9,8 @@ repository.workspace = true
 description = "Native linkage, FFI, and execution bridge for BamTS"
 
 [dependencies]
+bamts-bytecode.workspace = true
+
 # JIT linkage only. Off by default and activated exclusively by `jit-entry`, so
 # the default, `gc`, `node-host`, and `aot-image` builds carry no Cranelift
 # dependency. Pinned to match bamts-codegen's Cranelift pin (`=0.134.2`) so the
@@ -16,9 +18,9 @@ description = "Native linkage, FFI, and execution bridge for BamTS"
 cranelift-jit = { version = "=0.134.2", optional = true }
 cranelift-module = { version = "=0.134.2", optional = true }
 
-# Windows-only Win32 surface used by the `cache-guard` capability. Only
-# bamts-cli enables that feature, so the gc/node-host/aot-image/jit-entry
-# closures never resolve this dependency.
+# Windows-only Win32 surface used by the optional `cache-guard` capability.
+# The default, gc, node-host, aot-image, and jit-entry closures do not resolve
+# this dependency.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "=0.62.2", optional = true, default-features = false, features = [
     "Win32_Foundation",

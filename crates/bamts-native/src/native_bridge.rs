@@ -37,10 +37,10 @@ use crate::{Completion, CompletionTag, ShadowFrame, Value};
 // -- The helper algebra ------------------------------------------------------
 
 /// The number of runtime helpers, `0..HELPER_COUNT`.
-pub const HELPER_COUNT: u32 = 47;
+pub const HELPER_COUNT: u32 = 53;
 
 /// A runtime helper, identified by its stable ABI index. The variant order is
-/// the canonical `external_index` order (0..46) and is byte-identical to
+/// the canonical `external_index` order (0..52) and is byte-identical to
 /// `bamts_codegen::Helper`; [`NativeHelper::symbol`] returns the exact linker
 /// symbol generated code resolves against.
 ///
@@ -146,6 +146,18 @@ pub enum NativeHelper {
     WithHasBinding = 45,
     /// `bamts_resume_mode` — index 46.
     ResumeMode = 46,
+    /// `bamts_get_super` — index 47.
+    GetSuper = 47,
+    /// `bamts_set_super` — index 48.
+    SetSuper = 48,
+    /// `bamts_import_attributes` — index 49.
+    ImportAttributes = 49,
+    /// `bamts_import_dynamic_attributes` — index 50.
+    ImportDynamicAttributes = 50,
+    /// `bamts_copy_data_properties` — index 51.
+    CopyDataProperties = 51,
+    /// `bamts_get_template_object` — index 52.
+    GetTemplateObject = 52,
 }
 
 impl NativeHelper {
@@ -201,6 +213,12 @@ impl NativeHelper {
             NativeHelper::DefineOwnDescriptorSlot => "bamts_define_own_descriptor_slot",
             NativeHelper::WithHasBinding => "bamts_with_has_binding",
             NativeHelper::ResumeMode => "bamts_resume_mode",
+            NativeHelper::GetSuper => "bamts_get_super",
+            NativeHelper::SetSuper => "bamts_set_super",
+            NativeHelper::ImportAttributes => "bamts_import_attributes",
+            NativeHelper::ImportDynamicAttributes => "bamts_import_dynamic_attributes",
+            NativeHelper::CopyDataProperties => "bamts_copy_data_properties",
+            NativeHelper::GetTemplateObject => "bamts_get_template_object",
         }
     }
 
@@ -262,6 +280,12 @@ impl NativeHelper {
             44 => Some(NativeHelper::DefineOwnDescriptorSlot),
             45 => Some(NativeHelper::WithHasBinding),
             46 => Some(NativeHelper::ResumeMode),
+            47 => Some(NativeHelper::GetSuper),
+            48 => Some(NativeHelper::SetSuper),
+            49 => Some(NativeHelper::ImportAttributes),
+            50 => Some(NativeHelper::ImportDynamicAttributes),
+            51 => Some(NativeHelper::CopyDataProperties),
+            52 => Some(NativeHelper::GetTemplateObject),
             _ => None,
         }
     }
@@ -437,6 +461,31 @@ pub enum HelperCall {
     Export { name: u32, src: Value },
     /// Consume `amount` units from the shared instruction budget.
     ConsumeFuel { amount: u32 },
+    /// Read `key` through `home`'s prototype with receiver `receiver`.
+    GetSuper {
+        home: Value,
+        receiver: Value,
+        key: Value,
+    },
+    /// Set `key` through `home`'s prototype with receiver `receiver`.
+    SetSuper {
+        home: Value,
+        receiver: Value,
+        key: Value,
+        value: Value,
+    },
+    /// Import string constant `specifier` with the supplied attributes object.
+    ImportAttributes { specifier: u32, attributes: Value },
+    /// Evaluate `import(specifier, { with: attributes })`.
+    ImportDynamicAttributes { specifier: Value, attributes: Value },
+    /// Copy own enumerable data properties from `source` to `target`, excluding listed keys.
+    CopyDataProperties {
+        target: Value,
+        source: Value,
+        excluded: Value,
+    },
+    /// Return the template object interned by cooked-array identity.
+    GetTemplateObject { cooked: Value, raw: Value },
 }
 
 impl HelperCall {
@@ -491,6 +540,34 @@ impl HelperCall {
             HelperCall::SuppressError { .. } => NativeHelper::SuppressError,
             HelperCall::Export { .. } => NativeHelper::Export,
             HelperCall::ConsumeFuel { .. } => NativeHelper::ConsumeFuel,
+            HelperCall::GetSuper {
+                home: _home,
+                receiver: _receiver,
+                key: _key,
+            } => NativeHelper::GetSuper,
+            HelperCall::SetSuper {
+                home: _home,
+                receiver: _receiver,
+                key: _key,
+                value: _value,
+            } => NativeHelper::SetSuper,
+            HelperCall::ImportAttributes {
+                specifier: _specifier,
+                attributes: _attributes,
+            } => NativeHelper::ImportAttributes,
+            HelperCall::ImportDynamicAttributes {
+                specifier: _specifier,
+                attributes: _attributes,
+            } => NativeHelper::ImportDynamicAttributes,
+            HelperCall::CopyDataProperties {
+                target: _target,
+                source: _source,
+                excluded: _excluded,
+            } => NativeHelper::CopyDataProperties,
+            HelperCall::GetTemplateObject {
+                cooked: _cooked,
+                raw: _raw,
+            } => NativeHelper::GetTemplateObject,
         }
     }
 }
@@ -753,11 +830,27 @@ thread_local! {
 /// dispatcher. Panic-safe: the previous dispatcher is restored even if `body`
 /// unwinds (the restore runs in a guard's `Drop`).
 pub fn with_native_ops<R>(ops: &mut dyn NativeOps, body: impl FnOnce() -> R) -> R {
-    // `ops` is taken uniquely to guarantee the caller owns the engine while it
-    // is installed, but the dispatcher is invoked through shared `&self`
-    // reborrows (see `NativeOps`), so it is stored as a shared raw pointer;
-    // re-entrant native calls then form further shared reborrows that alias
-    // soundly.
+    // Unique `&mut` at the install site guarantees the caller owns the engine
+    // for this scope; re-entrant dispatch still goes through shared `&self`
+    // (see [`with_native_ops_ref`]).
+    with_native_ops_ref(ops, body)
+}
+
+/// Installs `ops` as the current thread's dispatcher for the duration of
+/// `body`, then restores the previous dispatcher.
+///
+/// Prefer [`with_native_ops`] when the caller holds a unique engine borrow.
+/// This shared-ref form exists so interpreted/tiered paths that only have
+/// `&self` can still publish the dispatcher before a nested compiled
+/// `entries.invoke` (OSR transfer or a promoted callee): generated helpers
+/// read the thread-local and must not observe a missing dispatcher as a
+/// spurious [`TRAP_MISSING_NATIVE_OPS`] deopt.
+///
+/// Nesting-safe and panic-safe, identical to [`with_native_ops`].
+pub fn with_native_ops_ref<R>(ops: &dyn NativeOps, body: impl FnOnce() -> R) -> R {
+    // The dispatcher is invoked through shared `&self` reborrows (see
+    // `NativeOps`), so it is stored as a shared raw pointer; re-entrant native
+    // calls then form further shared reborrows that alias soundly.
     let ptr: *const dyn NativeOps = ops;
     // SAFETY: `ptr` and `erased` have the identical fat-pointer representation,
     // alignment, initialization, and provenance; the transmute changes only the
@@ -1885,6 +1978,227 @@ pub unsafe extern "C" fn bamts_export(
         },
     )
 }
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_get_super(frame, home, receiver, key, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_get_super(
+    frame: *mut ShadowFrame,
+    home: u64,
+    receiver: u64,
+    key: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::GetSuper {
+            home: Value::from_bits(home),
+            receiver: Value::from_bits(receiver),
+            key: Value::from_bits(key),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_set_super(frame, home, receiver, key, value, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_set_super(
+    frame: *mut ShadowFrame,
+    home: u64,
+    receiver: u64,
+    key: u64,
+    value: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::SetSuper {
+            home: Value::from_bits(home),
+            receiver: Value::from_bits(receiver),
+            key: Value::from_bits(key),
+            value: Value::from_bits(value),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_import_attributes(frame, specifier, attributes, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_import_attributes(
+    frame: *mut ShadowFrame,
+    specifier: u32,
+    attributes: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::ImportAttributes {
+            specifier,
+            attributes: Value::from_bits(attributes),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_import_dynamic_attributes(frame, specifier, attributes, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_import_dynamic_attributes(
+    frame: *mut ShadowFrame,
+    specifier: u64,
+    attributes: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::ImportDynamicAttributes {
+            specifier: Value::from_bits(specifier),
+            attributes: Value::from_bits(attributes),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_copy_data_properties(frame, target, source, excluded, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_copy_data_properties(
+    frame: *mut ShadowFrame,
+    target: u64,
+    source: u64,
+    excluded: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::CopyDataProperties {
+            target: Value::from_bits(target),
+            source: Value::from_bits(source),
+            excluded: Value::from_bits(excluded),
+        },
+    )
+}
+
+/// # Safety
+///
+/// The caller must provide a live, uniquely owned `frame` whose nonempty handle
+/// range is disjoint from its header, and a live, aligned, writable `out`. Both
+/// remain valid and unaliased for the full call.
+///
+/// `bamts_get_template_object(frame, cooked, raw, out)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bamts_get_template_object(
+    frame: *mut ShadowFrame,
+    cooked: u64,
+    raw: u64,
+    out: *mut Completion,
+) -> u32 {
+    dispatch_simple(
+        frame,
+        out,
+        HelperCall::GetTemplateObject {
+            cooked: Value::from_bits(cooked),
+            raw: Value::from_bits(raw),
+        },
+    )
+}
+
+impl NativeHelper {
+    /// The address of the extern "C" wrapper generated code calls.
+    ///
+    /// This is the single authoritative helper→address binding in the
+    /// workspace: every binding job (JIT symbol resolution, AOT export
+    /// tables) MUST go through this table so a swapped arm fails the
+    /// address-pin test instead of silently calling the wrong runtime op.
+    /// Kept beside the extern definitions so an added or renamed wrapper
+    /// cannot drift away from its arm.
+    #[inline]
+    #[must_use]
+    pub fn address(self) -> *const u8 {
+        match self {
+            NativeHelper::LoadConstant => bamts_load_constant as *const u8,
+            NativeHelper::Unary => bamts_unary as *const u8,
+            NativeHelper::Binary => bamts_binary as *const u8,
+            NativeHelper::CreateObject => bamts_create_object as *const u8,
+            NativeHelper::CreateArray => bamts_create_array as *const u8,
+            NativeHelper::CreateClosure => bamts_create_closure as *const u8,
+            NativeHelper::GetProperty => bamts_get_property as *const u8,
+            NativeHelper::SetProperty => bamts_set_property as *const u8,
+            NativeHelper::DeleteProperty => bamts_delete_property as *const u8,
+            NativeHelper::Call => bamts_call as *const u8,
+            NativeHelper::Construct => bamts_construct as *const u8,
+            NativeHelper::Import => bamts_import as *const u8,
+            NativeHelper::Truthy => bamts_truthy as *const u8,
+            NativeHelper::ResumeValue => bamts_resume_value as *const u8,
+            NativeHelper::DefineAccessor => bamts_define_accessor as *const u8,
+            NativeHelper::LoadGlobal => bamts_load_global as *const u8,
+            NativeHelper::StoreGlobal => bamts_store_global as *const u8,
+            NativeHelper::TypeOfGlobal => bamts_typeof_global as *const u8,
+            NativeHelper::LoadThis => bamts_load_this as *const u8,
+            NativeHelper::LoadArguments => bamts_load_arguments as *const u8,
+            NativeHelper::LoadNewTarget => bamts_load_new_target as *const u8,
+            NativeHelper::ArrayPush => bamts_array_push as *const u8,
+            NativeHelper::ArrayExtend => bamts_array_extend as *const u8,
+            NativeHelper::ObjectSpread => bamts_object_spread as *const u8,
+            NativeHelper::SetPrototype => bamts_set_prototype as *const u8,
+            NativeHelper::CreatePrivateName => bamts_create_private_name as *const u8,
+            NativeHelper::CreateRegExp => bamts_create_regexp as *const u8,
+            NativeHelper::GetIterator => bamts_get_iterator as *const u8,
+            NativeHelper::IteratorNext => bamts_iterator_next as *const u8,
+            NativeHelper::Export => bamts_export as *const u8,
+            NativeHelper::ConsumeFuel => bamts_consume_fuel as *const u8,
+            NativeHelper::CreateCell => bamts_create_cell as *const u8,
+            NativeHelper::IteratorStep => bamts_iterator_step as *const u8,
+            NativeHelper::IteratorResult => bamts_iterator_result as *const u8,
+            NativeHelper::IteratorClose => bamts_iterator_close as *const u8,
+            NativeHelper::RequireCloseResult => bamts_require_close_result as *const u8,
+            NativeHelper::ToObject => bamts_to_object as *const u8,
+            NativeHelper::ImportDynamic => bamts_import_dynamic as *const u8,
+            NativeHelper::LoadImportMeta => bamts_load_import_meta as *const u8,
+            NativeHelper::DisposeCapture => bamts_dispose_capture as *const u8,
+            NativeHelper::SuppressError => bamts_suppress_error as *const u8,
+            NativeHelper::ConstructWithNewTarget => bamts_construct_with_new_target as *const u8,
+            NativeHelper::DefineDataProperty => bamts_define_data_property as *const u8,
+            NativeHelper::LoadOwnDescriptorSlot => bamts_load_own_descriptor_slot as *const u8,
+            NativeHelper::DefineOwnDescriptorSlot => bamts_define_own_descriptor_slot as *const u8,
+            NativeHelper::WithHasBinding => bamts_with_has_binding as *const u8,
+            NativeHelper::ResumeMode => bamts_resume_mode as *const u8,
+            NativeHelper::GetSuper => bamts_get_super as *const u8,
+            NativeHelper::SetSuper => bamts_set_super as *const u8,
+            NativeHelper::ImportAttributes => bamts_import_attributes as *const u8,
+            NativeHelper::ImportDynamicAttributes => bamts_import_dynamic_attributes as *const u8,
+            NativeHelper::CopyDataProperties => bamts_copy_data_properties as *const u8,
+            NativeHelper::GetTemplateObject => bamts_get_template_object as *const u8,
+        }
+    }
+}
 
 // Compile-time signature parity with `bamts_codegen::Helper::param_types`. Each
 // `const _` binds a `bamts_*` export to its exact ABI signature (every runtime
@@ -1963,6 +2277,18 @@ const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, u32, *mut Complet
 const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
     bamts_with_has_binding; // 45
 const _: unsafe extern "C" fn(*mut ShadowFrame, *mut Completion) -> u32 = bamts_resume_mode; // 46
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) -> u32 =
+    bamts_get_super; // 47
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, u64, *mut Completion) -> u32 =
+    bamts_set_super; // 48
+const _: unsafe extern "C" fn(*mut ShadowFrame, u32, u64, *mut Completion) -> u32 =
+    bamts_import_attributes; // 49
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_import_dynamic_attributes; // 50
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, u64, *mut Completion) -> u32 =
+    bamts_copy_data_properties; // 51
+const _: unsafe extern "C" fn(*mut ShadowFrame, u64, u64, *mut Completion) -> u32 =
+    bamts_get_template_object; // 52
 
 // -- Native entry invocation seam --------------------------------------------
 
@@ -2655,7 +2981,7 @@ mod tests {
     /// this crate under `host-jit`, so importing it would be a cycle), so this
     /// literal is the pinned contract; it must stay byte-identical to
     /// `bamts_codegen::Helper::{external_index, symbol}`.
-    const CODEGEN_HELPERS: [(u32, &str); 47] = [
+    const CODEGEN_HELPERS: [(u32, &str); 53] = [
         (0, "bamts_load_constant"),
         (1, "bamts_unary"),
         (2, "bamts_binary"),
@@ -2703,6 +3029,12 @@ mod tests {
         (44, "bamts_define_own_descriptor_slot"),
         (45, "bamts_with_has_binding"),
         (46, "bamts_resume_mode"),
+        (47, "bamts_get_super"),
+        (48, "bamts_set_super"),
+        (49, "bamts_import_attributes"),
+        (50, "bamts_import_dynamic_attributes"),
+        (51, "bamts_copy_data_properties"),
+        (52, "bamts_get_template_object"),
     ];
 
     /// A recording dispatcher: captures the last call and returns a fixed
@@ -2849,6 +3181,76 @@ mod tests {
         }
         // Dense and total: no index past the table, and the inverse rejects it.
         assert_eq!(NativeHelper::from_u32(HELPER_COUNT), None);
+    }
+
+    #[test]
+    fn helper_addresses_pin_every_extern_wrapper() {
+        // Dense by from_u32: every ABI index has exactly one address arm, and
+        // that arm is the corresponding bamts_* wrapper fn item.
+        let expected: [*const u8; HELPER_COUNT as usize] = [
+            bamts_load_constant as *const u8,
+            bamts_unary as *const u8,
+            bamts_binary as *const u8,
+            bamts_create_object as *const u8,
+            bamts_create_array as *const u8,
+            bamts_create_closure as *const u8,
+            bamts_get_property as *const u8,
+            bamts_set_property as *const u8,
+            bamts_delete_property as *const u8,
+            bamts_call as *const u8,
+            bamts_construct as *const u8,
+            bamts_import as *const u8,
+            bamts_truthy as *const u8,
+            bamts_resume_value as *const u8,
+            bamts_define_accessor as *const u8,
+            bamts_load_global as *const u8,
+            bamts_store_global as *const u8,
+            bamts_typeof_global as *const u8,
+            bamts_load_this as *const u8,
+            bamts_load_arguments as *const u8,
+            bamts_load_new_target as *const u8,
+            bamts_array_push as *const u8,
+            bamts_array_extend as *const u8,
+            bamts_object_spread as *const u8,
+            bamts_set_prototype as *const u8,
+            bamts_create_private_name as *const u8,
+            bamts_create_regexp as *const u8,
+            bamts_get_iterator as *const u8,
+            bamts_iterator_next as *const u8,
+            bamts_export as *const u8,
+            bamts_consume_fuel as *const u8,
+            bamts_create_cell as *const u8,
+            bamts_iterator_step as *const u8,
+            bamts_iterator_result as *const u8,
+            bamts_iterator_close as *const u8,
+            bamts_require_close_result as *const u8,
+            bamts_to_object as *const u8,
+            bamts_import_dynamic as *const u8,
+            bamts_load_import_meta as *const u8,
+            bamts_dispose_capture as *const u8,
+            bamts_suppress_error as *const u8,
+            bamts_construct_with_new_target as *const u8,
+            bamts_define_data_property as *const u8,
+            bamts_load_own_descriptor_slot as *const u8,
+            bamts_define_own_descriptor_slot as *const u8,
+            bamts_with_has_binding as *const u8,
+            bamts_resume_mode as *const u8,
+            bamts_get_super as *const u8,
+            bamts_set_super as *const u8,
+            bamts_import_attributes as *const u8,
+            bamts_import_dynamic_attributes as *const u8,
+            bamts_copy_data_properties as *const u8,
+            bamts_get_template_object as *const u8,
+        ];
+        assert_eq!(expected.len(), HELPER_COUNT as usize);
+        for index in 0..HELPER_COUNT {
+            let helper = NativeHelper::from_u32(index).expect("dense index");
+            assert_eq!(
+                helper.address(),
+                expected[index as usize],
+                "address for {helper:?} (index {index})"
+            );
+        }
     }
 
     #[test]
@@ -3652,7 +4054,7 @@ mod tests {
             Some(NativeHelper::WithHasBinding)
         );
         assert_eq!(NativeHelper::from_u32(46), Some(NativeHelper::ResumeMode));
-        assert_eq!(NativeHelper::from_u32(47), None);
+        assert_eq!(NativeHelper::from_u32(HELPER_COUNT), None);
         // Earlier appends stay stable.
         assert_eq!(NativeHelper::DefineDataProperty.as_u32(), 42);
         assert_eq!(

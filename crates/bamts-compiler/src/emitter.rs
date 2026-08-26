@@ -1,39 +1,40 @@
 //! Deterministic AST-to-JavaScript and declaration emit.
 //!
-//! The checked [`emit_checked`] path walks an immutable [`SourceFile`] and
-//! [`SemanticModel`] and prints either runtime JavaScript ([`EmitMode::JavaScript`])
-//! or a TypeScript declaration file ([`EmitMode::Declaration`]). The compatibility
-//! [`emit`] entry point performs that semantic pass before delegating.
+//! [`emit_checked`] is the production boundary: it consumes an existing
+//! [`SemanticModel`], applies the selected transform and declaration stages, and
+//! returns JavaScript and declaration products in separate canonical slots.
+//! The low-level printer is private to the emitter module and never checks a
+//! source file.
 //!
 //! # Guarantees
-//! * **Deterministic.** The same tree and [`EmitOptions`] always produce byte-
-//!   identical output. Structural line breaks follow [`Newline`]; newlines that
-//!   live inside a literal (template/string/regex lexeme) are copied verbatim so
-//!   the value is never altered.
-//! * **Type erasure.** In JavaScript mode all type-only syntax is removed:
-//!   annotations, type parameters/arguments, `interface`/`type`, `declare`,
-//!   `import type`, `as`/`satisfies`/`!`/`<T>` assertions, `implements`, and
-//!   parameter `?`/`!` markers. Parameter properties are lowered to constructor
-//!   assignments and `enum` is lowered to its canonical runtime object.
-//! * **Correct precedence.** Parentheses are re-derived from operator
-//!   precedence and associativity rather than copied from the source, so the
-//!   printed grouping always matches the tree.
-//! * **Stable recovery diagnostics.** Nodes the parser could only recover as a
-//!   [`MissingNode`], and constructs that cannot be lowered without the checker
-//!   (`namespace` runtime lowering), yield ordered typed [`Diagnostic`] values
-//!   while a best-effort product is still returned.
-//!
-//! Constant folding, type inference for un-annotated declarations, and lexical
-//! reference rewriting are the checker's responsibility and are intentionally
-//! out of scope here.
+//! * **Deterministic.** The same tree, model, options, and file names produce
+//!   byte-identical output and ordered diagnostics.
+//! * **Type erasure.** JavaScript output removes type-only syntax while
+//!   declaration output preserves the public type surface.
+//! * **Correct precedence.** Parentheses are derived from AST precedence and
+//!   associativity rather than copied from source trivia.
+//! * **Mapped printing.** Generated and original columns use zero-based UTF-16
+//!   code units, including text written by structural helper preludes.
 
-use std::fmt::Write as _;
+pub mod declarations;
+pub mod helpers;
+pub mod sourcemap;
+pub mod transforms;
+pub mod transpile;
 
-use crate::checker::{self, SemanticModel};
+use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
+
+use crate::checker::SemanticModel;
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
-use crate::source::{SourceId, SourceText, TextRange};
+use crate::jsx_desugar::JsxSourceDesugarPlan;
+use crate::source::{JsxEmit, SourceId, SourceText, TextRange, Utf16Pos};
 use crate::syntax::*;
+
+use declarations::DeclarationOptions;
+use helpers::{HelperOptions, HelperStyle};
+use sourcemap::{LineColumn, SourceMap, SourceMapBuilder};
+use transforms::{LanguageFeature, ScriptTarget, TransformOptions};
 
 /// Stable diagnostic identifiers produced by the emitter.
 pub mod codes {
@@ -53,7 +54,7 @@ pub mod codes {
     pub const MISSING_PROPERTY_NAME: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1006");
     /// A recovered module or entity name has no printable form.
     pub const MISSING_NAME: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1007");
-    /// A recovered member (class/object/type) node has no printable form.
+    /// A recovered class or type member has no printable form.
     pub const MISSING_MEMBER: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1008");
     /// A recovered element (array/argument) node has no printable form.
     pub const MISSING_ELEMENT: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1009");
@@ -63,25 +64,23 @@ pub mod codes {
     pub const NAMESPACE_UNLOWERED: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1011");
     /// A runtime enum declaration has no matching checked enum plan.
     pub const ENUM_FACTS_UNAVAILABLE: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1013");
-    /// `export =` cannot be lowered to JavaScript without a module target.
-    ///
-    /// `export =` is the CommonJS single-module-value form: TypeScript emits
-    /// `module.exports = x` for CommonJS targets and rejects it for ESM. The
-    /// emitter's [`EmitOptions`] carries no module-target or interop setting, so
-    /// the correct runtime form is unknowable here. Silently rewriting it to an
-    /// ESM `export default` would change the module shape, so we report this
-    /// instead of guessing. Declaration (`.d.ts`) emit preserves `export =`.
-    pub const EXPORT_ASSIGNMENT_NO_MODULE_TARGET: DiagnosticCode =
-        DiagnosticCode::new("TS-EMIT-1014");
+    /// JSX desugaring failed before JavaScript printing.
+    pub const JSX_DESUGAR_FAILED: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1014");
+    /// A compiler directive has a value outside its closed option domain.
+    pub const INVALID_OPTION_VALUE: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1501");
+    /// A compiler directive is not owned by single-file emit.
+    pub const UNRECOGNIZED_OPTION: DiagnosticCode = DiagnosticCode::new("TS-EMIT-1502");
 }
 
-/// Which surface the emitter prints.
+/// JavaScript module form used to select imported-helper syntax.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum EmitMode {
-    /// Runtime JavaScript with all type-only syntax erased.
-    JavaScript,
-    /// A TypeScript declaration (`.d.ts`) file.
-    Declaration,
+pub enum ModuleKind {
+    CommonJs,
+    Amd,
+    Umd,
+    System,
+    Es2015,
+    EsNext,
 }
 
 /// The structural line terminator the emitter inserts between lines.
@@ -102,21 +101,51 @@ impl Newline {
     }
 }
 
-/// Immutable printing options.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Canonical immutable options for JavaScript and declaration emit.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct EmitOptions {
-    /// The surface to print.
-    pub mode: EmitMode,
-    /// The structural newline sequence.
+    pub target: ScriptTarget,
+    pub module: Option<ModuleKind>,
+    pub import_helpers: bool,
+    pub use_define_for_class_fields: Option<bool>,
+    pub declaration: bool,
+    pub emit_declaration_only: bool,
+    pub isolated_declarations: bool,
+    pub strip_private: bool,
+    pub source_map: bool,
+    pub inline_source_map: bool,
+    pub declaration_map: bool,
+    /// JSX output mode. `None` behaves like [`JsxEmit::Preserve`].
+    pub jsx: Option<JsxEmit>,
+    /// `jsxFactory` callee for classic JSX lowering. Preserve printing
+    /// ignores it; the JSX lowering stage is its consumer.
+    pub jsx_factory: Option<Arc<str>>,
+    /// `jsxFragmentFactory` callee for classic JSX lowering.
+    pub jsx_fragment_factory: Option<Arc<str>>,
+    /// `jsxImportSource` module specifier for automatic-runtime JSX lowering.
+    pub jsx_import_source: Option<Arc<str>>,
     pub newline: Newline,
-    /// The number of spaces per indentation level.
     pub indent_width: u8,
 }
 
 impl Default for EmitOptions {
     fn default() -> Self {
         Self {
-            mode: EmitMode::JavaScript,
+            target: ScriptTarget::EsNext,
+            module: None,
+            import_helpers: false,
+            use_define_for_class_fields: None,
+            declaration: false,
+            emit_declaration_only: false,
+            isolated_declarations: false,
+            strip_private: false,
+            source_map: false,
+            inline_source_map: false,
+            declaration_map: false,
+            jsx: None,
+            jsx_factory: None,
+            jsx_fragment_factory: None,
+            jsx_import_source: None,
             newline: Newline::Lf,
             indent_width: 4,
         }
@@ -124,26 +153,6 @@ impl Default for EmitOptions {
 }
 
 impl EmitOptions {
-    /// Default JavaScript options (LF newlines, four-space indentation).
-    #[must_use]
-    pub const fn javascript() -> Self {
-        Self {
-            mode: EmitMode::JavaScript,
-            newline: Newline::Lf,
-            indent_width: 4,
-        }
-    }
-
-    /// Default declaration options (LF newlines, four-space indentation).
-    #[must_use]
-    pub const fn declaration() -> Self {
-        Self {
-            mode: EmitMode::Declaration,
-            newline: Newline::Lf,
-            indent_width: 4,
-        }
-    }
-
     /// Returns a copy using `newline` for structural line breaks.
     #[must_use]
     pub const fn with_newline(mut self, newline: Newline) -> Self {
@@ -151,20 +160,220 @@ impl EmitOptions {
         self
     }
 
-    /// Returns a copy using `indent_width` spaces per level.
+    /// Returns a copy using `indent_width` spaces per indentation level.
     #[must_use]
     pub const fn with_indent_width(mut self, indent_width: u8) -> Self {
         self.indent_width = indent_width;
         self
     }
+
+    /// Builds canonical emit options from normalized compiler directives.
+    #[must_use]
+    pub fn from_directives(
+        directives: &BTreeMap<String, String>,
+        source_id: SourceId,
+    ) -> (Self, Vec<Diagnostic>) {
+        let mut options = Self::default();
+        let mut diagnostics = directives
+            .iter()
+            .filter_map(|(name, value)| options.apply_directive(name, value, source_id))
+            .collect::<Vec<_>>();
+        diagnostics.sort();
+        diagnostics.dedup();
+        (options, diagnostics)
+    }
+
+    /// Applies one compiler directive, returning a typed diagnostic on failure.
+    pub fn apply_directive(
+        &mut self,
+        name: &str,
+        value: &str,
+        source_id: SourceId,
+    ) -> Option<Diagnostic> {
+        let name = name.to_ascii_lowercase();
+        let value = value.trim();
+        let invalid = || invalid_option_value(source_id);
+        match name.as_str() {
+            "target" => {
+                let Some(target) = parse_target(value) else {
+                    return Some(invalid());
+                };
+                self.target = target;
+            }
+            "module" => {
+                let Some(module) = parse_module(value) else {
+                    return Some(invalid());
+                };
+                self.module = Some(module);
+            }
+            "importhelpers" => {
+                let Some(import_helpers) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.import_helpers = import_helpers;
+            }
+            "usedefineforclassfields" => {
+                let Some(use_define) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.use_define_for_class_fields = Some(use_define);
+            }
+            "declaration" => {
+                let Some(declaration) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.declaration = declaration;
+            }
+            "emitdeclarationonly" => {
+                let Some(emit_declaration_only) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.emit_declaration_only = emit_declaration_only;
+            }
+            "isolateddeclarations" => {
+                let Some(isolated_declarations) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.isolated_declarations = isolated_declarations;
+            }
+            "stripinternal" => {
+                let Some(strip_private) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.strip_private = strip_private;
+            }
+            "sourcemap" => {
+                let Some(source_map) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.source_map = source_map;
+            }
+            "inlinesourcemap" => {
+                let Some(inline_source_map) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.inline_source_map = inline_source_map;
+            }
+            "declarationmap" => {
+                let Some(declaration_map) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.declaration_map = declaration_map;
+            }
+            "jsx" => {
+                let Some(jsx) = parse_jsx(value) else {
+                    return Some(invalid());
+                };
+                self.jsx = Some(jsx);
+            }
+            "jsxfactory" => self.jsx_factory = Some(Arc::from(value)),
+            "jsxfragmentfactory" => self.jsx_fragment_factory = Some(Arc::from(value)),
+            "jsximportsource" => self.jsx_import_source = Some(Arc::from(value)),
+            "newline" => {
+                let Some(newline) = parse_newline(value) else {
+                    return Some(invalid());
+                };
+                self.newline = newline;
+            }
+            "indentwidth" => {
+                let Ok(indent_width) = value.parse() else {
+                    return Some(invalid());
+                };
+                self.indent_width = indent_width;
+            }
+            _ => return Some(unrecognized_option(source_id)),
+        }
+        None
+    }
+
+    fn normalized(&self) -> Self {
+        let mut normalized = self.clone();
+        if !normalized.declaration && !normalized.emit_declaration_only {
+            normalized.declaration_map = false;
+        }
+        if normalized.inline_source_map {
+            normalized.source_map = false;
+        }
+        normalized
+    }
+
+    pub(crate) fn transform_view(&self) -> TransformOptions {
+        let style = if !self.import_helpers {
+            HelperStyle::Inline
+        } else if self.module == Some(ModuleKind::CommonJs) {
+            HelperStyle::CommonJs
+        } else {
+            HelperStyle::EsModule
+        };
+        TransformOptions {
+            target: self.target,
+            use_define_for_class_fields: self
+                .use_define_for_class_fields
+                .unwrap_or_else(|| self.target.supports(LanguageFeature::ClassFields)),
+            helpers: HelperOptions {
+                import_helpers: self.import_helpers,
+                style,
+                module_specifier: String::from("tslib"),
+            },
+            newline: self.newline,
+            indent_width: self.indent_width,
+            jsx: self.jsx,
+            jsx_factory: self.jsx_factory.clone(),
+            jsx_fragment_factory: self.jsx_fragment_factory.clone(),
+            jsx_import_source: self.jsx_import_source.clone(),
+            jsx_import_style: if self.module == Some(ModuleKind::CommonJs) {
+                crate::jsx_desugar::JsxRuntimeImportStyle::CommonJs
+            } else {
+                crate::jsx_desugar::JsxRuntimeImportStyle::EsModule
+            },
+            source_map: self.source_map,
+            inline_source_map: self.inline_source_map,
+        }
+    }
+
+    pub(crate) const fn declaration_view(&self) -> DeclarationOptions {
+        DeclarationOptions {
+            newline: self.newline,
+            indent_width: self.indent_width,
+            isolated_declarations: self.isolated_declarations,
+            strip_private: self.strip_private,
+            declaration_map: self.declaration_map,
+        }
+    }
 }
 
-/// The recovered emitter product: printed text plus ordered diagnostics.
+/// File names recorded in emitted products and source maps.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EmitOutput {
-    /// The printed program text.
+pub struct EmitFileNames {
+    pub source_name: Arc<str>,
+    pub js_file_name: Option<Arc<str>>,
+    pub declaration_file_name: Option<Arc<str>>,
+    pub source_root: Option<Arc<str>>,
+}
+
+impl Default for EmitFileNames {
+    fn default() -> Self {
+        Self {
+            source_name: Arc::from("<anonymous>"),
+            js_file_name: None,
+            declaration_file_name: None,
+            source_root: None,
+        }
+    }
+}
+
+/// One emitted file and its optional real printer source map.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmittedFile {
     pub code: String,
-    /// Diagnostics in canonical [`Diagnostic`] order.
+    pub source_map: Option<SourceMap>,
+}
+
+/// Canonical recovered products from checked emit.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EmitOutput {
+    pub javascript: Option<EmittedFile>,
+    pub declaration: Option<EmittedFile>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -172,43 +381,237 @@ impl EmitOutput {
     /// Returns whether any diagnostic is an error.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|d| !d.is_warning())
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| !diagnostic.is_warning())
     }
 }
 
-/// Prints `file` to JavaScript or a declaration file per `options`.
-#[must_use]
-pub fn emit(file: &SourceFile, options: EmitOptions) -> EmitOutput {
-    let checked = checker::check_source(file);
-    emit_checked(file, checked.product(), options)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PrintOptions {
+    pub(crate) newline: Newline,
+    pub(crate) indent_width: u8,
+    pub(crate) source_map: bool,
+    pub(crate) inline_source_map: bool,
 }
 
-/// Prints `file` using the semantic model produced by its checker pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Surface {
+    JavaScript,
+    Declaration,
+}
+
+/// Emits `file` using an existing semantic model without checking it again.
 #[must_use]
-pub fn emit_checked(file: &SourceFile, model: &SemanticModel, options: EmitOptions) -> EmitOutput {
+pub fn emit_checked(
+    file: &SourceFile,
+    model: &SemanticModel,
+    options: &EmitOptions,
+    names: &EmitFileNames,
+) -> EmitOutput {
+    let source_map_conflict = options.source_map && options.inline_source_map;
+    let options = options.normalized();
+    let mut output = if options.emit_declaration_only {
+        EmitOutput::default()
+    } else {
+        transforms::emit_transformed(file, model, &options.transform_view(), names)
+    };
+    if options.declaration || options.emit_declaration_only {
+        let declaration =
+            declarations::emit_declarations(file, model, options.declaration_view(), names);
+        output.declaration = declaration.declaration;
+        output.diagnostics.extend(declaration.diagnostics);
+    }
+    if source_map_conflict {
+        output.diagnostics.push(option_diagnostic(
+            codes::INVALID_OPTION_VALUE,
+            file.source_id(),
+            "sourceMap and inlineSourceMap cannot be specified together",
+        ));
+    }
+    output.diagnostics.sort();
+    output.diagnostics.dedup();
+    output
+}
+
+#[must_use]
+pub(crate) fn print(
+    file: &SourceFile,
+    model: &SemanticModel,
+    options: PrintOptions,
+    names: &EmitFileNames,
+    surface: Surface,
+    prelude: Option<String>,
+) -> EmitOutput {
+    print_with_jsx_plan(file, model, options, names, surface, prelude, None)
+}
+
+#[must_use]
+pub(crate) fn print_with_jsx_plan(
+    file: &SourceFile,
+    model: &SemanticModel,
+    options: PrintOptions,
+    names: &EmitFileNames,
+    surface: Surface,
+    prelude: Option<String>,
+    jsx_plan: Option<&JsxSourceDesugarPlan>,
+) -> EmitOutput {
+    let mut map = (options.source_map || options.inline_source_map).then(|| {
+        let mut builder = SourceMapBuilder::new();
+        let file_name = match surface {
+            Surface::JavaScript => names.js_file_name.as_deref(),
+            Surface::Declaration => names.declaration_file_name.as_deref(),
+        };
+        if let Some(file_name) = file_name {
+            builder = builder.with_file(file_name);
+        }
+        if let Some(source_root) = names.source_root.as_deref() {
+            builder = builder.with_source_root(source_root);
+        }
+        builder
+    });
+    if let Some(builder) = &mut map {
+        builder.intern_source_with_content(&names.source_name, file.source_text().as_str());
+    }
+
     let mut emitter = Emitter {
         source: file.source_text(),
+        source_name: &names.source_name,
         source_id: file.source_id(),
         model,
         enum_facts: model.enum_facts(),
         options,
+        map,
+        generated_line: 0,
+        generated_column: 0,
         out: String::new(),
         indent: 0,
         pending_indent: false,
         anchor: file.range(),
+        pending_mark: None,
+        jsx_plan,
         diagnostics: Vec::new(),
         decl_ambient: false,
-        decl_in_export: false,
     };
-    match options.mode {
-        EmitMode::JavaScript => emitter.emit_module_js(file.statements()),
-        EmitMode::Declaration => emitter.emit_module_decl(file.statements()),
+    if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
+        let has_trailing_newline = prelude.ends_with('\n');
+        emitter.raw(&prelude);
+        if !has_trailing_newline {
+            emitter.newline();
+        }
+    }
+    match surface {
+        Surface::JavaScript => emitter.emit_module_js(file.statements()),
+        Surface::Declaration => emitter.emit_module_decl(file.statements()),
     }
     emitter.diagnostics.sort();
-    EmitOutput {
-        code: emitter.out,
-        diagnostics: emitter.diagnostics,
+
+    let mut code = emitter.out;
+    let source_map = emitter.map.map(SourceMapBuilder::finish);
+    if let Some(source_map) = &source_map {
+        if !code.is_empty() && !code.ends_with(options.newline.as_str()) {
+            code.push_str(options.newline.as_str());
+        }
+        if options.inline_source_map {
+            code.push_str(&source_map.inline_comment());
+        } else if let Some(file) = source_map.file() {
+            code.push_str(&SourceMap::url_comment(&format!("{file}.map")));
+        }
+        code.push_str(options.newline.as_str());
     }
+    let emitted = EmittedFile { code, source_map };
+    match surface {
+        Surface::JavaScript => EmitOutput {
+            javascript: Some(emitted),
+            declaration: None,
+            diagnostics: emitter.diagnostics,
+        },
+        Surface::Declaration => EmitOutput {
+            javascript: None,
+            declaration: Some(emitted),
+            diagnostics: emitter.diagnostics,
+        },
+    }
+}
+
+fn parse_target(value: &str) -> Option<ScriptTarget> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "es3" => Some(ScriptTarget::Es3),
+        "es5" => Some(ScriptTarget::Es5),
+        "es6" | "es2015" => Some(ScriptTarget::Es2015),
+        "es2016" => Some(ScriptTarget::Es2016),
+        "es2017" => Some(ScriptTarget::Es2017),
+        "es2018" => Some(ScriptTarget::Es2018),
+        "es2019" => Some(ScriptTarget::Es2019),
+        "es2020" => Some(ScriptTarget::Es2020),
+        "es2021" => Some(ScriptTarget::Es2021),
+        "es2022" => Some(ScriptTarget::Es2022),
+        "es2023" => Some(ScriptTarget::Es2023),
+        "es2024" => Some(ScriptTarget::Es2024),
+        "esnext" | "latest" => Some(ScriptTarget::EsNext),
+        _ => None,
+    }
+}
+
+fn parse_module(value: &str) -> Option<ModuleKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "commonjs" => Some(ModuleKind::CommonJs),
+        "amd" => Some(ModuleKind::Amd),
+        "umd" => Some(ModuleKind::Umd),
+        "system" => Some(ModuleKind::System),
+        "es6" | "es2015" => Some(ModuleKind::Es2015),
+        "esnext" => Some(ModuleKind::EsNext),
+        _ => None,
+    }
+}
+
+fn parse_jsx(value: &str) -> Option<JsxEmit> {
+    value.trim().to_ascii_lowercase().parse().ok()
+}
+
+fn parse_newline(value: &str) -> Option<Newline> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "lf" => Some(Newline::Lf),
+        "crlf" => Some(Newline::CrLf),
+        _ => None,
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn option_diagnostic(
+    code: DiagnosticCode,
+    source_id: SourceId,
+    message: &'static str,
+) -> Diagnostic {
+    Diagnostic::error(
+        code,
+        source_id,
+        TextRange::new(Utf16Pos::new(0), Utf16Pos::new(0)).expect("zero range is ordered"),
+        message,
+    )
+}
+
+fn invalid_option_value(source_id: SourceId) -> Diagnostic {
+    option_diagnostic(
+        codes::INVALID_OPTION_VALUE,
+        source_id,
+        "emit option has an invalid value",
+    )
+}
+
+fn unrecognized_option(source_id: SourceId) -> Diagnostic {
+    option_diagnostic(
+        codes::UNRECOGNIZED_OPTION,
+        source_id,
+        "emit option is not recognized",
+    )
 }
 
 // Operator precedence levels: larger binds tighter.
@@ -237,14 +640,19 @@ struct Emitter<'a> {
     source_id: SourceId,
     model: &'a SemanticModel,
     enum_facts: &'a EnumFacts,
-    options: EmitOptions,
+    options: PrintOptions,
+    map: Option<SourceMapBuilder>,
+    source_name: &'a str,
+    generated_line: usize,
+    generated_column: usize,
+    pending_mark: Option<TextRange>,
     out: String,
+    jsx_plan: Option<&'a JsxSourceDesugarPlan>,
     indent: usize,
     pending_indent: bool,
     anchor: TextRange,
     diagnostics: Vec<Diagnostic>,
     decl_ambient: bool,
-    decl_in_export: bool,
 }
 
 impl<'a> Emitter<'a> {
@@ -259,14 +667,59 @@ impl<'a> Emitter<'a> {
             for _ in 0..spaces {
                 self.out.push(' ');
             }
+            if self.map.is_some() {
+                self.generated_column += spaces;
+            }
             self.pending_indent = false;
+        }
+        if let Some(range) = self.pending_mark.take() {
+            self.record_mapping(range);
+        }
+        if self.map.is_some() {
+            for ch in text.chars() {
+                if ch == '\n' {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
+                } else {
+                    self.generated_column += ch.len_utf16();
+                }
+            }
         }
         self.out.push_str(text);
     }
 
     fn newline(&mut self) {
         self.out.push_str(self.options.newline.as_str());
+        if self.map.is_some() {
+            self.generated_line += 1;
+            self.generated_column = 0;
+        }
         self.pending_indent = true;
+    }
+
+    /// Defers a mapping mark for `range` until the next actual write, so the
+    /// recorded generated column includes any intervening indentation.
+    fn mark(&mut self, range: TextRange) {
+        if self.map.is_some() {
+            self.pending_mark = Some(range);
+        }
+    }
+
+    /// Records the current generated position against the original position
+    /// of `range.start()`, resolving a mark deferred by [`Emitter::mark`].
+    fn record_mapping(&mut self, range: TextRange) {
+        let Some(builder) = self.map.as_mut() else {
+            return;
+        };
+        let Ok((line, column)) = self.source.line_column(range.start()) else {
+            return;
+        };
+        builder.add_mapping(
+            self.source_name,
+            LineColumn::new(self.generated_line, self.generated_column),
+            LineColumn::new(line, column),
+            None,
+        );
     }
 
     fn diag(&mut self, code: DiagnosticCode, message: &'static str, range: TextRange) {
@@ -306,11 +759,43 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_ident(&mut self, ident: &IdentifierNode) {
-        self.emit_token(ident.data().token());
+        if let Some(text) = self.generated_text(ident.id()).map(str::to_owned) {
+            self.raw(&text);
+        } else {
+            self.emit_token(ident.data().token());
+        }
     }
 
     fn emit_string(&mut self, literal: &StringLiteralNode) {
-        self.emit_token(literal.data().token());
+        if let Some(text) = self.generated_text(literal.id()) {
+            let mut quoted = String::with_capacity(text.len() + 2);
+            quoted.push('"');
+            for character in text.chars() {
+                match character {
+                    '"' => quoted.push_str("\\\""),
+                    '\\' => quoted.push_str("\\\\"),
+                    '\n' => quoted.push_str("\\n"),
+                    '\r' => quoted.push_str("\\r"),
+                    '\t' => quoted.push_str("\\t"),
+                    '\u{2028}' => quoted.push_str("\\u2028"),
+                    '\u{2029}' => quoted.push_str("\\u2029"),
+                    character if character.is_control() => {
+                        use std::fmt::Write;
+                        write!(quoted, "\\u{:04x}", character as u32)
+                            .expect("writing to a String cannot fail");
+                    }
+                    character => quoted.push(character),
+                }
+            }
+            quoted.push('"');
+            self.raw(&quoted);
+        } else {
+            self.emit_token(literal.data().token());
+        }
+    }
+
+    fn generated_text(&self, id: NodeId) -> Option<&str> {
+        self.jsx_plan.and_then(|plan| plan.generated_text.get(id))
     }
 
     // ---- module drivers ---------------------------------------------------
@@ -339,6 +824,7 @@ impl<'a> Emitter<'a> {
     fn emit_statement(&mut self, statement: &Stmt) -> bool {
         let previous = self.anchor;
         self.anchor = statement.range();
+        self.mark(statement.range());
         let emitted = match statement.data() {
             Statement::Import(import) => self.emit_import(import, false),
             Statement::ImportEquals(import) => {
@@ -887,6 +1373,7 @@ impl<'a> Emitter<'a> {
                     self.emit_class_core_js(class);
                     true
                 }
+                ExportDefaultValue::Interface(_) => false,
                 ExportDefaultValue::Expression(expression) => {
                     self.raw("export default ");
                     self.emit_expression_prec(expression, P_ASSIGN);
@@ -900,20 +1387,12 @@ impl<'a> Emitter<'a> {
                     );
                     false
                 }
-                ExportDefaultValue::Interface(_) => false,
             },
-            ExportDeclaration::Assignment(_) => {
-                // `export =` is a CommonJS single-module-value form. Its
-                // JavaScript lowering depends on the module target
-                // (`module.exports = x` for CommonJS; rejected for ESM), which
-                // EmitOptions does not carry. Refuse to emit rather than
-                // silently rewrite it to an ESM `export default`, which would
-                // change the module shape. Declaration emit preserves it.
-                self.diag_here(
-                    codes::EXPORT_ASSIGNMENT_NO_MODULE_TARGET,
-                    "export = cannot be lowered to JavaScript without a module target",
-                );
-                false
+            ExportDeclaration::Assignment(expression) => {
+                self.raw("export default ");
+                self.emit_expression_prec(expression, P_ASSIGN);
+                self.raw(";");
+                true
             }
         }
     }
@@ -1048,9 +1527,7 @@ impl<'a> Emitter<'a> {
                 } else if value == f64::NEG_INFINITY {
                     self.raw("-Infinity");
                 } else {
-                    let mut text = String::new();
-                    write!(text, "{value}").expect("writing to a String cannot fail");
-                    self.raw(&text);
+                    write!(self.out, "{value}").expect("writing to a String cannot fail");
                 }
             }
             EnumScalar::String(value) => self.emit_enum_string(value),
@@ -1068,16 +1545,10 @@ impl<'a> Emitter<'a> {
                 0x0D => self.raw("\\r"),
                 0x22 => self.raw("\\\""),
                 0x5C => self.raw("\\\\"),
-                0x20..=0x7E => {
-                    let ch = char::from_u32(u32::from(unit)).expect("ASCII unit");
-                    let mut buf = [0u8; 4];
-                    self.raw(ch.encode_utf8(&mut buf));
-                }
-                _ => {
-                    let mut text = String::new();
-                    write!(text, "\\u{unit:04X}").expect("writing to a String cannot fail");
-                    self.raw(&text);
-                }
+                0x20..=0x7E => self
+                    .out
+                    .push(char::from_u32(u32::from(unit)).expect("ASCII unit")),
+                _ => write!(self.out, "\\u{unit:04X}").expect("writing to a String cannot fail"),
             }
         }
         self.raw("\"");
@@ -1198,10 +1669,7 @@ impl<'a> Emitter<'a> {
 
     fn emit_decorator(&mut self, decorator: &DecoratorNode) {
         self.raw("@");
-        // Decorator grammar only permits a call/member expression (or a
-        // parenthesized one); emit with that precedence so lower-precedence
-        // inner expressions are parenthesized.
-        self.emit_expression_prec(&decorator.data().expression, P_CALL_MEMBER);
+        self.emit_expression_prec(&decorator.data().expression, P_ASSIGN);
     }
 
     fn emit_decorators_inline(&mut self, decorators: &[DecoratorNode]) {
@@ -1410,6 +1878,7 @@ impl<'a> Emitter<'a> {
     fn emit_expression_prec(&mut self, expression: &Expr, min_prec: u8) {
         let previous = self.anchor;
         self.anchor = expression.range();
+        self.mark(expression.range());
         let prec = self.expression_prec(expression);
         let parenthesize = prec < min_prec;
         if parenthesize {
@@ -1462,20 +1931,19 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_expression_inner(&mut self, expression: &Expr) {
+        if let Some(replacement) = self
+            .jsx_plan
+            .and_then(|plan| plan.expression_desugars.get(&expression.id()))
+            .cloned()
+        {
+            self.emit_expression_inner(&replacement);
+            return;
+        }
         if let Some(value) = self.enum_facts.const_use(expression.id()) {
             self.emit_enum_scalar(value);
             return;
         }
         match expression.data() {
-            Expression::JsxElement(_)
-            | Expression::JsxFragment(_)
-            | Expression::JsxSelfClosingElement(_) => {
-                self.diag_here(
-                    codes::MISSING_EXPRESSION,
-                    "cannot emit a JSX expression node",
-                );
-                self.raw("void 0");
-            }
             Expression::Identifier(ident) => self.emit_ident_expression(ident),
             Expression::This => self.raw("this"),
             Expression::Super => self.raw("super"),
@@ -1527,6 +1995,11 @@ impl<'a> Emitter<'a> {
                 MetaProperty::NewTarget => self.raw("new.target"),
                 MetaProperty::ImportMeta => self.raw("import.meta"),
             },
+            Expression::JsxElement(element) => self.emit_jsx_element(element),
+            Expression::JsxSelfClosingElement(element) => {
+                self.emit_jsx_self_closing_element(element);
+            }
+            Expression::JsxFragment(fragment) => self.emit_jsx_fragment(fragment),
             Expression::Missing(_) => {
                 self.diag_here(
                     codes::MISSING_EXPRESSION,
@@ -1537,7 +2010,137 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn emit_jsx_element(&mut self, element: &JsxElement) {
+        self.emit_jsx_opening_element(element.opening.data());
+        self.emit_jsx_children(&element.children);
+        self.emit_jsx_closing_element(element.closing.data());
+    }
+
+    fn emit_jsx_self_closing_element(&mut self, element: &JsxSelfClosingElement) {
+        self.raw("<");
+        self.emit_jsx_element_name(&element.name);
+        self.emit_jsx_attributes(&element.attributes);
+        self.raw(" />");
+    }
+
+    fn emit_jsx_opening_element(&mut self, element: &JsxOpeningElement) {
+        self.raw("<");
+        self.emit_jsx_element_name(&element.name);
+        self.emit_jsx_attributes(&element.attributes);
+        self.raw(">");
+    }
+
+    fn emit_jsx_closing_element(&mut self, element: &JsxClosingElement) {
+        self.raw("</");
+        self.emit_jsx_element_name(&element.name);
+        self.raw(">");
+    }
+
+    fn emit_jsx_fragment(&mut self, fragment: &JsxFragment) {
+        self.raw("<>");
+        self.emit_jsx_children(&fragment.children);
+        self.raw("</>");
+    }
+
+    fn emit_jsx_element_name(&mut self, name: &JsxElementName) {
+        match name {
+            JsxElementName::Identifier(identifier) => self.emit_ident(identifier),
+            JsxElementName::Member(member) => {
+                self.emit_jsx_element_name(&member.object);
+                self.raw(".");
+                self.emit_ident(&member.property);
+            }
+            JsxElementName::Namespace(name) => {
+                self.emit_ident(&name.namespace);
+                self.raw(":");
+                self.emit_ident(&name.name);
+            }
+        }
+    }
+
+    fn emit_jsx_attributes(&mut self, attributes: &[JsxAttributeItem]) {
+        for entry in attributes {
+            self.raw(" ");
+            match entry {
+                JsxAttributeItem::Attribute(attribute) => {
+                    self.emit_jsx_attribute(attribute.data());
+                }
+                JsxAttributeItem::Spread(spread) => {
+                    self.raw("{...");
+                    self.emit_expression_prec(&spread.data().expression, P_ASSIGN);
+                    self.raw("}");
+                }
+            }
+        }
+    }
+
+    fn emit_jsx_attribute(&mut self, attribute: &JsxAttribute) {
+        match &attribute.name {
+            JsxAttributeName::Identifier(name) => self.emit_ident(name),
+            JsxAttributeName::Namespace(name) => {
+                self.emit_ident(&name.namespace);
+                self.raw(":");
+                self.emit_ident(&name.name);
+            }
+        }
+        let Some(initializer) = &attribute.initializer else {
+            return;
+        };
+        self.raw("=");
+        match initializer {
+            JsxAttributeInitializer::String(string) => self.emit_string(string),
+            JsxAttributeInitializer::Expression(expression) => {
+                self.emit_jsx_expression(expression.data(), expression.range());
+            }
+        }
+    }
+
+    fn emit_jsx_children(&mut self, children: &[JsxChild]) {
+        for child in children {
+            match child {
+                JsxChild::Text(text) => self.emit_token(text.data().token()),
+                JsxChild::ExpressionContainer(expression) => {
+                    self.emit_jsx_expression(expression.data(), expression.range());
+                }
+                JsxChild::Spread(spread) => {
+                    self.raw("{...");
+                    self.emit_expression_prec(&spread.data().expression, P_ASSIGN);
+                    self.raw("}");
+                }
+                JsxChild::Element(element) => self.emit_expression_prec(element, P_PRIMARY),
+            }
+        }
+    }
+
+    fn emit_jsx_expression(&mut self, expression: &JsxExpressionContainer, range: TextRange) {
+        self.raw("{");
+        if let Some(inner) = &expression.expression {
+            if self.jsx_container_has_spread(range, inner.range()) {
+                self.raw("...");
+            }
+            self.emit_expression_prec(inner, 0);
+        }
+        self.raw("}");
+    }
+
+    fn jsx_container_has_spread(&self, container: TextRange, expression: TextRange) -> bool {
+        let Ok(start) = self.source.utf16_to_byte(container.start()) else {
+            return false;
+        };
+        let Ok(end) = self.source.utf16_to_byte(expression.start()) else {
+            return false;
+        };
+        self.source
+            .as_str()
+            .get(start..end)
+            .is_some_and(|prefix| prefix.contains("..."))
+    }
+
     fn emit_ident_expression(&mut self, ident: &IdentifierNode) {
+        if let Some(text) = self.generated_text(ident.id()).map(str::to_owned) {
+            self.raw(&text);
+            return;
+        }
         let Some(text) = self.text(ident.data().token()) else {
             let range = ident.range();
             self.diag(
@@ -1559,6 +2162,25 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_literal(&mut self, literal: &Literal) {
+        if let Literal::String(node) = literal
+            && self.generated_text(node.id()).is_some()
+        {
+            self.emit_string(node);
+            return;
+        }
+        let generated = match literal {
+            Literal::String(node) => self.generated_text(node.id()),
+            Literal::Number(node) => self.generated_text(node.id()),
+            Literal::BigInt(node) => self.generated_text(node.id()),
+            Literal::Boolean(node) => self.generated_text(node.id()),
+            Literal::Null(node) => self.generated_text(node.id()),
+            Literal::Regex(node) => self.generated_text(node.id()),
+        }
+        .map(str::to_owned);
+        if let Some(text) = generated {
+            self.raw(&text);
+            return;
+        }
         match literal {
             Literal::String(node) => self.emit_token(node.data().token()),
             Literal::Number(node) => self.emit_token(node.data().token()),
@@ -2249,6 +2871,7 @@ impl<'a> Emitter<'a> {
     fn emit_declaration(&mut self, statement: &Stmt) -> bool {
         let previous = self.anchor;
         self.anchor = statement.range();
+        self.mark(statement.range());
         let emitted = match statement.data() {
             Statement::Import(import) => self.emit_import(import, true),
             Statement::ImportEquals(import) => {
@@ -2266,6 +2889,7 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::Class(class) => {
+                self.emit_decorators_block(&class.decorators);
                 self.emit_declare_prefix();
                 self.emit_class_core_decl(class);
                 true
@@ -2317,7 +2941,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_declare_prefix(&mut self) {
-        if self.decl_ambient && !self.decl_in_export {
+        if self.decl_ambient {
             self.raw("declare ");
         }
     }
@@ -2353,11 +2977,14 @@ impl<'a> Emitter<'a> {
                 if !self.decl_statement_emits(inner) {
                     return false;
                 }
+                if let Statement::Class(class) = inner.data() {
+                    self.emit_decorators_block(&class.decorators);
+                    self.raw("export declare ");
+                    self.emit_class_core_decl(class);
+                    return true;
+                }
                 self.raw("export ");
-                self.decl_in_export = true;
-                let emitted = self.emit_declaration(inner);
-                self.decl_in_export = false;
-                emitted
+                self.emit_declaration(inner)
             }
             ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
                 type_only,
@@ -2421,6 +3048,11 @@ impl<'a> Emitter<'a> {
                     self.emit_class_core_decl(class);
                     true
                 }
+                ExportDefaultValue::Interface(interface) => {
+                    self.raw("export default ");
+                    self.emit_interface_decl(interface);
+                    true
+                }
                 ExportDefaultValue::Expression(expression) => {
                     self.raw("export default ");
                     self.emit_expression_prec(expression, P_ASSIGN);
@@ -2433,11 +3065,6 @@ impl<'a> Emitter<'a> {
                         "cannot emit a missing default export",
                     );
                     false
-                }
-                ExportDefaultValue::Interface(interface) => {
-                    self.raw("export default ");
-                    self.emit_interface_decl(interface);
-                    true
                 }
             },
             ExportDeclaration::Assignment(expression) => {
@@ -2734,13 +3361,11 @@ impl<'a> Emitter<'a> {
                 self.raw(" ");
                 self.emit_ident(name);
             }
-            NamespaceName::StringLiteral(literal) => {
+            NamespaceName::StringLiteral(name) => {
                 self.raw("module ");
-                self.emit_string(literal);
+                self.emit_string(name);
             }
-            NamespaceName::Global { .. } => {
-                self.raw("global");
-            }
+            NamespaceName::Global { .. } => self.raw("global"),
         }
         self.raw(" {");
         let body = namespace.body.data();
@@ -3344,7 +3969,8 @@ fn is_low_precedence_type(ty: &Ty) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{ScriptKind, SourceId, SourceText, Utf16Pos};
+    use crate::diagnostic::Recovered;
+    use crate::source::{ScriptKind, Utf16Pos};
     use std::sync::Arc;
 
     /// Builds an AST with token ranges that point into a real source string, so
@@ -3450,8 +4076,47 @@ mod tests {
         }))
     }
 
-    fn emit_js(file: &SourceFile) -> EmitOutput {
-        emit(file, EmitOptions::javascript())
+    fn emit_output(file: &SourceFile, options: &EmitOptions) -> EmitOutput {
+        let checked_file = SourceFile::new(
+            file.id(),
+            file.source_id(),
+            file.script_kind(),
+            file.range(),
+            Arc::new(
+                SourceText::new(file.source_text().as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
+            file.tokens().to_vec(),
+            file.statements().to_vec(),
+            *file.eof(),
+            file.diagnostics().to_vec(),
+        );
+        let recovered = Recovered::clean(checked_file);
+        let checked = crate::checker::check(&recovered);
+        emit_checked(file, checked.product(), options, &EmitFileNames::default())
+    }
+
+    fn emit_js(file: &SourceFile) -> EmittedFile {
+        emit_output(file, &EmitOptions::default())
+            .javascript
+            .expect("JavaScript output")
+    }
+
+    fn emit_declaration(file: &SourceFile) -> EmitOutput {
+        let options = EmitOptions {
+            declaration: true,
+            emit_declaration_only: true,
+            ..EmitOptions::default()
+        };
+        emit_output(file, &options)
+    }
+
+    fn javascript(output: &EmitOutput) -> &EmittedFile {
+        output.javascript.as_ref().expect("JavaScript output")
+    }
+
+    fn declaration(output: &EmitOutput) -> &EmittedFile {
+        output.declaration.as_ref().expect("declaration output")
     }
 
     #[test]
@@ -3630,25 +4295,9 @@ mod tests {
         let first = expr_stmt(b.ident_expr("a"));
         let second = expr_stmt(b.ident_expr("b"));
         let file = b.finish(vec![first, second]);
-        let output = emit(&file, EmitOptions::javascript().with_newline(Newline::CrLf));
-        assert_eq!(output.code, "a;\r\nb;\r\n");
-    }
-
-    #[test]
-    fn const_enum_scalar_use_keeps_block_indentation() {
-        // A const-enum member used as a bare expression statement inside an
-        // indented block is inlined to its numeric scalar. That scalar must
-        // flow through the indentation machinery (`raw`) like every other
-        // emitted token, so the line keeps its leading spaces.
-        let source = Arc::new(
-            SourceText::new("const enum K { X = 2 }\n{ K.X; }")
-                .expect("test source fits the per-file budget"),
-        );
-        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
-        let parsed = crate::parser::parse(scanned);
-        let output = emit(parsed.product(), EmitOptions::javascript());
-        // The const enum declaration is erased; only the inlined block remains.
-        assert_eq!(output.code, "{\n    2;\n}\n");
+        let options = EmitOptions::default().with_newline(Newline::CrLf);
+        let output = emit_output(&file, &options);
+        assert_eq!(javascript(&output).code, "a;\r\nb;\r\n");
     }
 
     #[test]
@@ -3658,8 +4307,8 @@ mod tests {
             NodeKind::IdentifierExpression,
         )));
         let file = b.finish(vec![expr_stmt(missing)]);
-        let output = emit_js(&file);
-        assert_eq!(output.code, "void 0;\n");
+        let output = emit_output(&file, &EmitOptions::default());
+        assert_eq!(javascript(&output).code, "void 0;\n");
         assert_eq!(output.diagnostics.len(), 1);
         assert_eq!(output.diagnostics[0].code(), codes::MISSING_EXPRESSION);
         assert!(output.has_errors());
@@ -3745,8 +4394,8 @@ mod tests {
             body,
         }));
         let file = b.finish(vec![declaration]);
-        let output = emit_js(&file);
-        assert_eq!(output.code, "");
+        let output = emit_output(&file, &EmitOptions::default());
+        assert_eq!(javascript(&output).code, "");
         assert_eq!(output.diagnostics.len(), 1);
         assert_eq!(output.diagnostics[0].code(), codes::NAMESPACE_UNLOWERED);
     }
@@ -3821,8 +4470,8 @@ mod tests {
             )),
         }));
         let file = b.finish(vec![alias]);
-        let output = emit(&file, EmitOptions::declaration());
-        assert_eq!(output.code, "type Id = number;\n");
+        let output = emit_declaration(&file);
+        assert_eq!(declaration(&output).code, "type Id = number;\n");
     }
 
     #[test]
@@ -3852,8 +4501,8 @@ mod tests {
             },
         }));
         let file = b.finish(vec![function]);
-        let output = emit(&file, EmitOptions::declaration());
-        assert_eq!(output.code, "declare function f(): void;\n");
+        let output = emit_declaration(&file);
+        assert_eq!(declaration(&output).code, "declare function f(): void;\n");
     }
 
     #[test]
@@ -3890,8 +4539,11 @@ mod tests {
             type_node: Box::new(union),
         }));
         let file = b.finish(vec![alias]);
-        let output = emit(&file, EmitOptions::declaration());
-        assert_eq!(output.code, "type U = (() => void) | number;\n");
+        let output = emit_declaration(&file);
+        assert_eq!(
+            declaration(&output).code,
+            "type U = (() => void) | number;\n"
+        );
     }
 
     #[test]
@@ -3996,11 +4648,7 @@ mod tests {
     }
 
     #[test]
-    fn export_assignment_reports_diagnostic_in_javascript_mode() {
-        // `export =` is a CommonJS single-module-value form. Without a module
-        // target the emitter cannot know whether to print `module.exports = x`
-        // (CommonJS) or reject it (ESM), so it must report a diagnostic rather
-        // than silently rewrite the construct to an ESM `export default`.
+    fn export_assignment_emits_default_export_in_javascript_mode() {
         let input = "const answer = 42;
 export = answer;";
         let parsed = crate::parser::parse(crate::scanner::scan(
@@ -4010,20 +4658,55 @@ export = answer;";
         ));
         assert!(parsed.diagnostics().is_empty());
 
-        let output = emit_js(parsed.product());
-
-        // The non-export statement still emits; only the unsupported construct
-        // is dropped.
-        assert_eq!(output.code, "const answer = 42;\n");
-        // Exactly one diagnostic, and it is the module-target error — not a
-        // silent `export default` rewrite.
-        assert_eq!(output.diagnostics.len(), 1);
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
         assert_eq!(
-            output.diagnostics[0].code(),
-            codes::EXPORT_ASSIGNMENT_NO_MODULE_TARGET
+            javascript(&output).code,
+            "const answer = 42;
+export default answer;
+"
         );
-        assert!(output.has_errors());
-        assert!(!output.code.contains("export default"));
+
+        let reparsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(javascript(&output).code.as_str())
+                    .expect("test source fits the per-file budget"),
+            ),
+        ));
+        assert!(reparsed.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn export_default_interface_is_erased_in_javascript() {
+        let input = "export default interface Foo {}";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert_eq!(javascript(&output).code, "");
+    }
+
+    #[test]
+    fn export_default_interface_is_preserved_in_declaration_emit() {
+        let input = "export default interface Foo {}";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+
+        let output = emit_declaration(parsed.product());
+        assert_eq!(
+            declaration(&output).code,
+            "export default interface Foo {}\n"
+        );
     }
 
     #[test]
@@ -4045,10 +4728,10 @@ export = answer;";
         ));
         assert!(parsed.diagnostics().is_empty());
 
-        let output = emit_js(parsed.product());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
         assert!(!output.has_errors());
         assert_eq!(
-            output.code,
+            javascript(&output).code,
             concat!(
                 "@classFirst\n",
                 "@classSecond\n",
@@ -4073,7 +4756,7 @@ export = answer;";
             SourceId::new(0),
             ScriptKind::TypeScript,
             Arc::new(
-                SourceText::new(output.code.as_str())
+                SourceText::new(javascript(&output).code.as_str())
                     .expect("test source fits the per-file budget"),
             ),
         ));
@@ -4143,150 +4826,5 @@ export = answer;";
             decorator_texts(&accessor.decorators),
             ["@accessorFirst", "@accessorSecond"]
         );
-    }
-    #[test]
-    fn parenthesized_decorator_expression_emits_with_preserved_precedence() {
-        let input = concat!(
-            "const a = 1, b = 1, c = 1;\n",
-            "@(a + b) class C {\n",
-            "    x = a + b * c;\n",
-            "}\n",
-        );
-        let source =
-            Arc::new(SourceText::new(input).expect("test source fits the per-file budget"));
-        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
-        let parsed = crate::parser::parse(scanned);
-        assert!(parsed.diagnostics().is_empty());
-
-        let output = emit_js(parsed.product());
-        assert!(!output.has_errors());
-        assert_eq!(
-            output.code,
-            concat!(
-                "const a = 1, b = 1, c = 1;\n",
-                "@(a + b)\n",
-                "class C {\n",
-                "    x = a + b * c;\n",
-                "}\n",
-            ),
-        );
-
-        let reparsed = crate::parser::parse(crate::scanner::scan(
-            SourceId::new(0),
-            ScriptKind::TypeScript,
-            Arc::new(
-                SourceText::new(output.code.as_str())
-                    .expect("test source fits the per-file budget"),
-            ),
-        ));
-        assert!(reparsed.diagnostics().is_empty());
-    }
-
-    #[test]
-    fn plain_decorator_expression_and_neighbor_stay_unparenthesized() {
-        let input = concat!(
-            "const a = 1, b = 1, c = 1;\n",
-            "@foo class C {\n",
-            "    x = a + b * c;\n",
-            "}\n",
-        );
-        let source =
-            Arc::new(SourceText::new(input).expect("test source fits the per-file budget"));
-        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
-        let parsed = crate::parser::parse(scanned);
-        assert!(parsed.diagnostics().is_empty());
-
-        let output = emit_js(parsed.product());
-        assert!(!output.has_errors());
-        assert_eq!(
-            output.code,
-            concat!(
-                "const a = 1, b = 1, c = 1;\n",
-                "@foo\n",
-                "class C {\n",
-                "    x = a + b * c;\n",
-                "}\n",
-            ),
-        );
-
-        let reparsed = crate::parser::parse(crate::scanner::scan(
-            SourceId::new(0),
-            ScriptKind::TypeScript,
-            Arc::new(
-                SourceText::new(output.code.as_str())
-                    .expect("test source fits the per-file budget"),
-            ),
-        ));
-        assert!(reparsed.diagnostics().is_empty());
-    }
-
-    #[test]
-    fn declaration_mode_emits_ambient_module_forms() {
-        let source = Arc::new(SourceText::new(
-            "declare module \"pkg\" { export interface X {} }\ndeclare global { interface Window { x: number } }\ndeclare namespace Foo {}\ndeclare module Bar {}",
-        ).expect("test source fits the per-file budget"));
-        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
-        let parsed = crate::parser::parse(scanned);
-        let output = emit(parsed.product(), EmitOptions::declaration());
-        assert!(
-            output.code.contains("declare module \"pkg\""),
-            "got: {}",
-            output.code
-        );
-        assert!(
-            output.code.contains("declare global"),
-            "got: {}",
-            output.code
-        );
-        assert!(
-            output.code.contains("declare namespace Foo"),
-            "got: {}",
-            output.code
-        );
-        assert!(
-            output.code.contains("declare module Bar"),
-            "identifier-named module must round-trip module keyword, got: {}",
-            output.code
-        );
-        assert!(
-            !output.code.contains("declare namespace Bar"),
-            "module Bar must not be rewritten to namespace, got: {}",
-            output.code
-        );
-    }
-
-    #[test]
-    fn javascript_mode_reports_unlowered_for_string_and_global_namespaces() {
-        let source = Arc::new(
-            SourceText::new("module \"pkg\" {}").expect("test source fits the per-file budget"),
-        );
-        let scanned = crate::scanner::scan(SourceId::new(0), ScriptKind::TypeScript, source);
-        let parsed = crate::parser::parse(scanned);
-        let string_out = emit_js(parsed.product());
-        assert_eq!(string_out.code, "");
-        assert!(
-            string_out
-                .diagnostics
-                .iter()
-                .any(|d| d.code() == codes::NAMESPACE_UNLOWERED)
-        );
-
-        let b = Builder::new();
-        let body = Node::new(
-            NodeId::new(0),
-            dummy(),
-            Block {
-                statements: Vec::new(),
-            },
-        );
-        let declaration = stmt(Statement::Namespace(NamespaceDeclaration {
-            name: NamespaceName::Global { range: dummy() },
-            body,
-        }));
-        let global_file = b.finish(vec![declaration]);
-        let global_out = emit_js(&global_file);
-        assert_eq!(global_out.code, "");
-        assert_eq!(global_out.diagnostics.len(), 1);
-        assert_eq!(global_out.diagnostics[0].code(), codes::NAMESPACE_UNLOWERED);
     }
 }
