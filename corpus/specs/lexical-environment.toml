@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "lexical-environment"
 repository = "local"
 commit = "87d9ea925a30b200968a20327b3a874bcfdc945f"

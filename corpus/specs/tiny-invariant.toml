@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "tiny-invariant"
 repository = "https://github.com/alexreardon/tiny-invariant"
 commit = "b5587cf4ba45e257bce49053c3345b6614324252"

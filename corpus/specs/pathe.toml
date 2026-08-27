@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "pathe"
 repository = "https://github.com/unjs/pathe"
 commit = "bc7477a01f0bd60ada017add8142c9f9d69ccdc5"

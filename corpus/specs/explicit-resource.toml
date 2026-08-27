@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "explicit-resource"
 repository = "local"
 commit = "d17921136745d8f68172ea341b3eb51fceb06e55"

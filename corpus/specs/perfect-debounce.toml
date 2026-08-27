@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "perfect-debounce"
 repository = "https://github.com/unjs/perfect-debounce"
 commit = "430686fdcb590b838909eac66fbd99997c09ef12"

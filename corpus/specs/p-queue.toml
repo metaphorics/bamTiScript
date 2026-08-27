@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "p-queue"
 repository = "https://github.com/sindresorhus/p-queue"
 commit = "180ab9e25cd10b6f548767d7176076b50d25e188"

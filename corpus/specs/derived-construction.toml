@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "derived-construction"
 repository = "local"
 commit = "2f0fd8c308717c827e30b19684fa114f7c5a2036"

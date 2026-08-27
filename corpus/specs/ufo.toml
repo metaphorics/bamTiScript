@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "ufo"
 repository = "https://github.com/unjs/ufo"
 commit = "f06c800d0c59f2a4a1b9ba65eb6cb61a84419be6"

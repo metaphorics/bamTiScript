@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "event-loop"
 repository = "local"
 commit = "c6cad132023e7405c4c2d5008106943a8d94e57f"

@@ -1,4 +1,5 @@
 schema = 1
+source_kind = "git"
 id = "is-plain-obj"
 repository = "https://github.com/sindresorhus/is-plain-obj"
 commit = "97f38e8836f86a642cce98fc6ab3058bc36df181"
