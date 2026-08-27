@@ -509,6 +509,24 @@ pub enum Helper {
     /// `frame` into `out.value`, consuming the pending completion after
     /// [`Helper::ResumeValue`] observed it.
     ResumeMode,
+    /// `bamts_get_super(frame, home, receiver, key, out)`: read `key` through
+    /// `home`'s prototype with `receiver` as the receiver.
+    GetSuper,
+    /// `bamts_set_super(frame, home, receiver, key, value, out)`: write `key`
+    /// through `home`'s prototype with `receiver` as the receiver.
+    SetSuper,
+    /// `bamts_import_attributes(frame, specifier, attributes, out)`: import the
+    /// module named by `specifier` with the supplied attributes object.
+    ImportAttributes,
+    /// `bamts_import_dynamic_attributes(frame, specifier, attributes, out)`:
+    /// evaluate `import(specifier, { with: attributes })`.
+    ImportDynamicAttributes,
+    /// `bamts_copy_data_properties(frame, target, source, excluded, out)`: copy
+    /// own enumerable data properties from `source` to `target`.
+    CopyDataProperties,
+    /// `bamts_get_template_object(frame, cooked, raw, out)`: return the
+    /// template object interned by cooked-array identity.
+    GetTemplateObject,
 }
 
 impl Helper {
@@ -563,6 +581,12 @@ impl Helper {
             Helper::ConsumeFuel => "bamts_consume_fuel",
             Helper::CreateCell => "bamts_create_cell",
             Helper::ResumeMode => "bamts_resume_mode",
+            Helper::GetSuper => "bamts_get_super",
+            Helper::SetSuper => "bamts_set_super",
+            Helper::ImportAttributes => "bamts_import_attributes",
+            Helper::ImportDynamicAttributes => "bamts_import_dynamic_attributes",
+            Helper::CopyDataProperties => "bamts_copy_data_properties",
+            Helper::GetTemplateObject => "bamts_get_template_object",
         }
     }
 
@@ -618,6 +642,12 @@ impl Helper {
             Helper::DefineOwnDescriptorSlot => 44,
             Helper::WithHasBinding => 45,
             Helper::ResumeMode => 46,
+            Helper::GetSuper => 47,
+            Helper::SetSuper => 48,
+            Helper::ImportAttributes => 49,
+            Helper::ImportDynamicAttributes => 50,
+            Helper::CopyDataProperties => 51,
+            Helper::GetTemplateObject => 52,
         }
     }
 
@@ -673,6 +703,12 @@ impl Helper {
             44 => Some(Helper::DefineOwnDescriptorSlot),
             45 => Some(Helper::WithHasBinding),
             46 => Some(Helper::ResumeMode),
+            47 => Some(Helper::GetSuper),
+            48 => Some(Helper::SetSuper),
+            49 => Some(Helper::ImportAttributes),
+            50 => Some(Helper::ImportDynamicAttributes),
+            51 => Some(Helper::CopyDataProperties),
+            52 => Some(Helper::GetTemplateObject),
             _ => None,
         }
     }
@@ -766,6 +802,25 @@ impl Helper {
             Helper::RequireCloseResult
             // (frame, error, suppressed, out)
             | Helper::SuppressError => &[types::I64, types::I64, types::I64, types::I64],
+            // (frame, home, receiver, key, out)
+            Helper::GetSuper => &[types::I64, types::I64, types::I64, types::I64, types::I64],
+            // (frame, home, receiver, key, value, out)
+            Helper::SetSuper => &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+            ],
+            // (frame, specifier, attributes, out)
+            Helper::ImportAttributes => &[types::I64, types::I32, types::I64, types::I64],
+            // (frame, specifier, attributes, out)
+            Helper::ImportDynamicAttributes => &[types::I64, types::I64, types::I64, types::I64],
+            // (frame, target, source, excluded, out)
+            Helper::CopyDataProperties => &[types::I64, types::I64, types::I64, types::I64, types::I64],
+            // (frame, cooked, raw, out)
+            Helper::GetTemplateObject => &[types::I64, types::I64, types::I64, types::I64],
             // (frame, value)
             Helper::Truthy => &[types::I64, types::I64],
         }
@@ -1936,6 +1991,105 @@ impl<'a> Lowering<'a> {
                     self.call_helper(Helper::Export, &[self.frame, name_id, src_value, self.out]);
                 self.route_completion(pc, tag, None);
             }
+            Instruction::GetSuper {
+                dst,
+                home,
+                receiver,
+                key,
+            } => {
+                let handles = self.load_handles();
+                let home_value = self.load_register(handles, home);
+                let receiver_value = self.load_register(handles, receiver);
+                let key_value = self.load_register(handles, key);
+                let tag = self.call_helper(
+                    Helper::GetSuper,
+                    &[self.frame, home_value, receiver_value, key_value, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::SetSuper {
+                home,
+                receiver,
+                key,
+                value,
+            } => {
+                let handles = self.load_handles();
+                let home_value = self.load_register(handles, home);
+                let receiver_value = self.load_register(handles, receiver);
+                let key_value = self.load_register(handles, key);
+                let value_value = self.load_register(handles, value);
+                let tag = self.call_helper(
+                    Helper::SetSuper,
+                    &[
+                        self.frame,
+                        home_value,
+                        receiver_value,
+                        key_value,
+                        value_value,
+                        self.out,
+                    ],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::ImportAttributes {
+                dst,
+                specifier,
+                attributes,
+            } => {
+                let handles = self.load_handles();
+                let attributes_value = self.load_register(handles, attributes);
+                let specifier_id = self.iconst32(i64::from(specifier.get()));
+                let tag = self.call_helper(
+                    Helper::ImportAttributes,
+                    &[self.frame, specifier_id, attributes_value, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::ImportDynamicAttributes {
+                dst,
+                specifier,
+                attributes,
+            } => {
+                let handles = self.load_handles();
+                let specifier_value = self.load_register(handles, specifier);
+                let attributes_value = self.load_register(handles, attributes);
+                let tag = self.call_helper(
+                    Helper::ImportDynamicAttributes,
+                    &[self.frame, specifier_value, attributes_value, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
+            Instruction::CopyDataProperties {
+                target,
+                source,
+                excluded,
+            } => {
+                let handles = self.load_handles();
+                let target_value = self.load_register(handles, target);
+                let source_value = self.load_register(handles, source);
+                let excluded_value = self.load_register(handles, excluded);
+                let tag = self.call_helper(
+                    Helper::CopyDataProperties,
+                    &[
+                        self.frame,
+                        target_value,
+                        source_value,
+                        excluded_value,
+                        self.out,
+                    ],
+                );
+                self.route_completion(pc, tag, None);
+            }
+            Instruction::GetTemplateObject { dst, cooked, raw } => {
+                let handles = self.load_handles();
+                let cooked_value = self.load_register(handles, cooked);
+                let raw_value = self.load_register(handles, raw);
+                let tag = self.call_helper(
+                    Helper::GetTemplateObject,
+                    &[self.frame, cooked_value, raw_value, self.out],
+                );
+                self.route_completion(pc, tag, Some(dst));
+            }
             Instruction::Jump { target } => {
                 let target = self.pc_block(target);
                 self.builder.ins().jump(target, &[]);
@@ -2341,6 +2495,12 @@ fn routes_to_handler(instruction: Instruction) -> bool {
         | Instruction::Import { .. }
         | Instruction::ImportDynamic { .. }
         | Instruction::Export { .. }
+        | Instruction::GetSuper { .. }
+        | Instruction::SetSuper { .. }
+        | Instruction::ImportAttributes { .. }
+        | Instruction::ImportDynamicAttributes { .. }
+        | Instruction::CopyDataProperties { .. }
+        | Instruction::GetTemplateObject { .. }
         | Instruction::Suspend { .. }
         | Instruction::Await { .. }
         | Instruction::Throw { .. } => true,
@@ -2414,7 +2574,13 @@ fn is_inline_instruction(instruction: Instruction) -> bool {
         | Instruction::SuppressError { .. }
         | Instruction::Import { .. }
         | Instruction::ImportDynamic { .. }
-        | Instruction::Export { .. } => false,
+        | Instruction::Export { .. }
+        | Instruction::GetSuper { .. }
+        | Instruction::SetSuper { .. }
+        | Instruction::ImportAttributes { .. }
+        | Instruction::ImportDynamicAttributes { .. }
+        | Instruction::CopyDataProperties { .. }
+        | Instruction::GetTemplateObject { .. } => false,
     }
 }
 
@@ -2523,7 +2689,13 @@ impl NormalSuccessors for Instruction {
             | Instruction::DisposeCapture { .. }
             | Instruction::Import { .. }
             | Instruction::ImportDynamic { .. }
-            | Instruction::Export { .. } => visit(pc + 1),
+            | Instruction::Export { .. }
+            | Instruction::GetSuper { .. }
+            | Instruction::SetSuper { .. }
+            | Instruction::ImportAttributes { .. }
+            | Instruction::ImportDynamicAttributes { .. }
+            | Instruction::CopyDataProperties { .. }
+            | Instruction::GetTemplateObject { .. } => visit(pc + 1),
         }
     }
 }
@@ -2674,7 +2846,7 @@ mod tests {
     #[test]
     fn helper_index_table_is_a_stable_bijection() {
         // Every helper round-trips through its external index, and the table
-        // covers a dense 0..=42 range with unique symbols.
+        // covers a dense 0..=52 range with unique symbols.
         let helpers = [
             Helper::LoadConstant,
             Helper::Unary,
@@ -2723,6 +2895,12 @@ mod tests {
             Helper::DefineOwnDescriptorSlot,
             Helper::WithHasBinding,
             Helper::ResumeMode,
+            Helper::GetSuper,
+            Helper::SetSuper,
+            Helper::ImportAttributes,
+            Helper::ImportDynamicAttributes,
+            Helper::CopyDataProperties,
+            Helper::GetTemplateObject,
         ];
         let mut symbols = BTreeSet::new();
         for (expected_index, helper) in helpers.iter().copied().enumerate() {
@@ -2735,8 +2913,8 @@ mod tests {
             );
             assert!(symbols.insert(helper.symbol()), "unique symbol {helper:?}");
         }
-        assert_eq!(symbols.len(), 47);
-        assert_eq!(Helper::from_external_index(47), None);
+        assert_eq!(symbols.len(), 53);
+        assert_eq!(Helper::from_external_index(53), None);
     }
     #[test]
     fn iterator_close_helpers_use_the_pinned_abis() {

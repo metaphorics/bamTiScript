@@ -20,7 +20,7 @@ use crate::Helper;
 /// grows a helper must extend [`helper_demand`] or [`STRUCTURAL_HELPERS`] and
 /// raise this bound; [`verify_helper_coverage`] refuses to certify coverage
 /// against an unexamined helper set.
-pub const EXPECTED_HELPER_COUNT: u32 = 47;
+pub const EXPECTED_HELPER_COUNT: u32 = 53;
 
 /// Helpers that no opcode requests.
 ///
@@ -115,6 +115,14 @@ pub const fn helper_demand(instruction: Instruction) -> HelperDemand {
         Instruction::Import { .. } => HelperDemand::Call(Helper::Import),
         Instruction::ImportDynamic { .. } => HelperDemand::Call(Helper::ImportDynamic),
         Instruction::Export { .. } => HelperDemand::Call(Helper::Export),
+        Instruction::GetSuper { .. } => HelperDemand::Call(Helper::GetSuper),
+        Instruction::SetSuper { .. } => HelperDemand::Call(Helper::SetSuper),
+        Instruction::ImportAttributes { .. } => HelperDemand::Call(Helper::ImportAttributes),
+        Instruction::ImportDynamicAttributes { .. } => {
+            HelperDemand::Call(Helper::ImportDynamicAttributes)
+        }
+        Instruction::CopyDataProperties { .. } => HelperDemand::Call(Helper::CopyDataProperties),
+        Instruction::GetTemplateObject { .. } => HelperDemand::Call(Helper::GetTemplateObject),
 
         // Both conditional branches test the same runtime truthiness predicate,
         // differing only in the native branch polarity.
@@ -135,7 +143,7 @@ pub const fn helper_demand(instruction: Instruction) -> HelperDemand {
 /// only on which variant each entry selects. Keeping one entry per opcode makes
 /// [`verify_helper_coverage`] a statement about the whole algebra rather than
 /// about a sampled subset.
-pub const ISA_REPRESENTATIVES: [Instruction; 52] = [
+pub const ISA_REPRESENTATIVES: [Instruction; 58] = [
     Instruction::LoadConst {
         dst: Register::new(0),
         constant: ConstantId::new(0),
@@ -360,6 +368,38 @@ pub const ISA_REPRESENTATIVES: [Instruction; 52] = [
         name: ConstantId::new(8),
         src: Register::new(99),
     },
+    Instruction::GetSuper {
+        dst: Register::new(100),
+        home: Register::new(101),
+        receiver: Register::new(102),
+        key: Register::new(103),
+    },
+    Instruction::SetSuper {
+        home: Register::new(104),
+        receiver: Register::new(105),
+        key: Register::new(106),
+        value: Register::new(107),
+    },
+    Instruction::ImportAttributes {
+        dst: Register::new(108),
+        specifier: ConstantId::new(9),
+        attributes: Register::new(109),
+    },
+    Instruction::ImportDynamicAttributes {
+        dst: Register::new(110),
+        specifier: Register::new(111),
+        attributes: Register::new(112),
+    },
+    Instruction::CopyDataProperties {
+        target: Register::new(113),
+        source: Register::new(114),
+        excluded: Register::new(115),
+    },
+    Instruction::GetTemplateObject {
+        dst: Register::new(116),
+        cooked: Register::new(117),
+        raw: Register::new(118),
+    },
     Instruction::Halt,
 ];
 
@@ -486,7 +526,7 @@ pub fn verify_helper_coverage() -> Result<(), HelperCoverageError> {
         }
     }
 
-    // A 47-helper namespace fits one word; the count check above pins that.
+    // A 53-helper namespace fits two words; the count check above pins that.
     let mut reached: u64 = 0;
     for helper in STRUCTURAL_HELPERS {
         reached |= 1u64 << helper.external_index();
@@ -570,7 +610,7 @@ mod tests {
             .collect();
         let total = discriminants.len();
         discriminants.dedup();
-        assert_eq!(total, 52, "the algebra has 52 opcodes");
+        assert_eq!(total, 58, "the algebra has 58 opcodes");
         assert_eq!(
             discriminants.len(),
             total,

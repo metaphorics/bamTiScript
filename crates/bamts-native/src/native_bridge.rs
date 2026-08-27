@@ -1,4 +1,4 @@
-//! The native runtime bridge: the typed helper-call algebra, the 47
+//! The native runtime bridge: the typed helper-call algebra, the 53
 //! `bamts_*` C-ABI helper exports, the panic- and nesting-safe thread-local
 //! [`NativeOps`] dispatch seam, and the feature-gated JIT and AOT linkage
 //! surfaces.
@@ -945,7 +945,7 @@ fn dispatch_simple(frame: *mut ShadowFrame, out: *mut Completion, call: HelperCa
     })
 }
 
-// -- The 47 exported C-ABI helpers -------------------------------------------
+// -- The 53 exported C-ABI helpers -------------------------------------------
 //
 // Parameter order and widths mirror `bamts_codegen::Helper::param_types`
 // exactly: `frame` (pointer) first, `out` (pointer) last, runtime `Value`s as

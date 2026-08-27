@@ -416,6 +416,14 @@ fn helper_address(helper: Helper) -> *const u8 {
         Helper::DisposeCapture => bamts_native::bamts_dispose_capture as *const u8,
         Helper::SuppressError => bamts_native::bamts_suppress_error as *const u8,
         Helper::ResumeMode => bamts_native::bamts_resume_mode as *const u8,
+        Helper::GetSuper => bamts_native::bamts_get_super as *const u8,
+        Helper::SetSuper => bamts_native::bamts_set_super as *const u8,
+        Helper::ImportAttributes => bamts_native::bamts_import_attributes as *const u8,
+        Helper::ImportDynamicAttributes => {
+            bamts_native::bamts_import_dynamic_attributes as *const u8
+        }
+        Helper::CopyDataProperties => bamts_native::bamts_copy_data_properties as *const u8,
+        Helper::GetTemplateObject => bamts_native::bamts_get_template_object as *const u8,
     }
 }
 

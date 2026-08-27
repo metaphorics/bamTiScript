@@ -211,8 +211,8 @@ fn every_classified_opcode_and_helper_is_accounted_for() {
 
     let expected: BTreeSet<_> = (0..bamts_native::HELPER_COUNT).collect();
     assert_eq!(helpers, expected, "every runtime helper must be reachable");
-    assert_eq!(ISA_REPRESENTATIVES.len(), 52, "append-only ISA changed");
-    assert_eq!(helpers.len(), 47, "runtime helper namespace changed");
+    assert_eq!(ISA_REPRESENTATIVES.len(), 58, "append-only ISA changed");
+    assert_eq!(helpers.len(), 53, "runtime helper namespace changed");
 }
 
 #[test]
