@@ -77,12 +77,6 @@ pub fn scan_regex_slice(text: &str) -> (usize, bool) {
     let mut p_chars = text.chars();
     let mut p_consumed = 0usize;
     let _ = take(&mut p_chars, &mut p_consumed);
-    let mut depth = 0usize;
-    let mut prev: Option<char> = None;
-    let mut prev_prev: Option<char> = None;
-    let mut p_term = false;
-    let mut p_end = 0usize;
-    let mut p_terminated = false;
     {
         let mut dc = p_chars.clone();
         let mut dcon = p_consumed;
@@ -102,19 +96,45 @@ pub fn scan_regex_slice(text: &str) -> (usize, bool) {
                     match after.next() {
                         None => {}
                         Some(c) if is_line_terminator(c) => break,
-                        Some(ch) => { dpp = dp; dp = Some(ch); take(&mut dc, &mut dcon); }
+                        Some(ch) => {
+                            dpp = dp;
+                            dp = Some(ch);
+                            take(&mut dc, &mut dcon);
+                        }
                     }
                 }
                 Some('[') => {
-                    if dd == 0 { dd = 1; } else {
+                    if dd == 0 {
+                        dd = 1;
+                    } else {
                         let is_nested = dp == Some('[') || (dp == Some('^') && dpp == Some('['));
-                        if is_nested { dd += 1; }
+                        if is_nested {
+                            dd += 1;
+                        }
                     }
-                    dpp = dp; dp = Some('['); take(&mut dc, &mut dcon);
+                    dpp = dp;
+                    dp = Some('[');
+                    take(&mut dc, &mut dcon);
                 }
-                Some(']') => { if dd > 0 { dd -= 1; } dpp = dp; dp = Some(']'); take(&mut dc, &mut dcon); }
-                Some('/') if dd == 0 => { take(&mut dc, &mut dcon); term = true; tend = dcon; break; }
-                Some(ch) => { dpp = dp; dp = Some(ch); take(&mut dc, &mut dcon); }
+                Some(']') => {
+                    if dd > 0 {
+                        dd = dd.saturating_sub(1);
+                    }
+                    dpp = dp;
+                    dp = Some(']');
+                    take(&mut dc, &mut dcon);
+                }
+                Some('/') if dd == 0 => {
+                    take(&mut dc, &mut dcon);
+                    term = true;
+                    tend = dcon;
+                    break;
+                }
+                Some(ch) => {
+                    dpp = dp;
+                    dp = Some(ch);
+                    take(&mut dc, &mut dcon);
+                }
             }
         }
         if term {
@@ -124,7 +144,11 @@ pub fn scan_regex_slice(text: &str) -> (usize, bool) {
             while {
                 let mut peek = fc.clone();
                 match peek.next() {
-                    Some(c) if is_id_continue(c) => { take(&mut fc, &mut fcon); fe = fcon; true }
+                    Some(c) if is_id_continue(c) => {
+                        take(&mut fc, &mut fcon);
+                        fe = fcon;
+                        true
+                    }
                     _ => false,
                 }
             } {}
@@ -149,26 +173,54 @@ pub fn scan_regex_slice(text: &str) -> (usize, bool) {
                             match after.next() {
                                 None => {}
                                 Some(c) if is_line_terminator(c) => break,
-                                Some(ch) => { ppp2 = pp2; pp2 = Some(ch); take(&mut chars2, &mut consumed2); }
+                                Some(ch) => {
+                                    ppp2 = pp2;
+                                    pp2 = Some(ch);
+                                    take(&mut chars2, &mut consumed2);
+                                }
                             }
                         }
                         Some('[') => {
-                            if dd2 == 0 { dd2 = 1; } else {
-                                let is_nested = pp2 == Some('[') || (pp2 == Some('^') && ppp2 == Some('['));
-                                if is_nested { dd2 += 1; }
+                            if dd2 == 0 {
+                                dd2 = 1;
+                            } else {
+                                let is_nested =
+                                    pp2 == Some('[') || (pp2 == Some('^') && ppp2 == Some('['));
+                                if is_nested {
+                                    dd2 += 1;
+                                }
                             }
-                            ppp2 = pp2; pp2 = Some('['); take(&mut chars2, &mut consumed2);
+                            ppp2 = pp2;
+                            pp2 = Some('[');
+                            take(&mut chars2, &mut consumed2);
                         }
-                        Some(']') => { if dd2 > 0 { dd2 -= 1; } ppp2 = pp2; pp2 = Some(']'); take(&mut chars2, &mut consumed2); }
-                        Some('/') if dd2 == 0 => { take(&mut chars2, &mut consumed2); term2 = true; break; }
-                        Some(ch) => { ppp2 = pp2; pp2 = Some(ch); take(&mut chars2, &mut consumed2); }
+                        Some(']') => {
+                            if dd2 > 0 {
+                                dd2 = dd2.saturating_sub(1);
+                            }
+                            ppp2 = pp2;
+                            pp2 = Some(']');
+                            take(&mut chars2, &mut consumed2);
+                        }
+                        Some('/') if dd2 == 0 => {
+                            take(&mut chars2, &mut consumed2);
+                            term2 = true;
+                            break;
+                        }
+                        Some(ch) => {
+                            ppp2 = pp2;
+                            pp2 = Some(ch);
+                            take(&mut chars2, &mut consumed2);
+                        }
                     }
                 }
                 if term2 {
                     loop {
                         let mut peek = chars2.clone();
                         match peek.next() {
-                            Some(c) if is_id_continue(c) => { take(&mut chars2, &mut consumed2); }
+                            Some(c) if is_id_continue(c) => {
+                                take(&mut chars2, &mut consumed2);
+                            }
                             _ => break,
                         }
                     }
@@ -191,15 +243,21 @@ pub fn scan_regex_slice(text: &str) -> (usize, bool) {
                 match after.next() {
                     None => {}
                     Some(c) if is_line_terminator(c) => break,
-                    Some(_) => { take(&mut chars, &mut consumed); }
+                    Some(_) => {
+                        take(&mut chars, &mut consumed);
+                    }
                 }
             }
             Some('[') => {
-                if !in_class { in_class = true; }
+                if !in_class {
+                    in_class = true;
+                }
                 take(&mut chars, &mut consumed);
             }
             Some(']') => {
-                if in_class { in_class = false; }
+                if in_class {
+                    in_class = false;
+                }
                 take(&mut chars, &mut consumed);
             }
             Some('/') if !in_class => {
@@ -207,21 +265,24 @@ pub fn scan_regex_slice(text: &str) -> (usize, bool) {
                 terminated = true;
                 break;
             }
-            Some(_) => { take(&mut chars, &mut consumed); }
+            Some(_) => {
+                take(&mut chars, &mut consumed);
+            }
         }
     }
     if terminated {
         loop {
             let mut peek = chars.clone();
             match peek.next() {
-                Some(c) if is_id_continue(c) => { take(&mut chars, &mut consumed); }
+                Some(c) if is_id_continue(c) => {
+                    take(&mut chars, &mut consumed);
+                }
                 _ => break,
             }
         }
     }
     (consumed, terminated)
 }
-
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanError {
@@ -836,7 +897,7 @@ impl<'a> Scanner<'a> {
                     out.push(token);
                 }
                 TokenKind::RBrace => {
-                    depth -= 1;
+                    depth = depth.saturating_sub(1);
                     out.push(token);
                     if depth == 0 {
                         break;
@@ -1028,8 +1089,12 @@ impl<'a> Scanner<'a> {
                 if clen <= remaining {
                     self.bump();
                     remaining -= clen;
-                } else { break; }
-            } else { break; }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
         if !terminated {
             self.error(

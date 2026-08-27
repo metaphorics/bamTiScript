@@ -379,6 +379,7 @@ fn view_fields<H: Host>(machine: &Machine<'_, H>, view: Value) -> Result<ViewFie
     })
 }
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct TypedArraySnapshot {
     pub(crate) kind: ElementKind,
     pub(crate) buffer: ViewBuffer,
@@ -386,6 +387,7 @@ pub(crate) struct TypedArraySnapshot {
     pub(crate) bounds: ViewBounds,
 }
 
+#[allow(dead_code)]
 pub(crate) fn typed_array_snapshot<H: Host>(
     machine: &Machine<'_, H>,
     view: Value,

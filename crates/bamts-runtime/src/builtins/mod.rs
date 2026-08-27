@@ -201,6 +201,7 @@ fn value_number(value: Value) -> f64 {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn to_uint8<H: Host>(
     machine: &mut Machine<'_, H>,
     value: Value,
@@ -218,6 +219,7 @@ pub(crate) fn to_uint8<H: Host>(
 /// `rem_euclid` returns a non-negative remainder strictly less than 256 for
 /// finite input, so the narrowing cast never saturates (unlike `as i64 as u8`,
 /// which saturates out-of-i64 finite values such as `1e20` to 255).
+#[allow(dead_code)]
 fn to_uint8_from_f64(number: f64) -> u8 {
     if number.is_finite() && number != 0.0 {
         number.trunc().rem_euclid(256.0) as u8

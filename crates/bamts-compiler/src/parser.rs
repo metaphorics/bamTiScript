@@ -342,6 +342,7 @@ fn is_line_terminator(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
 
+#[allow(dead_code)]
 fn is_id_continue(c: char) -> bool {
     c == '$' || c == '\u{200C}' || c == '\u{200D}' || unicode_id_start::is_id_continue(c)
 }
@@ -792,7 +793,7 @@ impl Parser {
     }
 
     fn leave(&mut self) {
-        self.depth -= 1;
+        self.depth = self.depth.saturating_sub(1);
     }
 
     // ------------------------------------------------------------------
@@ -1278,7 +1279,7 @@ impl Parser {
             match self.tokens.get(index).copied().unwrap_or(self.eof).kind() {
                 TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
                 TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
-                    depth -= 1;
+                    depth = depth.saturating_sub(1);
                     if depth < 0 {
                         return false;
                     }
@@ -5284,7 +5285,7 @@ impl Parser {
             match token.kind() {
                 TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
                 TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
-                    depth -= 1;
+                    depth = depth.saturating_sub(1);
                     if depth == 0 {
                         break;
                     }
@@ -6036,7 +6037,7 @@ impl Parser {
             if self.kind() == open {
                 depth += 1;
             } else if self.kind() == close {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 self.bump();
                 if depth <= 0 {
                     return;

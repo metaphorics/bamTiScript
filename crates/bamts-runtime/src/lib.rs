@@ -1725,6 +1725,7 @@ struct TimerRecord {
     interval_delay: Option<u32>,
 }
 
+#[allow(dead_code)]
 pub(crate) enum ExternalJob {
     ResolveWaitAsync { promise: u64, result: &'static str },
 }
@@ -1735,6 +1736,7 @@ pub(crate) struct ExternalInbox {
     pending: AtomicUsize,
 }
 
+#[allow(dead_code)]
 impl ExternalInbox {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -2543,6 +2545,7 @@ impl<'a, H: Host> Machine<'a, H> {
         !self.timers.is_empty()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn external_inbox(&self) -> Arc<ExternalInbox> {
         Arc::clone(&self.external_inbox)
     }
