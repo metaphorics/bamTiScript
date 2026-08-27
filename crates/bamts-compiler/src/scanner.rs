@@ -59,7 +59,170 @@ const INVALID_BIGINT_LITERAL: DiagnosticCode = DiagnosticCode::new("BAMTS-L010")
 /// A `#` that does not begin a private identifier.
 const INVALID_PRIVATE_IDENTIFIER: DiagnosticCode = DiagnosticCode::new("BAMTS-L011");
 
-/// A scanner operation was interrupted before completion.
+/// Scans a regular-expression literal starting at `text[0] == '/'`, returning
+/// `(consumed_utf16, terminated)`.  This is the single source of truth for
+/// both `Scanner::scan_regex` and `Parser::rescan_regex_here`.
+pub fn scan_regex_slice(text: &str) -> (usize, bool) {
+    // First, try depth scan for `v` flag (unicodeSets) where `[[` is nested.
+    // We peek with depth to see if it would produce a `v` flag; if so, use it.
+    let mut chars = text.chars();
+    let mut consumed = 0usize;
+    let take = |chars: &mut std::str::Chars<'_>, consumed: &mut usize| -> Option<char> {
+        let c = chars.next()?;
+        *consumed += c.len_utf16();
+        Some(c)
+    };
+    let _slash = take(&mut chars, &mut consumed);
+    // Depth peek
+    let mut p_chars = text.chars();
+    let mut p_consumed = 0usize;
+    let _ = take(&mut p_chars, &mut p_consumed);
+    let mut depth = 0usize;
+    let mut prev: Option<char> = None;
+    let mut prev_prev: Option<char> = None;
+    let mut p_term = false;
+    let mut p_end = 0usize;
+    let mut p_terminated = false;
+    {
+        let mut dc = p_chars.clone();
+        let mut dcon = p_consumed;
+        let mut dd = 0usize;
+        let mut dp: Option<char> = None;
+        let mut dpp: Option<char> = None;
+        let mut term = false;
+        let mut tend = 0usize;
+        loop {
+            let mut peek = dc.clone();
+            match peek.next() {
+                None => break,
+                Some(c) if is_line_terminator(c) => break,
+                Some('\\') => {
+                    take(&mut dc, &mut dcon);
+                    let mut after = dc.clone();
+                    match after.next() {
+                        None => {}
+                        Some(c) if is_line_terminator(c) => break,
+                        Some(ch) => { dpp = dp; dp = Some(ch); take(&mut dc, &mut dcon); }
+                    }
+                }
+                Some('[') => {
+                    if dd == 0 { dd = 1; } else {
+                        let is_nested = dp == Some('[') || (dp == Some('^') && dpp == Some('['));
+                        if is_nested { dd += 1; }
+                    }
+                    dpp = dp; dp = Some('['); take(&mut dc, &mut dcon);
+                }
+                Some(']') => { if dd > 0 { dd -= 1; } dpp = dp; dp = Some(']'); take(&mut dc, &mut dcon); }
+                Some('/') if dd == 0 => { take(&mut dc, &mut dcon); term = true; tend = dcon; break; }
+                Some(ch) => { dpp = dp; dp = Some(ch); take(&mut dc, &mut dcon); }
+            }
+        }
+        if term {
+            let mut fe = tend;
+            let mut fc = dc.clone();
+            let mut fcon = tend;
+            while {
+                let mut peek = fc.clone();
+                match peek.next() {
+                    Some(c) if is_id_continue(c) => { take(&mut fc, &mut fcon); fe = fcon; true }
+                    _ => false,
+                }
+            } {}
+            let flags = &text[tend..fe];
+            if flags.contains('v') {
+                // Use depth result
+                let mut chars2 = text.chars();
+                let mut consumed2 = 0usize;
+                let _ = take(&mut chars2, &mut consumed2);
+                let mut dd2 = 0usize;
+                let mut pp2: Option<char> = None;
+                let mut ppp2: Option<char> = None;
+                let mut term2 = false;
+                loop {
+                    let mut peek = chars2.clone();
+                    match peek.next() {
+                        None => break,
+                        Some(c) if is_line_terminator(c) => break,
+                        Some('\\') => {
+                            take(&mut chars2, &mut consumed2);
+                            let mut after = chars2.clone();
+                            match after.next() {
+                                None => {}
+                                Some(c) if is_line_terminator(c) => break,
+                                Some(ch) => { ppp2 = pp2; pp2 = Some(ch); take(&mut chars2, &mut consumed2); }
+                            }
+                        }
+                        Some('[') => {
+                            if dd2 == 0 { dd2 = 1; } else {
+                                let is_nested = pp2 == Some('[') || (pp2 == Some('^') && ppp2 == Some('['));
+                                if is_nested { dd2 += 1; }
+                            }
+                            ppp2 = pp2; pp2 = Some('['); take(&mut chars2, &mut consumed2);
+                        }
+                        Some(']') => { if dd2 > 0 { dd2 -= 1; } ppp2 = pp2; pp2 = Some(']'); take(&mut chars2, &mut consumed2); }
+                        Some('/') if dd2 == 0 => { take(&mut chars2, &mut consumed2); term2 = true; break; }
+                        Some(ch) => { ppp2 = pp2; pp2 = Some(ch); take(&mut chars2, &mut consumed2); }
+                    }
+                }
+                if term2 {
+                    loop {
+                        let mut peek = chars2.clone();
+                        match peek.next() {
+                            Some(c) if is_id_continue(c) => { take(&mut chars2, &mut consumed2); }
+                            _ => break,
+                        }
+                    }
+                }
+                return (consumed2, term2);
+            }
+        }
+    }
+    // Classic boolean
+    let mut in_class = false;
+    let mut terminated = false;
+    loop {
+        let mut peek = chars.clone();
+        match peek.next() {
+            None => break,
+            Some(c) if is_line_terminator(c) => break,
+            Some('\\') => {
+                take(&mut chars, &mut consumed);
+                let mut after = chars.clone();
+                match after.next() {
+                    None => {}
+                    Some(c) if is_line_terminator(c) => break,
+                    Some(_) => { take(&mut chars, &mut consumed); }
+                }
+            }
+            Some('[') => {
+                if !in_class { in_class = true; }
+                take(&mut chars, &mut consumed);
+            }
+            Some(']') => {
+                if in_class { in_class = false; }
+                take(&mut chars, &mut consumed);
+            }
+            Some('/') if !in_class => {
+                take(&mut chars, &mut consumed);
+                terminated = true;
+                break;
+            }
+            Some(_) => { take(&mut chars, &mut consumed); }
+        }
+    }
+    if terminated {
+        loop {
+            let mut peek = chars.clone();
+            match peek.next() {
+                Some(c) if is_id_continue(c) => { take(&mut chars, &mut consumed); }
+                _ => break,
+            }
+        }
+    }
+    (consumed, terminated)
+}
+
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanError {
     /// The caller requested cancellation.
@@ -855,71 +1018,26 @@ impl<'a> Scanner<'a> {
     }
 
     fn scan_regex(&mut self, start_u: usize) -> TokenKind {
-        self.bump();
-        let mut class_depth = 0usize;
-        loop {
-            if self.is_cancelled() {
-                break;
-            }
-            match self.first() {
-                None => {
-                    self.error(
-                        UNTERMINATED_REGEX,
-                        start_u,
-                        self.utf16_pos,
-                        "unterminated regular expression literal",
-                    );
-                    return TokenKind::RegularExpressionLiteral;
-                }
-                Some(c) if is_line_terminator(c) => {
-                    self.error(
-                        UNTERMINATED_REGEX,
-                        start_u,
-                        self.utf16_pos,
-                        "unterminated regular expression literal",
-                    );
-                    return TokenKind::RegularExpressionLiteral;
-                }
-                Some('\\') => {
+        let text = &self.text[self.byte_pos..];
+        let (consumed, terminated) = scan_regex_slice(text);
+        // consumed is in utf16 units, including initial '/'
+        let mut remaining = consumed;
+        while remaining > 0 {
+            if let Some(c) = self.first() {
+                let clen = c.len_utf16();
+                if clen <= remaining {
                     self.bump();
-                    match self.first() {
-                        None => {}
-                        Some(c) if is_line_terminator(c) => {
-                            self.error(
-                                UNTERMINATED_REGEX,
-                                start_u,
-                                self.utf16_pos,
-                                "unterminated regular expression literal",
-                            );
-                            return TokenKind::RegularExpressionLiteral;
-                        }
-                        Some(_) => {
-                            self.bump();
-                        }
-                    }
-                }
-                Some('[') => {
-                    class_depth += 1;
-                    self.bump();
-                }
-                Some(']') => {
-                    class_depth = class_depth.saturating_sub(1);
-                    self.bump();
-                }
-                Some('/') if class_depth == 0 => {
-                    self.bump();
-                    break;
-                }
-                Some(_) => {
-                    self.bump();
-                }
-            }
+                    remaining -= clen;
+                } else { break; }
+            } else { break; }
         }
-        while self.first().is_some_and(is_id_continue) {
-            if self.is_cancelled() {
-                break;
-            }
-            self.bump();
+        if !terminated {
+            self.error(
+                UNTERMINATED_REGEX,
+                start_u,
+                self.utf16_pos,
+                "unterminated regular expression literal",
+            );
         }
         TokenKind::RegularExpressionLiteral
     }

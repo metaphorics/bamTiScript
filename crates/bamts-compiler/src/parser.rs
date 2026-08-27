@@ -841,6 +841,7 @@ impl Parser {
     /// Reinterprets the current `/`/`/=` token as a regular-expression
     /// literal, merging the covered tokens. Grammar context (expression start)
     /// is the caller's assertion; the re-lex itself mirrors the scanner rules.
+    /// is the caller's assertion; the re-lex itself mirrors the scanner rules.
     fn rescan_regex_here(&mut self) {
         if !matches!(self.kind(), TokenKind::Slash | TokenKind::SlashEq) || self.at_eof() {
             return;
@@ -851,65 +852,7 @@ impl Parser {
             return;
         };
         let text = &self.source.as_str()[start_byte..];
-
-        // Mirror of `Scanner::scan_regex`: body with classes and escapes, then
-        // identifier-continue flags. Unterminated forms end at the offending
-        // position without consuming the terminator.
-        let mut chars = text.chars();
-        let mut consumed = 0usize;
-        let take = |chars: &mut std::str::Chars<'_>, consumed: &mut usize| -> Option<char> {
-            let c = chars.next()?;
-            *consumed += c.len_utf16();
-            Some(c)
-        };
-        let _slash = take(&mut chars, &mut consumed);
-        let mut class_depth = 0usize;
-        let mut terminated = false;
-        loop {
-            let mut peek = chars.clone();
-            match peek.next() {
-                None => break,
-                Some(c) if is_line_terminator(c) => break,
-                Some('\\') => {
-                    take(&mut chars, &mut consumed);
-                    let mut after = chars.clone();
-                    match after.next() {
-                        None => {}
-                        Some(c) if is_line_terminator(c) => break,
-                        Some(_) => {
-                            take(&mut chars, &mut consumed);
-                        }
-                    }
-                }
-                Some('[') => {
-                    class_depth += 1;
-                    take(&mut chars, &mut consumed);
-                }
-                Some(']') => {
-                    class_depth = class_depth.saturating_sub(1);
-                    take(&mut chars, &mut consumed);
-                }
-                Some('/') if class_depth == 0 => {
-                    take(&mut chars, &mut consumed);
-                    terminated = true;
-                    break;
-                }
-                Some(_) => {
-                    take(&mut chars, &mut consumed);
-                }
-            }
-        }
-        if terminated {
-            loop {
-                let mut peek = chars.clone();
-                match peek.next() {
-                    Some(c) if is_id_continue(c) => {
-                        take(&mut chars, &mut consumed);
-                    }
-                    _ => break,
-                }
-            }
-        }
+        let (consumed, terminated) = crate::scanner::scan_regex_slice(text);
         let mut end = start.get() + consumed;
         if !terminated {
             self.error_at(
