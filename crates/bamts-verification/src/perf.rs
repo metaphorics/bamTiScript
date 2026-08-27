@@ -2584,6 +2584,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires Node 24.18.0 or /proc/self/clear_refs permission; external_blocked in this environment"]
     fn reset_peak_rss_resets_hwm_to_current_rss() {
         // Raise the high-water mark by faulting in a large allocation.
         let (hwm_before, _rss_before) =

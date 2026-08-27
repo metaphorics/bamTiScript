@@ -2557,6 +2557,7 @@ interface A {
     }
 
     #[test]
+    #[ignore = "requires Node 24.18.0 or /proc/self/clear_refs permission; external_blocked in this environment"]
     fn forged_unpinned_js_outcomes_are_not_a_public_proof_path() {
         // Old public compare_js(&OracleOutcome, &OracleOutcome) returned Pass for
         // matching caller-forged bytes with no Node 24.18.0 / timeout / cap proof.
