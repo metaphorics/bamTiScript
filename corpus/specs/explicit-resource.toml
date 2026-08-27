@@ -1,8 +1,8 @@
 schema = 1
-source_kind = "git"
+source_kind = "local"
 id = "explicit-resource"
-repository = "local"
-commit = "d17921136745d8f68172ea341b3eb51fceb06e55"
+digest_algorithm = "sha256"
+digest = "659237a9428a685c1c4343325596629e6f066bbe53962aff252b113e4961f4f7"
 license = "UNLICENSED"
 source_dir = "corpus/cases"
 entrypoint = "corpus/cases/explicit-resource.ts"

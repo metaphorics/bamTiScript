@@ -1,8 +1,8 @@
 schema = 1
-source_kind = "git"
+source_kind = "local"
 id = "derived-construction"
-repository = "local"
-commit = "2f0fd8c308717c827e30b19684fa114f7c5a2036"
+digest_algorithm = "sha256"
+digest = "b5d44775efc4f2e21a0a9ee2be48a4c8b2299820aed88317c6106580130b682f"
 license = "UNLICENSED"
 source_dir = "corpus/cases"
 entrypoint = "corpus/cases/derived-construction.ts"

@@ -1,8 +1,8 @@
 schema = 1
-source_kind = "git"
+source_kind = "local"
 id = "import-meta"
-repository = "local"
-commit = "4fa3e55353469b874c705d2cd0745f6cf5e218e8"
+digest_algorithm = "sha256"
+digest = "b15ec05e36da8d951cdda67ad3904d77cab884e9156ee89c47181257d0b780f1"
 license = "UNLICENSED"
 source_dir = "corpus/cases"
 entrypoint = "corpus/cases/import-meta.ts"

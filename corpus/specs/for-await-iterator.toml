@@ -1,8 +1,8 @@
 schema = 1
-source_kind = "git"
+source_kind = "local"
 id = "for-await-iterator"
-repository = "local"
-commit = "006f26757ea92e6517cc80c1ed9bca7075bb9ee7"
+digest_algorithm = "sha256"
+digest = "7302efcadc7fb508c1af8da6ecc3ac040c66cd15f9a8e3e793dbf03addef37c7"
 license = "UNLICENSED"
 source_dir = "corpus/cases"
 entrypoint = "corpus/cases/for-await-iterator.ts"

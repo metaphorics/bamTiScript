@@ -1,8 +1,8 @@
 schema = 1
-source_kind = "git"
+source_kind = "local"
 id = "event-loop"
-repository = "local"
-commit = "c6cad132023e7405c4c2d5008106943a8d94e57f"
+digest_algorithm = "sha256"
+digest = "d84af3bc250fc6c0ae66c9954d29d29037b9cb2a72960de9c6d093d16fdab8b1"
 license = "UNLICENSED"
 source_dir = "corpus/cases"
 entrypoint = "corpus/cases/event-loop.ts"

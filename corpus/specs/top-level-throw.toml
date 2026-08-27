@@ -1,8 +1,8 @@
 schema = 1
-source_kind = "git"
+source_kind = "local"
 id = "top-level-throw"
-repository = "local"
-commit = "aacb3ab4d926dc73de601d12887dbc4a0da32efe"
+digest_algorithm = "sha256"
+digest = "dd3eda7f389c70e601b2f2180f0b07adf6a8444f478e3b79f4b6311f954dbdef"
 license = "UNLICENSED"
 source_dir = "corpus/cases"
 entrypoint = "corpus/cases/top-level-throw.ts"

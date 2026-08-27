@@ -1,8 +1,8 @@
 schema = 1
-source_kind = "git"
+source_kind = "local"
 id = "lexical-environment"
-repository = "local"
-commit = "87d9ea925a30b200968a20327b3a874bcfdc945f"
+digest_algorithm = "sha256"
+digest = "d62ea53e3621fa95c8b4bc2b89d68f515d4e8e016944fdc7af3283dd4033e90c"
 license = "UNLICENSED"
 source_dir = "corpus/cases"
 entrypoint = "corpus/cases/lexical-environment.ts"
