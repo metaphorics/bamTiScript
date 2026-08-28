@@ -1107,6 +1107,7 @@ pub struct LoweredProgram {
 }
 
 /// A deterministic failure from validating the structure of a lowered program.
+#[cfg(any(test, feature = "aot", feature = "host-jit"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LoweredProgramError {
     /// A module's canonical id does not match its position in the program.
@@ -1127,6 +1128,7 @@ pub(crate) enum LoweredProgramError {
     },
 }
 
+#[cfg(any(test, feature = "aot", feature = "host-jit"))]
 impl fmt::Display for LoweredProgramError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1145,6 +1147,7 @@ impl fmt::Display for LoweredProgramError {
     }
 }
 
+#[cfg(any(test, feature = "aot", feature = "host-jit"))]
 impl Error for LoweredProgramError {}
 
 /// Validates that `lowered` has dense, identity-ordered modules and functions.
@@ -1153,6 +1156,7 @@ impl Error for LoweredProgramError {}
 /// tuple order that the JIT binary search and the AOT unit descriptor table rely
 /// on. A mismatch between an id and its vector index is reported as a typed
 /// error so each backend can map it to its own public error variant.
+#[cfg(any(test, feature = "aot", feature = "host-jit"))]
 pub(crate) fn validate_lowered_program(
     lowered: &LoweredProgram,
 ) -> Result<Vec<(u32, u32)>, LoweredProgramError> {
