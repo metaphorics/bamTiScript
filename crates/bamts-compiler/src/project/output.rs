@@ -470,7 +470,7 @@ fn case_key(path: &Path) -> String {
     path.to_string_lossy().to_lowercase()
 }
 
-fn normalize_lexically(path: &Path) -> Option<PathBuf> {
+pub(super) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
