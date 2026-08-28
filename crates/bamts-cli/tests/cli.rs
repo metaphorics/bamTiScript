@@ -877,15 +877,72 @@ fn show_config_project_merges_effective_view_without_emit() {
     assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
     assert!(stderr(&output).is_empty(), "{}", stderr(&output));
     let text = stdout(&output);
+    // Exact structural assertion: parse the document and verify the JSON
+    // shape. serde_json sorts object keys (BTreeMap), so key ordering is
+    // verified separately by text position below.
+    let json: serde_json::Value =
+        serde_json::from_str(text.trim_end()).expect("showConfig output is valid JSON");
+    let root = json.as_object().expect("root is a JSON object");
 
-    // One merged effective view: `extends` never appears, the child
-    // `target`/`outDir` override the base, and the implied options from the
-    // node16-family module are appended.
-    assert!(!text.contains("extends"), "{text}");
-    assert!(text.contains("\"target\": \"es2022\""), "{text}");
-    assert!(text.contains("\"moduleResolution\": \"nodenext\""), "{text}");
-    assert!(text.contains("\"moduleDetection\": \"force\""), "{text}");
-    assert!(text.contains("\"noUnusedLocals\": true"), "{text}");
+    // Top-level keys are exactly the TypeScript project document keys.
+    // This fails if any implied option leaks to the document root.
+    let expected_top_keys = ["compilerOptions", "references", "files", "include", "exclude"];
+    assert_eq!(root.len(), expected_top_keys.len(), "top-level key count: {text}");
+    for key in expected_top_keys {
+        assert!(root.contains_key(key), "missing top-level key \"{key}\": {text}");
+    }
+    assert!(
+        !root.contains_key("moduleResolution") && !root.contains_key("moduleDetection"),
+        "implied option leaked to top level: {text}",
+    );
+
+    // `extends` is never emitted; the child overrides the base.
+    let compiler_options = root
+        .get("compilerOptions")
+        .and_then(|v| v.as_object())
+        .expect("compilerOptions is an object");
+    assert!(!compiler_options.contains_key("extends"), "{text}");
+    assert_eq!(compiler_options.get("target").and_then(|v| v.as_str()), Some("es2022"));
+    assert_eq!(compiler_options.get("module").and_then(|v| v.as_str()), Some("nodenext"));
+    assert_eq!(compiler_options.get("outDir").and_then(|v| v.as_str()), Some("./dist"));
+    assert_eq!(compiler_options.get("noUnusedLocals").and_then(|v| v.as_bool()), Some(true));
+
+    // Implied options are nested inside `compilerOptions`, not at the root.
+    assert_eq!(
+        compiler_options.get("moduleResolution").and_then(|v| v.as_str()),
+        Some("nodenext"),
+        "moduleResolution must be inside compilerOptions: {text}",
+    );
+    assert_eq!(
+        compiler_options.get("moduleDetection").and_then(|v| v.as_str()),
+        Some("force"),
+        "moduleDetection must be inside compilerOptions: {text}",
+    );
+
+    // References, files, include, exclude.
+    let references = root.get("references").and_then(|v| v.as_array()).expect("references array");
+    assert_eq!(references.len(), 1, "{text}");
+    assert_eq!(
+        references[0].get("path").and_then(|v| v.as_str()),
+        Some("../shared"),
+        "{text}",
+    );
+    let files = root.get("files").and_then(|v| v.as_array()).expect("files array");
+    let file_paths: Vec<&str> = files.iter().map(|v| v.as_str().expect("file string")).collect();
+    assert!(file_paths.contains(&"./src/main.ts"), "{text}");
+    assert!(file_paths.contains(&"./src/helper.ts"), "{text}");
+    let include = root.get("include").and_then(|v| v.as_array()).expect("include array");
+    assert_eq!(
+        include.iter().map(|v| v.as_str().expect("include string")).collect::<Vec<_>>(),
+        vec!["./src/**/*"],
+        "{text}",
+    );
+    let exclude = root.get("exclude").and_then(|v| v.as_array()).expect("exclude array");
+    assert_eq!(
+        exclude.iter().map(|v| v.as_str().expect("exclude string")).collect::<Vec<_>>(),
+        vec!["./node_modules"],
+        "{text}",
+    );
 
     // Top-level TypeScript order: compilerOptions, references, files,
     // include, exclude.
@@ -899,11 +956,20 @@ fn show_config_project_merges_effective_view_without_emit() {
     assert!(files_at < include_at, "{text}");
     assert!(include_at < exclude_at, "{text}");
 
-    // Descendant paths use `./`, sibling references use `../`; no absolute
-    // fallback for anything inside the project root.
-    assert!(text.contains("\"path\": \"../shared\""), "{text}");
-    assert!(text.contains(&format!("\"./src/main.ts\"")), "{text}");
-    assert!(text.contains(&format!("\"./src/helper.ts\"")), "{text}");
+    // Implied options appear inside the compilerOptions block (after the
+    // explicit entries, before the block closes) — not between top-level
+    // keys.
+    let module_resolution_at = text.find("\"moduleResolution\"").expect("moduleResolution key");
+    let module_detection_at = text.find("\"moduleDetection\"").expect("moduleDetection key");
+    let module_at = text.find("\"module\":").expect("module key");
+    assert!(module_at < module_resolution_at, "explicit before implied: {text}");
+    assert!(module_resolution_at < module_detection_at, "implied order: {text}");
+    assert!(
+        module_detection_at < references_at,
+        "implied options must be inside compilerOptions, before references: {text}",
+    );
+
+    // No absolute fallback for anything inside the project root.
     assert!(!text.contains(project.path.to_str().expect("UTF-8 scratch root")), "{text}");
 
     // The trailing byte is exactly one newline.

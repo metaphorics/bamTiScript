@@ -1035,7 +1035,9 @@ fn render_show_config_document<T: Serialize>(
 
 /// One typed key/value slot of the direct-route `--showConfig` document.
 /// Direct dispatch emits only options explicitly supplied on the command
-/// line, preserving TypeScript 7.0.2 CLI order; enum values were already
+/// line, in the lexical order of the parsed `BTreeMap` — which matches
+/// TypeScript 7.0.2's observed output order (verified by probe: `strict`
+/// precedes `target` regardless of argv order). Enum values were already
 /// canonicalized to lower case by the argv parser.
 enum DirectCompilerOption<'a> {
     Bool(bool),
@@ -1100,6 +1102,35 @@ impl<'a> Serialize
             state.serialize_entry(key, value)?;
         }
         state.end()
+    }
+}
+
+/// Borrowed compiler-options serializer: emits the canonical explicit
+/// `JsonObject` entries first, then the synthesized implied entries,
+/// inside one `compilerOptions` map — matching TypeScript 7.0.2, which
+/// nests implied options inside `compilerOptions` rather than emitting
+/// them as top-level document keys.
+struct CompilerOptionsView<'a> {
+    canonical: &'a JsonValue,
+    implied: &'a [(String, JsonValue)],
+}
+
+impl Serialize for CompilerOptionsView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.canonical {
+            JsonValue::Object(explicit) => {
+                let mut state = serializer
+                    .serialize_map(Some(explicit.entries().len() + self.implied.len()))?;
+                for (key, value) in explicit.entries() {
+                    state.serialize_entry(key.as_ref(), &JsonViewRef(value))?;
+                }
+                for (name, value) in self.implied {
+                    state.serialize_entry(name.as_str(), &JsonViewRef(value))?;
+                }
+                state.end()
+            }
+            other => JsonViewRef(other).serialize(serializer),
+        }
     }
 }
 
@@ -1184,14 +1215,18 @@ impl Serialize for ProjectShowConfig<'_> {
         let empty_object = JsonValue::Object(JsonObject::from_entries(Vec::new()));
         let compiler_options = raw.get("compilerOptions").unwrap_or(&empty_object);
         let canonical = canonicalize_compiler_options(compiler_options, config_directory);
-        // TypeScript 7.0.2 appends the implied options it reports for the
-        // supported target/module surface. Each implication applies only when
-        // the user did not set the option explicitly.
+        // TypeScript 7.0.2 nests the implied options it reports for the
+        // supported target/module surface inside `compilerOptions`, appended
+        // after the explicit entries. Each implication applies only when the
+        // user did not set the option explicitly.
         let implied: Vec<(String, JsonValue)> = implied_compiler_options(raw);
-        state.serialize_entry("compilerOptions", &JsonView::Borrowed(&canonical))?;
-        for (name, value) in &implied {
-            state.serialize_entry(name.as_str(), &JsonView::Owned(value.clone()))?;
-        }
+        state.serialize_entry(
+            "compilerOptions",
+            &CompilerOptionsView {
+                canonical: &canonical,
+                implied: &implied,
+            },
+        )?;
         let references: Vec<SerializeReferenceEntry> = self
             .project
             .references()
@@ -1444,9 +1479,10 @@ fn show_config_outcome<T: Serialize>(document: &T) -> Result<CommandOutcome, Dri
     })
 }
 
-/// Iterates the parsed direct command in argv order, matching TypeScript's
-/// effective CLI order (verified by probe: the first-supplied option prints
-/// first). Only parser-validated option names are emitted.
+/// Iterates the parsed direct command in the lexical order of the
+/// `BTreeMap`, which matches TypeScript 7.0.2's observed output order
+/// (verified by probe: `strict` precedes `target` for both argv orders).
+/// Only parser-validated option names are emitted.
 fn direct_compiler_options(
     command: &ParsedTscCommand,
 ) -> impl Iterator<Item = (&'static str, DirectCompilerOption<'_>)> {
@@ -1473,23 +1509,6 @@ fn direct_compiler_options(
         })
 }
 
-
-/// Borrowed read-only view over an immutable JSON value. `Owned` carries a
-/// synthesized value (implied options) by value so no clone of the shared
-/// graph is needed.
-enum JsonView<'a> {
-    Borrowed(&'a JsonValue),
-    Owned(JsonValue),
-}
-
-impl Serialize for JsonView<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Borrowed(value) => JsonViewRef(value).serialize(serializer),
-            Self::Owned(value) => JsonViewRef(value).serialize(serializer),
-        }
-    }
-}
 
 /// Shared serializer body over any referenced JSON value.
 struct JsonViewRef<'a>(&'a JsonValue);
