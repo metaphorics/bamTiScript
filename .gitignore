@@ -6,3 +6,6 @@
 verification/ts-suite/
 verification/ts-suite-ledger.json
 perf/fixtures/boundary/
+/out/
+/.merge_file_*
+/bamts-node-*/
