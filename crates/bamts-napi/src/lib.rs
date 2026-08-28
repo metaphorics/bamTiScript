@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use bamts_cancel::CancellationToken;
 use bamts_cli::cli::cli_outcome_in_context_with_cancel;
 use bamts_cli::context::ExecutionContext;
-use napi::bindgen_prelude::{Buffer, Object};
+use napi::bindgen_prelude::{AbortSignal, Buffer, Object};
 use napi::{Env, Error, JsDeferred, Result, Status};
 use napi_derive::napi;
 
@@ -19,11 +19,12 @@ const QUEUE_CAPACITY: usize = 2;
 type OutcomeResolver = Box<dyn FnOnce(Env) -> Result<RunOutcome> + Send>;
 type Deferred = JsDeferred<RunOutcome, OutcomeResolver>;
 
-#[napi(object)]
+#[napi(object, object_to_js = false)]
 pub struct RunRequest {
     pub args: Vec<Buffer>,
     pub cwd: Buffer,
     pub env: Vec<Buffer>,
+    pub signal: Option<AbortSignal>,
 }
 
 #[napi(object)]
@@ -61,6 +62,7 @@ struct RawRequest {
 struct Job {
     request: RawRequest,
     deferred: Deferred,
+    token: CancellationToken,
 }
 
 struct Shared {
@@ -153,7 +155,7 @@ impl Drop for Executor {
 
 fn worker_loop(shared: Arc<Shared>, receiver: Receiver<Job>) {
     while let Ok(job) = receiver.recv() {
-        let token = CancellationToken::new();
+        let token = job.token.clone();
         {
             let mut active = shared
                 .active
@@ -167,6 +169,14 @@ fn worker_loop(shared: Arc<Shared>, receiver: Receiver<Job>) {
         }
 
         let result = execute(job.request, &token);
+        let result = if token.is_cancelled() {
+            Err(Error::new(
+                Status::Cancelled,
+                "bamti native invocation was aborted".to_owned(),
+            ))
+        } else {
+            result
+        };
         shared
             .active
             .lock()
@@ -265,6 +275,11 @@ fn executor(env: &Env) -> Result<Arc<Executor>> {
 pub fn run<'env>(env: &'env Env, request: RunRequest) -> Result<Object<'env>> {
     let executor = executor(env)?;
     let (deferred, promise) = env.create_deferred::<RunOutcome, OutcomeResolver>()?;
+    let token = CancellationToken::new();
+    if let Some(signal) = request.signal {
+        let on_abort = token.clone();
+        signal.on_abort(move || on_abort.cancel());
+    }
     executor.submit(Job {
         request: RawRequest {
             args: request
@@ -280,6 +295,7 @@ pub fn run<'env>(env: &'env Env, request: RunRequest) -> Result<Object<'env>> {
                 .collect(),
         },
         deferred,
+        token,
     });
     Ok(promise)
 }
