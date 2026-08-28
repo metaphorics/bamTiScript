@@ -315,7 +315,9 @@ pub enum ModeOptionClassification {
 /// Options `Direct` dispatch consumes. `project` and `init` classify as
 /// consumed because dispatch routes them before classification runs
 /// (`--init` initializes the config, `-p` selects project mode); listing
-/// them keeps classification total over the parse table.
+/// them keeps classification total over the parse table. `showConfig`
+/// prints the effective configuration instead of compiling; direct
+/// dispatch routes it after ordinary argument validation.
 const DIRECT_CONSUMED: &[&str] = &[
     "allowJs",
     "checkJs",
@@ -331,6 +333,7 @@ const DIRECT_CONSUMED: &[&str] = &[
     "outFile",
     "pretty",
     "project",
+    "showConfig",
     "sourceMap",
     "strict",
     "version",
@@ -340,7 +343,9 @@ const DIRECT_CONSUMED: &[&str] = &[
 /// `ProjectOptionOverrides` mapping the driver forwards into project
 /// loading. `ignoreConfig` is deliberately absent: it only guards the
 /// direct files-plus-config conflict, which project dispatch never
-/// reaches, so project mode rejects it.
+/// reaches, so project mode rejects it. `showConfig` prints the effective
+/// merged configuration instead of compiling; project dispatch routes it
+/// after `EffectiveProject::load`.
 const PROJECT_CONSUMED: &[&str] = &[
     "allowJs",
     "checkJs",
@@ -360,7 +365,7 @@ const PROJECT_CONSUMED: &[&str] = &[
     "pretty",
     "project",
     "rootDir",
-    "sourceMap",
+    "showConfig",
     "strict",
     "tsBuildInfoFile",
     "version",
@@ -1167,11 +1172,22 @@ const BUILD: &[OptionSpec] = &[
     flag("build", Some("b")),
     flag("verbose", Some("v")),
     flag("dry", Some("d")),
+
     flag("force", Some("f")),
     flag("clean", None),
     number_opt("builders", 1),
     flag("stopBuildOnErrors", None),
 ];
+
+/// Looks up the canonical table spelling of one parsed option name. The
+/// parser stores canonical names already, so this exists for the showConfig
+/// reporting route to confirm a name is parser-validated ('static spelling).
+#[must_use]
+pub fn canonical_option_name(name: &str) -> Option<&'static str> {
+    option_table(false)
+        .find(|spec| spec.name == name)
+        .map(|spec| spec.name)
+}
 
 fn option_table(is_build: bool) -> impl Iterator<Item = OptionSpec> {
     let extra: &[OptionSpec] = if is_build { BUILD } else { COMPILER };

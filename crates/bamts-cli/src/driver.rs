@@ -10,8 +10,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc::{self, Receiver, TryRecvError},
 };
+use serde::{
+    Serialize,
+    ser::{SerializeMap, SerializeSeq, Serializer},
+};
 use std::{thread, time::Duration};
-
 use bamts::discover_project;
 use bamts_compiler::CancellationToken;
 use bamts_compiler::lower::LowerOptions;
@@ -27,7 +30,7 @@ use bamts_compiler::{
     diagnostics_parser::map_parse_diagnostics,
     lint::{LintOverride, LintProfile, LintTable},
     project::{
-        ProjectConfig, ProjectRoot,
+        JsonObject, JsonValue, ProjectConfig, ProjectRoot,
         build_mode::BuildInfo,
         effective::{
             EffectiveProject, MaterializeError, ProjectBuildOptions, ProjectCompileError,
@@ -45,7 +48,7 @@ use bamts_runtime::{Limits, run_linked_program_with_cancel};
 use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
 use crate::cli::{
     diagnostic_format::{self as tsc_diagnostics, TscDiagnosticFormat},
-    tsc_args::{ParsedTscCommand, TscDispatchMode, TscExitStatus},
+    tsc_args::{ParsedTscCommand, TscDispatchMode, TscExitStatus, TscOptionValue},
 };
 use crate::context::ExecutionContext;
 use crate::diagnostics::{self, DiagnosticSource, TruncationNotice};
@@ -116,6 +119,9 @@ pub enum DriverError {
     },
     WriteTscConfig {
         path: PathBuf,
+        source: io::Error,
+    },
+    ShowConfigRender {
         source: io::Error,
     },
     ToolchainMissing {
@@ -247,6 +253,9 @@ impl fmt::Display for DriverError {
                 "could not write TypeScript config `{}`: {source}",
                 path.display()
             ),
+            Self::ShowConfigRender { source } => {
+                write!(formatter, "could not render showConfig output: {source}")
+            }
             Self::ToolchainMissing { program } => write!(
                 formatter,
                 "system C toolchain `{}` was not found",
@@ -304,6 +313,7 @@ impl Error for DriverError {
             | Self::CacheArchive { source, .. }
             | Self::WriteObject { source, .. }
             | Self::WriteTscConfig { source, .. }
+            | Self::ShowConfigRender { source, .. }
             | Self::ToolchainProbe { source, .. }
             | Self::LinkStart { source, .. }
             | Self::PublishExecutable { source, .. } => Some(source),
@@ -513,6 +523,16 @@ fn execute_tsc_in_context(
             ..CommandOutcome::default()
         });
     }
+    // TypeScript 7.0.2 prints the final configuration after ordinary argument
+    // validation and the files-plus-config conflict, but before the direct
+    // compile-mode unsupported-option gate and before any parsing, binding,
+    // checking, code generation, or writes. Ordinary direct compilation keeps
+    // rejecting options it does not apply.
+    if command.flag("showConfig") {
+        // TypeScript prints argv file names relative to the process working
+        // directory with a leading `./` (probe-verified).
+        return show_config_outcome(&DirectShowConfig { command, cwd });
+    }
     if let Some(option) = command.first_unsupported_option(TscDispatchMode::Direct) {
         return Ok(unsupported_option_outcome(option));
     }
@@ -626,6 +646,12 @@ fn execute_tsc_project(
         Ok(project) => project,
         Err(error) => return Ok(project_compile_error_outcome(error, command, cwd)),
     };
+    // TypeScript 7.0.2 prints the final merged configuration instead of
+    // compiling: no project compilation, reference compilation, emit, or
+    // writes happen on this route. The project was loaded exactly once above.
+    if command.flag("showConfig") {
+        return show_config_outcome(&ProjectShowConfig::new(&project));
+    }
     let compile_options = ProjectCompileOptions {
         emit: !command.flag("listFilesOnly"),
         ..ProjectCompileOptions::default()
@@ -973,6 +999,538 @@ fn unsupported_option_outcome(option: &str) -> CommandOutcome {
         "Compiler option '--{option}' has no canonical native driver mapping."
     ))
 }
+
+// ---------------------------------------------------------------------------
+// `--showConfig`: borrowed TypeScript 7.0.2 configuration serialization.
+//
+// The document is a `serde::Serialize` view over the immutable
+// `bamts_compiler::project::JsonValue` graph. Nothing is cloned into
+// `serde_json::Value`; rendering walks the borrowed entries in declaration
+// order so the output is byte-deterministic. Serialization failure is typed,
+// not unwrapped: [`DriverError::ShowConfigRender`] carries the io error.
+// ---------------------------------------------------------------------------
+
+/// Renders one borrowed effective-configuration document as TypeScript
+/// `--showConfig` bytes: four-space `serde_json` indentation plus exactly one
+/// trailing newline. The writer failure is the io error itself, and a JSON
+/// serialization failure (non-finite number) is reported as io::InvalidData
+/// through the same typed [`DriverError::ShowConfigRender`] channel.
+fn render_show_config_document<T: Serialize>(
+    document: &T,
+) -> Result<Vec<u8>, DriverError> {
+    let mut buffer = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(
+        &mut buffer,
+        serde_json::ser::PrettyFormatter::with_indent(b"    "),
+    );
+    document
+        .serialize(&mut serializer)
+        .map_err(|error| DriverError::ShowConfigRender {
+            source: io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
+        })?;
+    buffer.push(b'\n');
+    Ok(buffer)
+}
+
+
+/// One typed key/value slot of the direct-route `--showConfig` document.
+/// Direct dispatch emits only options explicitly supplied on the command
+/// line, preserving TypeScript 7.0.2 CLI order; enum values were already
+/// canonicalized to lower case by the argv parser.
+enum DirectCompilerOption<'a> {
+    Bool(bool),
+    Text(&'a str),
+    Items(&'a [String]),
+    Number(i32),
+}
+
+impl Serialize for DirectCompilerOption<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Text(value) => serializer.serialize_str(value),
+            Self::Items(values) => serializer.collect_seq(values.iter()),
+            Self::Number(value) => serializer.serialize_i32(*value),
+        }
+    }
+}
+
+/// The direct-route `--showConfig` document: effective CLI compiler options
+/// plus the argv file list, rendered relative to the process working
+/// directory with TypeScript's `./` prefix (probe-verified).
+struct DirectShowConfig<'a> {
+    command: &'a ParsedTscCommand,
+    cwd: &'a Path,
+}
+
+impl Serialize for DirectShowConfig<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let options: Vec<(&'static str, DirectCompilerOption<'_>)> =
+            direct_compiler_options(self.command).collect();
+        let files: Vec<String> = self
+            .command
+            .file_names
+            .iter()
+            .map(|name| {
+                let path = self.cwd.join(name);
+                ProjectShowConfig::relative_path(self.cwd, &path)
+            })
+            .collect();
+        let mut state = serializer.serialize_map(Some(2))?;
+        state.serialize_entry(
+            "compilerOptions",
+            &SerializeMapEntries(options.iter()),
+        )?;
+        state.serialize_entry("files", &files)?;
+        state.end()
+    }
+}
+
+
+/// Serializes a borrowed compiler-option sequence as a JSON object so the
+/// document keeps TypeScript's key order instead of a struct field order.
+struct SerializeMapEntries<I>(I);
+
+impl<'a> Serialize
+    for SerializeMapEntries<std::slice::Iter<'a, (&'static str, DirectCompilerOption<'a>)>>
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in self.0.clone() {
+            state.serialize_entry(key, value)?;
+        }
+        state.end()
+    }
+}
+
+struct ProjectShowConfig<'a> {
+    project: &'a EffectiveProject,
+}
+
+impl<'a> ProjectShowConfig<'a> {
+    fn new(project: &'a EffectiveProject) -> Self {
+        Self { project }
+    }
+
+    /// Lexical relative path from `base` to `path` in TypeScript showConfig
+    /// form: descendants and equal paths get a leading `./`, parents and
+    /// siblings use `../` components. Both inputs are absolute; incompatible
+    /// Windows prefixes or roots fall back to the absolute path text rather
+    /// than producing a meaningless cross-root traversal.
+    fn relative_path(base: &Path, path: &Path) -> String {
+        /// Splits an absolute path into its filesystem root (prefix +
+        /// rootdir) and the remaining normal components. Non-normal
+        /// components (`.`, `..`) cause `None` so the caller falls back
+        /// to the absolute text instead of mis-rendering.
+        fn split_absolute(p: &Path) -> Option<(String, Vec<String>)> {
+            let mut root = String::new();
+            let mut normals = Vec::new();
+            for component in p.components() {
+                match component {
+                    std::path::Component::Prefix(prefix) => {
+                        root.push_str(&prefix.as_os_str().to_string_lossy());
+                    }
+                    std::path::Component::RootDir => {
+                        root.push('/');
+                    }
+                    std::path::Component::Normal(segment) => {
+                        normals
+                            .push(segment.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+                    }
+                    std::path::Component::CurDir | std::path::Component::ParentDir => return None,
+                }
+            }
+            if root.is_empty() {
+                return None;
+            }
+            Some((root, normals))
+        }
+        let Some((base_root, base_normals)) = split_absolute(base) else {
+            return path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        };
+        let Some((path_root, path_normals)) = split_absolute(path) else {
+            return path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        };
+        if base_root != path_root {
+            return path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        }
+        let shared = base_normals
+            .iter()
+            .zip(path_normals.iter())
+            .take_while(|(from, to)| from == to)
+            .count();
+        let mut relative = String::new();
+        for _ in shared..base_normals.len() {
+            relative.push_str("../");
+        }
+        if relative.is_empty() {
+            relative.push_str("./");
+        }
+        relative.push_str(&path_normals[shared..].join("/"));
+        relative
+    }
+}
+
+impl Serialize for ProjectShowConfig<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let raw = self.project.config().config().raw();
+        let config_directory = self
+            .project
+            .config_path()
+            .parent()
+            .expect("config path always has a parent directory");
+
+        let mut state = serializer.serialize_map(None)?;
+        let empty_object = JsonValue::Object(JsonObject::from_entries(Vec::new()));
+        let compiler_options = raw.get("compilerOptions").unwrap_or(&empty_object);
+        let canonical = canonicalize_compiler_options(compiler_options, config_directory);
+        // TypeScript 7.0.2 appends the implied options it reports for the
+        // supported target/module surface. Each implication applies only when
+        // the user did not set the option explicitly.
+        let implied: Vec<(String, JsonValue)> = implied_compiler_options(raw);
+        state.serialize_entry("compilerOptions", &JsonView::Borrowed(&canonical))?;
+        for (name, value) in &implied {
+            state.serialize_entry(name.as_str(), &JsonView::Owned(value.clone()))?;
+        }
+        let references: Vec<SerializeReferenceEntry> = self
+            .project
+            .references()
+            .iter()
+            .map(|reference| SerializeReferenceEntry {
+                base: config_directory,
+                path: reference.path(),
+            })
+            .collect();
+        if !references.is_empty() {
+            state.serialize_entry("references", &references)?;
+        }
+        let files: Vec<String> = self
+            .project
+            .source_files()
+            .iter()
+            .map(|path| Self::relative_path(config_directory, path))
+            .collect();
+        if !files.is_empty() {
+            state.serialize_entry("files", &files)?;
+        }
+        if let Some(include) = raw.get("include") {
+            let paths: Vec<String> = include
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|value| Self::relative_path(config_directory, Path::new(value.as_str().expect("include entry is a string"))))
+                .collect();
+            state.serialize_entry("include", &paths)?;
+        }
+        if let Some(exclude) = raw.get("exclude") {
+            let paths: Vec<String> = exclude
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|value| Self::relative_path(config_directory, Path::new(value.as_str().expect("exclude entry is a string"))))
+                .collect();
+            state.serialize_entry("exclude", &paths)?;
+        }
+
+        state.end()
+    }
+}
+
+/// Rewrites compiler-option values onto their canonical TypeScript form:
+/// enum values are lower-cased (`ES2022` → `es2022`, `NODE16` →
+/// `node16`, …), and path-like fields that the effective-config loader
+/// rewrote to absolute form are relativized back against the config
+/// directory so the output matches TypeScript's `--showConfig` text.
+fn canonicalize_compiler_options(options: &JsonValue, config_directory: &Path) -> JsonValue {
+    const ENUM_OPTIONS: &[&str] = &[
+        "target", "module", "jsx", "moduleResolution", "moduleDetection", "newLine",
+    ];
+    const PATH_FIELDS: &[&str] = &[
+        "baseUrl", "rootDir", "outDir", "declarationDir", "outFile", "tsBuildInfoFile",
+    ];
+    let Some(object) = options.as_object() else {
+        return options.clone();
+    };
+    let base_url = object
+        .get("baseUrl")
+        .and_then(JsonValue::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_directory.to_path_buf());
+    let entries = object
+        .entries()
+        .iter()
+        .map(|(key, value)| {
+            let key_str = key.as_ref();
+            let value = if ENUM_OPTIONS.contains(&key_str) {
+                match value {
+                    JsonValue::String(text) => {
+                        JsonValue::String(Arc::from(text.to_ascii_lowercase().as_str()))
+                    }
+                    other => other.clone(),
+                }
+            } else if PATH_FIELDS.contains(&key_str) {
+                match value {
+                    JsonValue::String(text) => JsonValue::String(Arc::from(
+                        ProjectShowConfig::relative_path(config_directory, Path::new(&**text))
+                            .as_str(),
+                    )),
+                    other => other.clone(),
+                }
+            } else if key_str == "typeRoots" {
+                match value {
+                    JsonValue::Array(items) => {
+                        let relativized: Vec<JsonValue> = items
+                            .iter()
+                            .map(|item| {
+                                let text = item
+                                    .as_str()
+                                    .expect("typeRoots entry is a string");
+                                JsonValue::String(Arc::from(
+                                    ProjectShowConfig::relative_path(config_directory, Path::new(text))
+                                        .as_str(),
+                                ))
+                            })
+                            .collect();
+                        JsonValue::Array(Arc::from(relativized))
+                    }
+                    other => other.clone(),
+                }
+            } else if key_str == "paths" {
+                match value {
+                    JsonValue::Object(mappings) => {
+                        let rewritten: Vec<(Arc<str>, JsonValue)> = mappings
+                            .entries()
+                            .iter()
+                            .map(|(pattern, targets)| {
+                                let relativized = match targets {
+                                    JsonValue::Array(items) => {
+                                        let relativized: Vec<JsonValue> = items
+                                            .iter()
+                                            .map(|item| {
+                                                let text = item
+                                                    .as_str()
+                                                    .expect("paths target is a string");
+                                                JsonValue::String(Arc::from(
+                                                    ProjectShowConfig::relative_path(&base_url, Path::new(text))
+                                                        .as_str(),
+                                                ))
+                                            })
+                                            .collect();
+                                        JsonValue::Array(Arc::from(relativized))
+                                    }
+                                    other => other.clone(),
+                                };
+                                (Arc::clone(pattern), relativized)
+                            })
+                            .collect();
+                        JsonValue::Object(JsonObject::from_entries(rewritten))
+                    }
+                    other => other.clone(),
+                }
+            } else {
+                match value {
+                    JsonValue::Object(nested) => {
+                        canonicalize_compiler_options(
+                            &JsonValue::Object(nested.clone()),
+                            config_directory,
+                        )
+                    }
+                    other => other.clone(),
+                }
+            };
+            (key.clone(), value)
+        })
+        .collect();
+    JsonValue::Object(JsonObject::from_entries(entries))
+}
+
+/// Computes the implied compiler options TypeScript 7.0.2 appends to a
+/// project `--showConfig` document, derived from observable CLI probes:
+/// - `module` implies `moduleResolution` (node16/node18 → "node16",
+///   node20/nodenext → that module) and `moduleDetection: "force"`;
+///   node16/node18 also imply `resolveJsonModule: false`.
+/// - `target` implies `module` (pre-es2022 targets → "es6"/"es2020",
+///   esnext → "esnext") and `useDefineForClassFields: false` for
+///   pre-es2022 targets.
+/// Every implication applies only when the option is not explicitly set.
+fn implied_compiler_options(raw: &JsonObject) -> Vec<(String, JsonValue)> {
+    let Some(options) = raw.get("compilerOptions").and_then(JsonValue::as_object) else {
+        return Vec::new();
+    };
+    let text = |name: &str| options.get(name).and_then(JsonValue::as_str);
+    let set = |name: &str| options.get(name).is_some();
+    let mut implied: Vec<(String, JsonValue)> = Vec::new();
+
+    if let Some(module) = text("module") {
+        if !set("moduleResolution") {
+            let resolution = match module {
+                "node16" | "node18" => Some("node16"),
+                "node20" | "nodenext" => Some(module),
+                _ => None,
+            };
+            if let Some(resolution) = resolution {
+                implied.push((
+                    "moduleResolution".to_owned(),
+                    JsonValue::String(Arc::from(resolution)),
+                ));
+            }
+        }
+        if !set("moduleDetection") && matches!(module, "node16" | "node18" | "node20" | "nodenext")
+        {
+            implied.push((
+                "moduleDetection".to_owned(),
+                JsonValue::String(Arc::from("force")),
+            ));
+        }
+        if !set("resolveJsonModule") && matches!(module, "node16" | "node18") {
+            implied.push(("resolveJsonModule".to_owned(), JsonValue::Bool(false)));
+        }
+    }
+
+    if let Some(target) = text("target") {
+        if !set("module") {
+            let module = match target {
+                "es6" | "es2015" | "es2016" | "es2017" | "es2018" | "es2019" => Some("es6"),
+                "es2020" | "es2021" => Some("es2020"),
+                "esnext" => Some("esnext"),
+                _ => None,
+            };
+            if let Some(module) = module {
+                implied.push(("module".to_owned(), JsonValue::String(Arc::from(module))));
+            }
+        }
+        if !set("useDefineForClassFields")
+            && matches!(
+                target,
+                "es6" | "es2015"
+                    | "es2016" | "es2017"
+                    | "es2018" | "es2019"
+                    | "es2020" | "es2021"
+            )
+        {
+            implied.push((
+                "useDefineForClassFields".to_owned(),
+                JsonValue::Bool(false),
+            ));
+        }
+    }
+
+    implied
+}
+
+/// One `references` entry serialized relative to the config directory.
+struct SerializeReferenceEntry<'a> {
+    base: &'a Path,
+    path: &'a Path,
+}
+
+impl Serialize for SerializeReferenceEntry<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_map(Some(1))?;
+        state.serialize_entry(
+            "path",
+            &ProjectShowConfig::relative_path(self.base, self.path),
+        )?;
+        state.end()
+    }
+}
+
+/// Renders a showConfig document and wraps it in a success outcome.
+fn show_config_outcome<T: Serialize>(document: &T) -> Result<CommandOutcome, DriverError> {
+    Ok(CommandOutcome {
+        stdout: render_show_config_document(document)?,
+        exit_code: TscExitStatus::Success.code(),
+        ..CommandOutcome::default()
+    })
+}
+
+/// Iterates the parsed direct command in argv order, matching TypeScript's
+/// effective CLI order (verified by probe: the first-supplied option prints
+/// first). Only parser-validated option names are emitted.
+fn direct_compiler_options(
+    command: &ParsedTscCommand,
+) -> impl Iterator<Item = (&'static str, DirectCompilerOption<'_>)> {
+    command
+        .options
+        .iter()
+        .filter_map(|(name, value)| {
+            // Dispatch controls are consumed by routing, not compiler state.
+            if matches!(
+                name.as_str(),
+                "help" | "version" | "init" | "showConfig" | "ignoreConfig" | "pretty" | "project"
+            ) {
+                return None;
+            }
+            let name = crate::cli::tsc_args::canonical_option_name(name)?;
+            let value = match value {
+                TscOptionValue::Bool(value) => DirectCompilerOption::Bool(*value),
+                TscOptionValue::String(value) => DirectCompilerOption::Text(value.as_str()),
+                TscOptionValue::Number(value) => DirectCompilerOption::Number(*value),
+                TscOptionValue::List(values) => DirectCompilerOption::Items(values.as_slice()),
+                TscOptionValue::Null => return None,
+            };
+            Some((name, value))
+        })
+}
+
+
+/// Borrowed read-only view over an immutable JSON value. `Owned` carries a
+/// synthesized value (implied options) by value so no clone of the shared
+/// graph is needed.
+enum JsonView<'a> {
+    Borrowed(&'a JsonValue),
+    Owned(JsonValue),
+}
+
+impl Serialize for JsonView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Borrowed(value) => JsonViewRef(value).serialize(serializer),
+            Self::Owned(value) => JsonViewRef(value).serialize(serializer),
+        }
+    }
+}
+
+/// Shared serializer body over any referenced JSON value.
+struct JsonViewRef<'a>(&'a JsonValue);
+
+impl Serialize for JsonViewRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            JsonValue::Null => serializer.serialize_none(),
+            JsonValue::Bool(value) => serializer.serialize_bool(*value),
+            JsonValue::Number(value) => {
+                if let Ok(number) = value.parse::<i64>() {
+                    serializer.serialize_i64(number)
+                } else if let Ok(number) = value.parse::<u64>() {
+                    serializer.serialize_u64(number)
+                } else if let Ok(number) = value.parse::<f64>() {
+                    serializer.serialize_f64(number)
+                } else {
+                    Err(serde::ser::Error::custom(format!(
+                        "invalid JSON number {value:?}"
+                    )))
+                }
+            }
+            JsonValue::String(value) => serializer.serialize_str(value),
+            JsonValue::Array(values) => {
+                let mut state = serializer.serialize_seq(Some(values.len()))?;
+                for value in values.iter() {
+                    state.serialize_element(&JsonViewRef(value))?;
+                }
+                state.end()
+            }
+            JsonValue::Object(object) => {
+                let mut state = serializer.serialize_map(Some(object.entries().len()))?;
+                for (key, value) in object.entries() {
+                    state.serialize_entry(key.as_ref(), &JsonViewRef(value))?;
+                }
+                state.end()
+            }
+        }
+    }
+}
+
 
 fn levels(args: &CliArgs, project_root: &Path) -> Result<LintTable, DriverError> {
     let profile = if args.pedantic {

@@ -823,6 +823,140 @@ fn build_mode_consumes_build_controls_and_reports_verbose_status() {
 }
 
 #[test]
+fn show_config_direct_matches_typescript_bytes() {
+    let project = ScratchDirectory::new();
+    project.write("file.ts", "export const value = 1;\n");
+
+    let output = project
+        .command()
+        .args([
+            "--showConfig",
+            "--ignoreConfig",
+            "file.ts",
+            "--target",
+            "ES2024",
+            "--strict",
+            "false",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("showConfig direct probe starts");
+
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let expected = "{\n    \"compilerOptions\": {\n        \"strict\": false,\n        \"target\": \"es2024\"\n    },\n    \"files\": [\n        \"./file.ts\"\n    ]\n}\n";
+    assert_eq!(stdout(&output), expected);
+}
+
+#[test]
+fn show_config_project_merges_effective_view_without_emit() {
+    let project = ScratchDirectory::new();
+    project.write("app/src/main.ts", "export const main = 1;\n");
+    project.write("app/src/helper.ts", "import { lib } from '../../shared/lib';\nexport const main = lib;\n");
+    project.write("shared/lib/src/lib.ts", "export const lib = 1;\n");
+    project.write(
+        "shared/tsconfig.json",
+        r#"{"compilerOptions":{"composite":true,"outDir":"out"},"include":["lib/src/**/*"]}"#,
+    );
+    project.write(
+        "app/tsconfig.base.json",
+        r#"{"compilerOptions":{"target":"ES2020","noUnusedLocals":true}}"#,
+    );
+    project.write(
+        "app/tsconfig.json",
+        r#"{"extends":"./tsconfig.base.json","compilerOptions":{"target":"ES2022","outDir":"dist","module":"nodenext"},"include":["src/**/*"],"exclude":["node_modules"],"references":[{"path":"../shared"}]}"#,
+    );
+
+    let output = project
+        .command()
+        .args(["--showConfig", "-p", "app"])
+        .current_dir(&project.path)
+        .output()
+        .expect("showConfig project probe starts");
+
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let text = stdout(&output);
+
+    // One merged effective view: `extends` never appears, the child
+    // `target`/`outDir` override the base, and the implied options from the
+    // node16-family module are appended.
+    assert!(!text.contains("extends"), "{text}");
+    assert!(text.contains("\"target\": \"es2022\""), "{text}");
+    assert!(text.contains("\"moduleResolution\": \"nodenext\""), "{text}");
+    assert!(text.contains("\"moduleDetection\": \"force\""), "{text}");
+    assert!(text.contains("\"noUnusedLocals\": true"), "{text}");
+
+    // Top-level TypeScript order: compilerOptions, references, files,
+    // include, exclude.
+    let options_at = text.find("\"compilerOptions\"").expect("compilerOptions key");
+    let references_at = text.find("\"references\"").expect("references key");
+    let files_at = text.find("\"files\"").expect("files key");
+    let include_at = text.find("\"include\"").expect("include key");
+    let exclude_at = text.find("\"exclude\"").expect("exclude key");
+    assert!(options_at < references_at, "{text}");
+    assert!(references_at < files_at, "{text}");
+    assert!(files_at < include_at, "{text}");
+    assert!(include_at < exclude_at, "{text}");
+
+    // Descendant paths use `./`, sibling references use `../`; no absolute
+    // fallback for anything inside the project root.
+    assert!(text.contains("\"path\": \"../shared\""), "{text}");
+    assert!(text.contains(&format!("\"./src/main.ts\"")), "{text}");
+    assert!(text.contains(&format!("\"./src/helper.ts\"")), "{text}");
+    assert!(!text.contains(project.path.to_str().expect("UTF-8 scratch root")), "{text}");
+
+    // The trailing byte is exactly one newline.
+    assert!(text.ends_with("}\n"), "{text}");
+
+    // No emit happened on this route.
+    assert!(!project.path.join("app/dist").exists());
+    assert!(!project.path.join("shared/out").exists());
+}
+
+#[test]
+fn show_config_build_dispatch_rejects_at_parse_time() {
+    let project = ScratchDirectory::new();
+    project.write("src/main.ts", "export const answer = 42;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"files":["src/main.ts"],"compilerOptions":{"outDir":"dist"}}"#,
+    );
+
+    assert_parse_failure(
+        &project
+            .command()
+            .args(["--build", "tsconfig.json", "--showConfig"])
+            .current_dir(&project.path)
+            .output()
+            .expect("build showConfig rejection starts"),
+        6387,
+        "Compiler option 'showConfig' may not be used with '--build'.",
+    );
+}
+
+#[test]
+fn show_config_project_malformed_config_stays_fail_closed() {
+    let project = ScratchDirectory::new();
+    project.write("src/main.ts", "export const answer = 42;\n");
+    project.write("broken/tsconfig.json", r#"{"files":["../src/main.ts"],"compilerOptions":{"outDir":"dist""#);
+
+    let output = project
+        .command()
+        .args(["--showConfig", "-p", "broken"])
+        .current_dir(&project.path)
+        .output()
+        .expect("malformed config probe starts");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    assert!(stderr(&output).is_empty());
+    let text = stdout(&output);
+    assert!(text.starts_with("error TS"), "{text}");
+    assert!(!text.contains("compilerOptions"), "{text}");
+}
+
+
+#[test]
 fn direct_mode_preserves_its_option_surface() {
     let project = ScratchDirectory::new();
     project.write("hello.ts", include_str!("fixtures/hello.ts"));
