@@ -1,6 +1,6 @@
 import { SERVICE_METHODS, createSession } from "../internal/session.js";
 
-export function createSyncService(options) {
+export function createSerialService(options) {
   const session = createSession(options);
   let tail = Promise.resolve();
   const enqueue = (method, params = {}, requestOptions) => {

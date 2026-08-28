@@ -71,11 +71,20 @@
     "README.md",
     "index.d.ts",
     "index.js",
+    "native-loader.js",
     "internal/",
     "unstable/",
+    "native-release-table.json",
     "native-runner.js"
   ],
   "dependencies": {
     "bamti-cli": "0.2.0"
+  },
+  "optionalDependencies": {
+    "@bamti/bamti-linux-x64-gnu": "0.2.0",
+    "@bamti/bamti-linux-arm64-gnu": "0.2.0",
+    "@bamti/bamti-darwin-x64": "0.2.0",
+    "@bamti/bamti-darwin-arm64": "0.2.0",
+    "@bamti/bamti-win32-x64-msvc": "0.2.0"
   }
 }

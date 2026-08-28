@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { access, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { registerHooks } from "node:module";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const npmRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(npmRoot, "..");
@@ -35,6 +36,91 @@ const CLI_ARTIFACTS = [
   { directory: "cli-darwin-arm64", package: "@bamti/cli-darwin-arm64", target: "aarch64-apple-darwin", platform: "darwin", arch: "arm64", entry: "bin/bamts" },
   { directory: "cli-win32-x64", package: "@bamti/cli-win32-x64", target: "x86_64-pc-windows-msvc", platform: "win32", arch: "x64", entry: "bin/bamts.exe" },
 ];
+
+const bamtiDirectory = join(npmRoot, "bamti");
+const bamtiIndexUrl = pathToFileURL(join(bamtiDirectory, "index.js")).href;
+
+const FAKE_NATIVE_LOADER_SOURCE = [
+  "export const state = { loads: [], requests: [], outcomes: [], failures: [] };",
+  "globalThis.__BAMTI_NATIVE_TEST_STATE__ = state;",
+  "export const NATIVE_TARGETS = [];",
+  "export class NativeArtifactLoadError extends Error {}",
+  "export class NativeArtifactNotFoundError extends Error {}",
+  "export class UnsupportedPlatformError extends Error {}",
+  "export function selectNativeTarget() { return undefined; }",
+  "const addon = {",
+  "  releaseMetadata() {",
+  "    return {",
+  '      packageVersion: "0.2.0",',
+  '      sourceCommit: "f".repeat(64),',
+  '      buildSetId: "a".repeat(64),',
+  '      releaseId: "bamti/0.2.0/" + "f".repeat(64) + "/native-abi-1/cli-protocol-1/" + "a".repeat(64),',
+  '      target: "x86_64-unknown-linux-gnu",',
+  '      artifactKind: "native-addon",',
+  "      nativeAbi: 1,",
+  "      cliProtocol: 1,",
+  "    };",
+  "  },",
+  "  run(request) {",
+  "    state.requests.push(request);",
+  "    const failure = state.failures.shift();",
+  "    if (failure !== undefined) return Promise.reject(failure);",
+  "    return Promise.resolve(state.outcomes.shift());",
+  "  },",
+  "};",
+  "export function loadNativeAddon(...options) {",
+  "  state.loads.push(options);",
+  "  return addon;",
+  "}",
+].join("\n");
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === "bamti-cli") {
+      return {
+        shortCircuit: true,
+        url: pathToFileURL(join(npmRoot, "bamti-cli", "index.js")).href,
+      };
+    }
+    if (
+      specifier === "./native-loader.js" &&
+      typeof context.parentURL === "string" &&
+      context.parentURL.startsWith(`${bamtiIndexUrl}?wiring=`)
+    ) {
+      return {
+        shortCircuit: true,
+        url: `data:text/javascript,${encodeURIComponent(FAKE_NATIVE_LOADER_SOURCE)}`,
+      };
+    }
+    return nextResolve(specifier, context);
+  },
+});
+
+const api = await import("../bamti/index.js");
+const wired = await import(`${bamtiIndexUrl}?wiring=1`);
+const wiredState = globalThis.__BAMTI_NATIVE_TEST_STATE__;
+
+function nativeRequest(overrides = {}) {
+  return {
+    args: [Buffer.from("--version"), Buffer.from("ünïcode.ts")],
+    cwd: Buffer.from("/tmp/bamti-native"),
+    env: [Buffer.from("BAMTS_COLOR=0"), Buffer.from("LANG=C.UTF-8")],
+    ...overrides,
+  };
+}
+
+function nativeOutcome() {
+  return {
+    exitCode: 3,
+    stdout: Buffer.from([0x00, 0x8f, 0xff]),
+    stderr: Buffer.from("compiler stderr\n"),
+    truncation: { elided: 12, limit: 4096 },
+  };
+}
+
+function resetWiredState() {
+  Object.assign(wiredState, { loads: [], requests: [], outcomes: [], failures: [] });
+}
 
 function run(command, args, options = {}) {
   return spawnSync(command, args, {
@@ -203,6 +289,135 @@ for (const target of CLI_ARTIFACTS) {
   });
 }
 
+test("bamti publishes exactly the thirteen entry points with truthful names", async () => {
+  const manifest = await readJson(join(bamtiDirectory, "package.json"));
+  assert.deepEqual(Object.keys(manifest.exports).sort(), [...PUBLIC_EXPORTS].sort());
+  assert.ok(JSON.stringify(manifest).includes("unstable/sync"));
+  for (const [key, entry] of Object.entries(manifest.exports)) {
+    if (key === "./package.json") continue;
+    assert.deepEqual(Object.keys(entry).sort(), ["import", "types"], `${key} must declare types and import`);
+    await access(join(bamtiDirectory, entry.types));
+    await access(join(bamtiDirectory, entry.import));
+  }
+  assert.equal(manifest.engines.node, ">=24");
+  assert.deepEqual(manifest.bin, { tsc: "native-runner.js" });
+  assert.ok(manifest.files.includes("native-release-table.json"), "packed table must ship for fail-closed loading");
+  assert.deepEqual(manifest.optionalDependencies, {
+    "@bamti/bamti-linux-x64-gnu": manifest.version,
+    "@bamti/bamti-linux-arm64-gnu": manifest.version,
+    "@bamti/bamti-darwin-x64": manifest.version,
+    "@bamti/bamti-darwin-arm64": manifest.version,
+    "@bamti/bamti-win32-x64-msvc": manifest.version,
+  });
+});
+
+test("root exposes the typed in-process native operation and loader surface", async () => {
+  assert.equal(typeof api.runNative, "function");
+  assert.equal(typeof api.loadNativeAddon, "function");
+  assert.equal(typeof api.selectNativeTarget, "function");
+  assert.equal(api.NATIVE_TARGETS.length, 5);
+  for (const errorName of ["UnsupportedPlatformError", "NativeArtifactNotFoundError", "NativeArtifactLoadError"]) {
+    assert.equal(typeof api[errorName], "function", errorName);
+    assert.ok(
+      Object.prototype.isPrototypeOf.call(Error.prototype, api[errorName].prototype),
+      `${errorName} must be an Error subclass`,
+    );
+  }
+  const declarations = await readFile(join(bamtiDirectory, "index.d.ts"), "utf8");
+  assert.match(declarations, /export declare function runNative\(\s*request: NativeRunRequest,\s*\): Promise<NativeRunOutcome>;/);
+  assert.match(declarations, /export interface NativeRunRequest \{[\s\S]*?readonly signal\?: AbortSignal;/);
+  assert.ok(!declarations.includes("createSyncService"), "false sync name must not survive in types");
+  const readme = await readFile(join(bamtiDirectory, "README.md"), "utf8");
+  assert.match(readme, /runNative\(/);
+  assert.match(readme, /createSerialService/);
+  assert.ok(!readme.includes("createSyncService"), "false sync name must not survive in docs");
+  assert.equal(existsSync(join(bamtiDirectory, "unstable", "sync.js")), true);
+  assert.equal(existsSync(join(bamtiDirectory, "unstable", "sync.d.ts")), true);
+  const serial = await import("../bamti/unstable/sync.js");
+  assert.equal(typeof serial.createSerialService, "function");
+  assert.equal(serial.createSyncService, undefined);
+});
+
+test("runNative forwards request bytes to the addon and returns the outcome unchanged", async () => {
+  resetWiredState();
+  const request = nativeRequest({ signal: new AbortController().signal });
+  const outcome = nativeOutcome();
+  wiredState.outcomes.push(outcome);
+  const returned = await wired.runNative(request);
+  assert.deepEqual(wiredState.loads, [[]]);
+  assert.equal(wiredState.loads.length, 1, "each invocation loads through the verified loader once");
+  assert.equal(wiredState.requests[0], request);
+  assert.equal(returned, outcome);
+  assert.ok(Buffer.isBuffer(request.args[0]) && Buffer.isBuffer(request.cwd) && Buffer.isBuffer(request.env[0]));
+  assert.ok(Buffer.isBuffer(returned.stdout) && Buffer.isBuffer(returned.stderr));
+});
+
+test("runNative surfaces addon queue and closing failures explicitly", async () => {
+  resetWiredState();
+  const queueError = new Error("bamti native invocation queue is full");
+  wiredState.failures.push(queueError);
+  await assert.rejects(() => wired.runNative(nativeRequest()), (error) => error === queueError);
+  const closingError = new Error("bamti native executor is closing");
+  wiredState.failures.push(closingError);
+  await assert.rejects(() => wired.runNative(nativeRequest()), (error) => error === closingError);
+  assert.equal(wiredState.outcomes.length, 0);
+  assert.equal(wiredState.requests.length, 2);
+});
+
+test("selectNativeTarget maps exactly the five published native targets", () => {
+  const supported = [
+    { platform: "linux", arch: "x64", libc: "glibc", selector: "linux-x64-gnu" },
+    { platform: "linux", arch: "arm64", libc: "glibc", selector: "linux-arm64-gnu" },
+    { platform: "darwin", arch: "x64", selector: "darwin-x64" },
+    { platform: "darwin", arch: "arm64", selector: "darwin-arm64" },
+    { platform: "win32", arch: "x64", selector: "win32-x64-msvc" },
+  ];
+  assert.deepEqual(
+    api.NATIVE_TARGETS.map(({ selector }) => selector),
+    supported.map(({ selector }) => selector),
+  );
+  for (const host of supported) {
+    const target = api.selectNativeTarget(host);
+    assert.equal(target.selector, host.selector);
+    assert.equal(target.package, `@bamti/bamti-${host.selector}`);
+    assert.equal(target.entry, `bamti.${host.selector}.node`);
+    assert.equal(target.artifactKind, "native-addon");
+    assert.ok(existsSync(join(npmRoot, "artifacts", `bamti-${host.selector}`)), `${host.selector} has a published artifact package`);
+  }
+  assert.equal(api.selectNativeTarget({ platform: "darwin", arch: "x64", libc: "musl" }).selector, "darwin-x64");
+  for (const host of [
+    { platform: "linux", arch: "x64", libc: "musl" },
+    { platform: "linux", arch: "x64", libc: "unknown" },
+    { platform: "linux", arch: "x64" },
+    { platform: "sunos", arch: "x64" },
+    { platform: "win32", arch: "arm64" },
+  ]) {
+    assert.throws(() => api.selectNativeTarget(host), api.UnsupportedPlatformError);
+  }
+});
+
+test("in-process loading fails closed without a staged release table", async () => {
+  assert.equal(existsSync(join(bamtiDirectory, "native-release-table.json")), false);
+  const hostLibc =
+    process.platform === "linux"
+      ? process.report?.getReport?.()?.header?.glibcVersionRuntime
+        ? "glibc"
+        : "unknown"
+      : undefined;
+  const hostSupported = (() => {
+    try {
+      api.selectNativeTarget({ platform: process.platform, arch: process.arch, libc: hostLibc });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  await assert.rejects(
+    () => api.runNative(nativeRequest()),
+    (error) => error instanceof (hostSupported ? api.NativeArtifactLoadError : api.UnsupportedPlatformError),
+  );
+});
+
 test("clean consumer imports all thirteen exports and runs the real API and CLI", async () => {
   const artifacts = await Promise.all(CLI_ARTIFACTS.map(artifactRecord));
   const hostCli = artifacts.find(
@@ -253,6 +468,7 @@ test("clean consumer imports all thirteen exports and runs the real API and CLI"
         `const session = api.createSession({ filesystem: loaded[3].osFileSystem(process.cwd()) });\n` +
         `assert.equal(typeof await session.snapshot(), "object");\n` +
         `await assert.rejects(session.snapshot({}, { signal: AbortSignal.abort() }), { name: "AbortError" });\n` +
+        `await assert.rejects(api.runNative({ args: [Buffer.from("--version")], cwd: Buffer.from(process.cwd()), env: [] }), (error) => error.name === "NativeArtifactLoadError" || error.name === "NativeArtifactNotFoundError");\n` +
         `await session.dispose();\n`,
     );
     const apiResult = run(process.execPath, [exercise], { cwd: root, env: npmEnvironment(root) });

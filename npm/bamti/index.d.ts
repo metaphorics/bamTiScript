@@ -2,10 +2,10 @@ import type {
   ResolveBinaryOptions as CliResolveBinaryOptions,
   RunOptions as CliRunOptions,
 } from "bamti-cli";
+import type { Buffer } from "node:buffer";
 
 export {
   ArtifactNotFoundError,
-  UnsupportedPlatformError,
   artifactPackage,
   resolveBinary,
   resolveBinary as resolveArtifact,
@@ -18,6 +18,116 @@ export function run(
   args?: readonly string[],
   options?: RunOptions,
 ): Promise<number>;
+
+export interface NativeRunTruncation {
+  readonly elided: number;
+  readonly limit: number;
+}
+
+export interface NativeRunOutcome {
+  readonly exitCode: number;
+  readonly stdout: Buffer;
+  readonly stderr: Buffer;
+  readonly truncation?: NativeRunTruncation;
+}
+
+export interface NativeRunRequest {
+  readonly args: readonly Buffer[];
+  readonly cwd: Buffer;
+  readonly env: readonly Buffer[];
+  readonly signal?: AbortSignal;
+}
+
+export interface NativeReleaseMetadata {
+  readonly packageVersion: string;
+  readonly sourceCommit: string;
+  readonly buildSetId: string;
+  readonly releaseId: string;
+  readonly target: string;
+  readonly artifactKind: string;
+  readonly nativeAbi: number;
+  readonly cliProtocol: number;
+}
+
+export interface NativeTarget {
+  readonly selector: string;
+  readonly target: string;
+  readonly package: string;
+  readonly entry: string;
+  readonly os: string;
+  readonly cpu: string;
+  readonly libc?: string;
+  readonly artifactKind: string;
+}
+
+export interface NativeReleaseTableRow extends NativeTarget {
+  readonly version: string;
+  readonly sha256: string;
+}
+
+export interface NativeReleaseTable {
+  readonly version: number;
+  readonly release: NativeReleaseMetadata;
+  readonly targets: readonly NativeReleaseTableRow[];
+}
+
+export interface NativeHost {
+  readonly platform: string;
+  readonly arch: string;
+  readonly libc?: string;
+  readonly nodeVersion: string;
+  readonly napiVersion: string;
+}
+
+export interface NativeAddon {
+  releaseMetadata(): NativeReleaseMetadata;
+  run(request: NativeRunRequest): Promise<NativeRunOutcome>;
+}
+
+export interface LoadNativeAddonOptions {
+  readonly table?: string | NativeReleaseTable;
+  readonly host?: NativeHost;
+  readonly resolver?: { resolve(id: string): string };
+  readonly readFile?: (path: string) => Buffer;
+  readonly realpath?: (path: string) => string;
+  readonly requireAddon?: (path: string) => NativeAddon;
+  readonly stage?: (bytes: Buffer) => string;
+  readonly cache?: {
+    get value(): NativeAddon | undefined;
+    set value(value: NativeAddon | undefined): void;
+  };
+}
+
+export declare class UnsupportedPlatformError extends Error {
+  constructor(platform: string, arch: string, libc?: string);
+}
+
+export declare class NativeArtifactNotFoundError extends Error {
+  constructor(packageName: string, version: string, cause?: Error);
+}
+
+export declare class NativeArtifactLoadError extends Error {
+  constructor(message: string, cause?: Error);
+}
+
+export declare const NATIVE_TARGETS: readonly NativeTarget[];
+
+export declare function selectNativeTarget(host: NativeHost): NativeTarget;
+
+export declare function loadNativeAddon(
+  options: LoadNativeAddonOptions & { host: NativeHost },
+): NativeAddon;
+export declare function loadNativeAddon(options?: undefined): NativeAddon;
+
+/**
+ * Executes the BamTS compiler in-process through the verified native Node-API addon.
+ * Requires Node.js 24+ with Node-API 10+. The request is forwarded byte-for-byte and
+ * the outcome carries `stdout`/`stderr` as `Buffer`s. Addon queue-full and closing
+ * failures reject the returned promise unchanged.
+ */
+export declare function runNative(
+  request: NativeRunRequest,
+): Promise<NativeRunOutcome>;
 
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue =
