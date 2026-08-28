@@ -36,12 +36,14 @@ pub struct ProjectOptionOverrides {
     pub source_map: Option<bool>,
     pub out_dir: Option<PathBuf>,
     pub root_dir: Option<PathBuf>,
+    pub map_root: Option<Arc<str>>,
     pub out_file: Option<PathBuf>,
     pub ts_build_info_file: Option<PathBuf>,
     pub strict: Option<bool>,
     pub allow_js: Option<bool>,
     pub check_js: Option<bool>,
     pub jsx: Option<Arc<str>>,
+    pub source_root: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,18 +374,12 @@ pub fn compile_project<F: FileSystem + Clone>(
                 unreachable!("JavaScript output never selects a native JSX route");
             }
         }
-        let names = EmitFileNames {
-            source_name: path_to_arc(source_path),
-            js_file_name: planned
-                .get(&ArtifactKind::JavaScript)
-                .and_then(|path| path.file_name())
-                .map(|name| Arc::from(name.to_string_lossy().as_ref())),
-            declaration_file_name: planned
-                .get(&ArtifactKind::Declaration)
-                .and_then(|path| path.file_name())
-                .map(|name| Arc::from(name.to_string_lossy().as_ref())),
-            source_root: project.options().source_root().map(path_to_arc),
-        };
+        let names = source_map_names(
+            source_path,
+            planned,
+            &plan,
+            project.options(),
+        );
         let emitted = emitter::emit_checked(
             module.source_file(),
             module.semantic_model(),
@@ -435,6 +431,221 @@ pub fn compile_project<F: FileSystem + Clone>(
         up_to_date: false,
         build_info: emitted.then_some(build_state).flatten(),
     })
+}
+
+/// One surface's source-map naming computed at the emitter boundary.
+struct SurfaceMapNames {
+    source_name: Option<Arc<str>>,
+    source_map_url: Option<Arc<str>>,
+}
+
+/// Joins `segments` onto `base` with one separating slash, trimming both edges.
+fn join_url_segments(base: &str, suffix: &str) -> String {
+    let trimmed_base = base.trim_end_matches('/');
+    let trimmed_suffix = suffix.trim_start_matches('/');
+    let mut joined = String::with_capacity(trimmed_base.len() + trimmed_suffix.len() + 1);
+    joined.push_str(trimmed_base);
+    joined.push('/');
+    joined.push_str(trimmed_suffix);
+    joined
+}
+
+/// Returns true when `value` looks like a scheme-qualified URL rather than a path.
+fn is_url_like(value: &str) -> bool {
+    if let Some((scheme, rest)) = value.split_once(':') {
+        return scheme.len() >= 2
+            && scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+            && scheme.bytes().next().is_some_and(|byte| byte.is_ascii_alphabetic())
+            && (rest.starts_with("//") || scheme.eq_ignore_ascii_case("file"));
+    }
+    false
+}
+
+/// Computes the map `sources` entry and `sourceMappingURL` for one output surface.
+///
+/// * Without `sourceRoot`, `sources` carries the lexical path from the physical
+///   map file's directory back to the original source.
+/// * With any `sourceRoot`, `sources` is relative to the common source base and
+///   the raw normalized `sourceRoot` rides in the map JSON.
+/// * `mapRoot` only rewrites `sourceMappingURL`. Relative roots resolve from the
+///   common source base (rootDir when configured, else the derived common
+///   directory); absolute and URL roots keep their identity.
+fn surface_map_names(
+    source_path: &Path,
+    output_path: &Path,
+    map_path: &Path,
+    map_root: Option<&str>,
+    source_root: Option<&str>,
+    common_source_dir: &Path,
+    has_explicit_source_root: bool,
+) -> SurfaceMapNames {
+    // Source-relative output identity: the source path under the common source
+    // base with its final extension replaced by the surface's full output
+    // extension chain ("js", "js.map", "d.ts", "d.ts.map", ...).
+    let output_name = output_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    let output_extension_chain = {
+        // Everything after the first dot of the output file name: "x.js.map"
+        // -> "js.map", "x.d.ts" -> "d.ts", "x.js" -> "js".
+        let name = output_name.to_string_lossy();
+        match name.split_once('.') {
+            Some((_, rest)) => rest.to_owned(),
+            None => name.into_owned(),
+        }
+    };
+    let source_stem = source_path
+        .file_stem()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    let mut output_relative = match source_path.strip_prefix(common_source_dir) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => PathBuf::from(&source_stem),
+    };
+    output_relative.set_file_name({
+        let stem = source_stem.to_string_lossy().into_owned();
+        if output_extension_chain.is_empty() {
+            stem
+        } else {
+            format!("{stem}.{output_extension_chain}")
+        }
+    });
+    // The map `sources` entry keeps the original source path relative to the
+    // common source base, independent of the emitted surface.
+    let source_relative = match source_path.strip_prefix(common_source_dir) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => source_path
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+    };
+
+    // With any explicit sourceRoot the map `sources` entry is the source path
+    // relative to the common source base; without one it is the path from the
+    // map directory back to the original source.
+    let source_name = match source_root {
+        Some(root) if has_explicit_source_root && !root.is_empty() => Some(Arc::<str>::from(
+            source_relative.to_string_lossy().as_ref(),
+        )),
+        _ => {
+            let map_directory = map_path.parent().unwrap_or_else(|| Path::new(""));
+            let relative_to_map = relative_path_between(map_directory, source_path);
+            Some(Arc::<str>::from(relative_to_map.to_string_lossy().as_ref()))
+        }
+    };
+
+    let source_map_url = map_root.map(|root| {
+        let source_relative_identity = format!("{}.map", output_relative.to_string_lossy());
+        if is_url_like(root) || root.starts_with('/') {
+            Arc::<str>::from(join_url_segments(root, &source_relative_identity))
+        } else {
+            let base = common_source_dir.join(root);
+            let output_directory = output_path.parent().unwrap_or_else(|| Path::new(""));
+            let url = relative_path_between(output_directory, &base.join(&source_relative_identity));
+            Arc::<str>::from(url.to_string_lossy().as_ref())
+        }
+    });
+
+    SurfaceMapNames {
+        source_name,
+        source_map_url,
+    }
+}
+
+/// Lexical relative path from `from` to `to`, using `..` segments when needed.
+fn relative_path_between(from: &Path, to: &Path) -> PathBuf {
+    let mut from_components = from
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .peekable();
+    let mut to_components = to
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .peekable();
+    let mut relative = PathBuf::new();
+    while from_components.peek().is_some() && from_components.peek() == to_components.peek() {
+        from_components.next();
+        to_components.next();
+    }
+    for _ in from_components {
+        relative.push("..");
+    }
+    for component in to_components {
+        relative.push(component.as_os_str());
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    relative
+}
+
+/// Builds the per-surface `EmitFileNames` for one planned source.
+fn source_map_names(
+    source_path: &Path,
+    planned: &BTreeMap<ArtifactKind, PathBuf>,
+    plan: &super::super::project::output::OutputPlan,
+    options: &CompilerOptions,
+) -> EmitFileNames {
+    let javascript = planned.get(&ArtifactKind::JavaScript);
+    let declaration = planned.get(&ArtifactKind::Declaration);
+    let js_map = planned.get(&ArtifactKind::SourceMap);
+    let declaration_map = planned.get(&ArtifactKind::DeclarationMap);
+    let map_root = options.map_root();
+    let source_root = options.source_root();
+    let has_explicit_source_root = source_root.is_some();
+
+    let js_surface = js_map
+        .zip(javascript)
+        .map(|(map_path, js_path)| {
+            surface_map_names(
+                source_path,
+                js_path,
+                map_path,
+                map_root,
+                source_root,
+                &plan.common_source_dir,
+                has_explicit_source_root,
+            )
+        })
+        .unwrap_or(SurfaceMapNames {
+            source_name: None,
+            source_map_url: None,
+        });
+    let declaration_surface = declaration_map
+        .zip(declaration)
+        .map(|(map_path, declaration_path)| {
+            surface_map_names(
+                source_path,
+                declaration_path,
+                map_path,
+                map_root,
+                source_root,
+                &plan.common_source_dir,
+                has_explicit_source_root,
+            )
+        })
+        .unwrap_or(SurfaceMapNames {
+            source_name: None,
+            source_map_url: None,
+        });
+
+    EmitFileNames {
+        source_name: path_to_arc(source_path),
+        js_file_name: javascript
+            .and_then(|path| path.file_name())
+            .map(|name| Arc::from(name.to_string_lossy().as_ref())),
+        declaration_file_name: declaration
+            .and_then(|path| path.file_name())
+            .map(|name| Arc::from(name.to_string_lossy().as_ref())),
+        source_root: source_root.map(Arc::from),
+        js_source_name: js_surface.source_name,
+        js_source_map_url: js_surface.source_map_url,
+        declaration_source_name: declaration_surface.source_name,
+        declaration_source_map_url: declaration_surface.source_map_url,
+    }
 }
 
 fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions, Vec<Diagnostic>) {
@@ -851,8 +1062,6 @@ fn rewrite_compiler_paths(
         "declarationDir",
         "outFile",
         "tsBuildInfoFile",
-        "mapRoot",
-        "sourceRoot",
     ] {
         if let Some(value) = compiler.get(field) {
             set_named_entry(
@@ -860,6 +1069,14 @@ fn rewrite_compiler_paths(
                 field,
                 rewrite_path_value(root, directory, value, field)?,
             );
+        }
+    }
+    for field in ["mapRoot", "sourceRoot"] {
+        if let Some(value) = compiler.get(field) {
+            let value = value
+                .as_str()
+                .ok_or_else(|| invalid_config_field(field))?;
+            set_named_entry(&mut entries, field, JsonValue::String(Arc::from(value)));
         }
     }
     if let Some(value) = compiler.get("typeRoots") {
@@ -998,6 +1215,12 @@ fn apply_overrides(
                 .map_err(ProjectCompileError::Path)?;
             set_named_entry(&mut compiler, key, JsonValue::String(path_to_arc(&value)));
         }
+    }
+    if let Some(value) = overrides.map_root.as_deref() {
+        set_named_entry(&mut compiler, "mapRoot", JsonValue::String(Arc::from(value)));
+    }
+    if let Some(value) = overrides.source_root.as_deref() {
+        set_named_entry(&mut compiler, "sourceRoot", JsonValue::String(Arc::from(value)));
     }
     if let Some(value) = &overrides.jsx {
         set_named_entry(&mut compiler, "jsx", JsonValue::String(Arc::clone(value)));
@@ -1875,5 +2098,207 @@ mod tests {
             ProjectCompileError::Output(OutputMapError::Collision { .. })
         ));
         assert!(!fixture.0.join("dist/a.js").exists());
+    }
+
+    fn map_json(report: &ProjectCompileResult, path: &Path) -> serde_helpers::MapView {
+        serde_helpers::MapView::parse(
+            report
+                .outputs
+                .files
+                .get(path)
+                .unwrap_or_else(|| panic!("missing output {}", path.display())),
+        )
+    }
+
+    #[test]
+    fn contract_examples_match_type_script_7_source_map_naming() {
+        let fixture = Fixture::new();
+        fixture.write("src/sub/x.ts", "export const x = 1;\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{
+                "files":["src/sub/x.ts"],
+                "compilerOptions":{
+                    "rootDir":"src",
+                    "outDir":"dist",
+                    "declaration":true,
+                    "sourceMap":true,
+                    "declarationMap":true
+                }
+            }"#,
+        );
+
+        let run = |map_root: Option<&str>, source_root: Option<&str>| {
+            let filesystem = fixture.filesystem();
+            let mut request = fixture.request("tsconfig.json");
+            request.overrides.map_root = map_root.map(Arc::from);
+            request.overrides.source_root = source_root.map(Arc::from);
+            let project = EffectiveProject::load(&request, &filesystem).unwrap();
+            let report =
+                compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+            assert!(report.emitted);
+            // Physical map files stay beside the planned outputs.
+            assert!(report
+                .outputs
+                .files
+                .contains_key(&fixture.0.join("dist/sub/x.js.map")));
+            assert!(report
+                .outputs
+                .files
+                .contains_key(&fixture.0.join("dist/sub/x.d.ts.map")));
+            report
+        };
+
+        // Relative mapRoot, no sourceRoot: URL is relative to the emitting file
+        // and `sources` is the path from the map directory to the source.
+        let report = run(Some("maps"), None);
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/sub/x.js"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            javascript.contains("//# sourceMappingURL=../../src/maps/sub/x.js.map"),
+            "{javascript}"
+        );
+        let map = map_json(&report, &fixture.0.join("dist/sub/x.js.map"));
+        assert_eq!(map.source_root, None);
+        assert_eq!(map.sources, vec!["../../src/sub/x.ts".to_owned()]);
+
+        // Relative mapRoot with sourceRoot: sources collapse to the common base
+        // and the raw (normalized) sourceRoot rides in the JSON for both maps.
+        let report = run(Some("maps"), Some("../sourceroot"));
+        let map = map_json(&report, &fixture.0.join("dist/sub/x.js.map"));
+        assert_eq!(map.source_root.as_deref(), Some("../sourceroot/"));
+        assert_eq!(map.sources, vec!["sub/x.ts".to_owned()]);
+        let declaration_map = map_json(&report, &fixture.0.join("dist/sub/x.d.ts.map"));
+        assert_eq!(declaration_map.source_root.as_deref(), Some("../sourceroot/"));
+        assert_eq!(declaration_map.sources, vec!["sub/x.ts".to_owned()]);
+
+        // URL mapRoot: verbatim URL joined with the source-relative identity.
+        let report = run(Some("https://maps.example.com/cdn"), None);
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/sub/x.js"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            javascript.contains(
+                "//# sourceMappingURL=https://maps.example.com/cdn/sub/x.js.map",
+            ),
+            "{javascript}"
+        );
+        let declaration = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/sub/x.d.ts"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            declaration.contains(
+                "//# sourceMappingURL=https://maps.example.com/cdn/sub/x.d.ts.map",
+            ),
+            "{declaration}"
+        );
+        let map = map_json(&report, &fixture.0.join("dist/sub/x.js.map"));
+        assert_eq!(map.sources, vec!["../../src/sub/x.ts".to_owned()]);
+
+        // Absolute mapRoot: absolute URL with the source-relative identity.
+        let report = run(Some("/abs/maps"), None);
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/sub/x.js"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            javascript.contains("//# sourceMappingURL=/abs/maps/sub/x.js.map"),
+            "{javascript}"
+        );
+    }
+
+    #[test]
+    fn project_config_parses_and_preserves_raw_map_options() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts", "export {};\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["src/a.ts"],"compilerOptions":{"mapRoot":"maps/","sourceRoot":"https://src.example.com/"}}"#,
+        );
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &fixture.filesystem())
+                .unwrap();
+        assert_eq!(project.options().map_root(), Some("maps/"));
+        assert_eq!(
+            project.options().source_root(),
+            Some("https://src.example.com/")
+        );
+    }
+
+    #[test]
+    fn cli_string_overrides_reach_project_options_verbatim() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts", "export {};\n");
+        fixture.write("tsconfig.json", r#"{"files":["src/a.ts"]}"#);
+        let mut request = fixture.request("tsconfig.json");
+        request.overrides.map_root = Some(Arc::from("https://maps.example.com/cdn"));
+        request.overrides.source_root = Some(Arc::from("/abs/root"));
+        let project =
+            EffectiveProject::load(&request, &fixture.filesystem()).unwrap();
+        assert_eq!(
+            project.options().map_root(),
+            Some("https://maps.example.com/cdn")
+        );
+        assert_eq!(project.options().source_root(), Some("/abs/root"));
+    }
+}
+
+/// Minimal reader for the map JSON fields these tests assert on.
+#[cfg(test)]
+mod serde_helpers {
+    use crate::project::{JsonObject, JsonValue};
+
+    pub struct MapView {
+        pub source_root: Option<String>,
+        pub sources: Vec<String>,
+    }
+
+    impl MapView {
+        pub fn parse(bytes: &[u8]) -> MapView {
+            let text = std::str::from_utf8(bytes).expect("UTF-8 map JSON");
+            let object: JsonObject = crate::project::parse_jsonc(text)
+                .expect("map JSON parses")
+                .as_object()
+                .expect("map JSON object")
+                .clone();
+            let source_root = object
+                .get("sourceRoot")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned);
+            let sources = object
+                .get("sources")
+                .and_then(JsonValue::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().expect("string source").to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            MapView {
+                source_root,
+                sources,
+            }
+        }
     }
 }

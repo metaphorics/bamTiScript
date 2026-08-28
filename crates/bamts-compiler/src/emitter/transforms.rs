@@ -3466,6 +3466,7 @@ mod tests {
             js_file_name: Some(Arc::from("output.js")),
             declaration_file_name: Some(Arc::from("output.d.ts")),
             source_root: None,
+            ..EmitFileNames::default()
         }
     }
 

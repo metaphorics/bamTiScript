@@ -445,6 +445,7 @@ pub fn compile_program_frontend_with_cancel(
                 )),
                 declaration_file_name: None,
                 source_root: None,
+                ..EmitFileNames::default()
             };
             let emit = if let Some(options) = program_emit_options(program, mode) {
                 cancel.check()?;
@@ -561,8 +562,8 @@ pub fn compile_frontend_with_lints(request: FrontendRequest, levels: &LintTable)
     let names = EmitFileNames {
         source_name: Arc::from(format!("source{}.ts", source_id.get()).into_boxed_str()),
         js_file_name: None,
-        declaration_file_name: None,
         source_root: None,
+        ..EmitFileNames::default()
     };
     let emit = if should_emit {
         mode.emit_options().map(|options| {

@@ -467,12 +467,23 @@ impl SourceMapBuilder {
     ///
     /// Mappings are sorted by generated position with the original position as a
     /// total tie-break, then exact duplicates are collapsed. The result always
-    /// satisfies [`SourceMap::validate`].
+    /// satisfies [`SourceMap::validate`]. A non-empty `sourceRoot` is normalized
+    /// to carry exactly one trailing slash, matching TypeScript's emitted maps.
     #[must_use]
     pub fn finish(mut self) -> SourceMap {
         self.mappings.sort_unstable();
         self.mappings.dedup();
 
+        let source_root = self
+            .source_root
+            .take()
+            .filter(|root| !root.is_empty())
+            .map(|root| {
+                let trimmed = root.trim_end_matches('/');
+                let mut normalized = trimmed.to_owned();
+                normalized.push('/');
+                normalized
+            });
         let sources_content = if self.include_sources_content {
             Some(self.sources_content)
         } else {
@@ -481,7 +492,7 @@ impl SourceMapBuilder {
 
         SourceMap {
             file: self.file,
-            source_root: self.source_root,
+            source_root,
             sources: self.sources,
             sources_content,
             names: self.names,
@@ -639,6 +650,7 @@ mod tests {
                 js_file_name: Some(Arc::from("output.js")),
                 declaration_file_name: Some(Arc::from("output.d.ts")),
                 source_root: None,
+                ..EmitFileNames::default()
             },
         )
     }
@@ -820,7 +832,7 @@ mod tests {
         builder.add_mapping("a.ts", LineColumn::new(0, 0), LineColumn::new(0, 0), None);
         let json = builder.finish().to_json();
 
-        assert!(json.starts_with("{\"version\":3,\"file\":\"out.js\",\"sourceRoot\":\"/root\","));
+        assert!(json.starts_with("{\"version\":3,\"file\":\"out.js\",\"sourceRoot\":\"/root/\""));
         assert!(json.contains("\"sourcesContent\":[\"const x = \\\"q\\\";\\n\"]"));
         assert!(json.contains("\"names\":[]"));
         assert!(json.ends_with("\"mappings\":\"AAAA\"}"));

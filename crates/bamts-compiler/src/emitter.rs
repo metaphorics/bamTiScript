@@ -352,12 +352,20 @@ impl EmitOptions {
 }
 
 /// File names recorded in emitted products and source maps.
+///
+/// Source-map names are explicit per surface: the emitter never re-derives
+/// paths from project layout, so the boundary carries the exact
+/// `sourceMappingURL` and map `sources` entry for each generated product.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmitFileNames {
     pub source_name: Arc<str>,
     pub js_file_name: Option<Arc<str>>,
     pub declaration_file_name: Option<Arc<str>>,
     pub source_root: Option<Arc<str>>,
+    pub js_source_name: Option<Arc<str>>,
+    pub js_source_map_url: Option<Arc<str>>,
+    pub declaration_source_name: Option<Arc<str>>,
+    pub declaration_source_map_url: Option<Arc<str>>,
 }
 
 impl Default for EmitFileNames {
@@ -367,6 +375,27 @@ impl Default for EmitFileNames {
             js_file_name: None,
             declaration_file_name: None,
             source_root: None,
+            js_source_name: None,
+            js_source_map_url: None,
+            declaration_source_name: None,
+            declaration_source_map_url: None,
+        }
+    }
+}
+
+impl EmitFileNames {
+    /// Returns the map `sources` entry and `sourceMappingURL` for `surface`.
+    #[must_use]
+    pub(crate) fn map_naming(&self, surface: Surface) -> (Option<&str>, Option<&str>) {
+        match surface {
+            Surface::JavaScript => (
+                self.js_source_name.as_deref(),
+                self.js_source_map_url.as_deref(),
+            ),
+            Surface::Declaration => (
+                self.declaration_source_name.as_deref(),
+                self.declaration_source_map_url.as_deref(),
+            ),
         }
     }
 }
@@ -495,7 +524,7 @@ pub(crate) fn print_with_jsx_plan(
         file,
         original_content,
     } = source;
-    let mut map = (options.source_map || options.inline_source_map).then(|| {
+    let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
             .with_sources_content(options.inline_sources && surface == Surface::JavaScript);
         let file_name = match surface {
@@ -510,18 +539,25 @@ pub(crate) fn print_with_jsx_plan(
         }
         builder
     });
-    if let Some(builder) = &mut map {
-        builder.intern_source_with_content(&names.source_name, original_content);
+    if let Some(builder) = &mut source_map {
+        let (source_name, _) = names.map_naming(surface);
+        builder.intern_source_with_content(
+            source_name.unwrap_or_else(|| names.source_name.as_ref()),
+            original_content,
+        );
     }
 
+
+    let (map_source, _) = names.map_naming(surface);
+    let mapped_source_name: &str = map_source.unwrap_or_else(|| names.source_name.as_ref());
     let mut emitter = Emitter {
         source: file.source_text(),
-        source_name: &names.source_name,
+        source_name: mapped_source_name,
         source_id: file.source_id(),
         model,
         enum_facts: model.enum_facts(),
         options,
-        map,
+        map: source_map.take(),
         generated_line: 0,
         generated_column: 0,
         out: String::new(),
@@ -544,16 +580,19 @@ pub(crate) fn print_with_jsx_plan(
         Surface::JavaScript => emitter.emit_module_js(file.statements()),
         Surface::Declaration => emitter.emit_module_decl(file.statements()),
     }
+    let mut code = emitter.out;
     emitter.diagnostics.sort();
 
-    let mut code = emitter.out;
-    let source_map = emitter.map.map(SourceMapBuilder::finish);
+    let source_map = emitter.map.take().map(SourceMapBuilder::finish);
     if let Some(source_map) = &source_map {
         if !code.is_empty() && !code.ends_with(options.newline.as_str()) {
             code.push_str(options.newline.as_str());
         }
+        let (_, map_url) = names.map_naming(surface);
         if options.inline_source_map {
             code.push_str(&source_map.inline_comment());
+        } else if let Some(url) = map_url {
+            code.push_str(&SourceMap::url_comment(url));
         } else if let Some(file) = source_map.file() {
             code.push_str(&SourceMap::url_comment(&format!("{file}.map")));
         }

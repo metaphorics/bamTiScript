@@ -770,6 +770,7 @@ fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOverrides {
         inline_sources: boolean("inlineSources"),
         out_dir: command.option_str("outDir").map(PathBuf::from),
         root_dir: command.option_str("rootDir").map(PathBuf::from),
+        map_root: command.option_str("mapRoot").map(Arc::from),
         out_file: command
             .option_str("outFile")
             .or_else(|| command.option_str("out"))
@@ -779,6 +780,7 @@ fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOverrides {
         allow_js: boolean("allowJs"),
         check_js: boolean("checkJs"),
         jsx: command.option_str("jsx").map(Arc::from),
+        source_root: command.option_str("sourceRoot").map(Arc::from),
     }
 }
 

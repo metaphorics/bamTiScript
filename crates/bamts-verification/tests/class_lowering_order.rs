@@ -84,6 +84,7 @@ fn lowered(source: &str) -> String {
             js_file_name: Some(Arc::from("output.mjs")),
             declaration_file_name: None,
             source_root: None,
+            ..EmitFileNames::default()
         },
     );
     assert!(

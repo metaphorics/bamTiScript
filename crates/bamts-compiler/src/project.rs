@@ -936,8 +936,8 @@ pub struct CompilerOptions {
     source_map: bool,
     inline_source_map: bool,
     inline_sources: bool,
-    map_root: Option<PathBuf>,
-    source_root: Option<PathBuf>,
+    map_root: Option<Arc<str>>,
+    source_root: Option<Arc<str>>,
     no_emit: bool,
     no_emit_on_error: bool,
     emit_declaration_only: bool,
@@ -1038,12 +1038,12 @@ impl CompilerOptions {
     }
 
     #[must_use]
-    pub fn map_root(&self) -> Option<&Path> {
+    pub fn map_root(&self) -> Option<&str> {
         self.map_root.as_deref()
     }
 
     #[must_use]
-    pub fn source_root(&self) -> Option<&Path> {
+    pub fn source_root(&self) -> Option<&str> {
         self.source_root.as_deref()
     }
 
@@ -1181,8 +1181,8 @@ impl ProjectConfig {
             source_map: optional_bool(compiler, "sourceMap")?.unwrap_or(false),
             inline_source_map: optional_bool(compiler, "inlineSourceMap")?.unwrap_or(false),
             inline_sources: optional_bool(compiler, "inlineSources")?.unwrap_or(false),
-            map_root: optional_path(root, directory, compiler, "mapRoot")?,
-            source_root: optional_path(root, directory, compiler, "sourceRoot")?,
+            map_root: optional_nested_string(compiler, "mapRoot")?,
+            source_root: optional_nested_string(compiler, "sourceRoot")?,
             no_emit: optional_bool(compiler, "noEmit")?.unwrap_or(false),
             no_emit_on_error: optional_bool(compiler, "noEmitOnError")?.unwrap_or(false),
             emit_declaration_only: optional_bool(compiler, "emitDeclarationOnly")?.unwrap_or(false),
