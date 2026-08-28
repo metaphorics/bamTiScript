@@ -30,9 +30,10 @@ use bamts_compiler::{
         ProjectConfig, ProjectRoot,
         build_mode::BuildInfo,
         effective::{
-            EffectiveProject, ProjectBuildOptions, ProjectCompileError, ProjectCompileOptions,
-            ProjectCompileResult, ProjectLoadRequest, ProjectOptionOverrides, compile_project,
-            compile_project_references, load_reference_closure,
+            EffectiveProject, MaterializeError, ProjectBuildOptions, ProjectCompileError,
+            ProjectCompileOptions, ProjectCompileResult, ProjectLoadRequest,
+            ProjectOptionOverrides, compile_project, compile_project_references,
+            load_reference_closure,
         },
         parse_bamts_toml,
         references::resolve_config_file_name,
@@ -623,11 +624,11 @@ fn execute_tsc_project(
     };
     let project = match EffectiveProject::load(&request, &filesystem) {
         Ok(project) => project,
-        Err(error) => return Ok(project_compile_error_outcome(error)),
+        Err(error) => return Ok(project_compile_error_outcome(error, command, cwd)),
     };
     let result = match compile_project(&project, &ProjectCompileOptions::default(), &filesystem) {
         Ok(result) => result,
-        Err(error) => return Ok(project_compile_error_outcome(error)),
+        Err(error) => return Ok(project_compile_error_outcome(error, command, cwd)),
     };
     if !result.up_to_date {
         publish_project_result(&result)?;
@@ -662,7 +663,7 @@ fn execute_tsc_build(
     if command.flag("clean") {
         let (_, graph) = match load_reference_closure(&root, &configs, &filesystem) {
             Ok(closure) => closure,
-            Err(error) => return Ok(project_compile_error_outcome(error)),
+            Err(error) => return Ok(project_error_outcome(error.to_string())),
         };
         let mut order = match graph.topological_order() {
             Ok(order) => order,
@@ -715,7 +716,7 @@ fn execute_tsc_build(
         &filesystem,
     ) {
         Ok(report) => report,
-        Err(error) => return Ok(project_compile_error_outcome(error)),
+        Err(error) => return Ok(project_error_outcome(error.to_string())),
     };
     let mut stdout = Vec::new();
     let mut has_errors = false;
@@ -862,18 +863,80 @@ fn project_result_outcome(
     }
 }
 
-fn project_compile_error_outcome(error: ProjectCompileError) -> CommandOutcome {
+fn project_compile_error_outcome(
+    error: ProjectCompileError,
+    command: &ParsedTscCommand,
+    cwd: &Path,
+) -> CommandOutcome {
     match error {
         unsupported @ ProjectCompileError::UnsupportedOption { .. } => {
             not_implemented(&unsupported.to_string())
         }
+        ProjectCompileError::ConfigNotFound { path } => {
+            config_not_found_outcome(command, cwd, &path)
+        }
+        ProjectCompileError::Materialize(
+            materialize @ (MaterializeError::FilesListEmpty { .. }
+            | MaterializeError::NoInputs { .. }),
+        ) => project_diagnostic_outcome(materialize.to_string()),
         other => project_error_outcome(other.to_string()),
     }
 }
 
-fn project_error_outcome(message: String) -> CommandOutcome {
+fn config_not_found_outcome(
+    command: &ParsedTscCommand,
+    cwd: &Path,
+    config_path: &Path,
+) -> CommandOutcome {
+    let Some(project) = command.project() else {
+        return tsc_error_outcome(
+            "TS5081",
+            format!(
+                "Cannot find a tsconfig.json file at the current directory: {}.",
+                config_path.display()
+            ),
+        );
+    };
+    let project_path = Path::new(project);
+    if project_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return tsc_error_outcome(
+            "TS5083",
+            format!("Cannot read file '{}'.", config_path.display()),
+        );
+    }
+    let directory = if project_path.is_absolute() {
+        project_path.to_path_buf()
+    } else {
+        cwd.join(project_path)
+    };
+    tsc_error_outcome(
+        "TS5057",
+        format!(
+            "Cannot find a tsconfig.json file at the specified directory: '{}'.",
+            directory.display()
+        ),
+    )
+}
+
+fn project_diagnostic_outcome(message: String) -> CommandOutcome {
     CommandOutcome {
-        stdout: format!("error TS5083: {message}\n").into_bytes(),
+        stdout: format!("error {message}\n").into_bytes(),
+        exit_code: TscExitStatus::DiagnosticsPresentOutputsSkipped.code(),
+        ..CommandOutcome::default()
+    }
+}
+
+fn project_error_outcome(message: String) -> CommandOutcome {
+    tsc_error_outcome("TS5083", message)
+}
+
+fn tsc_error_outcome(code: &str, message: String) -> CommandOutcome {
+    CommandOutcome {
+        stdout: format!("error {code}: {message}\n").into_bytes(),
         exit_code: TscExitStatus::DiagnosticsPresentOutputsSkipped.code(),
         ..CommandOutcome::default()
     }
@@ -2011,8 +2074,8 @@ mod tests {
     use crate::context::ExecutionContext;
 
     use super::{
-        DriverError, capture_process_with_cancel, content_hash, execute_in_context, execute_tsc,
-        execute_tsc_in, levels, link_executable, lower_options, probe_toolchain,
+        CommandOutcome, DriverError, capture_process_with_cancel, content_hash, execute_in_context,
+        execute_tsc, execute_tsc_in, levels, link_executable, lower_options, probe_toolchain,
         probe_toolchain_in_context,
     };
 
@@ -2271,6 +2334,126 @@ exit 2
             )
         );
         assert_eq!(fs::read(config).expect("read unchanged config"), original);
+    }
+
+    #[test]
+    fn tsc_project_load_errors_keep_their_typescript_diagnostics() {
+        let fixture = TscFixture::new();
+        let assert_error = |outcome: CommandOutcome, expected: String| {
+            assert_eq!(
+                outcome.exit_code,
+                TscExitStatus::DiagnosticsPresentOutputsSkipped.code()
+            );
+            assert!(outcome.stderr.is_empty());
+            assert_eq!(String::from_utf8(outcome.stdout).unwrap(), expected);
+        };
+
+        let current = execute_tsc_in(
+            &parse_tsc_args(std::iter::empty::<&str>()).expect("default project parses"),
+            &fixture.0,
+        )
+        .expect("default project executes");
+        assert_error(
+            current,
+            format!(
+                "error TS5081: Cannot find a tsconfig.json file at the current directory: {}.\n",
+                fixture.0.join("tsconfig.json").display()
+            ),
+        );
+
+        let directory = fixture.0.join("missing-project");
+        fs::create_dir_all(&directory).unwrap();
+        let explicit_directory = execute_tsc_in(
+            &parse_tsc_args(["--project", "missing-project"]).expect("directory project parses"),
+            &fixture.0,
+        )
+        .expect("directory project executes");
+        assert_error(
+            explicit_directory,
+            format!(
+                "error TS5057: Cannot find a tsconfig.json file at the specified directory: '{}'.\n",
+                directory.display()
+            ),
+        );
+
+        let config = fixture.0.join("missing.json");
+        let explicit_file = execute_tsc_in(
+            &parse_tsc_args(["--project", "missing.json"]).expect("file project parses"),
+            &fixture.0,
+        )
+        .expect("file project executes");
+        assert_error(
+            explicit_file,
+            format!("error TS5083: Cannot read file '{}'.\n", config.display()),
+        );
+
+        fixture.write("empty.json", r#"{"files":[]}"#);
+        let empty = execute_tsc_in(
+            &parse_tsc_args(["--project", "empty.json"]).expect("empty project parses"),
+            &fixture.0,
+        )
+        .expect("empty project executes");
+        assert_error(
+            empty,
+            format!(
+                "error TS18002: The 'files' list in config file '{}' is empty.\n",
+                fixture.0.join("empty.json").display()
+            ),
+        );
+
+        fixture.write(
+            "none.json",
+            r#"{"include":["src/**/*.ts"],"exclude":["build"]}"#,
+        );
+        let none = execute_tsc_in(
+            &parse_tsc_args(["--project", "none.json"]).expect("no-input project parses"),
+            &fixture.0,
+        )
+        .expect("no-input project executes");
+        assert_error(
+            none,
+            format!(
+                "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"src/**/*.ts\"]' and 'exclude' paths were '[\"build\"]'.\n",
+                fixture.0.join("none.json").display()
+            ),
+        );
+
+        let absolute_pattern = fixture.0.join("absolute/**/*.ts");
+        fixture.write(
+            "absolute.json",
+            &format!(r#"{{"include":["{}"]}}"#, absolute_pattern.display()),
+        );
+        let absolute = execute_tsc_in(
+            &parse_tsc_args(["--project", "absolute.json"]).expect("absolute project parses"),
+            &fixture.0,
+        )
+        .expect("absolute project executes");
+        assert_error(
+            absolute,
+            format!(
+                "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"{}\"]' and 'exclude' paths were '[]'.\n",
+                fixture.0.join("absolute.json").display(),
+                absolute_pattern.display()
+            ),
+        );
+
+        fixture.write(
+            "base/base.json",
+            r#"{"include":["src/**/*.ts"],"exclude":["build"]}"#,
+        );
+        fixture.write("app/tsconfig.json", r#"{"extends":"../base/base.json"}"#);
+        let inherited = execute_tsc_in(
+            &parse_tsc_args(["--project", "app/tsconfig.json"]).expect("inherited project parses"),
+            &fixture.0,
+        )
+        .expect("inherited project executes");
+        assert_error(
+            inherited,
+            format!(
+                "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"../base/src/**/*.ts\"]' and 'exclude' paths were '[\"../base/build\"]'.\n",
+                fixture.0.join("app/tsconfig.json").display()
+            ),
+        );
     }
 
     #[test]

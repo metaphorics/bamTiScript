@@ -91,12 +91,12 @@ impl EffectiveProject {
             }
             Err(error) => return Err(ProjectCompileError::FileSystem(error)),
         };
-        let raw = load_merged_raw(&root, &config_path, &source, fs)?;
+        let (raw, diagnostic_patterns) = load_merged_raw(&root, &config_path, &source, fs)?;
         let raw = apply_overrides(&root, &cwd, raw, &request.overrides)?;
         let raw = normalize_composite_options(raw);
         let config =
             TsConfig::parse_value(&root, &config_path, raw).map_err(ProjectCompileError::Config)?;
-        let source_files = materialize_sources(&root, &config, fs)?;
+        let source_files = materialize_sources(&root, &config, &diagnostic_patterns, fs)?;
         let build_info_path = effective_build_info_path(&root, &config)?;
 
         Ok(Self {
@@ -833,7 +833,7 @@ impl fmt::Display for MaterializeError {
         match self {
             Self::FilesListEmpty { config_path } => write!(
                 formatter,
-                "TS18002: The 'files' list in config file '{}' is empty",
+                "TS18002: The 'files' list in config file '{}' is empty.",
                 config_path.display()
             ),
             Self::NoInputs {
@@ -842,7 +842,7 @@ impl fmt::Display for MaterializeError {
                 exclude,
             } => write!(
                 formatter,
-                "TS18003: No inputs were found in config file '{}'. Specified 'include' paths were {:?} and 'exclude' paths were {:?}",
+                "TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '{:?}' and 'exclude' paths were '{:?}'.",
                 config_path.display(),
                 include,
                 exclude
@@ -917,12 +917,55 @@ impl From<MaterializeError> for ProjectCompileError {
     }
 }
 
+#[derive(Default)]
+struct DiagnosticPatterns {
+    include: Option<PatternSource>,
+    exclude: Option<PatternSource>,
+}
+
+struct PatternSource {
+    directory: PathBuf,
+    values: Arc<[Arc<str>]>,
+}
+
+impl DiagnosticPatterns {
+    fn capture(&mut self, raw: &JsonObject, config_path: &Path) {
+        let Some(directory) = config_path.parent() else {
+            return;
+        };
+        if let Some(values) = raw_pattern_list(raw, "include") {
+            self.include = Some(PatternSource {
+                directory: directory.to_path_buf(),
+                values,
+            });
+        }
+        if let Some(values) = raw_pattern_list(raw, "exclude") {
+            self.exclude = Some(PatternSource {
+                directory: directory.to_path_buf(),
+                values,
+            });
+        }
+    }
+}
+
+fn raw_pattern_list(raw: &JsonObject, name: &str) -> Option<Arc<[Arc<str>]>> {
+    raw.get(name).and_then(JsonValue::as_array).map(|values| {
+        Arc::from(
+            values
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(Arc::<str>::from)
+                .collect::<Vec<_>>(),
+        )
+    })
+}
+
 fn load_merged_raw(
     root: &ProjectRoot,
     config_path: &Path,
     source: &str,
     fs: &dyn FileSystem,
-) -> Result<JsonObject, ProjectCompileError> {
+) -> Result<(JsonObject, DiagnosticPatterns), ProjectCompileError> {
     let chain = resolve_extends(
         root,
         config_path,
@@ -948,15 +991,18 @@ fn merge_config_layers(
     chain: &[ResolvedExtends],
     derived_path: &Path,
     derived_raw: &JsonObject,
-) -> Result<JsonObject, ProjectCompileError> {
+) -> Result<(JsonObject, DiagnosticPatterns), ProjectCompileError> {
     let mut merged = JsonObject::from_entries(Vec::new());
+    let mut patterns = DiagnosticPatterns::default();
     for layer in chain.iter().rev() {
         let raw = parse_object(layer.source()).map_err(ProjectCompileError::Config)?;
+        patterns.capture(&raw, layer.path());
         let rewritten = rewrite_layer_paths(root, layer.path(), &raw, &merged)?;
         merged = merge_objects(&merged, &rewritten);
     }
+    patterns.capture(derived_raw, derived_path);
     let rewritten = rewrite_layer_paths(root, derived_path, derived_raw, &merged)?;
-    Ok(merge_objects(&merged, &rewritten))
+    Ok((merge_objects(&merged, &rewritten), patterns))
 }
 
 fn merge_objects(base: &JsonObject, derived: &JsonObject) -> JsonObject {
@@ -1275,6 +1321,7 @@ fn path_to_arc(path: &Path) -> Arc<str> {
 fn materialize_sources(
     root: &ProjectRoot,
     config: &TsConfig,
+    diagnostic_patterns: &DiagnosticPatterns,
     fs: &dyn FileSystem,
 ) -> Result<Arc<[PathBuf]>, MaterializeError> {
     let project = config.config();
@@ -1315,6 +1362,41 @@ fn materialize_sources(
             path: project.path().to_path_buf(),
         })
     })?;
+    let render_patterns = |source: &PatternSource| {
+        Arc::from(
+            source
+                .values
+                .iter()
+                .map(|value| {
+                    let value_path = Path::new(value.as_ref());
+                    if value_path.is_absolute() {
+                        return Arc::clone(value);
+                    }
+                    Arc::<str>::from(
+                        relative_path_between(directory, &source.directory.join(value_path))
+                            .to_string_lossy()
+                            .as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let diagnostic_include = diagnostic_patterns
+        .include
+        .as_ref()
+        .map(&render_patterns)
+        .unwrap_or_else(|| {
+            if raw.get("files").is_none() {
+                Arc::from([Arc::<str>::from("**/*")])
+            } else {
+                Arc::from([])
+            }
+        });
+    let diagnostic_exclude = diagnostic_patterns
+        .exclude
+        .as_ref()
+        .map(render_patterns)
+        .unwrap_or_else(|| Arc::from([]));
     let include: Arc<[Arc<str>]> = if raw.get("include").is_none() && raw.get("files").is_none() {
         Arc::from([Arc::<str>::from(
             directory.join("**/*").to_string_lossy().as_ref(),
@@ -1365,8 +1447,8 @@ fn materialize_sources(
     if sources.is_empty() {
         return Err(MaterializeError::NoInputs {
             config_path: project.path().to_path_buf(),
-            include,
-            exclude: Arc::from(exclude),
+            include: diagnostic_include,
+            exclude: diagnostic_exclude,
         });
     }
     Ok(Arc::from(sources.into_iter().collect::<Vec<_>>()))
@@ -1569,7 +1651,7 @@ pub fn load_reference_closure(
                 ProjectCompileError::FileSystem(error)
             }
         })?;
-        let raw = load_merged_raw(root, &path, &source, fs)?;
+        let (raw, _) = load_merged_raw(root, &path, &source, fs)?;
         let config =
             TsConfig::parse_value(root, &path, raw).map_err(ProjectCompileError::Config)?;
         let mut referenced = BTreeSet::new();
