@@ -3,14 +3,18 @@
 use std::io::{self, Write};
 
 use bamts_cli::api_server;
-use bamts_cli::cli::tsc_args::{api_transport_requested, parse_tsc_args};
+use bamts_cli::cli::tsc_args::{api_transport_requested, lsp_transport_requested, parse_tsc_args};
 use bamts_cli::driver::{DriverError, execute_tsc};
+use bamts_cli::lsp;
 
 fn main() {
     let argv = std::env::args().skip(1).collect::<Vec<_>>();
     if api_transport_requested(&argv) {
         let exit_code = api_server::maybe_run(&argv).expect("--api selects the API transport");
         std::process::exit(exit_code);
+    }
+    if lsp_transport_requested(&argv) {
+        std::process::exit(run_lsp());
     }
     let exit_code = match parse_tsc_args(&argv) {
         Ok(command) => match execute_tsc(&command) {
@@ -24,7 +28,7 @@ fn main() {
             Err(error) => report_driver_error(&error),
         },
         Err(errors) => {
-            if write_stderr(errors.pretty_false().as_bytes()) == 0 {
+            if write_stdout(errors.pretty_false().as_bytes()) == 0 {
                 errors.exit_status().code()
             } else {
                 1
@@ -32,6 +36,24 @@ fn main() {
         }
     };
     std::process::exit(exit_code);
+}
+
+fn run_lsp() -> i32 {
+    let root = match std::env::current_dir() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("bamts: {error}");
+            return 1;
+        }
+    };
+    match lsp::run(
+        std::io::BufReader::new(std::io::stdin()),
+        std::io::stdout(),
+        root,
+    ) {
+        Ok(lsp::Exit::Shutdown) => 0,
+        Ok(lsp::Exit::Unrequested) | Err(_) => 1,
+    }
 }
 
 fn report_driver_error(error: &DriverError) -> i32 {

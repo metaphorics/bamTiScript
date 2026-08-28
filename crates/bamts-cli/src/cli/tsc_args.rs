@@ -100,8 +100,12 @@ impl TscArgErrors {
     }
 
     #[must_use]
-    pub const fn exit_status(&self) -> TscExitStatus {
-        TscExitStatus::DiagnosticsPresentOutputsSkipped
+    pub fn exit_status(&self) -> TscExitStatus {
+        if self.errors.iter().any(|error| error.code == 5108) {
+            TscExitStatus::DiagnosticsPresentOutputsGenerated
+        } else {
+            TscExitStatus::DiagnosticsPresentOutputsSkipped
+        }
     }
 
     #[must_use]
@@ -465,7 +469,12 @@ where
                 index + 1
             }
             OptionKind::Enum => {
-                if let Some(canonical) = match_enum(value, spec.enum_values) {
+                if spec.name == "target" && value.eq_ignore_ascii_case("es5") {
+                    self.errors.push(TscArgError::new(
+                        5108,
+                        "Option 'target=ES5' has been removed. Please remove it from your configuration.",
+                    ));
+                } else if let Some(canonical) = match_enum(value, spec.enum_values) {
                     self.options.insert(
                         spec.name.to_owned(),
                         TscOptionValue::String(canonical.to_owned()),
@@ -551,6 +560,9 @@ where
             options: self.options,
             is_build: self.is_build,
         };
+        if command.flag("init") && !command.is_build {
+            return Ok(command);
+        }
         if command.flag("watch") && command.flag("listFilesOnly") {
             errors.push(TscArgError::new(
                 6370,
@@ -1069,6 +1081,35 @@ where
     args.into_iter().any(|token| token.as_ref() == "--api")
 }
 
+/// An exact `--lsp` token selects the stdio Language Server Protocol transport
+/// (`bamts_cli::lsp`) instead of a compilation. Detected before option parsing
+/// so the loop's stdout stays protocol-only.
+#[must_use]
+pub fn lsp_transport_requested<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|token| token.as_ref() == "--lsp")
+}
+
+#[cfg(test)]
+mod lsp_transport_tests {
+    use super::lsp_transport_requested;
+
+    #[test]
+    fn lsp_token_selects_transport_anywhere() {
+        assert!(lsp_transport_requested(["--lsp"]));
+        assert!(lsp_transport_requested([
+            "--project",
+            "tsconfig.json",
+            "--lsp"
+        ]));
+        assert!(!lsp_transport_requested(["--project", "tsconfig.json"]));
+        assert!(!lsp_transport_requested(["--lspish"]));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,13 +1205,16 @@ mod tests {
     }
 
     #[test]
-    fn removed_es5_target_is_rejected() {
-        let text = parse_err(&["--target", "es5", "a.ts"]).pretty_false();
-        assert!(text.contains("TS6046"));
-        assert!(text.contains("Argument for '--target'"));
-        assert!(!text.contains("'es5'"));
-        assert!(text.contains("'es6'"));
-        assert!(text.contains("'esnext'"));
+    fn removed_es5_target_reports_its_dedicated_diagnostic() {
+        let errors = parse_err(&["--target", "es5", "a.ts"]);
+        let text = errors.pretty_false();
+        assert_eq!(
+            errors.exit_status(),
+            TscExitStatus::DiagnosticsPresentOutputsGenerated
+        );
+        assert!(text.contains("TS5108"));
+        assert!(text.contains("Option 'target=ES5' has been removed."));
+        assert!(!text.contains("TS6046"));
     }
 
     #[test]
@@ -1213,6 +1257,13 @@ mod tests {
         let text = parse_err(&["-b", "--init"]).pretty_false();
         assert!(text.contains("error TS6387:"));
         assert!(text.contains("may not be used with '--build'"));
+    }
+
+    #[test]
+    fn init_ignores_compile_options() {
+        let command = parse(&["--init", "--target", "es5", "--pretty", "true", "main.ts"]);
+        assert!(command.flag("init"));
+        assert_eq!(command.file_names, ["main.ts"]);
     }
 
     #[test]

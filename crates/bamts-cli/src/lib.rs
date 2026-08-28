@@ -6,4 +6,5 @@ pub mod cli;
 pub mod context;
 pub mod diagnostics;
 pub mod driver;
+pub mod lsp;
 pub mod output;

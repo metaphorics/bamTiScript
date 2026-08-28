@@ -79,6 +79,21 @@ fn api_execution_preserves_stdout_and_exit_code() {
 }
 
 #[test]
+fn tsc_argument_diagnostics_use_stdout() {
+    let project = ScratchDirectory::new();
+    let output = project
+        .command()
+        .args(["--target", "es5", "--ignoreConfig"])
+        .current_dir(&project.path)
+        .output()
+        .expect("tsc argument validation starts");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("error TS5108:"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn api_execution_reports_bounded_resource_exhaustion() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "for (;;) {}\n");
@@ -521,10 +536,11 @@ fn check_reports_dependency_errors() {
 
     assert!(!output.status.success());
     assert_eq!(output.status.code(), Some(1));
+    let stdout = stdout(&output);
     assert!(
-        stderr(&output).contains("dependency.ts"),
+        stdout.contains("dependency.ts"),
         "{}",
-        stderr(&output)
+        stdout
     );
 }
 
@@ -565,17 +581,17 @@ fn check_accepts_module_cycles() {
 fn check_applies_project_lint_config_to_dependencies() {
     let project = ScratchDirectory::new();
     project.write("bamts.toml", "[lints.rules]\nexplicit-any = \"deny\"\n");
-    project.write("src/tsconfig.json", "{}\n");
     project.write("src/main.ts", "import '../dependency.ts';\n");
     project.write("dependency.ts", "export const value: any = 1;\n");
 
     let output = project.check_from("src", "main.ts");
 
     assert!(!output.status.success());
-    let stderr = stderr(&output);
-    assert!(stderr.contains("dependency.ts"), "{stderr}");
-    assert!(stderr.contains("BAMTS-W017"), "{stderr}");
+    let stdout = stdout(&output);
+    assert!(stdout.contains("dependency.ts"), "{stdout}");
+    assert!(stdout.contains("BAMTS-W017"), "{stdout}");
 }
+
 
 #[test]
 fn check_renders_multi_file_diagnostics_in_stable_source_order() {
@@ -588,11 +604,11 @@ fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     let second = project.check("main.ts");
 
     assert!(!first.status.success());
-    assert_eq!(first.stderr, second.stderr);
-    let stderr = stderr(&first);
-    let first_position = stderr.find("first.ts").expect("first diagnostic");
-    let second_position = stderr.find("second.ts").expect("second diagnostic");
-    assert!(first_position < second_position, "{stderr}");
+    assert_eq!(first.stdout, second.stdout);
+    let stdout = stdout(&first);
+    let first_position = stdout.find("first.ts").expect("first diagnostic");
+    let second_position = stdout.find("second.ts").expect("second diagnostic");
+    assert!(first_position < second_position, "{stdout}");
 }
 
 fn bamts_binary() -> &'static str {
@@ -695,6 +711,10 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 struct ScratchDirectory {
     path: PathBuf,
 }
@@ -740,6 +760,7 @@ impl ScratchDirectory {
             .output()
             .expect("bamts type-check starts")
     }
+
 
     fn emit(&self, entrypoint: &str, output: &Path) -> Output {
         self.command()

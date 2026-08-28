@@ -18,8 +18,8 @@ The concise help identifies the program as `tsc: The TypeScript Compiler - Versi
 # Compile the project selected by tsconfig.json in the working directory
 bamts
 
-# Compile explicit source files without loading tsconfig.json
-bamts app.ts util.ts
+# Compile explicit source files with command-line options
+bamts --ignoreConfig app.ts util.ts
 
 # Type-check without writing output files
 bamts --noEmit
@@ -34,31 +34,42 @@ bamts --build
 bamts --init
 ```
 
-With no explicit source files, `bamts` discovers `tsconfig.json` from the working directory. Use `--project` (`-p`) for a specific configuration or `--build` (`-b`) for composite projects. When source files are given directly, the CLI uses command-line options instead of loading `tsconfig.json`. `--init` is accepted by help text, but an empty directory currently fails with `TS5083` and does not write `tsconfig.json`.
+With no explicit source files, `bamts` discovers `tsconfig.json` in the working directory. Use `--project` (`-p`) for a specific configuration or `--build` (`-b`) for composite projects.
+
+When direct source files run in a directory that contains `tsconfig.json`, the CLI returns `TS5112`. Add `--ignoreConfig` to compile those files with command-line options instead.
+
+`bamts --init` writes the TypeScript 7.0.2 recommended configuration when `tsconfig.json` is absent. If it already exists, the command returns `TS5054` and leaves it unchanged. Initialization ignores source, project, pretty, and target options.
 
 ## Output options
 
-The parser accepts TypeScript output option names including `--outDir`, `--outFile`, `--declaration` (`-d`), `--declarationMap`, `--sourceMap`, and `--noEmit`. Direct source-file compilation with `--outDir` writes a native host executable. `--declaration` and `--sourceMap` on that path currently fail with `TS5047` (`Declaration and source-map emission require canonical compiler outputs`). Project mode applies the `tsconfig.json` equivalents of these options; it does not emit JavaScript.
+The parser accepts TypeScript output option names including `--outDir`, `--outFile`, `--declaration` (`-d`), `--declarationMap`, `--sourceMap`, and `--noEmit`.
+
+Direct source-file compilation writes a native host executable. With `--outDir <dir>`, it writes `<dir>/<entrypoint-name>`; otherwise it writes beside the source file. `--declaration` and `--sourceMap` fail closed with `TS5047` on that path because native compilation has no canonical mapping for those outputs.
+
+Project mode writes JavaScript and declaration outputs from the corresponding `tsconfig.json` options.
 
 ## Parsing behavior
 
-The parser accepts TypeScript 7.0.2 compiler option names and rejects unknown options instead of silently discarding them. Boolean options accept an omitted value, `true`, `false`, or `null`. Response files use the `@path` form.
+The parser accepts supported TypeScript 7.0.2 compiler option names and rejects unknown options instead of silently discarding them. Boolean options accept an omitted value, `true`, `false`, or `null`; on the command line, `null` leaves the flag unset. Response files use the `@path` form.
+
+Project mode accepts `--target` values from `es6` through `esnext`. `--target es5` returns `TS5108`. Direct native compilation fails closed with `TS5047` for accepted options that have no canonical native mapping, including `--target`.
 
 The previous `check`, `run`, `compile`, `explain`, `--target jit`, and `--target aot` interface is not part of the current public CLI.
 
 ## Exit codes
 
-The CLI preserves TypeScript-compatible status classes:
+The CLI uses TypeScript-compatible status classes 0 through 4 and reserves 5 for native compilation constraints.
 
 | Status | Meaning |
 |---:|---|
 | 0 | Success |
-| 1 | Diagnostics were generated and output was emitted |
-| 2 | Diagnostics prevented output |
-| 3 | One or more projects are out of date in build-status mode |
-| 4 | Build outputs were generated successfully |
+| 1 | Diagnostics were generated and output was skipped |
+| 2 | Diagnostics were generated and output was emitted |
+| 3 | Invalid project output prevented emission |
+| 4 | A project-reference cycle prevented emission |
+| 5 | The requested behavior has no canonical native mapping |
 
-Argument and configuration failures are rendered as TypeScript diagnostics and mapped through the same status model.
+TypeScript-format parse, project, and compiler diagnostics are written to stdout. Argument and configuration failures use the same status model.
 
 ## Resource budgets
 

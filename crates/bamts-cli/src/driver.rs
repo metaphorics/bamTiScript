@@ -113,6 +113,10 @@ pub enum DriverError {
         path: PathBuf,
         source: io::Error,
     },
+    WriteTscConfig {
+        path: PathBuf,
+        source: io::Error,
+    },
     ToolchainMissing {
         program: OsString,
     },
@@ -237,6 +241,11 @@ impl fmt::Display for DriverError {
                     path.display()
                 )
             }
+            Self::WriteTscConfig { path, source } => write!(
+                formatter,
+                "could not write TypeScript config `{}`: {source}",
+                path.display()
+            ),
             Self::ToolchainMissing { program } => write!(
                 formatter,
                 "system C toolchain `{}` was not found",
@@ -293,6 +302,7 @@ impl Error for DriverError {
             | Self::CreateDirectory { source, .. }
             | Self::CacheArchive { source, .. }
             | Self::WriteObject { source, .. }
+            | Self::WriteTscConfig { source, .. }
             | Self::ToolchainProbe { source, .. }
             | Self::LinkStart { source, .. }
             | Self::PublishExecutable { source, .. } => Some(source),
@@ -415,6 +425,54 @@ Print the compiler's version.
 Build one or more projects and their dependencies, if out of date.
 ";
 
+const TSC_INIT_CREATED: &str =
+    "\nCreated a new tsconfig.json\n\nYou can learn more at https://aka.ms/tsconfig\n";
+const TSC_INIT_CONFIG: &str = r#"{
+  // Visit https://aka.ms/tsconfig to read more about this file
+  "compilerOptions": {
+    // File Layout
+    // "rootDir": "./src",
+    // "outDir": "./dist",
+
+    // Environment Settings
+    // See also https://aka.ms/tsconfig/module
+    "module": "nodenext",
+    "target": "esnext",
+    "types": [],
+    // For nodejs:
+    // "lib": ["esnext"],
+    // "types": ["node"],
+    // and npm install -D @types/node
+
+    // Other Outputs
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+
+    // Stricter Typechecking Options
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+
+    // Style Options
+    // "noImplicitReturns": true,
+    // "noImplicitOverride": true,
+    // "noUnusedLocals": true,
+    // "noUnusedParameters": true,
+    // "noFallthroughCasesInSwitch": true,
+    // "noPropertyAccessFromIndexSignature": true,
+
+    // Recommended Options
+    "strict": true,
+    "jsx": "react-jsx",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noUncheckedSideEffectImports": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true,
+  }
+}
+"#;
+
 /// Executes a command parsed by the TypeScript-compatible argv parser.
 pub fn execute_tsc(command: &ParsedTscCommand) -> Result<CommandOutcome, DriverError> {
     let context = ExecutionContext::ambient()?;
@@ -438,11 +496,21 @@ fn execute_tsc_in_context(
             ..CommandOutcome::default()
         });
     }
+    if command.flag("init") {
+        return initialize_tsc_config(context);
+    }
     if command.is_build {
         return execute_tsc_build(command, cwd);
     }
     if command.project().is_some() || command.file_names.is_empty() {
         return execute_tsc_project(command, cwd);
+    }
+    if !command.flag("ignoreConfig") && context.resolve_path("tsconfig.json").is_file() {
+        return Ok(CommandOutcome {
+            stdout: b"error TS5112: tsconfig.json is present but will not be loaded if files are specified on commandline. Use '--ignoreConfig' to skip this error.\n".to_vec(),
+            exit_code: TscExitStatus::DiagnosticsPresentOutputsSkipped.code(),
+            ..CommandOutcome::default()
+        });
     }
     if let Some(option) = command.options.keys().find(|name| {
         !matches!(
@@ -454,6 +522,7 @@ fn execute_tsc_in_context(
                 | "jsx"
                 | "noEmit"
                 | "noEmitOnError"
+                | "ignoreConfig"
                 | "out"
                 | "outDir"
                 | "outFile"
@@ -486,7 +555,7 @@ fn execute_tsc_in_context(
         ));
     }
 
-    let mut stderr = Vec::new();
+    let mut stdout = Vec::new();
     let mut has_errors = false;
     let mut outputs_generated = false;
     for file_name in &command.file_names {
@@ -499,17 +568,9 @@ fn execute_tsc_in_context(
             &CancellationToken::new(),
         )?;
         let (rendered, file_has_errors) = render_tsc_program_diagnostics(command, &frontend);
-        stderr.extend_from_slice(rendered.as_bytes());
+        stdout.extend_from_slice(rendered.as_bytes());
         has_errors |= file_has_errors;
-        if args.mode == Mode::Compile && file_has_errors && !command.flag("noEmitOnError") {
-            let mut outcome = not_implemented(
-                "Error-tolerant emission requires the canonical compiler output pipeline.",
-            );
-            stderr.extend_from_slice(&outcome.stderr);
-            outcome.stderr = stderr;
-            return Ok(outcome);
-        }
-        if args.mode == Mode::Compile && !file_has_errors {
+        if args.mode == Mode::Compile && (!file_has_errors || !command.flag("noEmitOnError")) {
             let outcome = compile_in_context_with_cancel(
                 &args,
                 &frontend,
@@ -517,23 +578,43 @@ fn execute_tsc_in_context(
                 &CancellationToken::new(),
             )?;
             outputs_generated = true;
-            if !outcome.stdout.is_empty() {
-                return Ok(CommandOutcome {
-                    stdout: outcome.stdout,
-                    stderr,
-                    exit_code: TscExitStatus::from_compilation(has_errors, outputs_generated)
-                        .code(),
-                    truncation: None,
-                });
-            }
+            stdout.extend_from_slice(&outcome.stdout);
         }
     }
     Ok(CommandOutcome {
-        stderr,
+        stdout,
         exit_code: TscExitStatus::from_compilation(has_errors, outputs_generated).code(),
         ..CommandOutcome::default()
     })
 }
+fn initialize_tsc_config(context: &ExecutionContext) -> Result<CommandOutcome, DriverError> {
+    let path = context.resolve_path("tsconfig.json");
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return Ok(CommandOutcome {
+                stdout: format!(
+                    "error TS5054: A 'tsconfig.json' file is already defined at: '{}'.\n",
+                    path.display()
+                )
+                .into_bytes(),
+                ..CommandOutcome::default()
+            });
+        }
+        Err(source) => return Err(DriverError::WriteTscConfig { path, source }),
+    };
+    if let Err(source) = file
+        .write_all(TSC_INIT_CONFIG.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        return Err(DriverError::WriteTscConfig { path, source });
+    }
+    Ok(CommandOutcome {
+        stdout: TSC_INIT_CREATED.as_bytes().to_vec(),
+        ..CommandOutcome::default()
+    })
+}
+
 #[cfg(test)]
 fn execute_tsc_in(command: &ParsedTscCommand, cwd: &Path) -> Result<CommandOutcome, DriverError> {
     let environment = std::env::vars_os().collect();
@@ -651,13 +732,12 @@ fn execute_tsc_build(
         Ok(report) => report,
         Err(error) => return Ok(project_compile_error_outcome(error)),
     };
-    let mut stderr = Vec::new();
     let mut stdout = Vec::new();
     let mut has_errors = false;
     let mut outputs_generated = false;
     for project in report.projects {
         let outcome = project_result_outcome(command, &project.result);
-        stderr.extend_from_slice(&outcome.stderr);
+        stdout.extend_from_slice(&outcome.stdout);
         has_errors |= outcome.exit_code != TscExitStatus::Success.code();
         if command.flag("dry") {
             writeln!(stdout, "Would build {}", project.config_path.display())
@@ -670,7 +750,7 @@ fn execute_tsc_build(
     has_errors |= !report.blocked.is_empty();
     Ok(CommandOutcome {
         stdout,
-        stderr,
+        stderr: Vec::new(),
         exit_code: TscExitStatus::from_compilation(has_errors, outputs_generated).code(),
         truncation: None,
     })
@@ -771,7 +851,7 @@ fn project_result_outcome(
         TscDiagnosticFormat::PrettyFalse
     };
     CommandOutcome {
-        stderr: tsc_diagnostics::render(format, &diagnostics, &sources).into_bytes(),
+        stdout: tsc_diagnostics::render(format, &diagnostics, &sources).into_bytes(),
         exit_code: TscExitStatus::from_compilation(has_errors, result.emitted).code(),
         ..CommandOutcome::default()
     }
@@ -788,7 +868,7 @@ fn project_compile_error_outcome(error: ProjectCompileError) -> CommandOutcome {
 
 fn project_error_outcome(message: String) -> CommandOutcome {
     CommandOutcome {
-        stderr: format!("error TS5083: {message}\n").into_bytes(),
+        stdout: format!("error TS5083: {message}\n").into_bytes(),
         exit_code: TscExitStatus::DiagnosticsPresentOutputsSkipped.code(),
         ..CommandOutcome::default()
     }
@@ -855,7 +935,6 @@ fn forbidden_lint_override(error: bamts_compiler::lint::ForbidOverrideError) -> 
 fn lower_options(args: &CliArgs) -> LowerOptions {
     LowerOptions {
         javascript_compatibility: args.js_compat.enabled,
-        ..LowerOptions::default()
     }
 }
 
@@ -1281,6 +1360,7 @@ fn link_executable(
     context: &ExecutionContext,
     cancel: &CancellationToken,
 ) -> Result<(), DriverError> {
+    let destination = context.resolve_path(destination);
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| DriverError::CreateDirectory {
         path: parent.to_owned(),
@@ -1288,7 +1368,7 @@ fn link_executable(
     })?;
     let archive = cached_node_archive(context)?;
     let compiler = discover_toolchain(context, cancel)?;
-    let temporary = TemporaryLinkFiles::create(parent, destination)?;
+    let temporary = TemporaryLinkFiles::create(parent, &destination)?;
     fs::write(&temporary.object, object).map_err(|source| DriverError::WriteObject {
         path: temporary.object.clone(),
         source,
@@ -1319,7 +1399,7 @@ fn link_executable(
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    publish_linked_executable(&temporary.executable, destination)
+    publish_linked_executable(&temporary.executable, &destination)
 }
 
 fn discover_toolchain(
@@ -1881,20 +1961,7 @@ fn require_clean_frontend(
     args: &CliArgs,
     frontend: &LoadedProgramFrontend,
 ) -> Result<RenderedDiagnostics, DriverError> {
-    let diagnostics = render_program_diagnostics(args, frontend);
-    if frontend
-        .output
-        .modules()
-        .iter()
-        .any(|module| module.has_errors())
-    {
-        Err(DriverError::Diagnostics {
-            rendered: diagnostics.text,
-            truncation: diagnostics.truncation,
-        })
-    } else {
-        Ok(diagnostics)
-    }
+    Ok(render_program_diagnostics(args, frontend))
 }
 
 /// Compiles a source entrypoint through the same frontend, lint, and lowering
@@ -1902,11 +1969,14 @@ fn require_clean_frontend(
 /// running or linking it.  This is the in-process interpreter seam used by the
 /// corpus differential harness so that CLI-supplied lint overrides and
 /// JavaScript-compatibility flags reach the lowering stage.
+///
+/// Type diagnostics do not block lowering. That matches TypeScript's default
+/// emit-on-error policy; `check` still fail-closes on error diagnostics.
 pub fn compile_program(
     args: &CliArgs,
 ) -> Result<bamts_compiler::program::ExecutableProgram, DriverError> {
     let frontend = load_program_frontend(args)?;
-    require_clean_frontend(args, &frontend)?;
+    let _diagnostics = require_clean_frontend(args, &frontend)?;
     lower_program(&frontend.program, &frontend.output, lower_options(args))
         .map_err(DriverError::Lower)
 }
@@ -2099,7 +2169,7 @@ exit 2
 
         link_executable(
             &[],
-            &directory.join("linked-output"),
+            Path::new("linked-output"),
             &context,
             &CancellationToken::new(),
         )?;
@@ -2159,6 +2229,72 @@ exit 2
     }
 
     #[test]
+    fn tsc_init_creates_canonical_config_without_overwriting() {
+        let fixture = TscFixture::new();
+        let init = execute_tsc_in(
+            &parse_tsc_args(["--init", "--target", "es5", "--pretty", "true", "main.ts"])
+                .expect("init parses"),
+            &fixture.0,
+        )
+        .expect("init executes");
+        assert_eq!(init.exit_code, TscExitStatus::Success.code());
+        assert_eq!(init.stdout, super::TSC_INIT_CREATED.as_bytes());
+        assert!(init.stderr.is_empty());
+
+        let config = fixture.0.join("tsconfig.json");
+        let original = fs::read(&config).expect("init writes config");
+        assert_eq!(original, super::TSC_INIT_CONFIG.as_bytes());
+
+        let existing = execute_tsc_in(
+            &parse_tsc_args(["--init"]).expect("second init parses"),
+            &fixture.0,
+        )
+        .expect("second init executes");
+        assert_eq!(existing.exit_code, TscExitStatus::Success.code());
+        assert!(existing.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(existing.stdout).expect("UTF-8 TS5054"),
+            format!(
+                "error TS5054: A 'tsconfig.json' file is already defined at: '{}'.\n",
+                config.display()
+            )
+        );
+        assert_eq!(fs::read(config).expect("read unchanged config"), original);
+    }
+
+    #[test]
+    fn tsc_direct_source_requires_ignore_config() {
+        let fixture = TscFixture::new();
+        fixture.write("tsconfig.json", "{}\n");
+        fixture.write("main.ts", "export const value = 1;\n");
+
+        let blocked = execute_tsc_in(
+            &parse_tsc_args(["--noEmit", "main.ts"]).expect("direct parse"),
+            &fixture.0,
+        )
+        .expect("direct config guard executes");
+        assert_eq!(
+            blocked.exit_code,
+            TscExitStatus::DiagnosticsPresentOutputsSkipped.code()
+        );
+        assert!(blocked.stderr.is_empty());
+        assert_eq!(
+            blocked.stdout,
+            b"error TS5112: tsconfig.json is present but will not be loaded if files are specified on commandline. Use '--ignoreConfig' to skip this error.\n"
+        );
+
+        let ignored = execute_tsc_in(
+            &parse_tsc_args(["--noEmit", "--ignoreConfig", "main.ts"])
+                .expect("ignoreConfig parses"),
+            &fixture.0,
+        )
+        .expect("ignored config executes");
+        assert_eq!(ignored.exit_code, TscExitStatus::Success.code());
+        assert!(ignored.stderr.is_empty());
+        assert!(!String::from_utf8_lossy(&ignored.stdout).contains("TS5112"));
+    }
+
+    #[test]
     fn tsc_direct_check_maps_parse_diagnostics_once() {
         let id = NEXT_TSC_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path =
@@ -2172,23 +2308,38 @@ exit 2
         ])
         .expect("direct command parses");
         let outcome = execute_tsc(&command).expect("direct check executes");
-        let stderr = String::from_utf8(outcome.stderr).expect("UTF-8 diagnostics");
+        let stdout = String::from_utf8(outcome.stdout).expect("UTF-8 diagnostics");
         assert_eq!(
             outcome.exit_code,
             TscExitStatus::DiagnosticsPresentOutputsSkipped.code()
         );
-        assert!(stderr.contains("error TS1109: Expression expected."));
-        assert!(!stderr.contains("BAMTS-P002"));
-        let emit = execute_tsc(
+        assert!(outcome.stderr.is_empty());
+        assert!(stdout.contains("error TS1109: Expression expected."));
+        assert!(!stdout.contains("BAMTS-P002"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tsc_type_error_emits_with_status_2() {
+        let id = NEXT_TSC_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("bamts-tsc-emit-{}-{id}.ts", std::process::id()));
+        let emitted = path.with_extension("");
+        std::fs::write(&path, "const value: number = \"text\";\n").expect("write source");
+
+        let outcome = execute_tsc(
             &parse_tsc_args([path.to_str().expect("UTF-8 path")]).expect("default emit parses"),
         )
-        .expect("default emit returns a typed outcome");
-        assert_eq!(emit.exit_code, TscExitStatus::NotImplemented.code());
-        assert!(
-            String::from_utf8(emit.stderr)
-                .expect("UTF-8 diagnostics")
-                .contains("error TS5047: Error-tolerant emission")
+        .expect("default emit executes");
+        let stdout = String::from_utf8(outcome.stdout).expect("UTF-8 diagnostics");
+        assert_eq!(
+            outcome.exit_code,
+            TscExitStatus::DiagnosticsPresentOutputsGenerated.code()
         );
+        assert!(outcome.stderr.is_empty());
+        assert_eq!(stdout.matches("BAMTS-C004").count(), 1);
+        assert!(emitted.is_file(), "error-tolerant compilation emits output");
+        let _ = std::fs::remove_file(emitted);
         let _ = std::fs::remove_file(path);
     }
 
@@ -2244,6 +2395,10 @@ exit 2
             TscExitStatus::DiagnosticsPresentOutputsSkipped.code()
         );
         assert!(!fixture.0.join("gated/main.js").exists());
+        assert!(gated.stderr.is_empty());
+        assert!(
+            String::from_utf8_lossy(&gated.stdout).contains("error TS1109: Expression expected.")
+        );
     }
 
     #[test]
@@ -2292,6 +2447,10 @@ exit 2
             TscExitStatus::DiagnosticsPresentOutputsSkipped.code()
         );
         assert!(!fixture.0.join("app/dist/app.js").exists());
+        assert!(failed.stderr.is_empty());
+        assert!(
+            String::from_utf8_lossy(&failed.stdout).contains("error TS1109: Expression expected.")
+        );
     }
 
     #[test]
@@ -2656,9 +2815,8 @@ exit 2
             .expect_err("post-link cancellation must abort before spawn");
 
         assert!(matches!(error, DriverError::Cancelled));
-        assert_eq!(
-            destination.exists(),
-            false,
+        assert!(
+            !destination.exists(),
             "published destination must be removed on cancellation"
         );
         std::fs::remove_dir_all(directory)?;
