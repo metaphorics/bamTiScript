@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     corpus,
-    oracle_pins::{SUITE_DIGEST, SUITE_URL},
     perf::{
         BenchmarkManifest, Fixture, FixtureGroup, FixtureOrigin, PerfError, PerfErrorCode, Result,
     },
+    schema::{TYPESCRIPT_SUITE_SOURCE, load_sources, required_source},
     suite::{SuiteIndex, extract_archive, fetch_archive, sha256_hex, single_archive_root},
 };
 
@@ -24,11 +24,11 @@ const JSX_SNAPSHOT_SHA256: &str =
 const REQUIRED_FIXTURES: [(&str, &str); 37] = [
     (
         "bench-checker-ts",
-        "739c7534cbf2e465bc6e7d9a2ed7357a2ad2739d02951c9fa666ce0587d6de37",
+        "781e627828fa7fe337d90815afa38f81a58620be7d141849d3c8efaf34893eaf",
     ),
     (
         "bench-dom-dts",
-        "93faca2ccd3a7d9a9c5358a69e3ec61a49b7ce94ba2e6402bc47c2ac8fa7d2aa",
+        "e05c7f2d7ca6295cbd672cedbd006bec4d65b99aec21b795740d0596e6936103",
     ),
     (
         "bench-empty-ts",
@@ -36,11 +36,11 @@ const REQUIRED_FIXTURES: [(&str, &str); 37] = [
     ),
     (
         "bench-herebyfile",
-        "5f395de6df6758d96f26a8f2cf7c685ceb502d9b6f8dd6d1883dc71511d61c5e",
+        "c71f520073b1b1c4d870556b5eda487a70e605120b8b61a05515cb4b1215d862",
     ),
     (
         "bench-jsx-complexity",
-        "4fb1aee5e546595945493e2ad6394a5311cc3cc437e65c815610716a6881861e",
+        "5080818abe79bbd72a9f66021de7235cfd9f3303bbb18cf932184df36da5b0e0",
     ),
     (
         "boundary-json-depth-127",
@@ -112,7 +112,7 @@ const REQUIRED_FIXTURES: [(&str, &str); 37] = [
     ),
     (
         "corpus-hookable",
-        "ddf8d52c568c9255d1cbcf934a5afa33aa62dcd8fa53a50578773bfce7591b4d",
+        "a4180e92356b5949f509e56c6b228e5cb501450e0dd35358be8e3d49d76a0f0d",
     ),
     (
         "corpus-is-plain-obj",
@@ -364,18 +364,27 @@ pub fn materialize_fixtures(
         };
         let bytes = match fixture.origin {
             FixtureOrigin::TypescriptSuite => {
-                if fixture.source_archive.as_deref() != Some("typescript-7-suite") {
+                if fixture.source_archive.as_deref() != Some(TYPESCRIPT_SUITE_SOURCE) {
                     return Err(PerfError::harness(format!(
                         "fixture `{}` has unknown source archive",
                         fixture.id
                     )));
                 }
                 if archive_root.is_none() {
+                    let (sources, _) = load_sources(root)
+                        .map_err(|error| PerfError::harness(error.to_string()))?;
+                    let suite = required_source(&sources, TYPESCRIPT_SUITE_SOURCE)
+                        .map_err(|error| PerfError::harness(error.to_string()))?;
+                    if suite.digest_algorithm != "sha256" {
+                        return Err(PerfError::harness(format!(
+                            "source `{TYPESCRIPT_SUITE_SOURCE}` must use sha256"
+                        )));
+                    }
                     let cache = checked_root_path(root, "verification/ts-suite/.archives")?;
                     fs::create_dir_all(&cache).map_err(|error| {
                         PerfError::harness(format!("{}: {error}", cache.display()))
                     })?;
-                    let archive = fetch_archive(SUITE_URL, SUITE_DIGEST, &cache)
+                    let archive = fetch_archive(&suite.url, &suite.digest, &cache)
                         .map_err(|error| PerfError::harness(error.to_string()))?;
                     let extracted = extract_archive(&archive)
                         .map_err(|error| PerfError::harness(error.to_string()))?;
@@ -622,7 +631,7 @@ fn validate_fixture_descriptor(fixture: &Fixture) -> Result<()> {
             fixture.path.is_some()
                 && fixture.sha256.is_some()
                 && fixture.bytes.is_some()
-                && fixture.source_archive.as_deref() == Some("typescript-7-suite")
+                && fixture.source_archive.as_deref() == Some(TYPESCRIPT_SUITE_SOURCE)
                 && fixture.source_path.is_some()
                 && fixture.spec.is_none()
                 && fixture.tree_sha256.is_none()
@@ -946,7 +955,7 @@ mod tests {
                 sha256: Some(sha256_hex(b"original")),
                 bytes: Some(8),
                 origin: FixtureOrigin::TypescriptSuite,
-                source_archive: Some("typescript-7-suite".to_owned()),
+                source_archive: Some(TYPESCRIPT_SUITE_SOURCE.to_owned()),
                 source_path: Some("src/compiler/checker.ts".to_owned()),
                 spec: None,
                 tree_sha256: None,
@@ -1070,7 +1079,7 @@ mod tests {
             sha256: Some("digest".to_owned()),
             bytes: Some(1),
             origin: FixtureOrigin::TypescriptSuite,
-            source_archive: Some("typescript-7-suite".to_owned()),
+            source_archive: Some(TYPESCRIPT_SUITE_SOURCE.to_owned()),
             source_path: Some("src/compiler/checker.ts".to_owned()),
             spec: None,
             tree_sha256: None,

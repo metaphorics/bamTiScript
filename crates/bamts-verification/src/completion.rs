@@ -19,13 +19,31 @@ use serde::{
     de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 
-use crate::{ErrorCode, VerificationError, schema::sha256_hex};
+use crate::{ErrorCode, VerificationError, leaf_evidence, schema::sha256_hex};
 
 const PROGRAM_PATH: &str = "verification/completion-program.toml";
 const COMPLETENESS_LEDGER_PATH: &str = "proof/completeness-ledger.json";
 const PROGRAM_SCHEMA: &str = "bamti.completion-program/v1";
 const SPECIAL_ASPECT_LEAVES: [&str; 11] = [
     "A1.1", "A1.2", "A1.3", "A1.4", "A1.5", "A2.1", "A2.2", "A2.3", "A2.6", "A2.7", "F2.4",
+];
+
+// These recovery ledgers are not part of the frozen 105-leaf product authority.
+const LEGACY_INTEGRATION_LEDGER_IDS: [&str; 14] = [
+    "clean-port-authority-evidence",
+    "clean-port-authority-root",
+    "clean-port-bytecode-codegen",
+    "clean-port-compiler-cli",
+    "clean-port-compiler-frontend",
+    "clean-port-compiler-semantics",
+    "clean-port-corpus-workflow",
+    "clean-port-emitter-project-cli",
+    "clean-port-integration",
+    "clean-port-npm-api",
+    "clean-port-runtime-builtins",
+    "clean-port-runtime-core",
+    "clean-port-runtime-native",
+    "clean-port-verification-proof",
 ];
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -214,6 +232,7 @@ pub struct CompletionReport {
     pub checked_leaves: usize,
     pub checked_obligations: usize,
     pub failures: Vec<CompletionFailure>,
+    pub gate_evidence: Option<String>,
 }
 
 impl CompletionReport {
@@ -375,16 +394,23 @@ pub fn verify_completion(
                 CompletionAspect::Regression,
             ] {
                 if leaf.aspects.iter().any(|value| value == selected.as_str()) {
-                    verify_leaf_aspect(root, leaf, selected, &mut failures);
+                    verify_leaf_aspect(root, leaf, selected, true, &mut failures);
                 }
             }
             if leaf.mutation_required {
-                verify_leaf_aspect(root, leaf, CompletionAspect::Mutation, &mut failures);
+                verify_leaf_aspect(root, leaf, CompletionAspect::Mutation, true, &mut failures);
             }
         }
         checked_obligations = verify_obligations(root, &leaves, &mut failures)?;
     } else {
-        verify_scope_aspect(root, &program, scope, aspect, &mut failures);
+        verify_scope_aspect(
+            root,
+            &program,
+            scope,
+            aspect,
+            !matches!(scope, CompletionScope::Leaf(_)),
+            &mut failures,
+        );
         if matches!(
             aspect,
             CompletionAspect::Evidence | CompletionAspect::Coverage | CompletionAspect::Regression
@@ -397,6 +423,14 @@ pub fn verify_completion(
         verify_hierarchy_ledgers(root, &program, scope, &mut failures);
     }
 
+    let gate_evidence = match scope {
+        CompletionScope::Leaf(id) => leaf_gate_evidence(root, &program, id, aspect),
+        CompletionScope::Cluster(_)
+        | CompletionScope::Track(_)
+        | CompletionScope::Wave(_)
+        | CompletionScope::Root(_) => None,
+    };
+
     failures.sort_by_key(ToString::to_string);
     failures.dedup();
     Ok(CompletionReport {
@@ -404,6 +438,7 @@ pub fn verify_completion(
         aspect,
         checked_leaves: leaves.len(),
         checked_obligations,
+        gate_evidence,
         failures,
     })
 }
@@ -558,6 +593,7 @@ fn validate_program(root: &Path, p: &Program) -> Vec<CompletionFailure> {
                 && !["cluster-", "track-", "wave-", "root-"]
                     .iter()
                     .any(|prefix| id.starts_with(prefix))
+                && !LEGACY_INTEGRATION_LEDGER_IDS.contains(&id)
             {
                 disk.insert(id.to_owned());
             }
@@ -751,6 +787,7 @@ fn verify_scope_aspect(
     program: &Program,
     scope: &CompletionScope,
     aspect: CompletionAspect,
+    require_checked: bool,
     out: &mut Vec<CompletionFailure>,
 ) {
     if let CompletionScope::Leaf(id) = scope {
@@ -759,7 +796,7 @@ fn verify_scope_aspect(
             .iter()
             .find(|leaf| leaf.id == *id)
             .expect("validated leaf");
-        verify_leaf_aspect(root, leaf, aspect, out);
+        verify_leaf_aspect(root, leaf, aspect, require_checked, out);
         return;
     }
     let (kind, id) = match scope {
@@ -774,24 +811,76 @@ fn verify_scope_aspect(
         .iter()
         .find(|node| node.kind == kind && node.id == *id)
         .expect("validated node");
-    verify_ledger_aspect(root, &node.id, &node.ledger, &node.aspects, aspect, out);
+    verify_ledger_aspect(
+        root,
+        LedgerRef {
+            id: &node.id,
+            ledger: &node.ledger,
+            aspects: &node.aspects,
+            leaf: None,
+        },
+        aspect,
+        require_checked,
+        out,
+    );
 }
 fn verify_leaf_aspect(
     root: &Path,
     leaf: &Leaf,
     aspect: CompletionAspect,
+    require_checked: bool,
     out: &mut Vec<CompletionFailure>,
 ) {
-    verify_ledger_aspect(root, &leaf.id, &leaf.ledger, &leaf.aspects, aspect, out);
+    verify_ledger_aspect(
+        root,
+        LedgerRef {
+            id: &leaf.id,
+            ledger: &leaf.ledger,
+            aspects: &leaf.aspects,
+            leaf: Some(leaf),
+        },
+        aspect,
+        require_checked,
+        out,
+    );
 }
+
+fn leaf_gate_evidence(
+    root: &Path,
+    program: &Program,
+    leaf_id: &str,
+    aspect: CompletionAspect,
+) -> Option<String> {
+    let leaf = program.leaf.iter().find(|leaf| leaf.id == leaf_id)?;
+    let expected_gate = leaf_evidence::gate_for_aspect(aspect.as_str())?;
+    let text = fs::read_to_string(root.join(&leaf.ledger)).ok()?;
+    parse_gate_rows(&text)
+        .into_iter()
+        .find(|row| row.gate == expected_gate)
+        .map(|row| row.evidence)
+}
+/// One verifiable ledger: the scope identity, its gate file, the aspects it
+/// declares, and the owning leaf when the row must bind leaf-owned artifacts.
+struct LedgerRef<'a> {
+    id: &'a str,
+    ledger: &'a str,
+    aspects: &'a [String],
+    leaf: Option<&'a Leaf>,
+}
+
 fn verify_ledger_aspect(
     root: &Path,
-    id: &str,
-    ledger: &str,
-    aspects: &[String],
+    scope: LedgerRef<'_>,
     aspect: CompletionAspect,
+    require_checked: bool,
     out: &mut Vec<CompletionFailure>,
 ) {
+    let LedgerRef {
+        id,
+        ledger,
+        aspects,
+        leaf,
+    } = scope;
     if !aspects.iter().any(|a| a == aspect.as_str()) {
         out.push(if aspect == CompletionAspect::Mutation {
             CompletionFailure::UncheckedMutation { leaf: id.into() }
@@ -811,16 +900,24 @@ fn verify_ledger_aspect(
         });
         return;
     };
-    let needle = format!("--aspect {}", aspect.as_str());
+    let expected_gate = leaf_evidence::gate_for_aspect(aspect.as_str())
+        .expect("every completion aspect has a registered gate");
     let rows = parse_gate_rows(&text);
-    let Some(row) = rows.iter().find(|r| r.check.contains(&needle)) else {
+    let Some(row) = rows.iter().find(|row| row.gate == expected_gate) else {
         out.push(CompletionFailure::MissingAspect {
             id: id.into(),
             aspect,
         });
         return;
     };
-    if !row.checked || !current_evidence(root, &row.evidence) {
+    let evidence_current = leaf.map_or_else(
+        || current_evidence(root, &row.evidence),
+        |leaf| {
+            leaf_evidence::validate(root, &leaf.id, aspect.as_str(), &leaf.owns, &row.evidence)
+                .is_ok()
+        },
+    );
+    if (require_checked && !row.checked) || !evidence_current {
         out.push(if aspect == CompletionAspect::Mutation {
             CompletionFailure::UncheckedMutation { leaf: id.into() }
         } else {
@@ -849,9 +946,9 @@ fn parse_gate_rows(text: &str) -> Vec<GateRow> {
             }
             let checked = rest.starts_with('x') || rest.starts_with('X');
             let gate = rest
-                .split("]: ")
-                .nth(1)
-                .and_then(|s| s.split(':').next())
+                .split_once("] ")
+                .and_then(|(_, label)| label.split_once(':').map(|(gate, _)| gate.trim()))
+                .filter(|gate| !gate.is_empty())
                 .unwrap_or("?")
                 .to_owned();
             current = Some(GateRow {
@@ -1322,16 +1419,31 @@ mod tests {
              aspects=[\"contract\",\"regression\"]\n"
         );
         fs::write(scratch.0.join(PROGRAM_PATH), program).unwrap();
-        let receipt_path = "verification/receipts/test.jsonl";
-        let receipt = b"receipt";
         fs::create_dir_all(scratch.0.join("verification/receipts")).unwrap();
-        fs::write(scratch.0.join(receipt_path), receipt).unwrap();
-        let hash = sha256_hex(receipt);
+        let artifact = sha256_hex(&fs::read(scratch.0.join("src/x.rs")).unwrap());
         let mut gate = String::from("# Gates\n\nScope: test\n");
-        for (index, aspect) in ["contract", "evidence", "coverage", "regression", "mutation"]
-            .iter()
-            .enumerate()
+        for (index, (aspect, gate_id)) in [
+            ("contract", "G1"),
+            ("evidence", "G2"),
+            ("coverage", "G3"),
+            ("regression", "G4"),
+            ("mutation", "G5"),
+        ]
+        .iter()
+        .enumerate()
         {
+            let receipt_path = format!("verification/receipts/{aspect}.json");
+            let receipt = serde_json::to_vec(&serde_json::json!({
+                "schema": leaf_evidence::SCHEMA,
+                "leaf": "X1",
+                "aspect": *aspect,
+                "gate": *gate_id,
+                "adapter": "test_artifact",
+                "artifacts": [{"path": "src/x.rs", "sha256": artifact.as_str()}],
+            }))
+            .unwrap();
+            let hash = sha256_hex(&receipt);
+            fs::write(scratch.0.join(&receipt_path), receipt).unwrap();
             gate.push_str(&format!(
                 "\n- [x] G{}: {aspect}\n  CHECK: cargo run -- completion verify --leaf X1 --aspect {aspect}\n  EXPECT: PASS\n  EVIDENCE: receipt={receipt_path} sha256={hash}\n",
                 index + 1
@@ -1425,6 +1537,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_checked_and_unchecked_gate_identities() {
+        let rows = parse_gate_rows("- [x] G1: contract\n- [ ] G5: mutation\n");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].gate, "G1");
+        assert!(rows[0].checked);
+        assert_eq!(rows[1].gate, "G5");
+        assert!(!rows[1].checked);
+    }
+
+    #[test]
+    fn leaf_aspect_verifies_valid_unchecked_evidence_for_gate_checking() {
+        let fixture = fixture("PASS", None, true);
+        let ledger = fixture.0.join(".outline/gates/X1.md");
+        let text = fs::read_to_string(&ledger).unwrap();
+        fs::write(&ledger, text.replacen("- [x] G1:", "- [ ] G1:", 1)).unwrap();
+
+        let direct = verify_completion(
+            &fixture.0,
+            &CompletionScope::Leaf("X1".into()),
+            CompletionAspect::Contract,
+        )
+        .unwrap();
+        assert!(direct.is_pass(), "{:?}", direct.failures);
+        assert!(direct.gate_evidence.as_deref().is_some_and(|evidence| {
+            evidence.starts_with("receipt=verification/receipts/contract.json ")
+        }));
+
+        let aggregate = verify_completion(
+            &fixture.0,
+            &CompletionScope::Root("product".into()),
+            CompletionAspect::Aggregate,
+        )
+        .unwrap();
+        assert!(
+            aggregate
+                .failures
+                .iter()
+                .any(|failure| matches!(failure, CompletionFailure::NonCurrentEvidence { .. }))
+        );
+    }
+
+    #[test]
     fn stale_completeness_ledger_fails() {
         let fixture = fixture("PASS", None, true);
         fs::write(
@@ -1451,10 +1605,11 @@ mod tests {
         let fixture = fixture("PASS", None, true);
         let ledger = fixture.0.join(".outline/gates/X1.md");
         let text = fs::read_to_string(&ledger).unwrap();
+        let receipt = fs::read(fixture.0.join("verification/receipts/evidence.json")).unwrap();
         fs::write(
             &ledger,
             text.replace(
-                &sha256_hex(b"receipt"),
+                &sha256_hex(&receipt),
                 "0000000000000000000000000000000000000000000000000000000000000000",
             ),
         )
@@ -1463,6 +1618,85 @@ mod tests {
             &fixture.0,
             &CompletionScope::Leaf("X1".into()),
             CompletionAspect::Evidence,
+        )
+        .unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| matches!(failure, CompletionFailure::NonCurrentEvidence { .. }))
+        );
+    }
+
+    #[test]
+    fn receipt_without_current_owned_artifact_fails() {
+        let fixture = fixture("PASS", None, true);
+        fs::write(fixture.0.join("src/x.rs"), "changed").unwrap();
+
+        let report = verify_completion(
+            &fixture.0,
+            &CompletionScope::Leaf("X1".into()),
+            CompletionAspect::Contract,
+        )
+        .unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| matches!(failure, CompletionFailure::NonCurrentEvidence { .. }))
+        );
+    }
+
+    #[test]
+    fn arbitrary_hashed_receipt_fails() {
+        let fixture = fixture("PASS", None, true);
+        let receipt_path = fixture.0.join("verification/receipts/contract.json");
+        let original = fs::read(&receipt_path).unwrap();
+        let replacement = b"arbitrary bytes";
+        fs::write(&receipt_path, replacement).unwrap();
+        let ledger = fixture.0.join(".outline/gates/X1.md");
+        let text = fs::read_to_string(&ledger).unwrap();
+        fs::write(
+            &ledger,
+            text.replace(&sha256_hex(&original), &sha256_hex(replacement)),
+        )
+        .unwrap();
+
+        let report = verify_completion(
+            &fixture.0,
+            &CompletionScope::Leaf("X1".into()),
+            CompletionAspect::Contract,
+        )
+        .unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| matches!(failure, CompletionFailure::NonCurrentEvidence { .. }))
+        );
+    }
+
+    #[test]
+    fn receipt_with_wrong_leaf_identity_fails() {
+        let fixture = fixture("PASS", None, true);
+        let receipt_path = fixture.0.join("verification/receipts/contract.json");
+        let original = fs::read(&receipt_path).unwrap();
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        receipt["leaf"] = serde_json::Value::String("forged".to_owned());
+        let replacement = serde_json::to_vec(&receipt).unwrap();
+        fs::write(&receipt_path, &replacement).unwrap();
+        let ledger = fixture.0.join(".outline/gates/X1.md");
+        let text = fs::read_to_string(&ledger).unwrap();
+        fs::write(
+            &ledger,
+            text.replace(&sha256_hex(&original), &sha256_hex(&replacement)),
+        )
+        .unwrap();
+
+        let report = verify_completion(
+            &fixture.0,
+            &CompletionScope::Leaf("X1".into()),
+            CompletionAspect::Contract,
         )
         .unwrap();
         assert!(
@@ -1535,6 +1769,29 @@ mod tests {
         assert!(
             matches!(err,CompletionError::Invalid(v) if v.iter().any(|x|matches!(x,CompletionFailure::MissingLeaf(id) if id=="X2")))
         );
+    }
+
+    #[test]
+    fn unregistered_clean_port_ledger_fails_closed() {
+        let fixture = fixture("PASS", None, true);
+        fs::write(
+            fixture.0.join(".outline/gates/clean-port-unregistered.md"),
+            "# Gates\n",
+        )
+        .unwrap();
+
+        let error = verify_completion(
+            &fixture.0,
+            &CompletionScope::Leaf("X1".into()),
+            CompletionAspect::Contract,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CompletionError::Invalid(failures)
+                if failures.iter().any(|failure|
+                    matches!(failure, CompletionFailure::MissingLeaf(id) if id == "clean-port-unregistered"))
+        ));
     }
 
     #[test]

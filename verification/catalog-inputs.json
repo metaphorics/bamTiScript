@@ -155,7 +155,7 @@
         "Bamti/JitLifecycle.lean::osr_ordinal_in_range",
         "Bamti/JitLifecycle.lean::provider_allocation_only_writable",
         "Bamti/JitLifecycle.lean::provider_finalization_exactly_once",
-        "Bamti/JitLifecycle.lean::provider_finalization_failure_reclaims",
+        "Bamti/JitLifecycle.lean::provider_finalization_failure_frees",
         "Bamti/JitLifecycle.lean::provider_free_is_idempotent",
         "Bamti/JitLifecycle.lean::provider_never_writable_executable",
         "Bamti/JitLifecycle.lean::provider_trace_exclusivity",

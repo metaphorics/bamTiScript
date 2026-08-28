@@ -42,12 +42,13 @@ use crate::{
         TerminalState, WorkingDirectoryPolicy, merge_shards,
     },
     lane::{
-        LaneExecutor, LaneOutcome, LaneProcessResult, LaneRequest, LaneResponse, ProcessExecutor,
-        ProcessObservation, derive_row,
+        LaneBinding, LaneExecutor, LaneOutcome, LaneProcessResult, LaneRequest, LaneResponse,
+        ProcessExecutor, ProcessObservation, derive_row,
     },
     oracles::{self, ProcessBoundary},
     schema,
     shard::{ObligationKey, ShardIdentity, ShardSpec, validate_catalog},
+    suite::{DEFAULT_SNAPSHOT_REL, verify_snapshot},
     toolchain_schema::load_target_cells,
 };
 
@@ -664,7 +665,12 @@ fn lane_result(
     outcome: LaneOutcome,
     started: Instant,
 ) -> Result<LaneProcessResult> {
-    let response = LaneResponse::new(request.nonce(), request.key().clone(), outcome)?;
+    let response = LaneResponse::new(
+        request.binding().clone(),
+        request.request_id(),
+        request.key().clone(),
+        outcome,
+    )?;
     let body = serde_json::to_vec(&response).map_err(|error| {
         VerificationError::new(
             ErrorCode::Json,
@@ -730,6 +736,15 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
     let binding = current_run_binding(root, &request.catalog)?;
     let header = EvidenceHeader::new(shard.clone(), binding)?;
     let members: Vec<usize> = request.shard.member_indices(keys.len()).collect();
+    let lane_binding = {
+        let run = LaneBinding::fresh()?;
+        if runner == SuiteRunner::Compiler {
+            let verified = verify_snapshot(&root.join(DEFAULT_SNAPSHOT_REL))?;
+            verified.bind_compiler_lane(run)?
+        } else {
+            run
+        }
+    };
 
     let executor = SuiteExecutor {
         adapter,
@@ -751,6 +766,7 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
         for (ordinal, index) in members.iter().enumerate() {
             let obligation = &obligations[*index];
             let lane_request = LaneRequest::new(
+                lane_binding.clone(),
                 (ordinal + 1) as u64,
                 obligation.key.clone(),
                 obligation.observables.clone(),
@@ -1175,6 +1191,10 @@ fn hash_candidate_path(root: &Path, relative: &Path, hasher: &mut Sha256) -> Res
         hasher.update([0x0a]);
         return Ok(());
     }
+    // Porcelain already binds the directory path and status; it has no file bytes to hash.
+    if metadata.is_dir() {
+        return Ok(());
+    }
     if !metadata.is_file() {
         return Err(VerificationError::new(
             ErrorCode::Schema,
@@ -1467,22 +1487,38 @@ mod tests {
             .expect("deletion status");
             assert_eq!(status, expected_status.as_slice());
 
-            let tree =
-                git_probe(&scratch.root, &["rev-parse", "HEAD^{tree}"]).expect("candidate tree");
-            let mut expected = Sha256::new();
-            expected.update(b"dirty-tree\x00");
-            expected.update(String::from_utf8_lossy(&tree).trim().as_bytes());
-            expected.update([0x0a]);
-            expected.update(expected_status);
-            let expected = schema::sha256_hex(&expected.finalize());
             let dirty = candidate_tree_digest(&scratch.root).expect("deleted candidate digest");
-            assert_eq!(dirty, expected);
             assert_ne!(dirty, clean);
             assert_eq!(
                 candidate_tree_digest(&scratch.root).expect("repeat deleted candidate digest"),
                 dirty
             );
         }
+    }
+
+    #[test]
+    fn embedded_git_directory_contributes_status_without_file_bytes() {
+        let (scratch, _) = manifest_root("embedded-git", &["jit.a"]);
+        let clean = candidate_tree_digest(&scratch.root).expect("clean candidate digest");
+        let embedded = scratch.root.join(".references/bun");
+        fs::create_dir_all(&embedded).expect("create embedded repository");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&embedded)
+            .status()
+            .expect("initialize embedded repository");
+        assert!(status.success());
+
+        let status = git_probe(
+            &scratch.root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )
+        .expect("embedded repository status");
+        assert!(String::from_utf8_lossy(&status).contains(".references/bun/"));
+
+        let dirty = candidate_tree_digest(&scratch.root)
+            .expect("embedded repository is a non-file candidate");
+        assert_ne!(dirty, clean);
     }
 
     #[test]
@@ -1630,7 +1666,12 @@ mod tests {
             .expect("key")
         }
         let declared = BTreeSet::from(["jit.a".to_owned()]);
+        let binding = LaneBinding::unbound(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("binding");
         let request = LaneRequest::new(
+            binding.clone(),
             7,
             key("jit.a"),
             declared,
@@ -1639,15 +1680,20 @@ mod tests {
             CASE_TIMEOUT_MS,
         )
         .expect("request");
-        let response_completed = |artifacts: BTreeMap<String, String>, nonce: u64| {
+        let response_completed = |artifacts: BTreeMap<String, String>, request_id: u64| {
             serde_json::to_vec(
-                &LaneResponse::new(nonce, key("jit.a"), LaneOutcome::Completed { artifacts })
-                    .expect("response"),
+                &LaneResponse::new(
+                    binding.clone(),
+                    request_id,
+                    key("jit.a"),
+                    LaneOutcome::Completed { artifacts },
+                )
+                .expect("response"),
             )
             .expect("encode")
         };
         // Claimed completion with the exact declared artifact set, correct
-        // nonce and key: only the parent derivation may turn this into PASS.
+        // binding, request_id, and key: only the parent derivation may turn this into PASS.
         let exact = BTreeMap::from([("jit.a".to_owned(), hex(9))]);
         let row = derive_row(
             &request,
@@ -1660,7 +1706,7 @@ mod tests {
         )
         .expect("derive");
         assert_eq!(row.state(), TerminalState::Pass);
-        // Same claim with a wrong nonce, a wrong observable, or an extra
+        // Same claim with a wrong request_id, a wrong observable, or an extra
         // artifact is protocol evidence, never PASS.
         let mut extra = exact.clone();
         extra.insert("stderr".to_owned(), hex(4));

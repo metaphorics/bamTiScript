@@ -12,7 +12,7 @@ use bamts_verification::{
     authority::verify_authority,
     catalog::{extract_catalog_cells, regenerate_manifest, write_catalog_json},
     completion::{
-        CompletionAspect, CompletionScope, RegenerateMode, RegenerateOutcome,
+        CompletionAspect, CompletionReport, CompletionScope, RegenerateMode, RegenerateOutcome,
         regenerate_completion_program, verify_completion,
     },
     diagnostic_catalog::{self, CatalogError},
@@ -22,6 +22,7 @@ use bamts_verification::{
         regenerate_canonical_fixture, run_replay_canary_child,
     },
     formal_gates::audit_formal_gates,
+    leaf_evidence::generate as generate_leaf_evidence,
     ledger::verify_ledger_g0,
     perf_guard::{self, Verdict},
     perf_jit, perf_stage0,
@@ -59,7 +60,16 @@ enum Command {
     LedgerRebuild {
         check: bool,
     },
+    LeafEvidenceGenerate {
+        leaf: String,
+        aspect: String,
+        out: PathBuf,
+    },
     CompletionVerify {
+        scope: CompletionScope,
+        aspect: CompletionAspect,
+    },
+    CompletionEvidence {
         scope: CompletionScope,
         aspect: CompletionAspect,
     },
@@ -119,17 +129,29 @@ fn run() -> Result<()> {
 
 fn dispatch(root: &Path, command: Command) -> Result<()> {
     match command {
-        Command::AuthorityVerify { release } => verify_authority_command(&root, &release),
+        Command::AuthorityVerify { release } => verify_authority_command(root, &release),
         Command::CatalogExtract { catalog } => extract_catalog(root, &catalog),
-        Command::CatalogRegenerate { release, check } => regenerate_catalog(&root, &release, check),
-        Command::LedgerVerify => verify_g0(&root),
-        Command::LedgerRebuild { check } => rebuild_ledger_command(&root, check),
-        Command::CompletionVerify { scope, aspect } => {
-            verify_completion_command(&root, &scope, aspect)
+        Command::CatalogRegenerate { release, check } => regenerate_catalog(root, &release, check),
+        Command::LedgerVerify => verify_g0(root),
+        Command::LedgerRebuild { check } => rebuild_ledger_command(root, check),
+        Command::LeafEvidenceGenerate { leaf, aspect, out } => {
+            let evidence = generate_leaf_evidence(root, &leaf, &aspect, &out)?;
+            writeln!(io::stdout().lock(), "{evidence}").map_err(|error| {
+                VerificationError::new(
+                    ErrorCode::Io,
+                    format!("cannot write receipt evidence: {error}"),
+                )
+            })
         }
-        Command::CompletionRegenerate { check } => regenerate_completion_command(&root, check),
-        Command::DiagnosticsRegenerate { check } => regenerate_diagnostics(&root, check),
-        Command::ToolchainEvidence => audit_toolchain_evidence(&root),
+        Command::CompletionVerify { scope, aspect } => {
+            verify_completion_command(root, &scope, aspect)
+        }
+        Command::CompletionEvidence { scope, aspect } => {
+            completion_evidence_command(root, &scope, aspect)
+        }
+        Command::CompletionRegenerate { check } => regenerate_completion_command(root, check),
+        Command::DiagnosticsRegenerate { check } => regenerate_diagnostics(root, check),
+        Command::ToolchainEvidence => audit_toolchain_evidence(root),
         Command::ToolchainObject { target, out } => emit_toolchain_object(&target, &out),
         Command::PerfStage0 => run_perf_stage0(),
         Command::PerfJit => run_perf_jit(),
@@ -138,13 +160,13 @@ fn dispatch(root: &Path, command: Command) -> Result<()> {
             baseline,
             scorecard,
         } => compare_perf(&rules, &baseline, &scorecard),
-        Command::FormalAudit(gates) => audit_formal(&root, &gates),
-        Command::RegenerateFixtures => regenerate_fixtures(&root),
-        Command::SourceFetch { name, destination } => fetch_source(&root, &name, &destination),
-        Command::UnicodeFetch => fetch_unicode(&root),
-        Command::UnicodeEmit { destination } => emit_unicode(&root, destination.as_deref()),
-        Command::UnicodeVerify => verify_unicode(&root),
-        Command::ReplayCanary { faulty } => run_replay_canary_child(&root, faulty),
+        Command::FormalAudit(gates) => audit_formal(root, &gates),
+        Command::RegenerateFixtures => regenerate_fixtures(root),
+        Command::SourceFetch { name, destination } => fetch_source(root, &name, &destination),
+        Command::UnicodeFetch => fetch_unicode(root),
+        Command::UnicodeEmit { destination } => emit_unicode(root, destination.as_deref()),
+        Command::UnicodeVerify => verify_unicode(root),
+        Command::ReplayCanary { faulty } => run_replay_canary_child(root, faulty),
         Command::SuiteRun(request) => run_suite(root, &request).map(|_| ()),
         Command::SuiteMerge(request) => merge_suite(root, &request).map(|_| ()),
     }
@@ -158,6 +180,7 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         "authority" => parse_authority_command(&mut arguments),
         "catalog" => parse_catalog_command(&mut arguments),
         "ledger" => parse_ledger_command(&mut arguments),
+        "leaf-evidence" => parse_leaf_evidence_command(&mut arguments),
         "completion" => parse_completion_command(&mut arguments),
         "diagnostics" => parse_diagnostics_command(&mut arguments),
         "toolchain" => parse_toolchain_command(&mut arguments),
@@ -178,6 +201,20 @@ fn parse_command(mut arguments: impl Iterator<Item = OsString>) -> Result<Comman
         _ => Err(usage(format!("unknown command `{command}`"))),
     }
 }
+fn parse_leaf_evidence_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
+    expect_literal(arguments, "generate", "leaf-evidence subcommand")?;
+    let flags = parse_flags(arguments, &["--leaf", "--aspect", "--out"], &[])?;
+    Ok(Command::LeafEvidenceGenerate {
+        leaf: required_flag(&flags.values, "--leaf", "leaf-evidence generate")?,
+        aspect: required_flag(&flags.values, "--aspect", "leaf-evidence generate")?,
+        out: PathBuf::from(required_flag(
+            &flags.values,
+            "--out",
+            "leaf-evidence generate",
+        )?),
+    })
+}
+
 fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
     let subcommand = required_argument(arguments, "suite subcommand")?;
     match subcommand.as_str() {
@@ -348,23 +385,10 @@ const COMPLETION_ASPECTS: &str = "contract, evidence, coverage, regression, muta
 fn parse_completion_command(arguments: &mut impl Iterator<Item = OsString>) -> Result<Command> {
     let subcommand = required_argument(arguments, "completion subcommand")?;
     match subcommand.as_str() {
-        "verify" => {
-            let flags = parse_flags(
-                arguments,
-                &[
-                    "--leaf",
-                    "--cluster",
-                    "--track",
-                    "--wave",
-                    "--root",
-                    "--aspect",
-                ],
-                &[],
-            )?;
-            let scope = completion_scope(&flags.values)?;
-            let aspect = completion_aspect(&flags.values)?;
-            Ok(Command::CompletionVerify { scope, aspect })
-        }
+        "verify" => parse_completion_request(arguments)
+            .map(|(scope, aspect)| Command::CompletionVerify { scope, aspect }),
+        "evidence" => parse_completion_request(arguments)
+            .map(|(scope, aspect)| Command::CompletionEvidence { scope, aspect }),
         "regenerate" => {
             let flags = parse_flags(arguments, &[], &["--check"])?;
             let check = flags.switches.contains("--check");
@@ -375,6 +399,27 @@ fn parse_completion_command(arguments: &mut impl Iterator<Item = OsString>) -> R
             "unknown completion subcommand `{subcommand}`"
         ))),
     }
+}
+
+fn parse_completion_request(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(CompletionScope, CompletionAspect)> {
+    let flags = parse_flags(
+        arguments,
+        &[
+            "--leaf",
+            "--cluster",
+            "--track",
+            "--wave",
+            "--root",
+            "--aspect",
+        ],
+        &[],
+    )?;
+    Ok((
+        completion_scope(&flags.values)?,
+        completion_aspect(&flags.values)?,
+    ))
 }
 
 fn completion_scope(values: &BTreeMap<String, String>) -> Result<CompletionScope> {
@@ -766,27 +811,7 @@ fn verify_completion_command(
     scope: &CompletionScope,
     aspect: CompletionAspect,
 ) -> Result<()> {
-    let report = verify_completion(root, scope, aspect)?;
-    if !report.is_pass() {
-        let shown = report
-            .failures
-            .iter()
-            .take(10)
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        let extra = report.failures.len().saturating_sub(shown.len());
-        let mut detail = shown.join("; ");
-        if extra != 0 {
-            detail.push_str(&format!("; +{extra} more"));
-        }
-        return Err(VerificationError::new(
-            ErrorCode::Workspace,
-            format!(
-                "completion verification failed for aspect `{}`: {detail}",
-                aspect.as_str()
-            ),
-        ));
-    }
+    let report = verified_completion_report(root, scope, aspect)?;
     let line = report.success_line().ok_or_else(|| {
         VerificationError::new(
             ErrorCode::Schema,
@@ -794,6 +819,50 @@ fn verify_completion_command(
         )
     })?;
     emit(&format!("{line}\n"))
+}
+
+fn completion_evidence_command(
+    root: &Path,
+    scope: &CompletionScope,
+    aspect: CompletionAspect,
+) -> Result<()> {
+    let report = verified_completion_report(root, scope, aspect)?;
+    let evidence = report.gate_evidence.ok_or_else(|| {
+        VerificationError::new(
+            ErrorCode::Schema,
+            "canonical evidence is available only for direct leaf aspect checks",
+        )
+    })?;
+    emit(&format!("{evidence}\n"))
+}
+
+fn verified_completion_report(
+    root: &Path,
+    scope: &CompletionScope,
+    aspect: CompletionAspect,
+) -> Result<CompletionReport> {
+    let report = verify_completion(root, scope, aspect)?;
+    if report.is_pass() {
+        return Ok(report);
+    }
+    let shown = report
+        .failures
+        .iter()
+        .take(10)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let extra = report.failures.len().saturating_sub(shown.len());
+    let mut detail = shown.join("; ");
+    if extra != 0 {
+        detail.push_str(&format!("; +{extra} more"));
+    }
+    Err(VerificationError::new(
+        ErrorCode::Workspace,
+        format!(
+            "completion verification failed for aspect `{}`: {detail}",
+            aspect.as_str()
+        ),
+    ))
 }
 
 fn regenerate_completion_command(root: &Path, check: bool) -> Result<()> {
@@ -1137,6 +1206,51 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> Result<Command> {
         parse_command(arguments.iter().map(|argument| OsString::from(*argument)))
+    }
+
+    #[test]
+    fn parses_leaf_evidence_generation_request() {
+        let command = parse(&[
+            "bamts-verification",
+            "leaf-evidence",
+            "generate",
+            "--leaf",
+            "B0.1",
+            "--aspect",
+            "mutation",
+            "--out",
+            ".outline/evidence/B0.1-mutation.json",
+        ])
+        .expect("leaf evidence generation command");
+        assert_eq!(
+            command,
+            Command::LeafEvidenceGenerate {
+                leaf: "B0.1".to_owned(),
+                aspect: "mutation".to_owned(),
+                out: PathBuf::from(".outline/evidence/B0.1-mutation.json"),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_completion_evidence_request() {
+        let command = parse(&[
+            "bamts-verification",
+            "completion",
+            "evidence",
+            "--leaf",
+            "B0.1",
+            "--aspect",
+            "contract",
+        ])
+        .expect("completion evidence command");
+        assert_eq!(
+            command,
+            Command::CompletionEvidence {
+                scope: CompletionScope::Leaf("B0.1".to_owned()),
+                aspect: CompletionAspect::Contract,
+            }
+        );
     }
 
     #[test]

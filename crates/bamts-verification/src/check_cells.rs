@@ -32,13 +32,14 @@ use bamts_compiler::source::SourceText;
 use bamts_compiler::source::{TextRange, Utf16Pos};
 use bamts_compiler::syntax::{NodeId, Token, TokenKind};
 
+use crate::catalog::CaseConfiguration;
 use crate::facets::{
     DiagnosticCategory, DiagnosticCodeMap, FacetDiagnostic, FacetSeverity, FacetVerdict,
-    SourcePosition, compare_diagnostics, compare_symbols, compare_types,
+    SourcePosition, compare_diagnostics, compare_js_emit, compare_symbols, compare_types,
 };
 use crate::suite::{
-    CellResult, FailureClass, IndexEntry, PlannedCell, SuiteIndex, SuiteSnapshot, TempDir,
-    decode_case_source,
+    CellResult, FailureClass, IndexEntry, PlannedCell, SnapshotAssets, SuiteIndex, TempDir,
+    decode_case_source, read_verified_snapshot_asset,
 };
 use crate::{ErrorCode, Result, VerificationError};
 
@@ -78,6 +79,33 @@ pub struct CasePragmas {
     pub options: Vec<(String, Vec<String>)>,
     /// `@noTypesAndSymbols: true` suppresses types/symbols baseline output.
     pub no_types_and_symbols: bool,
+}
+
+impl CasePragmas {
+    /// Build the exact single-valued pragma set selected by the catalog.
+    #[must_use]
+    pub fn from_configuration(configuration: &CaseConfiguration) -> Self {
+        Self {
+            options: configuration
+                .options
+                .iter()
+                .map(|(name, value)| (name.clone(), vec![value.clone()]))
+                .collect(),
+            no_types_and_symbols: configuration
+                .options
+                .get("notypesandsymbols")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        }
+    }
+}
+
+/// Comparator-backed observation returned to exact compiler-lane callers.
+#[derive(Debug, Clone)]
+pub struct CompilerCheckObservation {
+    pub class: FailureClass,
+    pub detail: String,
+    /// Canonical BamTS-side observation bytes. Present only after compilation.
+    pub artifact: Option<Vec<u8>>,
 }
 
 /// One file-anchored error row of an `.errors.txt` baseline.
@@ -133,6 +161,7 @@ pub struct DiagnosticsBaselines {
     /// marker when this case is the stem's sole input. None ⇒ upstream
     /// expects zero diagnostics (the strictest row class).
     pub owned: Vec<String>,
+    contents: BTreeMap<String, String>,
 }
 
 /// The per-cell product of compiling one materialized case.
@@ -457,7 +486,7 @@ pub fn baseline_groups(index: &SuiteIndex) -> BaselineGroups {
 
 /// Split `<stem>[(suffix)].<ext>`; returns `None` for unrecognized names.
 fn split_baseline_file_name(file_name: &str) -> Option<(&str, &str, &str)> {
-    let extensions = [".errors.txt", ".types", ".symbols"];
+    let extensions = [".errors.txt", ".types", ".symbols", ".jsx", ".js"];
     let extension = extensions
         .iter()
         .find(|extension| file_name.ends_with(*extension))?;
@@ -527,20 +556,23 @@ pub fn case_stem(logical_path: &str) -> &str {
 /// exist (e.g. `(target=es5)`), only the variant matching the compile options
 /// is selected; the plain baseline is used as a fallback when no variant matches.
 pub fn resolve_errors_baselines(
-    snapshot: &SuiteSnapshot,
+    snapshot: &(impl SnapshotAssets + ?Sized),
     groups: &BaselineGroups,
     logical_path: &str,
     compile_options: &[(String, String)],
-) -> DiagnosticsBaselines {
+) -> Result<DiagnosticsBaselines> {
     let stem = case_stem(logical_path);
     let Some(candidates) = groups.get(&(stem.to_owned(), "errors.txt".to_owned())) else {
-        return DiagnosticsBaselines::default();
+        return Ok(DiagnosticsBaselines::default());
     };
     let sole_input = case_inputs_with_stem(snapshot, stem) == [logical_path];
     let mut variants = Vec::new();
     let mut plain = Vec::new();
+    let mut contents = BTreeMap::new();
     for (suffix, path) in candidates {
-        let owned = match baseline_owner(snapshot, path) {
+        let (owner, text) = baseline_owner(snapshot, path)?;
+        contents.insert(path.clone(), text);
+        let owned = match owner {
             Some(owner) => owner == logical_path,
             None => sole_input,
         };
@@ -559,14 +591,18 @@ pub fn resolve_errors_baselines(
         plain
     };
     owned.sort();
-    DiagnosticsBaselines { owned }
+    owned.dedup();
+    Ok(DiagnosticsBaselines { owned, contents })
 }
 
 /// The case inputs (compiler/conformance/project/projects only matter here)
 /// whose stem equals `stem`.
-fn case_inputs_with_stem<'a>(snapshot: &'a SuiteSnapshot, stem: &str) -> Vec<&'a str> {
+fn case_inputs_with_stem<'a>(
+    snapshot: &'a (impl SnapshotAssets + ?Sized),
+    stem: &str,
+) -> Vec<&'a str> {
     snapshot
-        .index
+        .index()
         .entries
         .values()
         .filter(|entry| {
@@ -578,23 +614,26 @@ fn case_inputs_with_stem<'a>(snapshot: &'a SuiteSnapshot, stem: &str) -> Vec<&'a
 }
 
 /// The first `//// [path] ////` marker of a baseline blob, if any.
-fn baseline_owner(snapshot: &SuiteSnapshot, logical_path: &str) -> Option<String> {
-    let entry = snapshot.index.entries.get(logical_path)?;
-    let blob = snapshot.root.join("baselines").join(&entry.sha256);
-    let text = fs::read_to_string(blob).ok()?;
+fn baseline_owner(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    logical_path: &str,
+) -> Result<(Option<String>, String)> {
+    let bytes = read_verified_snapshot_asset(snapshot, logical_path)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("//// [") {
-            return rest
-                .split_once("] ////")
-                .map(|(path, _)| path.trim().to_owned());
+            return Ok((
+                rest.split_once("] ////")
+                    .map(|(path, _)| path.trim().to_owned()),
+                text,
+            ));
         }
         if !line.is_empty() {
-            // Markers only lead the document; stop at the first content line.
-            return None;
+            return Ok((None, text));
         }
     }
-    None
+    Ok((None, text))
 }
 
 /// Parse an `.errors.txt` baseline into file-anchored and global rows.
@@ -739,6 +778,15 @@ pub fn compile_case_with_pragmas(
     entry_name: &str,
     pragmas: &CasePragmas,
 ) -> std::result::Result<CheckedCase, CaseCompileError> {
+    compile_case_frontend(units, entry_name, pragmas, FrontendMode::Check)
+}
+
+fn compile_case_frontend(
+    units: &[CaseUnit],
+    entry_name: &str,
+    pragmas: &CasePragmas,
+    mode: FrontendMode,
+) -> std::result::Result<CheckedCase, CaseCompileError> {
     let temp = TempDir::new("bamts-check-cell")
         .map_err(|error| CaseCompileError::Load(format!("temp root: {error}")))?;
     for unit in units {
@@ -785,7 +833,7 @@ pub fn compile_case_with_pragmas(
         let program = loader
             .load(Path::new(ENTRY))
             .map_err(|error| CaseCompileError::Load(error.to_string()))?;
-        let output = compile_program_frontend(&program, FrontendMode::Check);
+        let output = compile_program_frontend(&program, mode);
         Ok::<_, CaseCompileError>((program, output))
     }));
     let (program, output) = match compile {
@@ -901,19 +949,18 @@ pub fn collect_facet_diagnostics(case: &CheckedCase) -> Vec<FacetDiagnostic> {
 /// The unit basename printed by the baseline is carried through so a
 /// cross-unit position collision cannot pass the check.
 pub fn expected_facet_diagnostics(
-    snapshot: &SuiteSnapshot,
+    _snapshot: &(impl SnapshotAssets + ?Sized),
     baselines: &DiagnosticsBaselines,
-) -> Vec<FacetDiagnostic> {
+) -> Result<Vec<FacetDiagnostic>> {
     let mut expected = Vec::new();
     for path in &baselines.owned {
-        let Some(entry) = snapshot.index.entries.get(path) else {
-            continue;
+        let Some(text) = baselines.contents.get(path) else {
+            return Err(VerificationError::new(
+                ErrorCode::Schema,
+                format!("diagnostics baseline `{path}` was selected without retained bytes"),
+            ));
         };
-        let blob = snapshot.root.join("baselines").join(&entry.sha256);
-        let Ok(text) = fs::read_to_string(blob) else {
-            continue;
-        };
-        let parsed = parse_errors_baseline(&text);
+        let parsed = parse_errors_baseline(text);
         for row in parsed.diagnostics {
             let category = if row.category == "warning" {
                 DiagnosticCategory::Warning
@@ -937,7 +984,7 @@ pub fn expected_facet_diagnostics(
             });
         }
     }
-    expected
+    Ok(expected)
 }
 
 /// Run the diagnostics comparison for one compiled case.
@@ -948,19 +995,19 @@ pub fn expected_facet_diagnostics(
 /// `BAMTS-W…` lint warnings never fail a row.
 pub fn check_diagnostics(
     ctx: &CheckContext,
-    snapshot: &SuiteSnapshot,
+    snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
     baselines: &DiagnosticsBaselines,
-) -> DiagnosticsOutcome {
+) -> Result<DiagnosticsOutcome> {
     let mut actual = collect_facet_diagnostics(case);
     actual.retain(|diagnostic| ctx.code_map.get(&diagnostic.code).is_some());
-    let expected = expected_facet_diagnostics(snapshot, baselines);
+    let expected = expected_facet_diagnostics(snapshot, baselines)?;
     let verdict = compare_diagnostics(&expected, &actual, &ctx.code_map);
-    DiagnosticsOutcome {
+    Ok(DiagnosticsOutcome {
         actual,
         expected,
         verdict,
-    }
+    })
 }
 
 /// Execute the S2 `diagnostics` observation for one planned cell.
@@ -971,69 +1018,119 @@ pub fn check_diagnostics(
 /// records the emitted/expected counts in the detail.
 pub(crate) fn execute_diagnostics_check(
     ctx: &CheckContext,
-    snapshot: &SuiteSnapshot,
+    snapshot: &(impl SnapshotAssets + ?Sized),
     plan: &PlannedCell,
     index_entry: &IndexEntry,
 ) -> Result<CellResult> {
-    let blob = snapshot.root.join("cases").join(&index_entry.sha256);
-    let bytes = fs::read(&blob).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Io,
-            format!("cannot read case blob `{}`: {error}", blob.display()),
-        )
-    })?;
-    let text = decode_case_source(&bytes);
+    let text = read_case_text(snapshot, index_entry)?;
     let pragmas = parse_case_pragmas(&text);
-    let units = split_case_units(&index_entry.logical_path, &text);
-    let entry = entry_virtual_path(&index_entry.logical_path, &units);
-    let groups = &ctx.baseline_groups;
-    let compile_options: Vec<(String, String)> = pragmas
+    Ok(cell_result(
+        plan,
+        observe_diagnostics(ctx, snapshot, index_entry, &text, &pragmas),
+    ))
+}
+
+fn compile_option_pairs(pragmas: &CasePragmas) -> Vec<(String, String)> {
+    pragmas
         .options
         .iter()
         .filter_map(|(name, values)| values.first().map(|value| (name.clone(), value.clone())))
-        .collect();
-    let baselines = resolve_errors_baselines(
+        .collect()
+}
+
+fn read_case_text(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+) -> Result<String> {
+    let bytes = read_verified_snapshot_asset(snapshot, &index_entry.logical_path)?;
+    Ok(decode_case_source(&bytes))
+}
+
+fn compile_failure_observation(error: CaseCompileError) -> CompilerCheckObservation {
+    let detail = match &error {
+        CaseCompileError::Load(detail)
+        | CaseCompileError::SourceBound(detail)
+        | CaseCompileError::Panic(detail) => detail.clone(),
+    };
+    CompilerCheckObservation {
+        class: error.failure_class(),
+        detail,
+        artifact: None,
+    }
+}
+
+fn cell_result(plan: &PlannedCell, observation: CompilerCheckObservation) -> CellResult {
+    CellResult {
+        entry_id: plan.entry.id.clone(),
+        facet: plan.entry.facet,
+        backend: plan.backend,
+        class: observation.class,
+        detail: observation.detail,
+    }
+}
+
+/// Run the diagnostics comparator against the selected pragma variation.
+pub(crate) fn observe_diagnostics(
+    ctx: &CheckContext,
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+    text: &str,
+    pragmas: &CasePragmas,
+) -> CompilerCheckObservation {
+    let units = split_case_units(&index_entry.logical_path, text);
+    let entry = entry_virtual_path(&index_entry.logical_path, &units);
+    let compile_options = compile_option_pairs(pragmas);
+    let baselines = match resolve_errors_baselines(
         snapshot,
-        groups,
+        &ctx.baseline_groups,
         &index_entry.logical_path,
         &compile_options,
-    );
-    let result = compile_case_with_pragmas(&units, &entry, &pragmas);
-    let (class, detail) = match result {
+    ) {
+        Ok(baselines) => baselines,
         Err(error) => {
-            let detail = match &error {
-                CaseCompileError::Load(detail)
-                | CaseCompileError::SourceBound(detail)
-                | CaseCompileError::Panic(detail) => detail.clone(),
+            return CompilerCheckObservation {
+                class: FailureClass::HarnessError,
+                detail: error.to_string(),
+                artifact: None,
             };
-            (error.failure_class(), detail)
         }
+    };
+    match compile_case_with_pragmas(&units, &entry, pragmas) {
+        Err(error) => compile_failure_observation(error),
         Ok(case) => {
-            let outcome = check_diagnostics(ctx, snapshot, &case, &baselines);
+            let outcome = match check_diagnostics(ctx, snapshot, &case, &baselines) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::HarnessError,
+                        detail: error.to_string(),
+                        artifact: None,
+                    };
+                }
+            };
             match outcome.verdict {
-                FacetVerdict::Pass => (
-                    FailureClass::Pass,
-                    format!(
+                FacetVerdict::Pass => CompilerCheckObservation {
+                    class: FailureClass::Pass,
+                    detail: format!(
                         "diagnostic parity: {} expected, {} emitted",
                         outcome.expected.len(),
                         outcome.actual.len()
                     ),
-                ),
-                FacetVerdict::Fail { reason } => (FailureClass::FailDiagnostic, reason),
-                FacetVerdict::Unproven { reason } => (
-                    FailureClass::HarnessError,
-                    format!("diagnostics oracle could not prove parity: {reason}"),
-                ),
+                    artifact: serde_json::to_vec(&outcome.actual).ok(),
+                },
+                FacetVerdict::Fail { reason } => CompilerCheckObservation {
+                    class: FailureClass::FailDiagnostic,
+                    detail: reason,
+                    artifact: None,
+                },
+                FacetVerdict::Unproven { reason } => CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: format!("diagnostics oracle could not prove parity: {reason}"),
+                    artifact: None,
+                },
             }
         }
-    };
-    Ok(CellResult {
-        entry_id: plan.entry.id.clone(),
-        facet: plan.entry.facet,
-        backend: plan.backend,
-        class,
-        detail,
-    })
+    }
 }
 
 /// Index-only baseline-ownership view for U2.8 S2 `types` classification.
@@ -1475,34 +1572,75 @@ pub struct TypesOutcome {
     pub verdict: FacetVerdict,
 }
 
-/// Resolve the `.types` baseline logical path owned by one case. Classification
-/// guarantees sole-stem ownership for included rows, so resolution is by stem:
-/// the plain (no-suffix) baseline wins, else the lexicographically first
-/// variant (option semantics are unimplemented, so variants compile alike).
+/// Resolve the `.types` baseline logical path owned by one case.
+///
+/// Classification guarantees sole-stem ownership for included rows, so
+/// resolution is by stem. When `compile_options` names a variant suffix, that
+/// variant wins; otherwise the plain (no-suffix) baseline wins, else the
+/// lexicographically first variant.
 pub fn resolve_types_baseline(groups: &BaselineGroups, logical_path: &str) -> Option<String> {
+    resolve_stem_baseline(groups, logical_path, "types", &[])
+        .ok()
+        .flatten()
+}
+
+fn resolve_stem_baseline(
+    groups: &BaselineGroups,
+    logical_path: &str,
+    extension: &str,
+    compile_options: &[(String, String)],
+) -> Result<Option<String>> {
     let stem = case_stem(logical_path);
-    let candidates = groups.get(&(stem.to_owned(), "types".to_owned()))?;
-    let plain = candidates.iter().find(|(suffix, _)| suffix.is_empty());
-    let chosen = plain.or_else(|| candidates.iter().min_by(|left, right| left.0.cmp(&right.0)));
-    chosen.map(|(_, path)| path.clone())
+    let Some(candidates) = groups.get(&(stem.to_owned(), extension.to_owned())) else {
+        return Ok(None);
+    };
+    if !compile_options.is_empty() {
+        let matches: Vec<_> = candidates
+            .iter()
+            .filter(|(suffix, _)| {
+                !suffix.is_empty() && suffix_matches_options(suffix, compile_options)
+            })
+            .collect();
+        if matches.len() > 1 {
+            return Err(VerificationError::new(
+                ErrorCode::Duplicate,
+                format!("ambiguous `{extension}` baseline selection for `{logical_path}`"),
+            ));
+        }
+        if let Some((_, path)) = matches.first() {
+            return Ok(Some((*path).clone()));
+        }
+    }
+    let plains: Vec<_> = candidates
+        .iter()
+        .filter(|(suffix, _)| suffix.is_empty())
+        .collect();
+    if plains.len() > 1 {
+        return Err(VerificationError::new(
+            ErrorCode::Duplicate,
+            format!("duplicate plain `{extension}` baselines for `{logical_path}`"),
+        ));
+    }
+    if let Some((_, path)) = plains.first() {
+        return Ok(Some((*path).clone()));
+    }
+    Ok(candidates
+        .iter()
+        .min_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, path)| path.clone()))
 }
 
 /// Compare one compiled case's emitted `.types` document against its baseline.
 pub fn check_types(
-    snapshot: &SuiteSnapshot,
+    snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
     baseline_path: &str,
-) -> TypesOutcome {
+) -> Result<TypesOutcome> {
     let emitted = emit_types_baseline(case, &case.entry);
-    let expected = snapshot
-        .index
-        .entries
-        .get(baseline_path)
-        .map(|entry| snapshot.root.join("baselines").join(&entry.sha256))
-        .and_then(|blob| fs::read_to_string(blob).ok())
-        .unwrap_or_default();
+    let bytes = read_verified_snapshot_asset(snapshot, baseline_path)?;
+    let expected = String::from_utf8_lossy(&bytes).into_owned();
     let verdict = compare_types(&expected, &emitted);
-    TypesOutcome { emitted, verdict }
+    Ok(TypesOutcome { emitted, verdict })
 }
 
 /// Execute the S2 `types` observation for one planned cell.
@@ -1513,61 +1651,185 @@ pub fn check_types(
 /// oracle-side `HARNESS_ERROR`; a missing owned baseline is a
 /// classification/execution drift `HARNESS_ERROR`.
 pub(crate) fn execute_types_check(
-    snapshot: &SuiteSnapshot,
+    snapshot: &(impl SnapshotAssets + ?Sized),
     groups: &BaselineGroups,
     plan: &PlannedCell,
     index_entry: &IndexEntry,
 ) -> Result<CellResult> {
-    let blob = snapshot.root.join("cases").join(&index_entry.sha256);
-    let bytes = fs::read(&blob).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Io,
-            format!("cannot read case blob `{}`: {error}", blob.display()),
-        )
-    })?;
-    let text = decode_case_source(&bytes);
+    let text = read_case_text(snapshot, index_entry)?;
     let pragmas = parse_case_pragmas(&text);
-    let units = split_case_units(&index_entry.logical_path, &text);
-    let entry = entry_virtual_path(&index_entry.logical_path, &units);
-    let baseline_path = resolve_types_baseline(groups, &index_entry.logical_path);
+    Ok(cell_result(
+        plan,
+        observe_types(snapshot, groups, index_entry, &text, &pragmas),
+    ))
+}
 
-    let (class, detail) = match compile_case_with_pragmas(&units, &entry, &pragmas) {
-        Err(error) => {
-            let detail = match &error {
-                CaseCompileError::Load(detail)
-                | CaseCompileError::SourceBound(detail)
-                | CaseCompileError::Panic(detail) => detail.clone(),
-            };
-            (error.failure_class(), detail)
-        }
+/// Run the types comparator against the selected pragma variation.
+pub(crate) fn observe_types(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    groups: &BaselineGroups,
+    index_entry: &IndexEntry,
+    text: &str,
+    pragmas: &CasePragmas,
+) -> CompilerCheckObservation {
+    let units = split_case_units(&index_entry.logical_path, text);
+    let entry = entry_virtual_path(&index_entry.logical_path, &units);
+    let compile_options = compile_option_pairs(pragmas);
+    let baseline_path =
+        match resolve_stem_baseline(groups, &index_entry.logical_path, "types", &compile_options) {
+            Ok(path) => path,
+            Err(error) => {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: error.to_string(),
+                    artifact: None,
+                };
+            }
+        };
+    match compile_case_with_pragmas(&units, &entry, pragmas) {
+        Err(error) => compile_failure_observation(error),
         Ok(case) => {
             let Some(baseline_path) = baseline_path else {
-                return Ok(CellResult {
-                    entry_id: plan.entry.id.clone(),
-                    facet: plan.entry.facet,
-                    backend: plan.backend,
+                return CompilerCheckObservation {
                     class: FailureClass::HarnessError,
                     detail: "classification/execution drift: no owned `.types` baseline".to_owned(),
-                });
+                    artifact: None,
+                };
             };
-            let outcome = check_types(snapshot, &case, &baseline_path);
+            let outcome = match check_types(snapshot, &case, &baseline_path) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::HarnessError,
+                        detail: error.to_string(),
+                        artifact: None,
+                    };
+                }
+            };
             match outcome.verdict {
-                FacetVerdict::Pass => (FailureClass::Pass, "types parity".to_owned()),
-                FacetVerdict::Fail { reason } => (FailureClass::FailBehavior, reason),
-                FacetVerdict::Unproven { reason } => (
-                    FailureClass::HarnessError,
-                    format!("types oracle could not prove parity: {reason}"),
-                ),
+                FacetVerdict::Pass => CompilerCheckObservation {
+                    class: FailureClass::Pass,
+                    detail: "types parity".to_owned(),
+                    artifact: Some(outcome.emitted.into_bytes()),
+                },
+                FacetVerdict::Fail { reason } => CompilerCheckObservation {
+                    class: FailureClass::FailBehavior,
+                    detail: reason,
+                    artifact: None,
+                },
+                FacetVerdict::Unproven { reason } => CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: format!("types oracle could not prove parity: {reason}"),
+                    artifact: None,
+                },
             }
         }
-    };
-    Ok(CellResult {
-        entry_id: plan.entry.id.clone(),
-        facet: plan.entry.facet,
-        backend: plan.backend,
-        class,
-        detail,
-    })
+    }
+}
+
+/// Run the javascript emit comparator against the selected pragma variation.
+pub(crate) fn observe_javascript(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    groups: &BaselineGroups,
+    index_entry: &IndexEntry,
+    text: &str,
+    pragmas: &CasePragmas,
+) -> CompilerCheckObservation {
+    let units = split_case_units(&index_entry.logical_path, text);
+    let entry = entry_virtual_path(&index_entry.logical_path, &units);
+    let compile_options = compile_option_pairs(pragmas);
+    let baseline_path =
+        match resolve_stem_baseline(groups, &index_entry.logical_path, "js", &compile_options) {
+            Ok(path) => path,
+            Err(error) => {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: error.to_string(),
+                    artifact: None,
+                };
+            }
+        };
+    match compile_case_frontend(&units, &entry, pragmas, FrontendMode::JavaScript) {
+        Err(error) => compile_failure_observation(error),
+        Ok(case) => {
+            let Some(baseline_path) = baseline_path else {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: "classification/execution drift: no owned `.js` baseline".to_owned(),
+                    artifact: None,
+                };
+            };
+            let emitted = match emit_javascript_baseline(&case) {
+                Ok(emitted) => emitted,
+                Err(detail) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::FailBehavior,
+                        detail,
+                        artifact: None,
+                    };
+                }
+            };
+            let bytes = match read_verified_snapshot_asset(snapshot, &baseline_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::HarnessError,
+                        detail: error.to_string(),
+                        artifact: None,
+                    };
+                }
+            };
+            let expected = String::from_utf8_lossy(&bytes).into_owned();
+            match compare_js_emit(&expected, &emitted) {
+                FacetVerdict::Pass => CompilerCheckObservation {
+                    class: FailureClass::Pass,
+                    detail: "javascript parity".to_owned(),
+                    artifact: Some(emitted.into_bytes()),
+                },
+                FacetVerdict::Fail { reason } => CompilerCheckObservation {
+                    class: FailureClass::FailBehavior,
+                    detail: reason,
+                    artifact: None,
+                },
+                FacetVerdict::Unproven { reason } => CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: format!("javascript oracle could not prove parity: {reason}"),
+                    artifact: None,
+                },
+            }
+        }
+    }
+}
+
+fn emit_javascript_baseline(case: &CheckedCase) -> std::result::Result<String, String> {
+    let mut out = String::new();
+    for (unit, output) in case.reached_units() {
+        let Some(emit) = output.emit() else {
+            return Err(format!(
+                "unit `{}` produced no javascript emit",
+                unit.virtual_path
+            ));
+        };
+        let Some(javascript) = emit.javascript.as_ref() else {
+            return Err(format!(
+                "unit `{}` produced no javascript slot",
+                unit.virtual_path
+            ));
+        };
+        let section = unit_basename(&unit.virtual_path);
+        let js_name = match section.rsplit_once('.') {
+            Some((stem, _)) => format!("{stem}.js"),
+            None => format!("{section}.js"),
+        };
+        let _ = write!(out, "//// [{js_name}] ////\n{}", javascript.code);
+        if !javascript.code.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        return Err("javascript emit reached no case units".to_owned());
+    }
+    Ok(out)
 }
 
 /// Emit the `.symbols` baseline for a compiled case in the upstream framing:
@@ -1811,31 +2073,24 @@ pub struct SymbolsOutcome {
 /// Resolve the `.symbols` baseline logical path owned by one case. As for
 /// `.types`, classification guarantees sole-stem ownership for included rows,
 /// so resolution is by stem: the plain (no-suffix) baseline wins, else the
-/// lexicographically first variant.
+/// lexicographically first variant, unless `compile_options` names a match.
 pub fn resolve_symbols_baseline(groups: &BaselineGroups, logical_path: &str) -> Option<String> {
-    let stem = case_stem(logical_path);
-    let candidates = groups.get(&(stem.to_owned(), "symbols".to_owned()))?;
-    let plain = candidates.iter().find(|(suffix, _)| suffix.is_empty());
-    let chosen = plain.or_else(|| candidates.iter().min_by(|left, right| left.0.cmp(&right.0)));
-    chosen.map(|(_, path)| path.clone())
+    resolve_stem_baseline(groups, logical_path, "symbols", &[])
+        .ok()
+        .flatten()
 }
 
 /// Compare one compiled case's emitted `.symbols` document against its baseline.
 pub fn check_symbols(
-    snapshot: &SuiteSnapshot,
+    snapshot: &(impl SnapshotAssets + ?Sized),
     case: &CheckedCase,
     baseline_path: &str,
-) -> SymbolsOutcome {
+) -> Result<SymbolsOutcome> {
     let emitted = emit_symbols_baseline(case, &case.entry);
-    let expected = snapshot
-        .index
-        .entries
-        .get(baseline_path)
-        .map(|entry| snapshot.root.join("baselines").join(&entry.sha256))
-        .and_then(|blob| fs::read_to_string(blob).ok())
-        .unwrap_or_default();
+    let bytes = read_verified_snapshot_asset(snapshot, baseline_path)?;
+    let expected = String::from_utf8_lossy(&bytes).into_owned();
     let verdict = compare_symbols(&expected, &emitted);
-    SymbolsOutcome { emitted, verdict }
+    Ok(SymbolsOutcome { emitted, verdict })
 }
 
 /// Execute the S2 `symbols` observation for one planned cell.
@@ -1847,62 +2102,85 @@ pub fn check_symbols(
 /// `HARNESS_ERROR`; a missing owned baseline is a classification/execution
 /// drift `HARNESS_ERROR`.
 pub(crate) fn execute_symbols_check(
-    snapshot: &SuiteSnapshot,
+    snapshot: &(impl SnapshotAssets + ?Sized),
     groups: &BaselineGroups,
     plan: &PlannedCell,
     index_entry: &IndexEntry,
 ) -> Result<CellResult> {
-    let blob = snapshot.root.join("cases").join(&index_entry.sha256);
-    let bytes = fs::read(&blob).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Io,
-            format!("cannot read case blob `{}`: {error}", blob.display()),
-        )
-    })?;
-    let text = decode_case_source(&bytes);
+    let text = read_case_text(snapshot, index_entry)?;
     let pragmas = parse_case_pragmas(&text);
-    let units = split_case_units(&index_entry.logical_path, &text);
-    let entry = entry_virtual_path(&index_entry.logical_path, &units);
-    let baseline_path = resolve_symbols_baseline(groups, &index_entry.logical_path);
+    Ok(cell_result(
+        plan,
+        observe_symbols(snapshot, groups, index_entry, &text, &pragmas),
+    ))
+}
 
-    let (class, detail) = match compile_case_with_pragmas(&units, &entry, &pragmas) {
+/// Run the symbols comparator against the selected pragma variation.
+pub(crate) fn observe_symbols(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    groups: &BaselineGroups,
+    index_entry: &IndexEntry,
+    text: &str,
+    pragmas: &CasePragmas,
+) -> CompilerCheckObservation {
+    let units = split_case_units(&index_entry.logical_path, text);
+    let entry = entry_virtual_path(&index_entry.logical_path, &units);
+    let compile_options = compile_option_pairs(pragmas);
+    let baseline_path = match resolve_stem_baseline(
+        groups,
+        &index_entry.logical_path,
+        "symbols",
+        &compile_options,
+    ) {
+        Ok(path) => path,
         Err(error) => {
-            let detail = match &error {
-                CaseCompileError::Load(detail)
-                | CaseCompileError::SourceBound(detail)
-                | CaseCompileError::Panic(detail) => detail.clone(),
+            return CompilerCheckObservation {
+                class: FailureClass::HarnessError,
+                detail: error.to_string(),
+                artifact: None,
             };
-            (error.failure_class(), detail)
         }
+    };
+    match compile_case_with_pragmas(&units, &entry, pragmas) {
+        Err(error) => compile_failure_observation(error),
         Ok(case) => {
             let Some(baseline_path) = baseline_path else {
-                return Ok(CellResult {
-                    entry_id: plan.entry.id.clone(),
-                    facet: plan.entry.facet,
-                    backend: plan.backend,
+                return CompilerCheckObservation {
                     class: FailureClass::HarnessError,
                     detail: "classification/execution drift: no owned `.symbols` baseline"
                         .to_owned(),
-                });
+                    artifact: None,
+                };
             };
-            let outcome = check_symbols(snapshot, &case, &baseline_path);
+            let outcome = match check_symbols(snapshot, &case, &baseline_path) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::HarnessError,
+                        detail: error.to_string(),
+                        artifact: None,
+                    };
+                }
+            };
             match outcome.verdict {
-                FacetVerdict::Pass => (FailureClass::Pass, "symbols parity".to_owned()),
-                FacetVerdict::Fail { reason } => (FailureClass::FailBehavior, reason),
-                FacetVerdict::Unproven { reason } => (
-                    FailureClass::HarnessError,
-                    format!("symbols oracle could not prove parity: {reason}"),
-                ),
+                FacetVerdict::Pass => CompilerCheckObservation {
+                    class: FailureClass::Pass,
+                    detail: "symbols parity".to_owned(),
+                    artifact: Some(outcome.emitted.into_bytes()),
+                },
+                FacetVerdict::Fail { reason } => CompilerCheckObservation {
+                    class: FailureClass::FailBehavior,
+                    detail: reason,
+                    artifact: None,
+                },
+                FacetVerdict::Unproven { reason } => CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: format!("symbols oracle could not prove parity: {reason}"),
+                    artifact: None,
+                },
             }
         }
-    };
-    Ok(CellResult {
-        entry_id: plan.entry.id.clone(),
-        facet: plan.entry.facet,
-        backend: plan.backend,
-        class,
-        detail,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -2343,7 +2621,14 @@ export const a2 = 3;
             split_baseline_file_name("parserEnumDeclaration2.d.types"),
             Some(("parserEnumDeclaration2.d", "types", ""))
         );
-        assert_eq!(split_baseline_file_name("plain.js"), None);
+        assert_eq!(
+            split_baseline_file_name("plain.js"),
+            Some(("plain", "js", ""))
+        );
+        assert_eq!(
+            split_baseline_file_name("2dArrays(target=es5).js"),
+            Some(("2dArrays", "js", "(target=es5)"))
+        );
     }
 
     #[test]
@@ -2888,5 +3173,26 @@ class Board {\n\
         let symbols = emit_symbols_baseline(&case, logical);
         assert!(symbols.contains("=== index.ts ==="), "{symbols}");
         assert!(symbols.contains("Symbol(zzz, Decl(index.ts"), "{symbols}");
+    }
+
+    #[test]
+    fn duplicate_plain_types_baselines_are_ambiguous() {
+        let mut groups: BaselineGroups = BTreeMap::new();
+        groups.insert(
+            ("foo".to_owned(), "types".to_owned()),
+            vec![
+                (
+                    String::new(),
+                    "tests/baselines/reference/foo.types".to_owned(),
+                ),
+                (
+                    String::new(),
+                    "tests/baselines/reference/foo-dup.types".to_owned(),
+                ),
+            ],
+        );
+        let error = resolve_stem_baseline(&groups, "tests/cases/compiler/foo.ts", "types", &[])
+            .expect_err("duplicate plains");
+        assert_eq!(error.code(), ErrorCode::Duplicate);
     }
 }

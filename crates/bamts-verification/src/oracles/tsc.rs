@@ -33,8 +33,6 @@ use crate::{
 pub const PROTOCOL: &str = "bamti.oracle.tsc/v1";
 /// Stable TypeScript product version this oracle is pinned to.
 pub const STABLE_VERSION: &str = "7.0.2";
-/// Stable TypeScript git commit for the 7.0.2 authority.
-pub const STABLE_COMMIT: &str = "1e4744d68260a7cb91b62b12edc3f6a2187faaf1";
 /// SHA-256 (hex) the constructor requires from the authority probe.
 pub const STABLE_ORACLE_DIGEST: &str =
     "62f3da55b23a067821af3296ebd7a669bd22199e058053c96d3caa3b7547aede";

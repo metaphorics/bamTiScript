@@ -1,10 +1,16 @@
 //! Strict Test262 frontmatter, harness, phase, and async `$DONE` oracle.
 //!
-//! Process execution stays outside this leaf. Callers supply typed runner outcomes.
+//! The interpreter backend runs in-process through the public `bamts` facade;
+//! process-spawning backends stay outside. Callers may also supply typed
+//! runner outcomes of their own.
 
+use bamts_compiler::diagnostic::Diagnostic;
+use bamts_runtime::{RuntimeErrorKind, ThrowOrigin};
 use serde::Deserialize;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub const FRONTMATTER_OPEN: &str = "/*---";
 pub const FRONTMATTER_CLOSE: &str = "---*/";
@@ -20,17 +26,30 @@ const STRICT_PREFIX: &str = "\"use strict\";\n";
 pub enum OracleError {
     MissingDelimiter,
     UnterminatedFrontmatter,
-    OversizeFrontmatter { bytes: usize },
+    OversizeFrontmatter {
+        bytes: usize,
+    },
     Yaml(String),
     UnknownFlag(String),
     ConflictingFlags,
     UnknownNegativePhase(String),
     UnknownNegativeType(String),
-    IncludeNotConfined { include: String },
-    MissingHarness { name: String },
+    IncludeNotConfined {
+        include: String,
+    },
+    MissingHarness {
+        name: String,
+    },
     ModeFailure(ModeFailure),
     Done(DoneFailure),
-    ExpectationMismatch { expected: String, actual: String },
+    ExpectationMismatch {
+        expected: String,
+        actual: String,
+    },
+    /// The runner could not observe the script at all. Always blocking.
+    BlockedRun {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,8 +296,15 @@ pub struct AsyncTrace {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
-    Completed { thrown: Option<ThrownError> },
+    Completed {
+        thrown: Option<ThrownError>,
+    },
     Async(AsyncTrace),
+    /// No verdict-shaped observation was produced. This blocks the
+    /// obligation; it can never judge as a pass.
+    Blocked {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +648,9 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                 actual: format!("{:?}/{}", actual.phase, actual.error_type.as_str()),
             }),
         },
+        RunOutcome::Blocked { detail } => Err(OracleError::BlockedRun {
+            detail: detail.clone(),
+        }),
     }
 }
 
@@ -657,10 +686,388 @@ pub fn evaluate_in_all_modes<R: Test262Runner>(
     })
 }
 
+/// Why an execution backend cannot serve this oracle's in-process runs.
+///
+/// Every variant is a hard block: the obligation is recorded as blocked and
+/// can never become a pass. No native-code backend is wired into this leaf,
+/// so declaring the block costs no codegen dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedBackend {
+    /// The JIT backend has no in-process runner in this oracle.
+    Jit,
+    /// The AOT backend has no in-process runner in this oracle.
+    Aot,
+}
+
+impl BlockedBackend {
+    /// The execution mode this block applies to.
+    #[must_use]
+    pub const fn mode(self) -> ExecutionMode {
+        match self {
+            Self::Jit => ExecutionMode::Jit,
+            Self::Aot => ExecutionMode::Aot,
+        }
+    }
+
+    /// Why the backend cannot run.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Jit => "the JIT backend is not wired for in-process oracle runs",
+            Self::Aot => "the AOT backend is not wired for in-process oracle runs",
+        }
+    }
+}
+
+/// Returns the production runner for `mode`.
+///
+/// Only [`ExecutionMode::Interpreter`] executes here, through the in-process
+/// engine facade. The native-code modes return a typed [`BlockedBackend`]
+/// instead of a runner that could never honestly observe them.
+pub fn backend_runner(
+    mode: ExecutionMode,
+    scratch: impl Into<PathBuf>,
+) -> Result<InterpreterRunner, BlockedBackend> {
+    match mode {
+        ExecutionMode::Interpreter => Ok(InterpreterRunner::new(scratch)),
+        ExecutionMode::Jit => Err(BlockedBackend::Jit),
+        ExecutionMode::Aot => Err(BlockedBackend::Aot),
+    }
+}
+
+/// The production Test262 runner: the in-process bytecode interpreter.
+///
+/// One [`RunRequest`] becomes one engine run. The composed script is
+/// materialized verbatim under `scratch`, compiled through the public `bamts`
+/// facade, and executed by `bamts_runtime::run` against the deterministic
+/// Node host. Fuel is derived from the request deadline.
+///
+/// Classification is exactly what this boundary can observe:
+///
+/// - compile diagnostics in the lexical (`BAMTS-L`) or parser (`BAMTS-P`)
+///   code families are a parse-phase `SyntaxError`;
+/// - a runtime [`ThrowOrigin`] that names a native error class reports that
+///   class;
+/// - a guest-thrown value (`ThrowOrigin::Bytecode`) has no observable
+///   constructor through the public runtime boundary, so the outcome is
+///   [`RunOutcome::Blocked`] rather than a guessed type. The block can never
+///   judge as a pass;
+/// - exhausted fuel or a failed engine pipeline is likewise
+///   [`RunOutcome::Blocked`]: no observation was made, so none is reported.
+#[derive(Debug)]
+pub struct InterpreterRunner {
+    scratch: PathBuf,
+    composed: AtomicU64,
+}
+
+/// Removes a materialized script on every exit path, including early `?`-less
+/// classification returns and panics.
+struct MaterializedScript(PathBuf);
+
+impl Drop for MaterializedScript {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+impl InterpreterRunner {
+    /// Creates a runner that materializes composed scripts under `scratch`.
+    ///
+    /// The directory is created on demand; the caller owns its lifetime.
+    #[must_use]
+    pub fn new(scratch: impl Into<PathBuf>) -> Self {
+        Self {
+            scratch: scratch.into(),
+            composed: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Test262Runner for InterpreterRunner {
+    fn run(&self, request: &RunRequest) -> RunOutcome {
+        let foreign = match request.mode {
+            ExecutionMode::Interpreter => None,
+            ExecutionMode::Jit => Some(BlockedBackend::Jit.reason()),
+            ExecutionMode::Aot => Some(BlockedBackend::Aot.reason()),
+        };
+        if let Some(reason) = foreign {
+            return RunOutcome::Blocked {
+                detail: reason.to_owned(),
+            };
+        }
+
+        if let Err(error) = fs::create_dir_all(&self.scratch) {
+            return RunOutcome::Blocked {
+                detail: format!(
+                    "could not create scratch directory `{}`: {error}",
+                    self.scratch.display()
+                ),
+            };
+        }
+        let unique = self.composed.fetch_add(1, Ordering::Relaxed);
+        let script = MaterializedScript(
+            self.scratch
+                .join(format!("composed-{}-{unique}.js", std::process::id())),
+        );
+        if let Err(error) = fs::write(&script.0, &request.script.bytes) {
+            return RunOutcome::Blocked {
+                detail: format!(
+                    "could not materialize composed script `{}`: {error}",
+                    script.0.display()
+                ),
+            };
+        }
+
+        let executable = match bamts::compile_source_file(&script.0) {
+            Ok(executable) => executable,
+            Err(bamts::Error::Diagnostics { diagnostics }) => {
+                return parse_phase_outcome(&diagnostics);
+            }
+            Err(error) => {
+                return RunOutcome::Blocked {
+                    detail: format!("compile pipeline failed: {error}"),
+                };
+            }
+        };
+
+        let started = Instant::now();
+        let mut host = bamts_node::NodeHost::new();
+        let outcome = bamts_runtime::run(
+            executable.wire(),
+            &mut host,
+            &interpreter_fuel(request.deadline),
+        );
+        let elapsed = started.elapsed();
+        match outcome {
+            Ok(_) if request.async_done => RunOutcome::Async(observed_done_trace(
+                host.stdout(),
+                host.stderr(),
+                elapsed,
+                request.deadline,
+            )),
+            Ok(_) => RunOutcome::Completed { thrown: None },
+            Err(error) => observed_failure(&error, request.deadline),
+        }
+    }
+}
+
+/// Classifies compile diagnostics into a thrown parse error, or blocks when
+/// the diagnostics are not parse-shaped.
+///
+/// Only the lexical (`BAMTS-L`) and parser (`BAMTS-P`) code families are
+/// JavaScript parse errors. Any other diagnostic means the oracle pipeline
+/// rejected source that Test262 considers valid, which is an observation
+/// failure and never a Test262 verdict.
+fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
+    let parse_shaped = diagnostics.iter().any(|diagnostic| {
+        let code = diagnostic.code().as_str();
+        code.starts_with("BAMTS-L") || code.starts_with("BAMTS-P")
+    });
+    if parse_shaped {
+        return RunOutcome::Completed {
+            thrown: Some(ThrownError {
+                phase: NegativePhase::Parse,
+                error_type: NegativeType::SyntaxError,
+            }),
+        };
+    }
+    let codes = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code().as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    RunOutcome::Blocked {
+        detail: format!(
+            "compile produced {} non-parse diagnostic(s): {codes}",
+            diagnostics.len()
+        ),
+    }
+}
+
+/// Maps an engine throw origin onto the Test262 negative type it names.
+///
+/// [`ThrowOrigin::Bytecode`] is a guest-thrown value; its constructor is not
+/// observable through the public runtime boundary, so there is no mapping.
+#[must_use]
+fn classify_thrown(origin: ThrowOrigin) -> Option<NegativeType> {
+    match origin {
+        ThrowOrigin::TypeError { .. } => Some(NegativeType::TypeError),
+        ThrowOrigin::RangeError { .. } => Some(NegativeType::RangeError),
+        ThrowOrigin::ReferenceError { .. } => Some(NegativeType::ReferenceError),
+        ThrowOrigin::UriError { .. } => Some(NegativeType::UriError),
+        ThrowOrigin::Bytecode => None,
+    }
+}
+
+/// Classifies an engine failure into a thrown runtime error or a block.
+fn observed_failure(error: &bamts_runtime::RuntimeError, deadline: Duration) -> RunOutcome {
+    match &error.kind {
+        RuntimeErrorKind::UncaughtThrow { origin, .. } => match classify_thrown(*origin) {
+            Some(error_type) => RunOutcome::Completed {
+                thrown: Some(ThrownError {
+                    phase: NegativePhase::Runtime,
+                    error_type,
+                }),
+            },
+            None => {
+                let site = error
+                    .source
+                    .function_name
+                    .as_ref()
+                    .map_or_else(|| "<anonymous>".to_owned(), |name| name.to_utf8_lossy());
+                RunOutcome::Blocked {
+                    detail: format!(
+                        "guest threw a value whose constructor is unobservable at this \
+                         boundary (throw site: {site})"
+                    ),
+                }
+            }
+        },
+        RuntimeErrorKind::FuelExhausted { .. } => RunOutcome::Blocked {
+            detail: format!("fuel exhausted within the {deadline:?} deadline"),
+        },
+        _ => RunOutcome::Blocked {
+            detail: format!("runtime failed without a throw: {error}"),
+        },
+    }
+}
+
+/// Converts a wall-clock deadline into deterministic interpreter fuel.
+///
+/// The interpreter has no preemption, so fuel checked at instruction
+/// boundaries is the deadline's deterministic proxy, matching the corpus
+/// runner's budget.
+#[must_use]
+fn interpreter_fuel(deadline: Duration) -> bamts_runtime::Limits {
+    const FUEL_PER_MILLISECOND: u64 = 10_000;
+    let milliseconds = u64::try_from(deadline.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    bamts_runtime::Limits {
+        fuel: milliseconds.saturating_mul(FUEL_PER_MILLISECOND),
+        ..bamts_runtime::Limits::default()
+    }
+}
+
+/// Observes `$DONE` markers in the captured host output.
+///
+/// `$DONE()` records a success; `$DONE(` followed by any other byte records
+/// an error. Every marker is stamped with the post-run elapsed time, and
+/// [`judge_done`] owns every ordering rule.
+#[must_use]
+fn observed_done_trace(
+    stdout: &[u8],
+    stderr: &[u8],
+    elapsed: Duration,
+    deadline: Duration,
+) -> AsyncTrace {
+    let mut events = Vec::new();
+    for stream in [stdout, stderr] {
+        let mut cursor = 0;
+        while let Some(found) = find_marker(&stream[cursor..], b"$DONE(") {
+            let at = cursor + found;
+            let kind = if stream.get(at + MARKER_OPEN.len()) == Some(&b')') {
+                DoneEventKind::Success
+            } else {
+                DoneEventKind::Error
+            };
+            events.push(DoneEvent { kind, at: elapsed });
+            cursor = at + MARKER_OPEN.len();
+        }
+    }
+    AsyncTrace {
+        events,
+        exited_at: Some(elapsed),
+        deadline,
+    }
+}
+
+/// The `$DONE(` invocation prefix in Test262 harness output.
+const MARKER_OPEN: &[u8] = b"$DONE(";
+
+fn find_marker(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::super::test262_harness::{FileHarnessLoader, load_harness_sources};
+
+    static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A unique per-test scratch directory for harness files and materialized
+    /// composed scripts.
+    fn runner_scratch(tag: &str) -> PathBuf {
+        let unique = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bamts-test262-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create runner scratch dir");
+        dir
+    }
+
+    fn write_harness(root: &Path, name: &str, contents: &str) {
+        fs::write(root.join(name), contents).expect("write harness include");
+    }
+
+    /// Minimal clean-room stand-ins for the canonical Test262 harness files:
+    /// enough of `assert`, `$ERROR`, `Test262Error`, and `$DONE` for these
+    /// fixtures, with none of the upstream bodies.
+    const ASSERT_JS: &str = "var assert;\n\
+(function () {\n\
+  assert = {\n\
+    sameValue: function (actual, expected, message) {\n\
+      if (actual !== expected) {\n\
+        $ERROR(message);\n\
+      }\n\
+    },\n\
+  };\n\
+})();\n";
+
+    const STA_JS: &str = "function Test262Error(message) {\n\
+  this.message = message;\n\
+}\n\
+function $ERROR(message) {\n\
+  throw new Test262Error(message);\n\
+}\n";
+
+    const DONEPRINT_JS: &str = "function $DONE(failure) {\n\
+  if (failure) {\n\
+    console.log('$DONE(' + String(failure) + ')');\n\
+  } else {\n\
+    console.log('$DONE()');\n\
+  }\n\
+}\n";
+
+    /// The production interpreter flow for one variant: compose, request,
+    /// run in-process, and judge. Returns the judge verdict.
+    fn run_variant(
+        runner: &InterpreterRunner,
+        parsed: &ParsedTest,
+        plan: &ExecutionPlan,
+        sources: &[HarnessSource],
+        variant: &ExecutionVariant,
+    ) -> Result<(), OracleError> {
+        let script = compose_script(parsed, plan, variant, sources)?;
+        let request = RunRequest {
+            mode: ExecutionMode::Interpreter,
+            variant: variant.clone(),
+            script,
+            negative: plan.negative.clone(),
+            async_done: plan.async_done,
+            deadline: DEFAULT_ASYNC_DEADLINE,
+        };
+        let outcome = runner.run(&request);
+        judge_run(&request, &outcome)
+    }
 
     fn wrap(yaml: &str, body: &str) -> String {
         format!("{FRONTMATTER_OPEN}\n{yaml}\n{FRONTMATTER_CLOSE}\n{body}")
@@ -1087,6 +1494,174 @@ pub mod tests {
                 assert_eq!(failure.mode, ExecutionMode::Jit);
             }
             other => panic!("JIT failure must be recorded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpreter_runner_passes_positive_same_value_fixture() {
+        let harness = runner_scratch("pos-harness");
+        let scratch = runner_scratch("pos-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: assert.sameValue passes on identical primitives",
+            "assert.sameValue(1, 1, 'one is one');",
+        );
+        let parsed = parse_test(&source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+
+        // Strict frontmatter is preserved: the strict variant still composes
+        // the directive directly before the test body.
+        assert_eq!(plan.variants.len(), 2);
+        let strict = compose_script(&parsed, &plan, &plan.variants[1], &sources).unwrap();
+        assert_eq!(strict.kind, SourceKind::ScriptStrict);
+        assert_eq!(
+            &strict.bytes[strict.test_offset - STRICT_PREFIX.len()..strict.test_offset],
+            STRICT_PREFIX.as_bytes()
+        );
+
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
+        }
+    }
+
+    #[test]
+    fn interpreter_runner_judges_runtime_reference_error_fixture() {
+        let harness = runner_scratch("neg-runtime-harness");
+        let scratch = runner_scratch("neg-runtime-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: unresolvable reference throws\n\
+             negative:\n  phase: runtime\n  type: ReferenceError",
+            "unresolvableReference;",
+        );
+        let parsed = parse_test(&source).unwrap();
+        assert_eq!(
+            parsed.frontmatter.negative,
+            Some(Negative {
+                phase: NegativePhase::Runtime,
+                error_type: NegativeType::ReferenceError,
+            })
+        );
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
+        }
+    }
+
+    #[test]
+    fn interpreter_runner_judges_parse_syntax_error_fixture() {
+        let harness = runner_scratch("neg-parse-harness");
+        let scratch = runner_scratch("neg-parse-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: a numeric literal is not a binding target\n\
+             negative:\n  phase: parse\n  type: SyntaxError",
+            "var 1 = 1;",
+        );
+        let parsed = parse_test(&source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            let script = compose_script(&parsed, &plan, variant, &sources).unwrap();
+            assert!(script.untouched, "early negatives compose untouched");
+            run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
+        }
+    }
+
+    #[test]
+    fn interpreter_runner_judges_async_done_fixture() {
+        let harness = runner_scratch("async-harness");
+        let scratch = runner_scratch("async-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        write_harness(&harness, "doneprintHandle.js", DONEPRINT_JS);
+        let source = wrap(
+            "description: an async test completes through $DONE\nflags: [async]",
+            "$DONE();",
+        );
+        let parsed = parse_test(&source).unwrap();
+        assert!(parsed.frontmatter.has(Flag::Async));
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
+        }
+    }
+
+    #[test]
+    fn unobservable_guest_throws_block_the_run() {
+        let harness = runner_scratch("guest-harness");
+        let scratch = runner_scratch("guest-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: a guest throw carries no observable type",
+            "throw new Test262Error('unmatched');",
+        );
+        let parsed = parse_test(&source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            let result = run_variant(&runner, &parsed, &plan, &sources, variant);
+            assert!(
+                matches!(result, Err(OracleError::BlockedRun { .. })),
+                "a guest throw must block, never pass or mismatch: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fuel_exhaustion_blocks_the_run() {
+        let harness = runner_scratch("fuel-harness");
+        let scratch = runner_scratch("fuel-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: an endless loop never completes",
+            "for (;;) {}",
+        );
+        let parsed = parse_test(&source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            let script = compose_script(&parsed, &plan, variant, &sources).unwrap();
+            let request = RunRequest {
+                mode: ExecutionMode::Interpreter,
+                variant: variant.clone(),
+                script,
+                negative: plan.negative.clone(),
+                async_done: plan.async_done,
+                deadline: Duration::from_millis(1),
+            };
+            let outcome = runner.run(&request);
+            assert!(matches!(
+                judge_run(&request, &outcome),
+                Err(OracleError::BlockedRun { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn native_backends_report_typed_blocks() {
+        let scratch = runner_scratch("blocked-scratch");
+        for (mode, blocked) in [
+            (ExecutionMode::Jit, BlockedBackend::Jit),
+            (ExecutionMode::Aot, BlockedBackend::Aot),
+        ] {
+            assert_eq!(backend_runner(mode, &scratch).unwrap_err(), blocked);
+            assert_eq!(blocked.mode(), mode);
+            assert!(!blocked.reason().is_empty());
         }
     }
 }

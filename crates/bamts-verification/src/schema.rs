@@ -17,19 +17,20 @@ pub const SET_PREVIEW_LIMIT: usize = 16;
 
 pub const TYPESCRIPT_RELEASE: &str = "typescript-7.0.2";
 pub const TYPESCRIPT_VERSION: &str = "7.0.2";
-pub const TYPESCRIPT_COMMIT: &str = "1e4744d68260a7cb91b62b12edc3f6a2187faaf1";
+pub const TYPESCRIPT_NPM_SOURCE: &str = "typescript-primary";
+pub const TYPESCRIPT_COMPILER_SOURCE: &str = "typescript-7-compiler";
+pub const TYPESCRIPT_SUITE_SOURCE: &str = "typescript-primary-tests";
 pub const TYPESCRIPT_NPM_INTEGRITY: &str =
     "8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==";
-pub const PRIMARY_SOURCE: &str = "typescript-primary";
-pub const PRIMARY_TESTS_SOURCE: &str = "typescript-primary-tests";
 pub const COMPAT_SOURCE: &str = "typescript-compat";
 pub const COMPAT_TESTS_SOURCE: &str = "typescript-compat-tests";
 pub const LEGACY_SOURCE: &str = "typescript-6.0";
 pub const LEGACY_TESTS_SOURCE: &str = "typescript-6.0-tests";
 
-pub const SOURCE_NAMES: [&str; 26] = [
+pub const SOURCE_NAMES: [&str; 27] = [
     "rust",
     "typescript-primary",
+    "typescript-7-compiler",
     "typescript-6.0",
     "typescript-compat",
     "node-source",
@@ -448,7 +449,7 @@ pub fn required_source<'a>(
 
 pub fn upstream_source_name(catalog_id: &str) -> Option<&'static str> {
     match catalog_id {
-        "typescript-7.0.2" => Some("typescript-primary-tests"),
+        "typescript-7.0.2" => Some(TYPESCRIPT_SUITE_SOURCE),
         "typescript-6.0.2" => Some("typescript-6.0-tests"),
         "typescript-5.9.3" => Some("typescript-compat-tests"),
         "test262" => Some("test262"),

@@ -492,6 +492,12 @@
       "evidence": "Circular type alias -> TS2456 via tsc --noEmit on \"type A = A;\".",
       "status": "mapped",
       "tsCode": 2456
+    },
+    {
+      "bamtsCode": "BAMTS-C080",
+      "evidence": "Parameter property outside a constructor implementation -> TS2369 via tsc --noEmit on \"var v = (public x: string) => { };\".",
+      "status": "mapped",
+      "tsCode": 2369
     }
   ]
 }

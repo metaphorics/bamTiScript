@@ -17,7 +17,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use toml::Table;
 
-use crate::{ErrorCode, Result, VerificationError};
+use crate::{
+    ErrorCode, Result, VerificationError,
+    schema::{TYPESCRIPT_COMPILER_SOURCE, TYPESCRIPT_NPM_SOURCE, TYPESCRIPT_SUITE_SOURCE},
+};
 
 /// Exact npm package name.
 pub const NPM_NAME: &str = "typescript";
@@ -69,9 +72,9 @@ const PACKAGE_JSON_PATH: &str = "package.json";
 const PACKAGE_LOCK_PATH: &str = "package-lock.json";
 const TYPESCRIPT_PACKAGE_PATH: &str = "node_modules/typescript/package.json";
 const LOCK_PACKAGE_KEY: &str = "node_modules/typescript";
-const SOURCE_NPM: &str = "typescript-7-npm";
-const SOURCE_COMPILER: &str = "typescript-7-compiler";
-const SOURCE_SUITE: &str = "typescript-7-suite";
+const SOURCE_NPM: &str = TYPESCRIPT_NPM_SOURCE;
+const SOURCE_COMPILER: &str = TYPESCRIPT_COMPILER_SOURCE;
+const SOURCE_SUITE: &str = TYPESCRIPT_SUITE_SOURCE;
 const SOURCE_KIND_NPM: &str = "npm";
 const SOURCE_KIND_GIT_ARCHIVE: &str = "git-archive";
 
@@ -1091,6 +1094,15 @@ commit = "{suite_commit}"
 
         let pins = verify_oracle_pins(directory.path()).expect("matching pins");
         assert_eq!(pins, OraclePins::expected());
+    }
+
+    #[test]
+    fn workspace_vendor_records_match_release_oracle() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(
+            verify_oracle_pins(&root).expect("workspace source records match release oracle"),
+            OraclePins::expected()
+        );
     }
 
     #[test]

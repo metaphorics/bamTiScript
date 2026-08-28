@@ -19,13 +19,14 @@ bamts-compiler.workspace = true
 bamts-native.workspace = true
 bamts-node = { workspace = true, features = ["script-compiler"] }
 bamts-runtime.workspace = true
-libc.workspace = true
+libc = "=0.2.189"
 anyhow = "=1.0.104"
 quint-connect = "=0.1.2"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde-saphyr = "=1.1.0"
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
+getrandom = "=0.3.4"
 toml = "=0.9.12"
 
 [lints.rust]
@@ -47,3 +48,7 @@ path = "src/bin/perf_budget.rs"
 [[bin]]
 name = "bh1_jit"
 path = "src/bin/bh1_jit.rs"
+
+[[bin]]
+name = "ts_lane_worker"
+path = "src/bin/ts_lane_worker.rs"

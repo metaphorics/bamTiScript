@@ -12,6 +12,7 @@ pub mod formal_bridge;
 pub mod formal_gates;
 pub mod jit_runner;
 pub mod lane;
+pub mod leaf_evidence;
 pub mod ledger;
 #[path = "../../../formal/ledger_wiring.rs"]
 pub mod ledger_wiring;

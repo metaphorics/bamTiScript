@@ -51,7 +51,7 @@ pub const DIAGNOSTIC_CODE_MAP_PATH: &str = "verification/diagnostic-code-map.jso
 pub const DIAGNOSTIC_CODE_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Every current BAMTS diagnostic code the map must cover exactly once.
-pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 81] = [
+pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 82] = [
     "BAMTS-L001",
     "BAMTS-L002",
     "BAMTS-L003",
@@ -133,6 +133,7 @@ pub const REQUIRED_BAMTS_DIAGNOSTIC_CODES: [&str; 81] = [
     "BAMTS-C070",
     "BAMTS-C071",
     "BAMTS-C072",
+    "BAMTS-C080",
 ];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FacetVerdict {
@@ -564,6 +565,23 @@ pub fn compare_symbols(expected: &str, actual: &str) -> FacetVerdict {
 /// AST. A baseline that does not parse without recovery can never pass.
 pub fn compare_dts(expected: &str, actual: &str) -> FacetVerdict {
     compare_structural("d.ts", expected, actual, canonicalize_dts)
+}
+
+/// Line-wise comparator for `.js` emit baselines.
+///
+/// Newlines are normalized to `\n` and trailing spaces are stripped. Marker
+/// order and code text stay source-order; emit is not a declaration set.
+pub fn compare_js_emit(expected: &str, actual: &str) -> FacetVerdict {
+    compare_structural("javascript", expected, actual, canonicalize_js_emit)
+}
+
+fn canonicalize_js_emit(text: &str) -> Result<Vec<String>, ()> {
+    Ok(text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(|line| line.trim_end().to_owned())
+        .collect())
 }
 
 fn compare_structural(

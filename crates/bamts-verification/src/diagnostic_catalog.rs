@@ -420,9 +420,7 @@ mod tests {
             }
         }
     }
-}
-
-"###;
+}"###;
 
 fn category_to_rust(category: &str) -> &'static str {
     match category {
@@ -513,6 +511,7 @@ pub fn generate(json_path: &Path, source_label: &str) -> Result<String, CatalogE
     out = out.replace("__SOURCE__", source_label);
     out = out.replace("__CATALOG_LEN__", &entries.len().to_string());
     out = out.replace("__CATALOG__", &catalog);
+    out.push('\n');
     Ok(out)
 }
 
@@ -582,7 +581,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bamts_catalog_shape_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let json = dir.join("diagnosticMessages.json");
-        let generated = dir.join("diagnostic_messages.rs");
         fs::write(&json, fixture()).unwrap();
         let label = json.to_string_lossy().into_owned();
         let output = generate(&json, &label).unwrap();

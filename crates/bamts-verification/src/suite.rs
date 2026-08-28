@@ -25,15 +25,20 @@ use bamts_compiler::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::catalog::{self, ObservableKind};
+use crate::check_cells::{self, CasePragmas, CheckContext};
 use crate::corpus::{
-    ArtifactDirectory, CaseSpec, DigestAlgorithm, ExecutionMode, NODE_VERSION, OracleLimits,
-    Provenance, bounded_output, cli_args, drain_stream, normalized_env, run_process,
+    ArtifactDirectory, CaseSpec, DigestAlgorithm, ExecutionMode as CorpusExecutionMode,
+    NODE_VERSION, OracleLimits, Provenance, bounded_output, cli_args, drain_stream, normalized_env,
+    run_process,
 };
+use crate::lane::{LaneBinding, LaneOutcome, LaneRequest};
 use crate::oracle_pins::{
     COMPILER_COMMIT, COMPILER_DIGEST, COMPILER_REPOSITORY, COMPILER_TAG, COMPILER_URL,
     NPM_INTEGRITY, NPM_SPECIFIER, OraclePins, SUITE_COMMIT, SUITE_DIGEST, SUITE_REPOSITORY,
     SUITE_URL, verify_oracle_pins,
 };
+use crate::shard::ExecutionMode;
 use crate::ts_ledger::{
     Backend, CompilerOracle, Confidence, Entry, EvidenceRecord, Facet, LEDGER_SCHEMA_VERSION,
     NpmOracle, Oracle, Partition, ReasonCode, SUITE_BASELINE_ROOT, SUITE_CASE_ROOT, Snapshot,
@@ -269,10 +274,65 @@ pub struct SuiteSnapshot {
     pub ledger: TsLedger,
 }
 
+/// Authenticated metadata required by the exact compiler worker.
+///
+/// Unlike [`SuiteSnapshot`], this view deliberately carries no parsed ledger:
+/// the parent already verified the full snapshot before issuing the binding,
+/// while the worker authenticates those same raw metadata bytes before parsing
+/// only the pin and index it consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilerSnapshot {
+    pub root: PathBuf,
+    pub metadata_digest: String,
+    pub index: SuiteIndex,
+}
+
+/// Read-only snapshot metadata needed to select and authenticate one asset.
+pub trait SnapshotAssets {
+    fn root(&self) -> &Path;
+    fn index(&self) -> &SuiteIndex;
+}
+
+impl SnapshotAssets for SuiteSnapshot {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn index(&self) -> &SuiteIndex {
+        &self.index
+    }
+}
+
+impl SnapshotAssets for CompilerSnapshot {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn index(&self) -> &SuiteIndex {
+        &self.index
+    }
+}
+
 /// Snapshot that passed digest re-verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSuite {
     pub snapshot: SuiteSnapshot,
+    pin_bytes: Vec<u8>,
+    index_bytes: Vec<u8>,
+    ledger_bytes: Vec<u8>,
+}
+
+impl VerifiedSuite {
+    /// Bind a parent-issued run identity to the exact retained metadata bytes.
+    pub fn bind_compiler_lane(&self, run: LaneBinding) -> Result<LaneBinding> {
+        run.with_snapshot(
+            COMPILER_CATALOG,
+            &self.snapshot.root,
+            &self.pin_bytes,
+            &self.index_bytes,
+            &self.ledger_bytes,
+        )
+    }
 }
 
 /// A materialized suite asset (type exported for `walk_extracted_tree`).
@@ -708,8 +768,7 @@ fn execute_parse_check(
     plan: &PlannedCell,
     index_entry: &IndexEntry,
 ) -> Result<CellResult> {
-    let blob = snapshot.root.join("cases").join(&index_entry.sha256);
-    let bytes = match fs::read(&blob) {
+    let bytes = match read_verified_asset(snapshot, &index_entry.logical_path) {
         Ok(bytes) => bytes,
         Err(error) => {
             return Ok(CellResult {
@@ -717,7 +776,7 @@ fn execute_parse_check(
                 facet: plan.entry.facet,
                 backend: plan.backend,
                 class: FailureClass::HarnessError,
-                detail: format!("cannot read case blob `{}`: {error}", blob.display()),
+                detail: error.to_string(),
             });
         }
     };
@@ -967,9 +1026,9 @@ fn execute_process_cell(
     };
 
     let mode = match plan.backend {
-        Backend::Interpreter => ExecutionMode::Interpreter,
-        Backend::Jit => ExecutionMode::Jit,
-        Backend::Aot => ExecutionMode::Aot,
+        Backend::Interpreter => CorpusExecutionMode::Interpreter,
+        Backend::Jit => CorpusExecutionMode::Jit,
+        Backend::Aot => CorpusExecutionMode::Aot,
         Backend::Check => {
             return Err(VerificationError::new(
                 ErrorCode::Usage,
@@ -978,7 +1037,7 @@ fn execute_process_cell(
         }
     };
 
-    if matches!(mode, ExecutionMode::Aot) {
+    if matches!(mode, CorpusExecutionMode::Aot) {
         let spec = scratch_case_spec(&plan.entry.id);
         let artifacts = ArtifactDirectory::create(snapshot_root, &spec, mode)?;
         enforce_aot_scratch_cap(&artifacts.0)?;
@@ -1952,15 +2011,12 @@ fn status_name(status: Status) -> &'static str {
 
 /// Re-verify blob digests and `snapshot.sha256`.
 pub fn verify_snapshot(snapshot_root: &Path) -> Result<VerifiedSuite> {
-    let pin_bytes = fs::read(snapshot_root.join("oracle/pin.json"))
-        .map_err(|e| io_err(&snapshot_root.join("oracle/pin.json"), &e))?;
-    let index_bytes = fs::read(snapshot_root.join("index.json"))
-        .map_err(|e| io_err(&snapshot_root.join("index.json"), &e))?;
-    let ledger_bytes = fs::read(snapshot_root.join("ledger.json"))
-        .map_err(|e| io_err(&snapshot_root.join("ledger.json"), &e))?;
+    let snapshot_root =
+        fs::canonicalize(snapshot_root).map_err(|error| io_err(snapshot_root, &error))?;
+    let (pin_bytes, index_bytes, ledger_bytes) = read_snapshot_metadata_bytes(&snapshot_root)?;
     let expected = sha256_hex_concat(&[&pin_bytes, &index_bytes, &ledger_bytes]);
     let recorded = fs::read_to_string(snapshot_root.join("snapshot.sha256"))
-        .map_err(|e| io_err(&snapshot_root.join("snapshot.sha256"), &e))?;
+        .map_err(|error| io_err(&snapshot_root.join("snapshot.sha256"), &error))?;
     let recorded = recorded.trim();
     if recorded != expected {
         return Err(VerificationError::new(
@@ -1969,41 +2025,175 @@ pub fn verify_snapshot(snapshot_root: &Path) -> Result<VerifiedSuite> {
         ));
     }
 
-    let index: SuiteIndex = serde_json::from_slice(&index_bytes)
-        .map_err(|e| VerificationError::new(ErrorCode::Json, format!("index.json: {e}")))?;
+    let (index, ledger) = parse_snapshot_metadata(&pin_bytes, &index_bytes, &ledger_bytes)?;
     for entry in index.entries.values() {
-        let dir = match entry.asset_kind {
-            AssetKind::CaseInput => snapshot_root.join("cases"),
-            AssetKind::BaselineFacet | AssetKind::DifferenceRecord => {
-                snapshot_root.join("baselines")
-            }
-            AssetKind::LicenseNotice => continue,
-        };
-        let path = dir.join(&entry.sha256);
-        let bytes = fs::read(&path).map_err(|e| io_err(&path, &e))?;
-        let actual = sha256_hex(&bytes);
-        if actual != entry.sha256 {
-            return Err(VerificationError::new(
-                ErrorCode::Digest,
-                format!(
-                    "blob digest mismatch for `{}`: index `{}`, actual `{actual}`",
-                    entry.logical_path, entry.sha256
-                ),
-            ));
+        if matches!(entry.asset_kind, AssetKind::LicenseNotice) {
+            continue;
         }
+        let _ = read_verified_index_entry(&snapshot_root, entry)?;
     }
-
-    verify_pin_document_bytes(&pin_bytes)?;
-    let ledger = TsLedgerReader::from_slice(&ledger_bytes)?;
 
     Ok(VerifiedSuite {
         snapshot: SuiteSnapshot {
-            root: snapshot_root.to_path_buf(),
+            root: snapshot_root,
             digest: expected,
             index,
             ledger,
         },
+        pin_bytes,
+        index_bytes,
+        ledger_bytes,
     })
+}
+
+/// Load a compiler snapshot from retained metadata only. Never walks the blob tree.
+pub fn load_bound_compiler_snapshot(
+    snapshot_root: &Path,
+    binding: &LaneBinding,
+) -> Result<CompilerSnapshot> {
+    binding.validate()?;
+    if !binding.has_snapshot() {
+        return Err(VerificationError::new(
+            ErrorCode::Schema,
+            "compiler worker request is missing snapshot binding",
+        ));
+    }
+    let snapshot_root =
+        fs::canonicalize(snapshot_root).map_err(|error| io_err(snapshot_root, &error))?;
+    let (pin_bytes, index_bytes, ledger_bytes) = read_snapshot_metadata_bytes(&snapshot_root)?;
+    binding.verify_snapshot(
+        COMPILER_CATALOG,
+        &snapshot_root,
+        &pin_bytes,
+        &index_bytes,
+        &ledger_bytes,
+    )?;
+    verify_pin_document_bytes(&pin_bytes)?;
+    let index: SuiteIndex = serde_json::from_slice(&index_bytes)
+        .map_err(|error| VerificationError::new(ErrorCode::Json, format!("index.json: {error}")))?;
+    validate_suite_index(&index)?;
+    Ok(CompilerSnapshot {
+        root: snapshot_root,
+        metadata_digest: sha256_hex_concat(&[&pin_bytes, &index_bytes, &ledger_bytes]),
+        index,
+    })
+}
+
+/// Read one selected snapshot asset once and consume only those digest-checked bytes.
+pub fn read_verified_asset(snapshot: &SuiteSnapshot, logical_path: &str) -> Result<Vec<u8>> {
+    read_verified_snapshot_asset(snapshot, logical_path)
+}
+
+pub(crate) fn read_verified_snapshot_asset(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    logical_path: &str,
+) -> Result<Vec<u8>> {
+    if !is_safe_logical_path(logical_path) {
+        return Err(VerificationError::new(
+            ErrorCode::Schema,
+            format!("unsafe snapshot logical path `{logical_path}`"),
+        ));
+    }
+    let entry = snapshot.index().entries.get(logical_path).ok_or_else(|| {
+        VerificationError::new(
+            ErrorCode::Schema,
+            format!("snapshot has no asset `{logical_path}`"),
+        )
+    })?;
+    if entry.logical_path != logical_path {
+        return Err(VerificationError::new(
+            ErrorCode::Schema,
+            format!(
+                "index key `{logical_path}` does not match entry path `{}`",
+                entry.logical_path
+            ),
+        ));
+    }
+    read_verified_index_entry(snapshot.root(), entry)
+}
+
+fn read_snapshot_metadata_bytes(snapshot_root: &Path) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let pin_path = snapshot_root.join("oracle/pin.json");
+    let index_path = snapshot_root.join("index.json");
+    let ledger_path = snapshot_root.join("ledger.json");
+    let pin_bytes = fs::read(&pin_path).map_err(|error| io_err(&pin_path, &error))?;
+    let index_bytes = fs::read(&index_path).map_err(|error| io_err(&index_path, &error))?;
+    let ledger_bytes = fs::read(&ledger_path).map_err(|error| io_err(&ledger_path, &error))?;
+    Ok((pin_bytes, index_bytes, ledger_bytes))
+}
+
+fn parse_snapshot_metadata(
+    pin_bytes: &[u8],
+    index_bytes: &[u8],
+    ledger_bytes: &[u8],
+) -> Result<(SuiteIndex, crate::ts_ledger::TsLedger)> {
+    verify_pin_document_bytes(pin_bytes)?;
+    let index: SuiteIndex = serde_json::from_slice(index_bytes)
+        .map_err(|error| VerificationError::new(ErrorCode::Json, format!("index.json: {error}")))?;
+    validate_suite_index(&index)?;
+    let ledger = TsLedgerReader::from_slice(ledger_bytes)?;
+    Ok((index, ledger))
+}
+
+fn validate_suite_index(index: &SuiteIndex) -> Result<()> {
+    for (path, entry) in &index.entries {
+        if path != &entry.logical_path {
+            return Err(VerificationError::new(
+                ErrorCode::Schema,
+                format!(
+                    "index key `{path}` does not match entry path `{}`",
+                    entry.logical_path
+                ),
+            ));
+        }
+        if !is_safe_logical_path(path) {
+            return Err(VerificationError::new(
+                ErrorCode::Schema,
+                format!("unsafe snapshot logical path `{path}`"),
+            ));
+        }
+        crate::shard::require_sha256("index entry digest", &entry.sha256)?;
+    }
+    Ok(())
+}
+
+fn read_verified_index_entry(snapshot_root: &Path, entry: &IndexEntry) -> Result<Vec<u8>> {
+    crate::shard::require_sha256("index entry digest", &entry.sha256)?;
+    if entry.sha256.contains('/') || entry.sha256.contains('\\') {
+        return Err(VerificationError::new(
+            ErrorCode::Schema,
+            format!(
+                "index digest for `{}` is not a path-safe blob name",
+                entry.logical_path
+            ),
+        ));
+    }
+    let dir = match entry.asset_kind {
+        AssetKind::CaseInput => snapshot_root.join("cases"),
+        AssetKind::BaselineFacet | AssetKind::DifferenceRecord => snapshot_root.join("baselines"),
+        AssetKind::LicenseNotice => {
+            return Err(VerificationError::new(
+                ErrorCode::Schema,
+                format!(
+                    "license asset `{}` is not a case or baseline blob",
+                    entry.logical_path
+                ),
+            ));
+        }
+    };
+    let path = dir.join(&entry.sha256);
+    let bytes = fs::read(&path).map_err(|error| io_err(&path, &error))?;
+    let actual = sha256_hex(&bytes);
+    if actual != entry.sha256 {
+        return Err(VerificationError::new(
+            ErrorCode::Digest,
+            format!(
+                "blob digest mismatch for `{}`: index `{}`, actual `{actual}`",
+                entry.logical_path, entry.sha256
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn verify_pin_document(path: &Path) -> Result<()> {
@@ -2411,6 +2601,361 @@ pub fn materialize_from_extracted(
     })
 }
 
+const COMPILER_CATALOG: &str = "typescript-7.0.2";
+
+/// Exact compiler-lane observation of one catalog key through BamTS check cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilerLaneObservation {
+    pub snapshot_input: String,
+    pub variant: String,
+    pub observable: String,
+    pub selected_options: BTreeMap<String, String>,
+    pub class: FailureClass,
+    pub detail: String,
+    pub artifacts: BTreeMap<String, String>,
+}
+
+impl CompilerLaneObservation {
+    fn blocking(
+        snapshot_input: impl Into<String>,
+        variant: impl Into<String>,
+        observable: impl Into<String>,
+        selected_options: BTreeMap<String, String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            snapshot_input: snapshot_input.into(),
+            variant: variant.into(),
+            observable: observable.into(),
+            selected_options,
+            class: FailureClass::HarnessError,
+            detail: detail.into(),
+            artifacts: BTreeMap::new(),
+        }
+    }
+
+    /// Bind this observation to the lane protocol. Only an observed pass becomes
+    /// [`LaneOutcome::Completed`].
+    #[must_use]
+    pub fn lane_outcome(&self) -> LaneOutcome {
+        if self.class == FailureClass::Pass {
+            LaneOutcome::Completed {
+                artifacts: self.artifacts.clone(),
+            }
+        } else {
+            LaneOutcome::BlockingFail {
+                detail: self.detail.clone(),
+            }
+        }
+    }
+}
+
+/// Map one TypeScript compiler lane request onto exactly one BamTS check cell.
+///
+/// Catalog, case prefix, `<variant>#<observable>` configuration, and the
+/// declared observable singleton are validated independently. Status, slice,
+/// and backend filters are not consulted. Every unmappable component or
+/// comparator non-pass stays a closed non-pass.
+pub fn observe_compiler_lane(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    ctx: &CheckContext,
+    request: &LaneRequest,
+) -> CompilerLaneObservation {
+    let key = request.key();
+    if !request.binding().has_snapshot() {
+        return CompilerLaneObservation::blocking(
+            "",
+            "",
+            "",
+            BTreeMap::new(),
+            "compiler lane request is missing snapshot binding",
+        );
+    }
+    if request.binding().snapshot_catalog() != Some(COMPILER_CATALOG) {
+        return CompilerLaneObservation::blocking(
+            "",
+            "",
+            "",
+            BTreeMap::new(),
+            "compiler snapshot binding catalog does not match typescript-7.0.2",
+        );
+    }
+    let snapshot_root = snapshot.root().to_str().unwrap_or_default();
+    if request.binding().snapshot_root() != Some(snapshot_root) {
+        return CompilerLaneObservation::blocking(
+            "",
+            "",
+            "",
+            BTreeMap::new(),
+            "compiler snapshot binding root does not match loaded snapshot",
+        );
+    }
+    if key.catalog() != COMPILER_CATALOG {
+        return CompilerLaneObservation::blocking(
+            "",
+            "",
+            "",
+            BTreeMap::new(),
+            format!("catalog `{}` is not `{COMPILER_CATALOG}`", key.catalog()),
+        );
+    }
+    if key.mode() != ExecutionMode::Aot {
+        return CompilerLaneObservation::blocking(
+            "",
+            "",
+            "",
+            BTreeMap::new(),
+            format!("compiler lane does not bind mode `{}`", key.mode().as_str()),
+        );
+    }
+    let Some(snapshot_input) = compiler_snapshot_input(key.case()) else {
+        return CompilerLaneObservation::blocking(
+            "",
+            "",
+            "",
+            BTreeMap::new(),
+            format!(
+                "case `{}` is not a compiler/ or conformance/ tests/cases path",
+                key.case()
+            ),
+        );
+    };
+    let Some((variant, observable)) = split_configuration(key.configuration()) else {
+        return CompilerLaneObservation::blocking(
+            snapshot_input,
+            "",
+            "",
+            BTreeMap::new(),
+            format!(
+                "configuration `{}` is not `<variant>#<observable>`",
+                key.configuration()
+            ),
+        );
+    };
+    let declared = request.observables();
+    let expected = BTreeSet::from([observable.to_owned()]);
+    if declared != &expected {
+        return CompilerLaneObservation::blocking(
+            snapshot_input,
+            variant,
+            observable,
+            BTreeMap::new(),
+            format!(
+                "declared observables {declared:?} do not equal configuration observable `{observable}`"
+            ),
+        );
+    }
+    let Some(kind) = observable_kind(observable) else {
+        return CompilerLaneObservation::blocking(
+            snapshot_input,
+            variant,
+            observable,
+            BTreeMap::new(),
+            format!("unknown compiler observable `{observable}`"),
+        );
+    };
+    let Some(index_entry) = snapshot.index().entries.get(snapshot_input) else {
+        return CompilerLaneObservation::blocking(
+            snapshot_input,
+            variant,
+            observable,
+            BTreeMap::new(),
+            format!("snapshot has no case input `{snapshot_input}`"),
+        );
+    };
+    let text = match read_snapshot_case(snapshot, index_entry) {
+        Ok(text) => text,
+        Err(error) => {
+            return CompilerLaneObservation::blocking(
+                snapshot_input,
+                variant,
+                observable,
+                BTreeMap::new(),
+                error.to_string(),
+            );
+        }
+    };
+    let configurations = match catalog::parse_case_configuration(&text) {
+        Ok(configurations) => configurations,
+        Err(error) => {
+            return CompilerLaneObservation::blocking(
+                snapshot_input,
+                variant,
+                observable,
+                BTreeMap::new(),
+                error.to_string(),
+            );
+        }
+    };
+    let Some(configuration) = configurations.iter().find(|item| item.name == variant) else {
+        return CompilerLaneObservation::blocking(
+            snapshot_input,
+            variant,
+            observable,
+            BTreeMap::new(),
+            format!("case `{snapshot_input}` has no configuration `{variant}`"),
+        );
+    };
+    if !configuration.observables.contains(&kind) {
+        return CompilerLaneObservation::blocking(
+            snapshot_input,
+            variant,
+            observable,
+            configuration.options.clone(),
+            format!("configuration `{variant}` does not declare observable `{observable}`"),
+        );
+    }
+    let selected_options = configuration.options.clone();
+    let pragmas = CasePragmas::from_configuration(configuration);
+    let check = match kind {
+        ObservableKind::Diagnostics => {
+            check_cells::observe_diagnostics(ctx, snapshot, index_entry, &text, &pragmas)
+        }
+        ObservableKind::Types => {
+            check_cells::observe_types(snapshot, &ctx.baseline_groups, index_entry, &text, &pragmas)
+        }
+        ObservableKind::Symbols => check_cells::observe_symbols(
+            snapshot,
+            &ctx.baseline_groups,
+            index_entry,
+            &text,
+            &pragmas,
+        ),
+        ObservableKind::JavaScript => check_cells::observe_javascript(
+            snapshot,
+            &ctx.baseline_groups,
+            index_entry,
+            &text,
+            &pragmas,
+        ),
+        other => {
+            return CompilerLaneObservation::blocking(
+                snapshot_input,
+                variant,
+                observable,
+                selected_options,
+                format!(
+                    "no BamTS check-cell comparator for observable `{}`",
+                    other.as_str()
+                ),
+            );
+        }
+    };
+    bind_compiler_observation(
+        snapshot_input,
+        variant,
+        observable,
+        selected_options,
+        declared,
+        check,
+    )
+}
+
+fn bind_compiler_observation(
+    snapshot_input: &str,
+    variant: &str,
+    observable: &str,
+    selected_options: BTreeMap<String, String>,
+    declared: &BTreeSet<String>,
+    check: check_cells::CompilerCheckObservation,
+) -> CompilerLaneObservation {
+    if check.class == FailureClass::Pass {
+        let Some(bytes) = check.artifact else {
+            return CompilerLaneObservation::blocking(
+                snapshot_input,
+                variant,
+                observable,
+                selected_options,
+                "pass observation produced no artifact",
+            );
+        };
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert(observable.to_owned(), sha256_hex(&bytes));
+        let observed: BTreeSet<String> = artifacts.keys().cloned().collect();
+        if &observed != declared {
+            return CompilerLaneObservation::blocking(
+                snapshot_input,
+                variant,
+                observable,
+                selected_options,
+                format!("observable set mismatch: declared {declared:?}, observed {observed:?}"),
+            );
+        }
+        return CompilerLaneObservation {
+            snapshot_input: snapshot_input.to_owned(),
+            variant: variant.to_owned(),
+            observable: observable.to_owned(),
+            selected_options,
+            class: FailureClass::Pass,
+            detail: check.detail,
+            artifacts,
+        };
+    }
+    CompilerLaneObservation {
+        snapshot_input: snapshot_input.to_owned(),
+        variant: variant.to_owned(),
+        observable: observable.to_owned(),
+        selected_options,
+        class: check.class,
+        detail: check.detail,
+        artifacts: BTreeMap::new(),
+    }
+}
+
+fn compiler_snapshot_input(case: &str) -> Option<&str> {
+    let input = case
+        .strip_prefix("compiler/")
+        .or_else(|| case.strip_prefix("conformance/"))?;
+    if !input.starts_with("tests/cases/") {
+        return None;
+    }
+    if !is_safe_logical_path(input) {
+        return None;
+    }
+    Some(input)
+}
+
+fn is_safe_logical_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn split_configuration(configuration: &str) -> Option<(&str, &str)> {
+    let (variant, observable) = configuration.split_once('#')?;
+    if variant.is_empty() || observable.is_empty() || observable.contains('#') {
+        None
+    } else {
+        Some((variant, observable))
+    }
+}
+
+fn observable_kind(name: &str) -> Option<ObservableKind> {
+    match name {
+        "parse" => Some(ObservableKind::Parse),
+        "diagnostics" => Some(ObservableKind::Diagnostics),
+        "javascript" => Some(ObservableKind::JavaScript),
+        "declaration" => Some(ObservableKind::Declaration),
+        "source-map" => Some(ObservableKind::SourceMap),
+        "trace" => Some(ObservableKind::Trace),
+        "build-info" => Some(ObservableKind::BuildInfo),
+        "types" => Some(ObservableKind::Types),
+        "symbols" => Some(ObservableKind::Symbols),
+        "runtime" => Some(ObservableKind::Runtime),
+        _ => None,
+    }
+}
+
+fn read_snapshot_case(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+) -> Result<String> {
+    let bytes = read_verified_snapshot_asset(snapshot, &index_entry.logical_path)?;
+    Ok(decode_case_source(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2627,7 +3172,8 @@ mod tests {
     fn aot_scratch_over_1gib_fails_and_cleans_up() {
         let root = TestDir::new("aot-root");
         let spec = scratch_case_spec("scratch_case");
-        let artifacts = ArtifactDirectory::create(root.path(), &spec, ExecutionMode::Aot).unwrap();
+        let artifacts =
+            ArtifactDirectory::create(root.path(), &spec, CorpusExecutionMode::Aot).unwrap();
         let path = artifacts.0.clone();
         fs::write(path.join("ok.bin"), b"tiny").unwrap();
         enforce_aot_scratch_cap(&path).unwrap();
@@ -3203,5 +3749,601 @@ mod tests {
             let line = format!("{special}rw-r--r-- owner/group 0 date package/docs/special");
             assert!(reject_tar_verbose_line(&line).is_err());
         }
+    }
+
+    const SCALAR_TYPES_SOURCE: &str = "var x: any;\nvar s: string = \"hi\";\n";
+    const SCALAR_TYPES_BASELINE: &str = "//// [tests/cases/compiler/scalarPin.ts] ////\n\
+\n\
+=== scalarPin.ts ===\n\
+var x: any;\n\
+>x : any\n\
+>  : ^^^\n\
+\n\
+var s: string = \"hi\";\n\
+>s : string\n\
+>  : ^^^^^^\n\
+>\"hi\" : \"hi\"\n\
+>     : ^^^^\n";
+
+    struct CompilerLaneFixture {
+        _extracted: TestDir,
+        _snap: TestDir,
+        snapshot: SuiteSnapshot,
+        ctx: CheckContext,
+    }
+
+    fn compiler_lane_fixture(
+        label: &str,
+        file_name: &str,
+        source: &str,
+        types_baseline: &str,
+    ) -> CompilerLaneFixture {
+        let extracted = TestDir::new(&format!("{label}-src"));
+        let case = extracted
+            .path()
+            .join("tests/cases/compiler")
+            .join(file_name);
+        fs::create_dir_all(case.parent().unwrap()).unwrap();
+        fs::write(&case, source).unwrap();
+        let stem = file_name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .unwrap_or(file_name);
+        let baseline = extracted
+            .path()
+            .join("tests/baselines/reference")
+            .join(format!("{stem}.types"));
+        fs::create_dir_all(baseline.parent().unwrap()).unwrap();
+        fs::write(&baseline, types_baseline).unwrap();
+        fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
+        let snap = TestDir::new(&format!("{label}-snap"));
+        materialize_from_extracted(snap.path(), extracted.path()).unwrap();
+        let verified = verify_snapshot(snap.path()).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ctx = CheckContext {
+            code_map: crate::facets::load_diagnostic_code_map(&repo).expect("code map"),
+            baseline_groups: crate::check_cells::baseline_groups(&verified.snapshot.index),
+        };
+        CompilerLaneFixture {
+            _extracted: extracted,
+            _snap: snap,
+            snapshot: verified.snapshot,
+            ctx,
+        }
+    }
+
+    const COMPILER_TEST_RUN_ID: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn bind_snapshot(snapshot: &(impl SnapshotAssets + ?Sized)) -> LaneBinding {
+        let pin = fs::read(snapshot.root().join("oracle/pin.json")).expect("pin");
+        let index = fs::read(snapshot.root().join("index.json")).expect("index");
+        let ledger = fs::read(snapshot.root().join("ledger.json")).expect("ledger");
+        LaneBinding::unbound(COMPILER_TEST_RUN_ID)
+            .expect("run")
+            .with_snapshot(COMPILER_CATALOG, snapshot.root(), &pin, &index, &ledger)
+            .expect("bind")
+    }
+
+    fn compiler_lane_request(
+        snapshot: &(impl SnapshotAssets + ?Sized),
+        catalog: &str,
+        case: &str,
+        configuration: &str,
+        observables: &[&str],
+    ) -> LaneRequest {
+        let key = crate::shard::ObligationKey::new(
+            catalog,
+            case,
+            configuration,
+            ExecutionMode::Aot,
+            "x86_64-unknown-linux-gnu",
+        )
+        .expect("key");
+        LaneRequest::new(
+            bind_snapshot(snapshot),
+            1,
+            key,
+            observables.iter().copied().map(str::to_owned).collect(),
+            vec!["ts_lane_worker".to_owned()],
+            crate::evidence::WorkingDirectoryPolicy::RepositoryRoot,
+            5_000,
+        )
+        .expect("request")
+    }
+
+    fn closed_non_pass(observation: &CompilerLaneObservation) {
+        assert_ne!(
+            observation.class,
+            FailureClass::Pass,
+            "{}",
+            observation.detail
+        );
+        assert!(
+            !matches!(observation.lane_outcome(), LaneOutcome::Completed { .. }),
+            "{}",
+            observation.detail
+        );
+        assert!(observation.artifacts.is_empty());
+    }
+
+    #[test]
+    fn compiler_observation_selects_named_configuration() {
+        let source = "// @target: es5, es2015\n\
+            var x: any;\n\
+            var s: string = \"hi\";\n";
+        let pragmas = crate::check_cells::parse_case_pragmas(source);
+        let first_target = pragmas
+            .options
+            .iter()
+            .find(|(name, _)| name == "target")
+            .and_then(|(_, values)| values.first())
+            .map(String::as_str);
+        assert_eq!(first_target, Some("es5"));
+
+        let fixture = compiler_lane_fixture(
+            "cfg-select",
+            "targetVary.ts",
+            source,
+            "//// [tests/cases/compiler/targetVary.ts] ////\n",
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/targetVary.ts",
+            "target=es2015#types",
+            &["types"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(observation.variant, "target=es2015");
+        assert_eq!(
+            observation
+                .selected_options
+                .get("target")
+                .map(String::as_str),
+            Some("es2015")
+        );
+        assert_ne!(
+            observation
+                .selected_options
+                .get("target")
+                .map(String::as_str),
+            first_target
+        );
+        assert_eq!(
+            observation.snapshot_input,
+            "tests/cases/compiler/targetVary.ts"
+        );
+    }
+
+    #[test]
+    fn compiler_observation_rejects_wrong_case_prefix() {
+        let fixture = compiler_lane_fixture(
+            "prefix",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "conformance/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            &["types"],
+        );
+        closed_non_pass(&observe_compiler_lane(
+            &fixture.snapshot,
+            &fixture.ctx,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn compiler_observation_rejects_unknown_configuration() {
+        let fixture = compiler_lane_fixture(
+            "unknown-cfg",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "target=es5#types",
+            &["types"],
+        );
+        closed_non_pass(&observe_compiler_lane(
+            &fixture.snapshot,
+            &fixture.ctx,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn compiler_observation_rejects_malformed_configuration() {
+        let fixture = compiler_lane_fixture(
+            "bad-cfg",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default",
+            &["types"],
+        );
+        closed_non_pass(&observe_compiler_lane(
+            &fixture.snapshot,
+            &fixture.ctx,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn compiler_snapshot_input_maps_compiler_and_conformance_cases() {
+        assert_eq!(
+            compiler_snapshot_input("compiler/tests/cases/compiler/2dArrays.ts"),
+            Some("tests/cases/compiler/2dArrays.ts")
+        );
+        assert_eq!(
+            compiler_snapshot_input(
+                "conformance/tests/cases/conformance/es6/functionExpressions/FunctionExpression1_es6.ts"
+            ),
+            Some(
+                "tests/cases/conformance/es6/functionExpressions/FunctionExpression1_es6.ts"
+            )
+        );
+        assert_eq!(compiler_snapshot_input("fourslash/foo.ts"), None);
+        assert_eq!(compiler_snapshot_input("compiler/LICENSE"), None);
+    }
+
+    #[test]
+    fn compiler_observation_conformance_path_reaches_snapshot_lookup() {
+        let fixture = compiler_lane_fixture(
+            "conformance-prefix",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "conformance/tests/cases/conformance/es6/functionExpressions/FunctionExpression1_es6.ts",
+            "default#diagnostics",
+            &["diagnostics"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert!(
+            observation
+                .detail
+                .contains("snapshot has no case input `tests/cases/conformance/es6/functionExpressions/FunctionExpression1_es6.ts`"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    #[test]
+    fn compiler_observation_rejects_unsupported_observable() {
+        let fixture = compiler_lane_fixture(
+            "bad-obs",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#source-map",
+            &["source-map"],
+        );
+        closed_non_pass(&observe_compiler_lane(
+            &fixture.snapshot,
+            &fixture.ctx,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn compiler_observation_javascript_reaches_js_baseline_lookup() {
+        let fixture = compiler_lane_fixture(
+            "js-obs",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#javascript",
+            &["javascript"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert!(
+            !observation
+                .detail
+                .contains("no BamTS check-cell comparator for observable `javascript`"),
+            "{}",
+            observation.detail
+        );
+        closed_non_pass(&observation);
+    }
+
+    #[test]
+    fn compiler_observation_rejects_wrong_catalog() {
+        let fixture = compiler_lane_fixture(
+            "catalog",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            "typescript-6.0.2",
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            &["types"],
+        );
+        closed_non_pass(&observe_compiler_lane(
+            &fixture.snapshot,
+            &fixture.ctx,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn compiler_observation_rejects_observable_set_mismatch() {
+        let fixture = compiler_lane_fixture(
+            "obs-set",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            &["types", "symbols"],
+        );
+        closed_non_pass(&observe_compiler_lane(
+            &fixture.snapshot,
+            &fixture.ctx,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn compiler_observation_types_fixture_uses_real_comparator() {
+        let fixture = compiler_lane_fixture(
+            "types-pass",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            &["types"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::Pass,
+            "{}",
+            observation.detail
+        );
+        assert_eq!(observation.variant, "default");
+        assert_eq!(observation.observable, "types");
+        let LaneOutcome::Completed { artifacts } = observation.lane_outcome() else {
+            panic!("expected completed: {}", observation.detail);
+        };
+        assert_eq!(artifacts.len(), 1);
+        let digest = artifacts.get("types").expect("types artifact");
+        assert_eq!(digest.len(), 64);
+        assert!(
+            digest
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn bound_loader_observes_without_full_blob_scan() {
+        let fixture = compiler_lane_fixture(
+            "fast-path",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let poison = fixture
+            .snapshot
+            .root
+            .join("baselines")
+            .join("ff".repeat(32));
+        fs::write(&poison, b"unrelated blob corruption").expect("poison");
+        let binding = bind_snapshot(&fixture.snapshot);
+        let loaded =
+            load_bound_compiler_snapshot(&fixture.snapshot.root, &binding).expect("fast load");
+        let request = compiler_lane_request(
+            &loaded,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            &["types"],
+        );
+        let observation = observe_compiler_lane(&loaded, &fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::Pass,
+            "{}",
+            observation.detail
+        );
+    }
+
+    #[test]
+    fn bound_loader_rejects_metadata_identity_mismatch() {
+        let fixture = compiler_lane_fixture(
+            "meta-mismatch",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let binding = bind_snapshot(&fixture.snapshot);
+        let swapped = fixture.snapshot.root.join("oracle/pin.json");
+        let mut pin = fs::read(&swapped).expect("pin");
+        pin.extend_from_slice(b" ");
+        fs::write(&swapped, pin).expect("swap pin");
+        let error =
+            load_bound_compiler_snapshot(&fixture.snapshot.root, &binding).expect_err("pin swap");
+        assert_eq!(error.code(), ErrorCode::ProvenanceMismatch);
+    }
+
+    #[test]
+    fn selected_case_tamper_is_rejected() {
+        let fixture = compiler_lane_fixture(
+            "case-tamper",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let logical = "tests/cases/compiler/scalarPin.ts";
+        let digest = fixture.snapshot.index.entries[logical].sha256.clone();
+        fs::write(
+            fixture.snapshot.root.join("cases").join(&digest),
+            b"tampered",
+        )
+        .expect("tamper case");
+        let error = read_verified_asset(&fixture.snapshot, logical).expect_err("digest");
+        assert_eq!(error.code(), ErrorCode::Digest);
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            &["types"],
+        );
+        closed_non_pass(&observe_compiler_lane(
+            &fixture.snapshot,
+            &fixture.ctx,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn selected_baseline_tamper_is_rejected() {
+        let fixture = compiler_lane_fixture(
+            "base-tamper",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let logical = "tests/baselines/reference/scalarPin.types";
+        let digest = fixture.snapshot.index.entries[logical].sha256.clone();
+        fs::write(
+            fixture.snapshot.root.join("baselines").join(&digest),
+            b"tampered baseline",
+        )
+        .expect("tamper baseline");
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            &["types"],
+        );
+        closed_non_pass(&observe_compiler_lane(
+            &fixture.snapshot,
+            &fixture.ctx,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn worker_loader_does_not_fall_back_to_full_verification() {
+        let fixture = compiler_lane_fixture(
+            "no-fallback",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let unbound = LaneBinding::unbound(COMPILER_TEST_RUN_ID).expect("unbound");
+        let error =
+            load_bound_compiler_snapshot(&fixture.snapshot.root, &unbound).expect_err("unbound");
+        assert_eq!(error.code(), ErrorCode::Schema);
+        assert!(error.to_string().contains("missing snapshot binding"));
+    }
+
+    #[test]
+    fn bound_loader_does_not_deserialize_ledger() {
+        let fixture = compiler_lane_fixture(
+            "no-ledger-parse",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let ledger_path = fixture.snapshot.root.join("ledger.json");
+        let garbage = b"not-json-ledger";
+        fs::write(&ledger_path, garbage).expect("garbage ledger");
+        let pin = fs::read(fixture.snapshot.root.join("oracle/pin.json")).expect("pin");
+        let index = fs::read(fixture.snapshot.root.join("index.json")).expect("index");
+        let binding = LaneBinding::unbound(COMPILER_TEST_RUN_ID)
+            .expect("run")
+            .with_snapshot(
+                COMPILER_CATALOG,
+                &fixture.snapshot.root,
+                &pin,
+                &index,
+                garbage,
+            )
+            .expect("bind");
+        let loaded =
+            load_bound_compiler_snapshot(&fixture.snapshot.root, &binding).expect("fast load");
+        assert_eq!(
+            loaded.index.entries.len(),
+            fixture.snapshot.index.entries.len()
+        );
+        verify_snapshot(&fixture.snapshot.root).expect_err("parent still requires a parsed ledger");
+    }
+
+    #[test]
+    fn compiler_observation_rejects_missing_snapshot_binding() {
+        let fixture = compiler_lane_fixture(
+            "missing-bind",
+            "scalarPin.ts",
+            SCALAR_TYPES_SOURCE,
+            SCALAR_TYPES_BASELINE,
+        );
+        let key = crate::shard::ObligationKey::new(
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/scalarPin.ts",
+            "default#types",
+            ExecutionMode::Aot,
+            "x86_64-unknown-linux-gnu",
+        )
+        .expect("key");
+        let request = LaneRequest::new(
+            LaneBinding::unbound(COMPILER_TEST_RUN_ID).expect("unbound"),
+            1,
+            key,
+            ["types".to_owned()].into_iter().collect(),
+            vec!["ts_lane_worker".to_owned()],
+            crate::evidence::WorkingDirectoryPolicy::RepositoryRoot,
+            5_000,
+        )
+        .expect("unbound request is still a valid generic lane request");
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        closed_non_pass(&observation);
+        assert!(
+            observation.detail.contains("missing snapshot binding"),
+            "{}",
+            observation.detail
+        );
     }
 }

@@ -9,9 +9,10 @@
 use crate::{
     ErrorCode, Result, VerificationError,
     schema::{
-        CATALOG_NAMES, Catalog, CatalogSource, MANIFEST_PATH, VerificationManifest,
-        catalog_source_from_pin, encode_manifest, identifiers_sha256, load_sources, parse_json,
-        reject_duplicate_json_keys, required_source, sha256_hex, validate_manifest,
+        CATALOG_NAMES, Catalog, CatalogSource, MANIFEST_PATH, TYPESCRIPT_SUITE_SOURCE,
+        VerificationManifest, catalog_source_from_pin, encode_manifest, identifiers_sha256,
+        load_sources, parse_json, reject_duplicate_json_keys, required_source, sha256_hex,
+        validate_manifest,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -868,7 +869,7 @@ fn generate_manifest(root: &Path) -> Result<VerificationManifest> {
     let typescript_catalogs = [
         (
             "typescript-7.0.2",
-            "typescript-primary-tests",
+            TYPESCRIPT_SUITE_SOURCE,
             "target/authority/typescript-7.0.2-tests",
         ),
         (

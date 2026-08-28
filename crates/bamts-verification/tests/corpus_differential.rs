@@ -1340,6 +1340,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write class decorator fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -1437,6 +1438,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write class decorator state fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -1522,6 +1524,7 @@ try {
 "#;
     fs::write(&source_path, source).expect("write invalid class decorator fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -1615,6 +1618,7 @@ try {
 "#;
     fs::write(&source_path, source).expect("write invalid auto-accessor decorator fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -1843,6 +1847,7 @@ console.log(`fn:${Item(5)};ns:${Item.label};tag:${Item.tag()}`);
 "#;
     fs::write(&source_path, source).expect("write merged namespace function fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -1992,6 +1997,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write standard member decorator fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2096,6 +2102,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write callable decorator initializer fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2201,6 +2208,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write member decorator application-stage fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2306,6 +2314,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write auto-accessor decorator call-depth fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2414,6 +2423,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write stacked auto-accessor decorator fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2532,6 +2542,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write stacked field/accessor initializer fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2614,6 +2625,7 @@ console.log(trace.join('\n'));
 "#;
     fs::write(&source_path, source).expect("write undecorated auto-accessor fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2721,6 +2733,7 @@ console.log(trace.join('\n'));
     fs::write(&source_path, source)
         .expect("write class decorator replacement static/accessor fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2813,6 +2826,7 @@ console.log(trace.join('\n'));
     fs::write(&source_path, source)
         .expect("write decorated member same-key last-definition-wins fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -2911,6 +2925,7 @@ console.log(trace.join('\n'));
     fs::write(&source_path, source)
         .expect("write decorated member distinct computed same-runtime-key fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -3038,6 +3053,7 @@ console.log(trace.join('\n'));
     fs::write(&source_path, source)
         .expect("write computed member source-order/key-once/accessor-init fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -3148,6 +3164,7 @@ fn sync_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode(
 "#;
     fs::write(&source_path, source).expect("write sync explicit resource management fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -3282,6 +3299,7 @@ fn async_explicit_resource_management_matches_tsc_oracle_in_every_execution_mode
 "#;
     fs::write(&source_path, source).expect("write async explicit resource management fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -3380,6 +3398,7 @@ fn sync_explicit_resource_management_suppression_matches_tsc_oracle_in_every_exe
     fs::write(&source_path, source)
         .expect("write sync explicit resource management suppression fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -3548,6 +3567,7 @@ fn resource_management_abrupt_completion_matches_tsc_oracle_in_every_execution_m
 "#;
     fs::write(&source_path, source).expect("write resource management abrupt completion fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),
@@ -3650,6 +3670,7 @@ fn async_explicit_resource_management_suppression_matches_tsc_oracle_in_every_ex
     fs::write(&source_path, source)
         .expect("write async explicit resource management suppression fixture");
     let tsc_args: Vec<String> = vec![
+        "--ignoreConfig".into(),
         "--target".into(),
         "es2022".into(),
         "--module".into(),

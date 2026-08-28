@@ -8,14 +8,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml::{Table, Value};
 
-const MEMBERS: [(&str, &str); 9] = [
+const MEMBERS: [(&str, &str); 11] = [
     ("bamts-compiler", "crates/bamts-compiler"),
+    ("bamts-cancel", "crates/bamts-cancel"),
     ("bamts-bytecode", "crates/bamts-bytecode"),
     ("bamts-runtime", "crates/bamts-runtime"),
     ("bamts-native", "crates/bamts-native"),
     ("bamts-node", "crates/bamts-node"),
     ("bamts-codegen", "crates/bamts-codegen"),
     ("bamts-cli", "crates/bamts-cli"),
+    ("bamts-napi", "crates/bamts-napi"),
     ("bamts-verification", "crates/bamts-verification"),
     ("bamts", "crates/bamts"),
 ];
@@ -294,7 +296,7 @@ fn validate_member_manifest(expected_name: &str, manifest: &Value, path: &Path) 
     require_exact_bool(
         package,
         "publish",
-        expected_name != "bamts-verification",
+        !matches!(expected_name, "bamts-verification" | "bamts-napi"),
         &format!("{} [package]", path.display()),
     )?;
     validate_member_lints(expected_name, manifest, &path.display().to_string())?;
@@ -332,7 +334,10 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
 
     // These crates own tightly-scoped unsafe boundaries, so they pin a local
     // `deny` policy instead of inheriting the workspace-wide `forbid`.
-    if matches!(name, "bamts-native" | "bamts-node" | "bamts-codegen") {
+    if matches!(
+        name,
+        "bamts-native" | "bamts-node" | "bamts-codegen" | "bamts-napi" | "bamts-verification"
+    ) {
         if lints.contains_key("workspace") {
             return Err(workspace_error(format!(
                 "{context}: {name} must not inherit workspace lints"
@@ -358,7 +363,7 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
                 "deny",
                 &format!("{context} [lints.rust]"),
             )?;
-            if name == "bamts-codegen" {
+            if matches!(name, "bamts-codegen" | "bamts-napi" | "bamts-verification") {
                 require_exact_string(
                     rust,
                     "unsafe_op_in_unsafe_fn",
@@ -393,10 +398,17 @@ fn validate_member_lints(name: &str, manifest: &Value, context: &str) -> Result<
 fn validate_native_features(manifest: &Value, context: &str) -> Result<()> {
     let root = root_table(manifest, context)?;
     let features = required_table(root, "features", context)?;
-    let expected: BTreeSet<String> = ["default", "gc", "node-host", "jit-entry", "aot-image"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let expected: BTreeSet<String> = [
+        "default",
+        "gc",
+        "node-host",
+        "jit-entry",
+        "aot-image",
+        "cache-guard",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     let actual: BTreeSet<String> = features.keys().cloned().collect();
     if actual != expected {
         return Err(workspace_error(format!(
@@ -416,6 +428,7 @@ fn validate_native_features(manifest: &Value, context: &str) -> Result<()> {
         &["dep:cranelift-jit", "dep:cranelift-module"],
         context,
     )?;
+    require_feature_set(features, "cache-guard", &["dep:windows"], context)?;
 
     Ok(())
 }
@@ -440,19 +453,31 @@ fn validate_codegen_features(manifest: &Value, context: &str) -> Result<()> {
     let host_jit = parse_feature_set(features, "host-jit", context)?;
     if !aot.is_disjoint(&host_jit) {
         let overlap: BTreeSet<String> = aot.intersection(&host_jit).cloned().collect();
-        return Err(workspace_error(format!(
-            "{context}: bamts-codegen `aot` and `host-jit` overlap [{}]",
-            format_set(&overlap)
-        )));
+        let allowed: BTreeSet<String> = ["dep:bamts-native"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if overlap != allowed {
+            return Err(workspace_error(format!(
+                "{context}: bamts-codegen `aot` and `host-jit` overlap [{}]",
+                format_set(&overlap)
+            )));
+        }
     }
 
     require_exact_feature_set("default", &default, &[], context)?;
-    require_exact_feature_set("aot", &aot, &["dep:cranelift-object"], context)?;
+    require_exact_feature_set(
+        "aot",
+        &aot,
+        &["dep:bamts-native", "dep:cranelift-object", "dep:sha2"],
+        context,
+    )?;
     require_exact_feature_set(
         "host-jit",
         &host_jit,
         &[
             "dep:bamts-native",
+            "bamts-native/jit-entry",
             "dep:cranelift-jit",
             "dep:libc",
             "dep:region",
@@ -967,15 +992,23 @@ fn validate_internal_graph(graph: &InternalGraph) -> Result<()> {
 fn expected_internal_graph() -> InternalGraph {
     let mut graph = BTreeMap::new();
     graph.insert("bamts-bytecode".to_owned(), BTreeMap::new());
-    graph.insert("bamts-native".to_owned(), BTreeMap::new());
+    graph.insert("bamts-cancel".to_owned(), BTreeMap::new());
+    graph.insert(
+        "bamts-native".to_owned(),
+        BTreeMap::from([("bamts-bytecode".to_owned(), internal_dependency(false, &[]))]),
+    );
     graph.insert(
         "bamts-compiler".to_owned(),
-        BTreeMap::from([("bamts-bytecode".to_owned(), internal_dependency(false, &[]))]),
+        BTreeMap::from([
+            ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
+        ]),
     );
     graph.insert(
         "bamts-runtime".to_owned(),
         BTreeMap::from([
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
             (
                 "bamts-native".to_owned(),
                 internal_dependency(false, &["gc"]),
@@ -997,17 +1030,16 @@ fn expected_internal_graph() -> InternalGraph {
         "bamts-codegen".to_owned(),
         BTreeMap::from([
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
             ("bamts-runtime".to_owned(), internal_dependency(false, &[])),
-            (
-                "bamts-native".to_owned(),
-                internal_dependency(true, &["jit-entry"]),
-            ),
+            ("bamts-native".to_owned(), internal_dependency(true, &[])),
         ]),
     );
     graph.insert(
         "bamts".to_owned(),
         BTreeMap::from([
             ("bamts-bytecode".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
             ("bamts-codegen".to_owned(), internal_dependency(true, &[])),
             ("bamts-compiler".to_owned(), internal_dependency(false, &[])),
             ("bamts-node".to_owned(), internal_dependency(true, &[])),
@@ -1031,6 +1063,13 @@ fn expected_internal_graph() -> InternalGraph {
                 "bamts-node".to_owned(),
                 internal_dependency(false, &["aot-main", "script-compiler"]),
             ),
+        ]),
+    );
+    graph.insert(
+        "bamts-napi".to_owned(),
+        BTreeMap::from([
+            ("bamts-cancel".to_owned(), internal_dependency(false, &[])),
+            ("bamts-cli".to_owned(), internal_dependency(false, &[])),
         ]),
     );
     graph.insert(
@@ -1783,7 +1822,7 @@ unsafe_code = "forbid"
             r#"
 [features]
 default = []
-aot = ["dep:cranelift-object", "dep:cranelift-jit"]
+aot = ["dep:bamts-native", "dep:cranelift-object", "dep:sha2", "dep:cranelift-jit"]
 host-jit = ["dep:cranelift-jit", "dep:bamts-native"]
 "#,
         );
@@ -1875,9 +1914,10 @@ workspace = false
             r#"
 [features]
 default = []
-aot = ["dep:cranelift-object"]
+aot = ["dep:bamts-native", "dep:cranelift-object", "dep:sha2"]
 host-jit = [
     "dep:bamts-native",
+    "bamts-native/jit-entry",
     "dep:cranelift-jit",
     "dep:libc",
     "dep:region",

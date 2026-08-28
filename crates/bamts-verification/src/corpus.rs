@@ -58,17 +58,11 @@ pub const MANIFEST_PATH: &str = "corpus/manifest.toml";
 pub const PINNED_CASE_IDS: [&str; 27] = [
     "citty",
     "defu",
-    "derived-construction",
     "destr",
     "dot-prop",
     "escape-string-regexp",
-    "event-loop",
-    "explicit-resource",
-    "for-await-iterator",
     "hookable",
-    "import-meta",
     "is-plain-obj",
-    "lexical-environment",
     "mitt",
     "ohash",
     "p-defer",
@@ -78,11 +72,17 @@ pub const PINNED_CASE_IDS: [&str; 27] = [
     "perfect-debounce",
     "rou3",
     "tiny-invariant",
-    "top-level-throw",
     "tslib",
     "ufo",
     "valita",
     "yocto-queue",
+    "derived-construction",
+    "event-loop",
+    "explicit-resource",
+    "for-await-iterator",
+    "import-meta",
+    "lexical-environment",
+    "top-level-throw",
 ];
 
 /// Synchronous corpus cases unblocked by Task 106 alone, in manifest order.
@@ -103,14 +103,14 @@ pub const TASK_106_SYNC_CASE_IDS: [&str; 11] = [
 /// Pinned Node builtin cases completed by Task 107, in manifest order.
 pub const TASK_107_NODE_CASE_IDS: [&str; 10] = [
     "citty",
+    "is-plain-obj",
+    "ohash",
     "derived-construction",
     "event-loop",
     "explicit-resource",
     "for-await-iterator",
     "import-meta",
-    "is-plain-obj",
     "lexical-environment",
-    "ohash",
     "top-level-throw",
 ];
 
@@ -884,6 +884,7 @@ impl CorpusFailure {
             | driver::DriverError::NonUnicodeEnvironmentValue { .. }
             | driver::DriverError::ProjectConfig { .. }
             | driver::DriverError::LintConfig { .. }
+            | driver::DriverError::WriteTscConfig { .. }
             | driver::DriverError::MissingEntrypoint
             | driver::DriverError::MultipleCompileInputs
             | driver::DriverError::UnsupportedCompileTarget(_)
@@ -2298,6 +2299,20 @@ mod tests {
     }
 
     #[test]
+    fn tsc_config_write_failure_reports_resolve() {
+        let failure = CorpusFailure::from_driver_error(&driver::DriverError::WriteTscConfig {
+            path: PathBuf::from("tsconfig.json"),
+            source: std::io::Error::other("denied"),
+        });
+        assert_eq!(failure.stage, CorpusStage::Resolve);
+        assert!(
+            failure
+                .evidence
+                .contains("could not write TypeScript config")
+        );
+    }
+
+    #[test]
     fn host_exit_option_precedes_interpreter_outcome_without_sentinels() {
         assert_eq!(select_host_exit_code(Some(0), 7), 0);
         assert_eq!(select_host_exit_code(Some(9), 0), 9);
@@ -2377,6 +2392,12 @@ mod tests {
             }
             assert!(case.entrypoint.ends_with(".ts"));
         }
+        let ids = corpus
+            .cases
+            .iter()
+            .map(|case| case.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, PINNED_CASE_IDS);
         assert!(corpus.case("tiny-invariant").is_some());
     }
 

@@ -4,10 +4,11 @@ use serde::Deserialize;
 
 use crate::{
     ErrorCode, Result, VerificationError,
+    oracle_pins::{COMPILER_COMMIT, SUITE_COMMIT, verify_oracle_pins},
     schema::{
         COMPAT_SOURCE, COMPAT_TESTS_SOURCE, LEGACY_SOURCE, LEGACY_TESTS_SOURCE, LOCKFILE_PATH,
-        PRIMARY_SOURCE, PRIMARY_TESTS_SOURCE, SourcePin, TYPESCRIPT_COMMIT,
-        TYPESCRIPT_NPM_INTEGRITY, TYPESCRIPT_RELEASE, TYPESCRIPT_VERSION, load_sources, parse_json,
+        SourcePin, TYPESCRIPT_COMPILER_SOURCE, TYPESCRIPT_NPM_INTEGRITY, TYPESCRIPT_NPM_SOURCE,
+        TYPESCRIPT_RELEASE, TYPESCRIPT_SUITE_SOURCE, TYPESCRIPT_VERSION, load_sources, parse_json,
         read_bytes, required_source,
     },
 };
@@ -42,8 +43,7 @@ pub fn verify_authority(root: &Path, release: &str) -> Result<AuthorityReport> {
     }
 
     let (sources, _) = load_sources(root)?;
-    let primary = required_source(&sources, PRIMARY_SOURCE)?;
-    let primary_tests = required_source(&sources, PRIMARY_TESTS_SOURCE)?;
+    let primary = required_source(&sources, TYPESCRIPT_NPM_SOURCE)?;
     let compat = required_source(&sources, COMPAT_SOURCE)?;
     let compat_tests = required_source(&sources, COMPAT_TESTS_SOURCE)?;
     let legacy = required_source(&sources, LEGACY_SOURCE)?;
@@ -61,8 +61,9 @@ pub fn verify_authority(root: &Path, release: &str) -> Result<AuthorityReport> {
 
     let mut checks = 0;
     checks += check_primary_pin(primary)?;
-    checks += check_primary_tests(primary, primary_tests)?;
     checks += check_lockfile(primary, typescript)?;
+    verify_oracle_pins(root)?;
+    checks += 1;
     checks += check_historical(legacy, legacy_tests)?;
     checks += check_historical(compat, compat_tests)?;
     checks += 1;
@@ -78,22 +79,24 @@ fn check_primary_pin(primary: &SourcePin) -> Result<usize> {
         return Err(VerificationError::new(
             ErrorCode::Schema,
             format!(
-                "source `{PRIMARY_SOURCE}` pin `{}` is not `{TYPESCRIPT_VERSION}`",
+                "source `{TYPESCRIPT_NPM_SOURCE}` pin `{}` is not `{TYPESCRIPT_VERSION}`",
                 primary.pin
             ),
         ));
     }
-    if primary.commit.as_deref() != Some(TYPESCRIPT_COMMIT) {
+    if primary.commit.as_deref() != Some(COMPILER_COMMIT) {
         return Err(VerificationError::new(
             ErrorCode::Digest,
-            format!("source `{PRIMARY_SOURCE}` commit is not the stable TypeScript commit"),
+            format!(
+                "source `{TYPESCRIPT_NPM_SOURCE}` commit is not the TypeScript Go release commit"
+            ),
         ));
     }
     if primary.digest_algorithm != "sha512" || primary.digest != TYPESCRIPT_NPM_INTEGRITY {
         return Err(VerificationError::new(
             ErrorCode::Digest,
             format!(
-                "source `{PRIMARY_SOURCE}` digest is not the published TypeScript {TYPESCRIPT_VERSION} integrity"
+                "source `{TYPESCRIPT_NPM_SOURCE}` digest is not the published TypeScript {TYPESCRIPT_VERSION} integrity"
             ),
         ));
     }
@@ -103,36 +106,11 @@ fn check_primary_pin(primary: &SourcePin) -> Result<usize> {
         return Err(VerificationError::new(
             ErrorCode::Schema,
             format!(
-                "source `{PRIMARY_SOURCE}` url is not the TypeScript {TYPESCRIPT_VERSION} tarball"
+                "source `{TYPESCRIPT_NPM_SOURCE}` url is not the TypeScript {TYPESCRIPT_VERSION} tarball"
             ),
         ));
     }
     Ok(4)
-}
-
-fn check_primary_tests(primary: &SourcePin, tests: &SourcePin) -> Result<usize> {
-    let Some(primary_commit) = primary.commit.as_deref() else {
-        return Err(VerificationError::new(
-            ErrorCode::Schema,
-            format!("source `{PRIMARY_SOURCE}` is missing a commit"),
-        ));
-    };
-    if tests.commit.as_deref() != Some(primary_commit) || tests.pin != primary_commit {
-        return Err(VerificationError::new(
-            ErrorCode::Digest,
-            "typescript primary tests do not share the stable source commit",
-        ));
-    }
-    if !tests
-        .url
-        .contains(&format!("TypeScript/archive/{primary_commit}"))
-    {
-        return Err(VerificationError::new(
-            ErrorCode::Schema,
-            "typescript primary tests url does not pin the shared source commit",
-        ));
-    }
-    Ok(2)
 }
 
 fn check_lockfile(primary: &SourcePin, typescript: &LockedPackage) -> Result<usize> {
@@ -152,7 +130,9 @@ fn check_lockfile(primary: &SourcePin, typescript: &LockedPackage) -> Result<usi
     if integrity != expected {
         return Err(VerificationError::new(
             ErrorCode::Digest,
-            format!("{LOCKFILE_PATH}: typescript integrity does not match `{PRIMARY_SOURCE}`"),
+            format!(
+                "{LOCKFILE_PATH}: typescript integrity does not match `{TYPESCRIPT_NPM_SOURCE}`"
+            ),
         ));
     }
     if let Some(resolved) = typescript.resolved.as_deref()
@@ -160,7 +140,9 @@ fn check_lockfile(primary: &SourcePin, typescript: &LockedPackage) -> Result<usi
     {
         return Err(VerificationError::new(
             ErrorCode::Schema,
-            format!("{LOCKFILE_PATH}: typescript resolved url does not match `{PRIMARY_SOURCE}`"),
+            format!(
+                "{LOCKFILE_PATH}: typescript resolved url does not match `{TYPESCRIPT_NPM_SOURCE}`"
+            ),
         ));
     }
     Ok(3)
@@ -173,10 +155,15 @@ fn check_historical(source: &SourcePin, tests: &SourcePin) -> Result<usize> {
             "historical TypeScript corpus cannot act as the primary oracle",
         ));
     }
-    if source.pin == TYPESCRIPT_VERSION || source.commit.as_deref() == Some(TYPESCRIPT_COMMIT) {
+    if source.pin == TYPESCRIPT_VERSION
+        || matches!(
+            source.commit.as_deref(),
+            Some(COMPILER_COMMIT) | Some(SUITE_COMMIT)
+        )
+    {
         return Err(VerificationError::new(
             ErrorCode::Schema,
-            "historical TypeScript corpus cannot share the 7.0.2 oracle pin",
+            "historical TypeScript corpus cannot share a 7.0.2 oracle commit",
         ));
     }
     let commit = source.commit.as_deref().ok_or_else(|| {
@@ -204,7 +191,9 @@ fn check_historical(source: &SourcePin, tests: &SourcePin) -> Result<usize> {
 }
 
 fn is_oracle_source(source: &SourcePin) -> bool {
-    source.name == PRIMARY_SOURCE || source.name == PRIMARY_TESTS_SOURCE
+    source.name == TYPESCRIPT_NPM_SOURCE
+        || source.name == TYPESCRIPT_COMPILER_SOURCE
+        || source.name == TYPESCRIPT_SUITE_SOURCE
 }
 
 fn load_lockfile(root: &Path) -> Result<PackageLock> {
@@ -250,10 +239,16 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(root.join("vendor/libuv-1.52.1")).unwrap();
-        fs::create_dir_all(root.join("vendor")).unwrap();
+        fs::create_dir_all(root.join("node_modules/typescript")).unwrap();
         let workspace = workspace_root();
-        fs::copy(workspace.join(SOURCES_PATH), root.join(SOURCES_PATH)).unwrap();
-        fs::copy(workspace.join(LOCKFILE_PATH), root.join(LOCKFILE_PATH)).unwrap();
+        for relative in [
+            SOURCES_PATH,
+            LOCKFILE_PATH,
+            "package.json",
+            "node_modules/typescript/package.json",
+        ] {
+            fs::copy(workspace.join(relative), root.join(relative)).unwrap();
+        }
         Fixture { root }
     }
 
@@ -265,13 +260,15 @@ mod tests {
     }
 
     #[test]
-    fn source_and_tests_share_commit() {
+    fn release_sources_bind_distinct_oracle_roles() {
         let (sources, _) = load_sources(&workspace_root()).unwrap();
-        let primary = required_source(&sources, PRIMARY_SOURCE).unwrap();
-        let tests = required_source(&sources, PRIMARY_TESTS_SOURCE).unwrap();
-        assert_eq!(primary.commit.as_deref(), Some(TYPESCRIPT_COMMIT));
-        assert_eq!(tests.commit.as_deref(), Some(TYPESCRIPT_COMMIT));
-        assert_eq!(tests.pin, TYPESCRIPT_COMMIT);
+        let npm = required_source(&sources, TYPESCRIPT_NPM_SOURCE).unwrap();
+        let compiler = required_source(&sources, TYPESCRIPT_COMPILER_SOURCE).unwrap();
+        let suite = required_source(&sources, TYPESCRIPT_SUITE_SOURCE).unwrap();
+        assert_eq!(npm.commit.as_deref(), Some(COMPILER_COMMIT));
+        assert_eq!(compiler.commit.as_deref(), Some(COMPILER_COMMIT));
+        assert_eq!(suite.commit.as_deref(), Some(SUITE_COMMIT));
+        assert_eq!(suite.pin, SUITE_COMMIT);
     }
 
     #[test]
@@ -307,8 +304,10 @@ mod tests {
             let source = required_source(&sources, source_name).unwrap();
             let tests = required_source(&sources, tests_name).unwrap();
             assert_ne!(source.pin, TYPESCRIPT_VERSION);
-            assert_ne!(source.commit.as_deref(), Some(TYPESCRIPT_COMMIT));
-            assert_ne!(tests.commit.as_deref(), Some(TYPESCRIPT_COMMIT));
+            for oracle_commit in [COMPILER_COMMIT, SUITE_COMMIT] {
+                assert_ne!(source.commit.as_deref(), Some(oracle_commit));
+                assert_ne!(tests.commit.as_deref(), Some(oracle_commit));
+            }
             assert!(!is_oracle_source(source));
             assert!(!is_oracle_source(tests));
         }
