@@ -106,6 +106,20 @@ async function artifactRecord(target) {
   return { ...target, manifest, archive };
 }
 
+async function assembledFacade() {
+  const manifest = await readJson(join(npmRoot, "bamti-cli", "package.json"));
+  const archive = join(stagedArtifactRoot, `bamti-cli-${manifest.version}.tgz`);
+  try {
+    await access(archive, constants.R_OK);
+  } catch (cause) {
+    throw new Error(
+      `missing assembled facade ${archive}; run node npm/scripts/stage-cli-artifacts.mjs to assemble it`,
+      { cause },
+    );
+  }
+  return { manifest, archive };
+}
+
 function npmEnvironment(root) {
   return {
     HOME: root,
@@ -195,10 +209,10 @@ test("clean consumer imports all thirteen exports and runs the real API and CLI"
     ({ platform, arch }) => platform === process.platform && arch === process.arch,
   );
   assert.ok(hostCli, `no staged CLI target supports test host ${process.platform}-${process.arch}`);
+  const bamtiCli = await assembledFacade();
 
   await withTemporaryRoot("bamti-clean-install-", async (root) => {
     const bamti = await packPackage(root, join(npmRoot, "bamti"));
-    const bamtiCli = await packPackage(root, join(npmRoot, "bamti-cli"));
 
     const emptyConsumer = join(root, "empty-consumer");
     await mkdir(emptyConsumer);
@@ -226,7 +240,7 @@ test("clean consumer imports all thirteen exports and runs the real API and CLI"
     await writeFile(
       exercise,
       `import assert from "node:assert/strict";\n` +
-        `import { sep } from "node:path";\n` +
+        `import { isAbsolute, sep } from "node:path";\n` +
         `const subpaths = ${JSON.stringify(PUBLIC_EXPORTS.map((entry) => entry === "." ? "bamti" : `bamti/${entry.slice(2)}`))};\n` +
         `const loaded = await Promise.all(subpaths.map((specifier) => specifier.endsWith("/package.json") ? import(specifier, { with: { type: "json" } }) : import(specifier)));\n` +
         `for (let index = 0; index < loaded.length; index += 1) {\n` +
@@ -234,7 +248,7 @@ test("clean consumer imports all thirteen exports and runs the real API and CLI"
         `}\n` +
         `const api = loaded[0];\n` +
         `assert.equal(api.artifactPackage(), ${JSON.stringify(hostCli.manifest.name)});\n` +
-        `assert.ok(api.resolveBinary().endsWith(["", "bin", ${JSON.stringify(hostCli.entry.slice(4))}].join(sep)));\n` +
+        `assert.ok(isAbsolute(api.resolveBinary()) && api.resolveBinary().endsWith(sep + ${JSON.stringify(hostCli.entry.split("/").at(-1))}));\n` +
         `assert.equal(await api.run(["--version"], { stdio: "pipe" }), 0);\n` +
         `const session = api.createSession({ filesystem: loaded[3].osFileSystem(process.cwd()) });\n` +
         `assert.equal(typeof await session.snapshot(), "object");\n` +
@@ -250,7 +264,7 @@ test("clean consumer imports all thirteen exports and runs the real API and CLI"
       env: npmEnvironment(root),
     });
     assertSucceeded(cliResult, "exercise installed bamts CLI");
-    assert.match(cliResult.stdout, /^bamts\s+\S+/m);
+    assert.match(cliResult.stdout, /^Version \d+\.\d+\.\d+$/m);
   });
 });
 
@@ -262,10 +276,10 @@ test("clean consumer rejects absent and wrong-platform artifacts", async () => {
   assert.ok(hostArtifact, `no staged artifact target supports test host ${process.platform}-${process.arch}`);
   const wrongArtifact = artifacts.find(({ manifest }) => manifest.name !== hostArtifact.manifest.name);
   assert.ok(wrongArtifact);
+  const bamtiCli = await assembledFacade();
 
   await withTemporaryRoot("bamti-rejection-", async (root) => {
     const bamti = await packPackage(root, join(npmRoot, "bamti"));
-    const bamtiCli = await packPackage(root, join(npmRoot, "bamti-cli"));
     const install = await installArchives(root, [bamti, bamtiCli, wrongArtifact], { force: true });
     assertSucceeded(install, "install consumer with only wrong-platform artifact");
 
