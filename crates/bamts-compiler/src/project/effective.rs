@@ -52,6 +52,8 @@ pub struct ProjectLoadRequest {
     pub cwd: PathBuf,
     pub overrides: ProjectOptionOverrides,
     pub allow_missing_config: bool,
+    /// Explicit roots supplied by direct CLI compilation.
+    pub source_files: Option<Vec<PathBuf>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,22 +83,37 @@ impl EffectiveProject {
         let config_path = root
             .resolve_from(&cwd, requested)
             .map_err(ProjectCompileError::Path)?;
-        let source = match fs.read(&config_path) {
-            Ok(source) => source,
-            Err(error) if error.kind() == ErrorKind::NotFound && request.allow_missing_config => {
-                String::from("{}")
+        // Direct CLI compilation supplies its own roots and no configuration
+        // document: the effective options come only from the overrides.
+        let (raw, diagnostic_patterns) = match &request.source_files {
+            Some(_) => (
+                JsonObject::from_entries(Vec::new()),
+                DiagnosticPatterns::default(),
+            ),
+            None => {
+                let source = match fs.read(&config_path) {
+                    Ok(source) => source,
+                    Err(error)
+                        if error.kind() == ErrorKind::NotFound && request.allow_missing_config =>
+                    {
+                        String::from("{}")
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        return Err(ProjectCompileError::ConfigNotFound { path: config_path });
+                    }
+                    Err(error) => return Err(ProjectCompileError::FileSystem(error)),
+                };
+                load_merged_raw(&root, &config_path, &source, fs)?
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(ProjectCompileError::ConfigNotFound { path: config_path });
-            }
-            Err(error) => return Err(ProjectCompileError::FileSystem(error)),
         };
-        let (raw, diagnostic_patterns) = load_merged_raw(&root, &config_path, &source, fs)?;
         let raw = apply_overrides(&root, &cwd, raw, &request.overrides)?;
         let raw = normalize_composite_options(raw);
         let config =
             TsConfig::parse_value(&root, &config_path, raw).map_err(ProjectCompileError::Config)?;
-        let source_files = materialize_sources(&root, &config, &diagnostic_patterns, fs)?;
+        let source_files = match &request.source_files {
+            Some(paths) => materialize_explicit_sources(&root, paths)?,
+            None => materialize_sources(&root, &config, &diagnostic_patterns, fs)?,
+        };
         let build_info_path = effective_build_info_path(&root, &config)?;
 
         Ok(Self {
@@ -769,6 +786,7 @@ pub fn compile_project_references<F: FileSystem + Clone>(
                 cwd: cwd.to_path_buf(),
                 overrides: ProjectOptionOverrides::default(),
                 allow_missing_config: false,
+                source_files: None,
             },
             fs,
         )?;
@@ -1318,6 +1336,18 @@ fn path_to_arc(path: &Path) -> Arc<str> {
     Arc::from(path.to_string_lossy().as_ref())
 }
 
+fn materialize_explicit_sources(
+    root: &ProjectRoot,
+    paths: &[PathBuf],
+) -> Result<Arc<[PathBuf]>, MaterializeError> {
+    let mut sources = BTreeSet::new();
+    for path in paths {
+        let path = root.resolve(path).map_err(MaterializeError::Path)?;
+        sources.insert(path);
+    }
+    Ok(sources.into_iter().collect::<Vec<_>>().into())
+}
+
 fn materialize_sources(
     root: &ProjectRoot,
     config: &TsConfig,
@@ -1737,8 +1767,36 @@ mod tests {
                 cwd: self.0.clone(),
                 overrides: ProjectOptionOverrides::default(),
                 allow_missing_config: false,
+                source_files: None,
             }
         }
+
+        fn direct_request(&self, sources: &[&str]) -> ProjectLoadRequest {
+            ProjectLoadRequest {
+                config_path: None,
+                cwd: self.0.clone(),
+                overrides: ProjectOptionOverrides::default(),
+                allow_missing_config: true,
+                source_files: Some(sources.iter().map(PathBuf::from).collect()),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_source_files_skip_the_config_document() {
+        let fixture = Fixture::new();
+        fixture.write("root.ts", "export const root = 1;\n");
+        fixture.write("extra/extra.ts", "export const extra = 2;\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"include":["**/*"],"compilerOptions":{"declaration":true}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project = EffectiveProject::load(&fixture.direct_request(&["root.ts"]), &filesystem)
+            .expect("inferred project loads");
+        assert_eq!(project.source_files(), &[fixture.0.join("root.ts")]);
+        assert!(!project.options().declaration());
+        assert!(!project.options().source_map());
     }
 
     impl Drop for Fixture {
