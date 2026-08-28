@@ -4,7 +4,7 @@
 //! maps document sync onto open/update/close, and forwards queries.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,6 +20,7 @@ use bamts_compiler::source::{SourceText, TextRange, Utf16Pos};
 use serde_json::{Value, json};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const REQUEST_CANCELLED: i32 = -32800;
 
 /// How the stdio loop finished.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,31 +37,86 @@ pub fn run(input: impl BufRead, output: impl Write, root: impl AsRef<Path>) -> i
     session.serve(input, output)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Lifecycle {
+    AwaitingInitialize,
+    AwaitingInitialized,
+    Running,
+    ShutdownRequested,
+    Exited(Exit),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RequestId {
+    Null,
+    Signed(i64),
+    Unsigned(u64),
+    String(String),
+}
+
+impl RequestId {
+    fn parse(value: &Value) -> Option<Self> {
+        match value {
+            Value::Null => Some(Self::Null),
+            Value::String(value) => Some(Self::String(value.clone())),
+            Value::Number(value) => value
+                .as_i64()
+                .map(Self::Signed)
+                .or_else(|| value.as_u64().map(Self::Unsigned)),
+            _ => None,
+        }
+    }
+
+    fn value(&self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Signed(value) => json!(value),
+            Self::Unsigned(value) => json!(value),
+            Self::String(value) => json!(value),
+        }
+    }
+}
+
+struct Incoming {
+    id: Option<RequestId>,
+    method: String,
+    params: Value,
+}
+
 struct Session {
     state: ServiceState<OsFileSystem>,
     snapshots: BTreeMap<PathBuf, Arc<DocumentSnapshot>>,
-    initialized: bool,
-    shutdown: bool,
+    process_root: PathBuf,
+    workspace_root: PathBuf,
+    lifecycle: Lifecycle,
+    cancelled: BTreeSet<RequestId>,
+    current_request: Option<RequestId>,
 }
 
 impl Session {
     fn new(root: &Path) -> io::Result<Self> {
-        let filesystem = OsFileSystem::new(root).map_err(fs_io)?;
+        let process_root = root.canonicalize()?;
+        let filesystem = OsFileSystem::new(&process_root).map_err(fs_io)?;
         Ok(Self {
             state: ServiceState::new(filesystem),
             snapshots: BTreeMap::new(),
-            initialized: false,
-            shutdown: false,
+            workspace_root: process_root.clone(),
+            process_root,
+            lifecycle: Lifecycle::AwaitingInitialize,
+            cancelled: BTreeSet::new(),
+            current_request: None,
         })
     }
 
     fn serve(&mut self, mut input: impl BufRead, mut output: impl Write) -> io::Result<Exit> {
         loop {
             let Some(raw) = read_message(&mut input)? else {
-                return Ok(if self.shutdown {
-                    Exit::Shutdown
-                } else {
-                    Exit::Unrequested
+                return Ok(match self.lifecycle {
+                    Lifecycle::Exited(exit) => exit,
+                    Lifecycle::ShutdownRequested => Exit::Shutdown,
+                    Lifecycle::AwaitingInitialize
+                    | Lifecycle::AwaitingInitialized
+                    | Lifecycle::Running => Exit::Unrequested,
                 });
             };
             let parsed: Value = match serde_json::from_slice(&raw) {
@@ -68,89 +124,227 @@ impl Session {
                 Err(_) => {
                     write_json(
                         &mut output,
-                        &json!({
-                            "jsonrpc": "2.0",
-                            "id": Value::Null,
-                            "error": { "code": -32700, "message": "Parse error" }
-                        }),
+                        &error_response(Value::Null, -32700, "Parse error"),
                     )?;
                     continue;
                 }
             };
-            if parsed.get("method").and_then(Value::as_str) == Some("exit") {
-                return Ok(if self.shutdown {
-                    Exit::Shutdown
-                } else {
-                    Exit::Unrequested
-                });
-            }
-            if let Some(responses) = self.dispatch(&parsed) {
+            let responses = match validate_message(&parsed) {
+                Ok(message) => self.dispatch(message),
+                Err(response) => Some(vec![response]),
+            };
+            if let Some(responses) = responses {
                 for response in responses {
                     write_json(&mut output, &response)?;
                 }
             }
+            if let Lifecycle::Exited(exit) = self.lifecycle {
+                return Ok(exit);
+            }
         }
     }
 
-    fn dispatch(&mut self, message: &Value) -> Option<Vec<Value>> {
-        let method = match message.get("method").and_then(Value::as_str) {
-            Some(method) => method,
-            None => {
-                return message
-                    .get("id")
-                    .map(|id| vec![error_response(id.clone(), -32600, "Invalid Request")]);
+    fn dispatch(&mut self, message: Incoming) -> Option<Vec<Value>> {
+        if message.method == "exit" {
+            return self.exit(message.id, &message.params);
+        }
+        if message.method == "$/cancelRequest" {
+            return self.cancel(message.id, &message.params);
+        }
+
+        match message.id {
+            Some(id) => Some(vec![self.dispatch_request(
+                id,
+                &message.method,
+                &message.params,
+            )]),
+            None => self.dispatch_notification(&message.method, &message.params),
+        }
+    }
+
+    fn dispatch_request(&mut self, id: RequestId, method: &str, params: &Value) -> Value {
+        if self.cancelled.remove(&id) {
+            return error_response(id.value(), REQUEST_CANCELLED, "Request cancelled");
+        }
+        if matches!(
+            method,
+            "initialized"
+                | "textDocument/didOpen"
+                | "textDocument/didChange"
+                | "textDocument/didClose"
+                | "textDocument/didSave"
+        ) {
+            return error_response(id.value(), -32600, "LSP notification sent as a request");
+        }
+        self.current_request = Some(id.clone());
+        let response = match self.lifecycle {
+            Lifecycle::AwaitingInitialize => {
+                if method == "initialize" {
+                    self.initialize(id.value(), params)
+                } else {
+                    error_response(id.value(), -32002, "Server not initialized")
+                }
+            }
+            Lifecycle::AwaitingInitialized => {
+                if method == "initialize" {
+                    error_response(id.value(), -32600, "Initialize request already received")
+                } else {
+                    error_response(id.value(), -32002, "Server not initialized")
+                }
+            }
+            Lifecycle::Running => match method {
+                "initialize" => {
+                    error_response(id.value(), -32600, "Initialize request already received")
+                }
+                "shutdown" => {
+                    self.lifecycle = Lifecycle::ShutdownRequested;
+                    json!({ "jsonrpc": "2.0", "id": id.value(), "result": Value::Null })
+                }
+                "textDocument/completion" => self.completion(id.value(), params),
+                "textDocument/definition" => self.definition(id.value(), params),
+                "textDocument/references" => self.references(id.value(), params),
+                "textDocument/rename" => self.rename(id.value(), params),
+                _ => error_response(id.value(), -32601, "Method not found"),
+            },
+            Lifecycle::ShutdownRequested | Lifecycle::Exited(_) => {
+                error_response(id.value(), -32600, "Server has shut down")
             }
         };
-        let id = message.get("id").cloned();
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        self.current_request = None;
+        if self.cancelled.remove(&id) {
+            error_response(id.value(), REQUEST_CANCELLED, "Request cancelled")
+        } else {
+            response
+        }
+    }
 
-        if method == "initialize" {
-            self.initialized = true;
-            let id = id.unwrap_or(Value::Null);
-            return Some(vec![json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "capabilities": {
-                        "positionEncoding": "utf-16",
-                        "textDocumentSync": { "openClose": true, "change": 1 },
-                        "completionProvider": { "triggerCharacters": ["."] },
-                        "definitionProvider": true,
-                        "referencesProvider": true,
-                        "renameProvider": true
-                    },
-                    "serverInfo": { "name": "bamts-lsp", "version": "0.2.0" }
+    fn dispatch_notification(&mut self, method: &str, params: &Value) -> Option<Vec<Value>> {
+        match self.lifecycle {
+            Lifecycle::AwaitingInitialize => None,
+            Lifecycle::AwaitingInitialized => {
+                if method == "initialized" {
+                    self.lifecycle = Lifecycle::Running;
+                    None
+                } else {
+                    None
                 }
-            })]);
-        }
-
-        if !self.initialized {
-            return id.map(|id| vec![error_response(id, -32002, "Server not initialized")]);
-        }
-
-        match method {
-            "initialized" | "textDocument/didSave" => None,
-            "shutdown" => {
-                self.shutdown = true;
-                id.map(|id| vec![json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })])
             }
-            "textDocument/didOpen" => self.did_open(&params),
-            "textDocument/didChange" => self.did_change(&params),
-            "textDocument/didClose" => self.did_close(&params),
-            "textDocument/completion" => id.map(|id| vec![self.completion(id, &params)]),
-            "textDocument/definition" => id.map(|id| vec![self.definition(id, &params)]),
-            "textDocument/references" => id.map(|id| vec![self.references(id, &params)]),
-            "textDocument/rename" => id.map(|id| vec![self.rename(id, &params)]),
-            _ => id.map(|id| vec![error_response(id, -32601, "Method not found")]),
+            Lifecycle::Running => match method {
+                "textDocument/didOpen" => self.did_open(params),
+                "textDocument/didChange" => self.did_change(params),
+                "textDocument/didClose" => self.did_close(params),
+                "textDocument/didSave" => None,
+                "initialize" | "shutdown" => Some(vec![invalid_params_notification(format!(
+                    "{method} must be sent as a request"
+                ))]),
+                // LSP 3.17: servers must ignore notifications they do not understand.
+                _ => None,
+            },
+            Lifecycle::ShutdownRequested | Lifecycle::Exited(_) => None,
         }
+    }
+
+    fn initialize(&mut self, id: Value, params: &Value) -> Value {
+        let root = match initialize_root(params, &self.process_root) {
+            Ok(root) => root,
+            Err(message) => return error_response(id, -32602, &message),
+        };
+        let filesystem = match OsFileSystem::new(&root) {
+            Ok(filesystem) => filesystem,
+            Err(error) => return error_response(id, -32603, &error.to_string()),
+        };
+        self.workspace_root = root;
+        self.state = ServiceState::new(filesystem);
+        self.snapshots.clear();
+        self.lifecycle = Lifecycle::AwaitingInitialized;
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "capabilities": {
+                    "positionEncoding": "utf-16",
+                    "textDocumentSync": { "openClose": true, "change": 1 },
+                    "completionProvider": { "triggerCharacters": ["."] },
+                    "definitionProvider": true,
+                    "referencesProvider": true,
+                    "renameProvider": true
+                },
+                "serverInfo": { "name": "bamts-lsp", "version": "0.2.0" }
+            }
+        })
+    }
+
+    fn exit(&mut self, id: Option<RequestId>, params: &Value) -> Option<Vec<Value>> {
+        if let Some(id) = id {
+            return Some(vec![error_response(
+                id.value(),
+                -32600,
+                "exit must be a notification",
+            )]);
+        }
+        if !params.is_null() {
+            return Some(vec![invalid_params_notification(
+                "exit does not accept params".to_owned(),
+            )]);
+        }
+        let exit = if self.lifecycle == Lifecycle::ShutdownRequested {
+            Exit::Shutdown
+        } else {
+            Exit::Unrequested
+        };
+        self.lifecycle = Lifecycle::Exited(exit);
+        None
+    }
+
+    fn cancel(&mut self, id: Option<RequestId>, params: &Value) -> Option<Vec<Value>> {
+        if let Some(id) = id {
+            return Some(vec![error_response(
+                id.value(),
+                -32600,
+                "$/cancelRequest must be a notification",
+            )]);
+        }
+        let Some(value) = params.get("id") else {
+            return Some(vec![invalid_params_notification(
+                "$/cancelRequest requires an id".to_owned(),
+            )]);
+        };
+        let Some(cancelled) = RequestId::parse(value) else {
+            return Some(vec![invalid_params_notification(
+                "$/cancelRequest id must be a string or integer".to_owned(),
+            )]);
+        };
+        if self.current_request.as_ref() == Some(&cancelled) || self.current_request.is_none() {
+            self.cancelled.insert(cancelled);
+        }
+        None
+    }
+
+    fn document_path(&self, uri: &str) -> Result<PathBuf, String> {
+        let path = uri_to_path(uri)?;
+        canonicalize_confined(&path, &self.workspace_root)
     }
 
     fn did_open(&mut self, params: &Value) -> Option<Vec<Value>> {
-        let doc = params.get("textDocument")?;
-        let uri = doc.get("uri").and_then(Value::as_str)?;
-        let text = doc.get("text").and_then(Value::as_str)?;
-        let version = doc.get("version").and_then(Value::as_u64).unwrap_or(1);
-        let path = match uri_to_path(uri) {
+        let Some(doc) = params.get("textDocument") else {
+            return Some(vec![invalid_params_notification(
+                "didOpen requires textDocument".to_owned(),
+            )]);
+        };
+        let (Some(uri), Some(text)) = (
+            doc.get("uri").and_then(Value::as_str),
+            doc.get("text").and_then(Value::as_str),
+        ) else {
+            return Some(vec![invalid_params_notification(
+                "didOpen requires uri and text".to_owned(),
+            )]);
+        };
+        let Some(version) = doc.get("version").and_then(Value::as_u64) else {
+            return Some(vec![invalid_params_notification(
+                "didOpen requires an integer version".to_owned(),
+            )]);
+        };
+        let path = match self.document_path(uri) {
             Ok(path) => path,
             Err(message) => return Some(vec![invalid_params_notification(message)]),
         };
@@ -165,21 +359,44 @@ impl Session {
     }
 
     fn did_change(&mut self, params: &Value) -> Option<Vec<Value>> {
-        let doc = params.get("textDocument")?;
-        let uri = doc.get("uri").and_then(Value::as_str)?;
-        let version = doc.get("version").and_then(Value::as_u64)?;
-        let text = params
-            .get("contentChanges")
-            .and_then(Value::as_array)
-            .and_then(|changes| changes.last())
-            .and_then(|change| {
-                if change.get("range").is_some() {
-                    None
-                } else {
-                    change.get("text").and_then(Value::as_str)
-                }
-            })?;
-        let path = uri_to_path(uri).ok()?;
+        let Some(doc) = params.get("textDocument") else {
+            return Some(vec![invalid_params_notification(
+                "didChange requires textDocument".to_owned(),
+            )]);
+        };
+        let (Some(uri), Some(version)) = (
+            doc.get("uri").and_then(Value::as_str),
+            doc.get("version").and_then(Value::as_u64),
+        ) else {
+            return Some(vec![invalid_params_notification(
+                "didChange requires uri and version".to_owned(),
+            )]);
+        };
+        let Some(changes) = params.get("contentChanges").and_then(Value::as_array) else {
+            return Some(vec![invalid_params_notification(
+                "didChange requires contentChanges".to_owned(),
+            )]);
+        };
+        if changes.len() != 1 {
+            return Some(vec![invalid_params_notification(
+                "full-sync didChange requires exactly one content change".to_owned(),
+            )]);
+        }
+        let change = &changes[0];
+        if change.get("range").is_some() || change.get("rangeLength").is_some() {
+            return Some(vec![invalid_params_notification(
+                "ranged document changes are not supported".to_owned(),
+            )]);
+        }
+        let Some(text) = change.get("text").and_then(Value::as_str) else {
+            return Some(vec![invalid_params_notification(
+                "content change requires text".to_owned(),
+            )]);
+        };
+        let path = match self.document_path(uri) {
+            Ok(path) => path,
+            Err(message) => return Some(vec![invalid_params_notification(message)]),
+        };
         match self.state.update(&path, text, version) {
             Ok(snapshot) => {
                 self.snapshots
@@ -191,11 +408,19 @@ impl Session {
     }
 
     fn did_close(&mut self, params: &Value) -> Option<Vec<Value>> {
-        let uri = params
+        let Some(uri) = params
             .get("textDocument")
             .and_then(|doc| doc.get("uri"))
-            .and_then(Value::as_str)?;
-        let path = uri_to_path(uri).ok()?;
+            .and_then(Value::as_str)
+        else {
+            return Some(vec![invalid_params_notification(
+                "didClose requires a uri".to_owned(),
+            )]);
+        };
+        let path = match self.document_path(uri) {
+            Ok(path) => path,
+            Err(message) => return Some(vec![invalid_params_notification(message)]),
+        };
         let _ = self.state.close(&path);
         self.snapshots.remove(&path);
         Some(vec![json!({
@@ -204,7 +429,6 @@ impl Session {
             "params": { "uri": uri, "diagnostics": [] }
         })])
     }
-
     fn publish_diagnostics(&mut self, path: &Path) -> Value {
         let uri = path_to_uri(path);
         let diagnostics = self
@@ -362,7 +586,7 @@ impl Session {
             .and_then(|doc| doc.get("uri"))
             .and_then(Value::as_str)?;
         let position = params.get("position")?;
-        let path = uri_to_path(uri).ok()?;
+        let path = self.document_path(uri).ok()?;
         let line = u32::try_from(position.get("line").and_then(Value::as_u64)?).ok()?;
         let character = u32::try_from(position.get("character").and_then(Value::as_u64)?).ok()?;
         let snapshot = self.snapshots.get(&path)?;
@@ -537,6 +761,102 @@ fn invalid_params_notification(message: String) -> Value {
     })
 }
 
+/// Validates the JSON-RPC 2.0 envelope of one decoded message.
+///
+/// LSP traffic is object-shaped requests (with `id`) and notifications
+/// (without). Anything else — arrays, responses, wrong `jsonrpc` version,
+/// non-string methods, malformed ids, unstructured params — is rejected with
+/// the JSON-RPC "Invalid Request" error so the failure is deterministic
+/// instead of silently interpreted.
+fn validate_message(message: &Value) -> Result<Incoming, Value> {
+    let invalid = |message: &str, id: Option<&RequestId>| {
+        error_response(id.map_or(Value::Null, RequestId::value), -32600, message)
+    };
+    let Some(object) = message.as_object() else {
+        return Err(invalid("Invalid Request: expected a JSON object", None));
+    };
+    // The id is parsed first so every later rejection can echo it back and
+    // let clients correlate the failure; a malformed id answers as null.
+    let id = object
+        .get("id")
+        .map(|value| {
+            RequestId::parse(value).ok_or_else(|| {
+                invalid(
+                    "Invalid Request: id must be a string, integer, or null",
+                    None,
+                )
+            })
+        })
+        .transpose()?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(invalid(
+            "Invalid Request: jsonrpc must be \"2.0\"",
+            id.as_ref(),
+        ));
+    }
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return Err(invalid(
+            "Invalid Request: method must be a string",
+            id.as_ref(),
+        ));
+    };
+    let params = match object.get("params") {
+        None | Some(Value::Null) => Value::Null,
+        Some(params @ (Value::Object(_) | Value::Array(_))) => params.clone(),
+        Some(_) => {
+            return Err(invalid(
+                "Invalid Request: params must be structured",
+                id.as_ref(),
+            ));
+        }
+    };
+    Ok(Incoming {
+        id,
+        method: method.to_owned(),
+        params,
+    })
+}
+
+/// Resolves the initialize `rootUri`/`rootPath` parameters against the
+/// process root.
+///
+/// `rootUri` takes precedence, `rootPath` is the legacy fallback, and when
+/// both are null or absent the process root stands in. The resolved path is
+/// canonicalized and must remain within `process_root`.
+fn initialize_root(params: &Value, process_root: &Path) -> Result<PathBuf, String> {
+    if let Some(root_uri) = params.get("rootUri").filter(|value| !value.is_null()) {
+        let uri = root_uri
+            .as_str()
+            .ok_or_else(|| "rootUri must be a string or null".to_owned())?;
+        let path = uri_to_path(uri)?;
+        return canonicalize_confined(&path, process_root);
+    }
+    if let Some(root_path) = params.get("rootPath").filter(|value| !value.is_null()) {
+        let path = root_path
+            .as_str()
+            .ok_or_else(|| "rootPath must be a string or null".to_owned())?;
+        return canonicalize_confined(Path::new(path), process_root);
+    }
+    Ok(process_root.to_path_buf())
+}
+
+/// Canonicalizes `path` and requires the result to stay within `root`.
+///
+/// Symlinks are resolved by canonicalization, so a link that escapes the
+/// root is rejected just like a lexical `..` traversal.
+fn canonicalize_confined(path: &Path, root: &Path) -> Result<PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize {}: {error}", path.display()))?;
+    if canonical.strip_prefix(root).is_err() {
+        return Err(format!(
+            "path escapes the workspace root: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 fn show_message(error: &ServiceError) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -580,6 +900,96 @@ mod tests {
                 "rootUri": path_to_uri(root)
             }
         })
+    }
+
+    fn error_codes(messages: &[Value], id: &Value) -> Vec<i64> {
+        messages
+            .iter()
+            .filter(|message| message.get("id") == Some(id))
+            .filter_map(|message| message["error"]["code"].as_i64())
+            .collect()
+    }
+
+    fn results_with_id<'a>(messages: &'a [Value], id: &Value) -> Vec<&'a Value> {
+        messages
+            .iter()
+            .filter(|message| message.get("id") == Some(id))
+            .collect()
+    }
+
+    fn run_session(root: &Path, input: Vec<u8>) -> (Exit, Vec<Value>) {
+        let mut output = Vec::new();
+        let exit = run(Cursor::new(input), &mut output, root).expect("run");
+        (exit, read_all(&output))
+    }
+
+    fn lifecycle_traffic(root: &Path, extra: &[Value]) -> (Exit, Vec<Value>) {
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root)));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        for message in extra {
+            input.extend(frame(message));
+        }
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "shutdown",
+            "params": null
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        run_session(root, input)
+    }
+
+    fn open_document(uri: &str, text: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "typescript",
+                    "version": 1,
+                    "text": text
+                }
+            }
+        })
+    }
+
+    fn change_document(uri: &str, version: u64, changes: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": changes
+            }
+        })
+    }
+
+    fn query_request(id: i64, method: &str, uri: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 0 }
+            }
+        })
+    }
+
+    fn show_message_texts(messages: &[Value]) -> Vec<String> {
+        messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str) == Some("window/showMessage")
+            })
+            .filter_map(|message| message["params"]["message"].as_str().map(str::to_owned))
+            .collect()
     }
 
     #[test]
@@ -768,5 +1178,749 @@ mod tests {
         assert_eq!(lsp_position(source, 0, 0), Utf16Pos::new(0));
         assert_eq!(lsp_position(source, 0, 1), Utf16Pos::new(1));
         assert_eq!(lsp_position(source, 0, 3), Utf16Pos::new(3));
+    }
+
+    #[test]
+    fn lsp_position_respects_lines_and_utf16_units() {
+        let source = "a😀\r\n😀b\nok";
+        // Line 0: "a😀" is 3 UTF-16 units, then "\r\n" is 2.
+        assert_eq!(lsp_position(source, 1, 0), Utf16Pos::new(5));
+        // A position inside the surrogate pair snaps to its end.
+        assert_eq!(lsp_position(source, 1, 1), Utf16Pos::new(7));
+        assert_eq!(lsp_position(source, 1, 2), Utf16Pos::new(7));
+        // Line 2: 4 + 1 (bare \n) + 3 + 1 = 9.
+        assert_eq!(lsp_position(source, 2, 0), Utf16Pos::new(9));
+        // Positions past the end of a line clamp to the line end.
+        assert_eq!(lsp_position(source, 2, 100), Utf16Pos::new(11));
+        // Lines past the end of the file clamp to the source end.
+        assert_eq!(lsp_position(source, 9, 0), Utf16Pos::new(11));
+    }
+
+    #[test]
+    fn initialize_advertises_exactly_supported_capabilities() {
+        let root = tempfile::tempdir().expect("temp");
+        let (_, messages) = lifecycle_traffic(root.path(), &[]);
+        let init = results_with_id(&messages, &json!(1))
+            .into_iter()
+            .next()
+            .expect("initialize response");
+        let capabilities = init["result"]["capabilities"]
+            .as_object()
+            .expect("capabilities object");
+        let mut advertised: Vec<&String> = capabilities.keys().collect();
+        advertised.sort_unstable();
+        assert_eq!(
+            advertised,
+            [
+                "completionProvider",
+                "definitionProvider",
+                "positionEncoding",
+                "referencesProvider",
+                "renameProvider",
+                "textDocumentSync"
+            ]
+        );
+        let sync = &capabilities["textDocumentSync"];
+        assert_eq!(sync["openClose"], json!(true));
+        assert_eq!(sync["change"], json!(1));
+        assert_eq!(init["result"]["serverInfo"]["name"], json!("bamts-lsp"));
+    }
+
+    #[test]
+    fn requests_before_initialize_fail_with_server_not_initialized() {
+        let root = tempfile::tempdir().expect("temp");
+        let mut input = Vec::new();
+        input.extend(frame(&query_request(
+            7,
+            "textDocument/definition",
+            "file:///nowhere.ts",
+        )));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "shutdown",
+            "params": null
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Unrequested);
+        assert_eq!(error_codes(&messages, &json!(7)), [-32002]);
+        assert_eq!(error_codes(&messages, &json!(8)), [-32002]);
+        // Notifications before initialize are ignored, never answered.
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.get("method").is_none()),
+            "no server-to-client notifications before initialize: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn initialize_before_initialized_is_completed_and_repeats_fail() {
+        let root = tempfile::tempdir().expect("temp");
+        // Second initialize while still awaiting `initialized`.
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": { "capabilities": {}, "rootUri": path_to_uri(root.path()) }
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        // Third initialize once fully running.
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "initialize",
+            "params": { "capabilities": {}, "rootUri": path_to_uri(root.path()) }
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Unrequested);
+        assert_eq!(error_codes(&messages, &json!(2)), [-32600]);
+        assert_eq!(error_codes(&messages, &json!(3)), [-32600]);
+        assert!(
+            results_with_id(&messages, &json!(1))[0]["result"]["capabilities"]
+                .as_object()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn requests_are_rejected_after_shutdown() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("after.ts");
+        std::fs::write(&file, "const value = 1;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&open_document(&uri, "const value = 1;\n")));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "shutdown",
+            "params": null
+        })));
+        input.extend(frame(&query_request(100, "textDocument/definition", &uri)));
+        input.extend(frame(&open_document(&uri, "const value = 2;\n")));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Shutdown);
+        // Every request after shutdown fails.
+        assert_eq!(error_codes(&messages, &json!(100)), [-32600]);
+        // Notifications after shutdown are dropped: no second publish.
+        let publishes = messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str)
+                    == Some("textDocument/publishDiagnostics")
+            })
+            .count();
+        assert_eq!(publishes, 1);
+    }
+
+    #[test]
+    fn exit_without_shutdown_reports_unrequested() {
+        let root = tempfile::tempdir().expect("temp");
+        let input = frame(&json!({ "jsonrpc": "2.0", "method": "exit" }));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Unrequested);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn stream_end_without_exit_reports_unrequested() {
+        let root = tempfile::tempdir().expect("temp");
+        let (exit, _) = run_session(root.path(), Vec::new());
+        assert_eq!(exit, Exit::Unrequested);
+    }
+
+    #[test]
+    fn exit_as_request_is_rejected() {
+        let root = tempfile::tempdir().expect("temp");
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "exit",
+            "params": null
+        })));
+        // The rejected exit must not terminate the session.
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Unrequested);
+        assert_eq!(error_codes(&messages, &json!(5)), [-32600]);
+    }
+
+    #[test]
+    fn parse_errors_answer_with_null_id() {
+        let root = tempfile::tempdir().expect("temp");
+        let body = b"{not json";
+        let mut input = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        input.extend_from_slice(body);
+        let (_, messages) = run_session(root.path(), input);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]["id"].is_null());
+        assert_eq!(messages[0]["error"]["code"], json!(-32700));
+    }
+
+    #[test]
+    fn invalid_request_objects_are_rejected() {
+        let root = tempfile::tempdir().expect("temp");
+        let cases: Vec<(Value, Option<Value>)> = vec![
+            // Missing jsonrpc member.
+            (json!({ "id": 1, "method": "shutdown" }), Some(json!(1))),
+            // Wrong protocol version.
+            (
+                json!({ "jsonrpc": "1.0", "id": 2, "method": "shutdown" }),
+                Some(json!(2)),
+            ),
+            // jsonrpc not a string.
+            (
+                json!({ "jsonrpc": 2.0, "id": 3, "method": "shutdown" }),
+                Some(json!(3)),
+            ),
+            // Missing method.
+            (json!({ "jsonrpc": "2.0", "id": 4 }), Some(json!(4))),
+            // Method not a string.
+            (
+                json!({ "jsonrpc": "2.0", "id": 5, "method": 42 }),
+                Some(json!(5)),
+            ),
+            // Non-array, non-object message.
+            (json!([1, 2, 3]), None),
+            // Malformed id: fractional numbers are not valid ids.
+            (
+                json!({ "jsonrpc": "2.0", "id": 1.5, "method": "shutdown" }),
+                None,
+            ),
+            // Malformed id: structured values are not valid ids.
+            (
+                json!({ "jsonrpc": "2.0", "id": { "n": 1 }, "method": "shutdown" }),
+                None,
+            ),
+            // Malformed params: must be structured or omitted.
+            (
+                json!({ "jsonrpc": "2.0", "id": 6, "method": "shutdown", "params": 17 }),
+                Some(json!(6)),
+            ),
+        ];
+        for (invalid, id) in cases {
+            let mut input = frame(&invalid);
+            input.extend(frame(&initialize(root.path())));
+            input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+            let (_, messages) = run_session(root.path(), input);
+            let errors: Vec<&Value> = messages
+                .iter()
+                .filter(|message| message.get("error").is_some())
+                .collect();
+            assert_eq!(errors.len(), 1, "one rejection for {invalid}");
+            assert_eq!(errors[0]["error"]["code"], json!(-32600), "for {invalid}");
+            let expected_id = id.unwrap_or(Value::Null);
+            assert_eq!(errors[0]["id"], expected_id, "for {invalid}");
+            // The session must remain usable: initialize still answered.
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.get("result").is_some()),
+                "session survives {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_request_method_is_method_not_found() {
+        let root = tempfile::tempdir().expect("temp");
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "textDocument/hover",
+                "params": {}
+            })],
+        );
+        assert_eq!(error_codes(&messages, &json!(21)), [-32601]);
+    }
+
+    #[test]
+    fn notification_only_methods_rejected_as_requests() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("shape.ts");
+        std::fs::write(&file, "const value = 1;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        let (exit, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "initialized",
+                    "params": {}
+                }),
+                json!({ "jsonrpc": "2.0", "id": 30, "method": "textDocument/didOpen",
+                        "params": { "textDocument": { "uri": uri, "languageId": "typescript",
+                                                       "version": 1, "text": "const value = 1;\n" } } }),
+                json!({ "jsonrpc": "2.0", "id": 31, "method": "initialized", "params": {} }),
+            ],
+        );
+        assert_eq!(exit, Exit::Shutdown);
+        assert_eq!(error_codes(&messages, &json!(30)), [-32600]);
+        assert_eq!(error_codes(&messages, &json!(31)), [-32600]);
+    }
+
+    #[test]
+    fn request_only_methods_sent_as_notifications_are_reported() {
+        let root = tempfile::tempdir().expect("temp");
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "shutdown" })));
+        // The malformed shutdown must not end the session.
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 51,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": { "uri": "file:///missing.ts" },
+                "position": { "line": 0, "character": 0 }
+            }
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Unrequested);
+        let texts = show_message_texts(&messages);
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("shutdown"), "{texts:?}");
+        // The session kept serving requests after the malformed notification.
+        assert_eq!(error_codes(&messages, &json!(51)), [-32602]);
+    }
+
+    #[test]
+    fn queued_cancelled_request_never_succeeds() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("cancel.ts");
+        std::fs::write(&file, "const answer = 1;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        // The cancel notification arrives before the request it targets.
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                open_document(&uri, "const answer = 1;\n"),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/cancelRequest",
+                    "params": { "id": 40 }
+                }),
+                query_request(40, "textDocument/definition", &uri),
+            ],
+        );
+        assert_eq!(error_codes(&messages, &json!(40)), [-32800]);
+        assert!(results_with_id(&messages, &json!(40))[0]["error"].is_object());
+    }
+
+    #[test]
+    fn string_ids_cancel_and_respond_symmetrically() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("cancel-str.ts");
+        std::fs::write(&file, "const answer = 1;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                open_document(&uri, "const answer = 1;\n"),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/cancelRequest",
+                    "params": { "id": "req-1" }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "req-1",
+                    "method": "textDocument/completion",
+                    "params": {
+                        "textDocument": { "uri": uri },
+                        "position": { "line": 0, "character": 0 }
+                    }
+                }),
+            ],
+        );
+        assert_eq!(error_codes(&messages, &json!("req-1")), [-32800]);
+    }
+
+    #[test]
+    fn malformed_cancel_requests_are_reported() {
+        let root = tempfile::tempdir().expect("temp");
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 50,
+                    "method": "$/cancelRequest",
+                    "params": { "id": 51 }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/cancelRequest",
+                    "params": {}
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/cancelRequest",
+                    "params": { "id": true }
+                }),
+            ],
+        );
+        assert_eq!(error_codes(&messages, &json!(50)), [-32600]);
+        let texts = show_message_texts(&messages);
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(
+            texts.iter().all(|text| text.contains("cancelRequest")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn ranged_and_ambiguous_changes_are_rejected() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("sync.ts");
+        std::fs::write(&file, "const value = 1;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                open_document(&uri, "const value = 1;\n"),
+                // Ranged incremental change: not supported by the advertised
+                // full sync (change: 1).
+                change_document(
+                    &uri,
+                    2,
+                    json!([{ "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 5 }
+                    }, "text": "let" }]),
+                ),
+                // rangeLength without being a full change is still ranged.
+                change_document(
+                    &uri,
+                    3,
+                    json!([{ "rangeLength": 5, "text": "let value = 2;\n" }]),
+                ),
+                // Two changes are ambiguous under full sync.
+                change_document(
+                    &uri,
+                    4,
+                    json!([{ "text": "const a = 1;\n" }, { "text": "const b = 2;\n" }]),
+                ),
+                // Zero changes carry no document state.
+                change_document(&uri, 5, json!([])),
+                // A change entry without text is invalid.
+                change_document(&uri, 6, json!([{ "range": null }])),
+                // Non-string text is invalid.
+                change_document(&uri, 7, json!([{ "text": 42 }])),
+                // A final valid full change must still apply: rejections never
+                // leave the document in a half-updated state.
+                change_document(&uri, 8, json!([{ "text": "const value = 9;\n" }])),
+            ],
+        );
+        let texts = show_message_texts(&messages);
+        assert_eq!(
+            texts,
+            [
+                "ranged document changes are not supported",
+                "ranged document changes are not supported",
+                "full-sync didChange requires exactly one content change",
+                "full-sync didChange requires exactly one content change",
+                "ranged document changes are not supported",
+                "content change requires text",
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_open_close_and_missing_version_are_reported() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("open.ts");
+        std::fs::write(&file, "const value = 1;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen",
+                        "params": { "textDocument": { "uri": uri, "version": 1 } } }),
+                json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen",
+                        "params": { "textDocument": { "uri": uri, "languageId": "typescript",
+                                                       "version": 1 } } }),
+                json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen",
+                        "params": { "textDocument": { "uri": uri, "languageId": "typescript",
+                                                       "text": "const value = 1;\n" } } }),
+                json!({ "jsonrpc": "2.0", "method": "textDocument/didChange",
+                        "params": { "textDocument": { "uri": uri },
+                                    "contentChanges": [{ "text": "const value = 2;\n" }] } }),
+                json!({ "jsonrpc": "2.0", "method": "textDocument/didClose",
+                        "params": {} }),
+            ],
+        );
+        let texts = show_message_texts(&messages);
+        assert_eq!(
+            texts,
+            [
+                "didOpen requires uri and text",
+                "didOpen requires uri and text",
+                "didOpen requires an integer version",
+                "didChange requires uri and version",
+                "didClose requires a uri",
+            ]
+        );
+    }
+
+    #[test]
+    fn initialize_root_outside_process_root_is_rejected() {
+        let process_root = tempfile::tempdir().expect("temp");
+        let outside = tempfile::tempdir().expect("temp");
+        let mut input = Vec::new();
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "capabilities": {}, "rootUri": path_to_uri(outside.path()) }
+        })));
+        // Still uninitialized after the failed initialize.
+        input.extend(frame(&query_request(
+            2,
+            "textDocument/completion",
+            "file:///x.ts",
+        )));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(process_root.path(), input);
+        assert_eq!(exit, Exit::Unrequested);
+        assert_eq!(error_codes(&messages, &json!(1)), [-32602]);
+        assert_eq!(error_codes(&messages, &json!(2)), [-32002]);
+    }
+
+    #[test]
+    fn initialize_accepts_root_path_fallback_and_defaults() {
+        let root = tempfile::tempdir().expect("temp");
+        // rootUri: null with rootPath set falls back to rootPath.
+        let mut input = Vec::new();
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "capabilities": {},
+                "rootUri": Value::Null,
+                "rootPath": root.path().to_str().expect("utf8")
+            }
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "shutdown",
+            "params": null
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Shutdown);
+        assert!(results_with_id(&messages, &json!(1))[0]["result"].is_object());
+        // No root parameters at all: the process root stands in.
+        let mut input = Vec::new();
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "capabilities": {} }
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "shutdown",
+            "params": null
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Shutdown);
+        assert!(results_with_id(&messages, &json!(1))[0]["result"].is_object());
+    }
+
+    #[test]
+    fn document_uris_must_stay_inside_the_workspace_root() {
+        let root = tempfile::tempdir().expect("temp");
+        let inner = root.path().join("inner");
+        std::fs::create_dir(&inner).expect("mkdir");
+        let outside_file = root.path().join("outside.ts");
+        std::fs::write(&outside_file, "const outside = 1;\n").expect("seed");
+        let workspace_file = inner.join("inside.ts");
+        std::fs::write(&workspace_file, "const inside = 1;\n").expect("seed");
+        // Lexical traversal out of the workspace root.
+        let escape_uri = path_to_uri(&inner.join("..").join("outside.ts"));
+        // A symlink inside the workspace pointing outside it.
+        let link = inner.join("link.ts");
+        std::os::unix::fs::symlink(&outside_file, &link).expect("symlink");
+        let mut input = Vec::new();
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "capabilities": {}, "rootUri": path_to_uri(&inner) }
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        // Every document outside the workspace root is refused: direct,
+        // traversed, and symlinked alike.
+        input.extend(frame(&open_document(
+            &path_to_uri(&outside_file),
+            "const outside = 1;\n",
+        )));
+        input.extend(frame(&open_document(&escape_uri, "const outside = 1;\n")));
+        input.extend(frame(&open_document(
+            &path_to_uri(&link),
+            "const outside = 1;\n",
+        )));
+        // Documents inside the workspace root still work.
+        input.extend(frame(&open_document(
+            &path_to_uri(&workspace_file),
+            "const inside = 1;\n",
+        )));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "shutdown",
+            "params": null
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let (exit, messages) = run_session(root.path(), input);
+        assert_eq!(exit, Exit::Shutdown);
+        let texts = show_message_texts(&messages);
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert!(
+            texts.iter().all(|text| text.contains("workspace root")),
+            "{texts:?}"
+        );
+        // Exactly one diagnostics publish succeeded: the in-workspace file.
+        let publishes = messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str)
+                    == Some("textDocument/publishDiagnostics")
+            })
+            .count();
+        assert_eq!(publishes, 1);
+    }
+
+    #[test]
+    fn non_file_uris_are_rejected() {
+        let root = tempfile::tempdir().expect("temp");
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                open_document("untitled:Untitled-1", "const value = 1;\n"),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 70,
+                    "method": "textDocument/completion",
+                    "params": {
+                        "textDocument": { "uri": "https://example.com/x.ts" },
+                        "position": { "line": 0, "character": 0 }
+                    }
+                }),
+            ],
+        );
+        let texts = show_message_texts(&messages);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("unsupported URI scheme")),
+            "{texts:?}"
+        );
+        assert_eq!(error_codes(&messages, &json!(70)), [-32602]);
+    }
+
+    #[test]
+    fn percent_encoded_uris_resolve_to_the_same_document() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("with space.ts");
+        std::fs::write(&file, "const answer = 1;\nconst copy = answer;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        assert!(uri.contains("%20"), "{uri}");
+        let (exit, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                open_document(&uri, "const answer = 1;\nconst copy = answer;\n"),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 80,
+                    "method": "textDocument/definition",
+                    "params": {
+                        "textDocument": { "uri": uri },
+                        "position": { "line": 1, "character": 14 }
+                    }
+                }),
+            ],
+        );
+        assert_eq!(exit, Exit::Shutdown);
+        assert_eq!(error_codes(&messages, &json!(80)), Vec::<i64>::new());
+        let definition = results_with_id(&messages, &json!(80))
+            .into_iter()
+            .next()
+            .expect("definition response");
+        assert_eq!(definition["result"]["uri"], json!(uri));
+    }
+
+    #[test]
+    fn framing_rejects_messages_over_16_mib() {
+        let oversized = MAX_MESSAGE_BYTES + 1;
+        let header = format!("Content-Length: {oversized}\r\n\r\n");
+        let mut cursor = Cursor::new(header.into_bytes());
+        let error = read_message(&mut cursor).expect_err("oversized");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn framing_accepts_a_message_at_the_16_mib_bound() {
+        let body = vec![0u8; MAX_MESSAGE_BYTES];
+        let mut input = format!("Content-Length: {}\r\n\r\n", MAX_MESSAGE_BYTES).into_bytes();
+        input.extend_from_slice(&body);
+        let mut cursor = Cursor::new(input);
+        let raw = read_message(&mut cursor)
+            .expect("boundary message")
+            .expect("body");
+        assert_eq!(raw.len(), MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn framing_requires_content_length() {
+        let mut cursor = Cursor::new(b"Content-Type: application/vscode-jsonrpc\r\n\r\n".to_vec());
+        let error = read_message(&mut cursor).expect_err("missing length");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
