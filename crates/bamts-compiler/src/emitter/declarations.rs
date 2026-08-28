@@ -110,6 +110,7 @@ pub fn emit_declarations(
             indent_width: options.indent_width,
             source_map: options.declaration_map,
             inline_source_map: false,
+            inline_sources: false,
         },
         names,
         Surface::Declaration,

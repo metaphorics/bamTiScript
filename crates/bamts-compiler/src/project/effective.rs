@@ -31,6 +31,7 @@ pub struct ProjectOptionOverrides {
     pub no_emit_on_error: Option<bool>,
     pub declaration_map: Option<bool>,
     pub inline_source_map: Option<bool>,
+    pub inline_sources: Option<bool>,
     pub declaration: Option<bool>,
     pub source_map: Option<bool>,
     pub out_dir: Option<PathBuf>,
@@ -195,6 +196,14 @@ pub fn compile_project<F: FileSystem + Clone>(
     if project.options().source_map() && project.options().inline_source_map() {
         return Err(ProjectCompileError::UnsupportedOption {
             option: "sourceMap with inlineSourceMap",
+        });
+    }
+    if project.options().inline_sources()
+        && !project.options().source_map()
+        && !project.options().inline_source_map()
+    {
+        return Err(ProjectCompileError::UnsupportedOption {
+            option: "inlineSources without sourceMap or inlineSourceMap",
         });
     }
 
@@ -444,6 +453,7 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
         ("sourceMap", options.source_map()),
         ("inlineSourceMap", options.inline_source_map()),
         ("declarationMap", options.declaration_map()),
+        ("inlineSources", options.inline_sources()),
     ] {
         if enabled {
             directives.insert(name.to_owned(), String::from("true"));
@@ -967,6 +977,7 @@ fn apply_overrides(
         ("declarationMap", overrides.declaration_map),
         ("sourceMap", overrides.source_map),
         ("inlineSourceMap", overrides.inline_source_map),
+        ("inlineSources", overrides.inline_sources),
         ("strict", overrides.strict),
         ("allowJs", overrides.allow_js),
         ("checkJs", overrides.check_js),
@@ -1665,6 +1676,27 @@ mod tests {
     }
 
     #[test]
+    fn inline_sources_requires_a_javascript_map_in_projects() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts", "export const a = 1;\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["src/a.ts"],"compilerOptions":{"inlineSources":true}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        let error = compile_project(&project, &ProjectCompileOptions::default(), &filesystem)
+            .expect_err("inlineSources without a JavaScript map must fail");
+        assert!(matches!(
+            error,
+            ProjectCompileError::UnsupportedOption {
+                option: "inlineSources without sourceMap or inlineSourceMap"
+            }
+        ));
+    }
+
+    #[test]
     fn compile_project_reuses_graph_emits_maps_and_tracks_incremental_hashes() {
         let fixture = Fixture::new();
         fixture.write("src/shared.ts", "export const shared = 1;\n");
@@ -1685,6 +1717,7 @@ mod tests {
                     "outDir":"dist",
                     "declaration":true,
                     "sourceMap":true,
+                    "inlineSources":true,
                     "declarationMap":true,
                     "incremental":true
                 }
@@ -1727,6 +1760,12 @@ mod tests {
             );
         }
         for (path, bytes) in &first.outputs.files {
+            let text = std::str::from_utf8(bytes).expect("text artifact");
+            if path.to_string_lossy().ends_with(".d.ts.map") {
+                assert!(!text.contains("\"sourcesContent\""), "{}", path.display());
+            } else if path.to_string_lossy().ends_with(".js.map") {
+                assert!(text.contains("\"sourcesContent\""), "{}", path.display());
+            }
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, bytes).unwrap();
         }

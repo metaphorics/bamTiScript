@@ -114,6 +114,7 @@ pub struct EmitOptions {
     pub strip_private: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
+    pub inline_sources: bool,
     pub declaration_map: bool,
     /// JSX output mode. `None` behaves like [`JsxEmit::Preserve`].
     pub jsx: Option<JsxEmit>,
@@ -141,6 +142,7 @@ impl Default for EmitOptions {
             strip_private: false,
             source_map: false,
             inline_source_map: false,
+            inline_sources: false,
             declaration_map: false,
             jsx: None,
             jsx_factory: None,
@@ -254,6 +256,12 @@ impl EmitOptions {
                 };
                 self.inline_source_map = inline_source_map;
             }
+            "inlinesources" => {
+                let Some(inline_sources) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.inline_sources = inline_sources;
+            }
             "declarationmap" => {
                 let Some(declaration_map) = parse_bool(value) else {
                     return Some(invalid());
@@ -328,6 +336,7 @@ impl EmitOptions {
             },
             source_map: self.source_map,
             inline_source_map: self.inline_source_map,
+            inline_sources: self.inline_sources,
         }
     }
 
@@ -393,6 +402,12 @@ pub(crate) struct PrintOptions {
     pub(crate) indent_width: u8,
     pub(crate) source_map: bool,
     pub(crate) inline_source_map: bool,
+    pub(crate) inline_sources: bool,
+}
+
+pub(crate) struct PrintSource<'a> {
+    pub(crate) file: &'a SourceFile,
+    pub(crate) original_content: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -410,6 +425,8 @@ pub fn emit_checked(
     names: &EmitFileNames,
 ) -> EmitOutput {
     let source_map_conflict = options.source_map && options.inline_source_map;
+    let inline_sources_without_source_map =
+        options.inline_sources && !options.source_map && !options.inline_source_map;
     let options = options.normalized();
     let mut output = if options.emit_declaration_only {
         EmitOutput::default()
@@ -429,6 +446,13 @@ pub fn emit_checked(
             "sourceMap and inlineSourceMap cannot be specified together",
         ));
     }
+    if inline_sources_without_source_map {
+        output.diagnostics.push(option_diagnostic(
+            codes::INVALID_OPTION_VALUE,
+            file.source_id(),
+            "inlineSources can only be used when sourceMap or inlineSourceMap is provided",
+        ));
+    }
     output.diagnostics.sort();
     output.diagnostics.dedup();
     output
@@ -443,12 +467,23 @@ pub(crate) fn print(
     surface: Surface,
     prelude: Option<String>,
 ) -> EmitOutput {
-    print_with_jsx_plan(file, model, options, names, surface, prelude, None)
+    print_with_jsx_plan(
+        PrintSource {
+            file,
+            original_content: file.source_text().as_str(),
+        },
+        model,
+        options,
+        names,
+        surface,
+        prelude,
+        None,
+    )
 }
 
 #[must_use]
 pub(crate) fn print_with_jsx_plan(
-    file: &SourceFile,
+    source: PrintSource<'_>,
     model: &SemanticModel,
     options: PrintOptions,
     names: &EmitFileNames,
@@ -456,8 +491,13 @@ pub(crate) fn print_with_jsx_plan(
     prelude: Option<String>,
     jsx_plan: Option<&JsxSourceDesugarPlan>,
 ) -> EmitOutput {
+    let PrintSource {
+        file,
+        original_content,
+    } = source;
     let mut map = (options.source_map || options.inline_source_map).then(|| {
-        let mut builder = SourceMapBuilder::new();
+        let mut builder = SourceMapBuilder::new()
+            .with_sources_content(options.inline_sources && surface == Surface::JavaScript);
         let file_name = match surface {
             Surface::JavaScript => names.js_file_name.as_deref(),
             Surface::Declaration => names.declaration_file_name.as_deref(),
@@ -471,7 +511,7 @@ pub(crate) fn print_with_jsx_plan(
         builder
     });
     if let Some(builder) = &mut map {
-        builder.intern_source_with_content(&names.source_name, file.source_text().as_str());
+        builder.intern_source_with_content(&names.source_name, original_content);
     }
 
     let mut emitter = Emitter {

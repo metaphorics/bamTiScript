@@ -623,7 +623,7 @@ mod tests {
         LineColumn, SourceMapBuilder, SourceMapError, decode_vlq, encode_base64, encode_vlq,
     };
     use crate::emitter::transpile::transpile_text;
-    use crate::emitter::{EmitFileNames, EmitOptions, codes};
+    use crate::emitter::{EmitFileNames, EmitOptions, ScriptTarget, codes};
     use crate::source::{ScriptKind, SourceId};
     use crate::source::{SourceText, Utf16Pos};
     use std::sync::Arc;
@@ -1024,6 +1024,83 @@ mod tests {
                 .code
                 .contains("//# sourceMappingURL=output.d.ts.map")
         );
+    }
+
+    #[test]
+    fn inline_sources_populates_javascript_but_not_declaration_maps() {
+        let source = "export async function f(x: number) { return await x; }";
+        let output = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                inline_sources: true,
+                declaration: true,
+                declaration_map: true,
+                ..EmitOptions::default()
+            },
+        );
+        let javascript = output.javascript.expect("javascript output");
+        assert_eq!(
+            javascript
+                .source_map
+                .expect("javascript source map")
+                .sources_content(),
+            Some(&[Some(source.to_owned())][..])
+        );
+        assert!(
+            output
+                .declaration
+                .expect("declaration output")
+                .source_map
+                .expect("declaration source map")
+                .sources_content()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inline_sources_populates_inline_javascript_maps() {
+        let source = "const value: number = 1;";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                inline_source_map: true,
+                inline_sources: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        assert!(
+            javascript
+                .code
+                .contains("//# sourceMappingURL=data:application/json;base64,")
+        );
+        assert_eq!(
+            javascript
+                .source_map
+                .expect("inline source map")
+                .sources_content(),
+            Some(&[Some(source.to_owned())][..])
+        );
+    }
+
+    #[test]
+    fn inline_sources_requires_a_javascript_source_map() {
+        let output = emit(
+            "const value = 1;",
+            &EmitOptions {
+                inline_sources: true,
+                declaration: true,
+                declaration_map: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert!(output.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code() == codes::INVALID_OPTION_VALUE
+                && diagnostic.message().contains("inlineSources")
+        }));
     }
 
     #[test]

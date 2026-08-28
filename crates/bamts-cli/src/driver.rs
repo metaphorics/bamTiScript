@@ -767,6 +767,7 @@ fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOverrides {
         declaration_map: boolean("declarationMap"),
         source_map: boolean("sourceMap"),
         inline_source_map: boolean("inlineSourceMap"),
+        inline_sources: boolean("inlineSources"),
         out_dir: command.option_str("outDir").map(PathBuf::from),
         root_dir: command.option_str("rootDir").map(PathBuf::from),
         out_file: command

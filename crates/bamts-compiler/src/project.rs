@@ -935,6 +935,7 @@ pub struct CompilerOptions {
     declaration_dir: Option<PathBuf>,
     source_map: bool,
     inline_source_map: bool,
+    inline_sources: bool,
     map_root: Option<PathBuf>,
     source_root: Option<PathBuf>,
     no_emit: bool,
@@ -1029,6 +1030,11 @@ impl CompilerOptions {
     #[must_use]
     pub const fn inline_source_map(&self) -> bool {
         self.inline_source_map
+    }
+
+    #[must_use]
+    pub const fn inline_sources(&self) -> bool {
+        self.inline_sources
     }
 
     #[must_use]
@@ -1174,6 +1180,7 @@ impl ProjectConfig {
             declaration_dir: optional_path(root, directory, compiler, "declarationDir")?,
             source_map: optional_bool(compiler, "sourceMap")?.unwrap_or(false),
             inline_source_map: optional_bool(compiler, "inlineSourceMap")?.unwrap_or(false),
+            inline_sources: optional_bool(compiler, "inlineSources")?.unwrap_or(false),
             map_root: optional_path(root, directory, compiler, "mapRoot")?,
             source_root: optional_path(root, directory, compiler, "sourceRoot")?,
             no_emit: optional_bool(compiler, "noEmit")?.unwrap_or(false),

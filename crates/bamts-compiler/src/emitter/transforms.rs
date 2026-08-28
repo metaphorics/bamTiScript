@@ -30,7 +30,9 @@ use crate::source::{
 use crate::syntax::*;
 
 use super::helpers::{self, HelperKind, HelperOptions};
-use super::{EmitFileNames, EmitOutput, Newline, PrintOptions, Surface, print_with_jsx_plan};
+use super::{
+    EmitFileNames, EmitOutput, Newline, PrintOptions, PrintSource, Surface, print_with_jsx_plan,
+};
 
 /// Stable diagnostic identifiers produced by target transforms.
 pub mod codes {
@@ -141,6 +143,8 @@ pub struct TransformOptions {
     pub source_map: bool,
     /// Whether to produce and inline a JavaScript source map.
     pub inline_source_map: bool,
+    /// Whether JavaScript source maps include the original source text.
+    pub inline_sources: bool,
 }
 
 /// Features found in a file, helpers they require, and diagnostics they produce.
@@ -256,13 +260,17 @@ pub fn emit_transformed(
     let helper_emit = helpers::emit_helpers(&used_helpers, &options.helpers, Some(&rewritten));
     let prelude = join_preludes(&runtime_prelude, &helper_emit.prelude);
     let mut output = print_with_jsx_plan(
-        &rewritten,
+        PrintSource {
+            file: &rewritten,
+            original_content: file.source_text().as_str(),
+        },
         model,
         PrintOptions {
             newline: options.newline,
             indent_width: options.indent_width,
             source_map: options.source_map,
             inline_source_map: options.inline_source_map,
+            inline_sources: options.inline_sources,
         },
         names,
         Surface::JavaScript,
