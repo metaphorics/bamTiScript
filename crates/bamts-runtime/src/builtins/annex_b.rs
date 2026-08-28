@@ -6,6 +6,11 @@
 //!   `trimStart`/`trimEnd` function objects (same object identity)
 //! - the `Object.prototype.__proto__` accessor (§B.2.2.1), with cycle and
 //!   non-extensible rejection behind the ordinary `SetPrototypeOf` semantics
+//! - the `Object.prototype` legacy accessor methods (§B.2.2.2-§B.2.2.5):
+//!   `__defineGetter__`/`__defineSetter__` install a whole accessor descriptor
+//!   after validating the accessor is callable, and
+//!   `__lookupGetter__`/`__lookupSetter__` walk the prototype chain for the
+//!   matching accessor slot
 //! - `RegExp.prototype.compile` (§B.2.5.1), delegating pattern compilation to
 //!   the canonical RegExp machinery
 //! - RegExp legacy constructor statics (§B.2.5.2), backed by hidden per-realm
@@ -44,6 +49,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     install_proto_accessor(heap, builtins);
+    install_object_accessor_methods(heap, builtins);
     install_string_annex_b(heap, builtins);
     install_regexp_compile(heap, builtins);
     install_regexp_legacy_statics(heap, globals, builtins);
@@ -63,6 +69,179 @@ fn install_proto_accessor<H: Host>(heap: &mut Vec<HeapEntry>, builtins: &mut Bui
             configurable: true,
         },
     );
+}
+/// §B.2.2.2-§B.2.2.5 accessor slot addressed by the legacy `Object.prototype`
+/// methods.
+#[derive(Clone, Copy, PartialEq)]
+enum LegacyAccessorSlot {
+    Getter,
+    Setter,
+}
+
+/// Installs the §B.2.2.2-§B.2.2.5 `Object.prototype` legacy accessor methods
+/// as writable, non-enumerable, configurable data properties, matching the
+/// surrounding `Object.prototype` surface.
+fn install_object_accessor_methods<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+) {
+    let prototype = builtins.object_prototype();
+    for (name, length, handler) in [
+        (
+            "__defineGetter__",
+            2,
+            define_getter::<H> as BuiltinHandler<H>,
+        ),
+        ("__defineSetter__", 2, define_setter::<H>),
+        ("__lookupGetter__", 1, lookup_getter::<H>),
+        ("__lookupSetter__", 1, lookup_setter::<H>),
+    ] {
+        let function = install_function(heap, builtins, name, length, handler);
+        define_data(heap, prototype, name, function);
+    }
+}
+
+/// §B.2.2.2 `Object.prototype.__defineGetter__(P, getter)`.
+fn define_getter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    define_legacy_accessor(
+        machine,
+        this,
+        args,
+        constructing,
+        LegacyAccessorSlot::Getter,
+    )
+}
+
+/// §B.2.2.3 `Object.prototype.__defineSetter__(P, setter)`.
+fn define_setter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    define_legacy_accessor(
+        machine,
+        this,
+        args,
+        constructing,
+        LegacyAccessorSlot::Setter,
+    )
+}
+
+/// Shared body of §B.2.2.2 and §B.2.2.3: the receiver is boxed first, the
+/// accessor is validated as callable before the key is coerced, and the whole
+/// accessor descriptor (a single slot, non-enumerable, configurable) is
+/// installed through ordinary `[[DefineOwnProperty]]` validation, so a
+/// non-configurable existing property rejects the redefinition.
+fn define_legacy_accessor<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+    slot: LegacyAccessorSlot,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    reject_construction(
+        constructing,
+        match slot {
+            LegacyAccessorSlot::Getter => "Object.prototype.__defineGetter__ is not a constructor",
+            LegacyAccessorSlot::Setter => "Object.prototype.__defineSetter__ is not a constructor",
+        },
+    )?;
+    let object = machine.value_to_object(this)?;
+    let accessor = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    if !machine.is_callable(accessor)? {
+        return Err(type_error(match slot {
+            LegacyAccessorSlot::Getter => {
+                "Object.prototype.__defineGetter__ requires a callable getter"
+            }
+            LegacyAccessorSlot::Setter => {
+                "Object.prototype.__defineSetter__ requires a callable setter"
+            }
+        }));
+    }
+    let key = machine.observable_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let descriptor = Property::Accessor {
+        getter: (slot == LegacyAccessorSlot::Getter).then_some(accessor),
+        setter: (slot == LegacyAccessorSlot::Setter).then_some(accessor),
+        enumerable: false,
+        configurable: true,
+    };
+    machine.define_descriptor(object, key, descriptor)?;
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+/// §B.2.2.4 `Object.prototype.__lookupGetter__(P)`.
+fn lookup_getter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    lookup_legacy_accessor(
+        machine,
+        this,
+        args,
+        constructing,
+        LegacyAccessorSlot::Getter,
+    )
+}
+
+/// §B.2.2.5 `Object.prototype.__lookupSetter__(P)`.
+fn lookup_setter<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    lookup_legacy_accessor(
+        machine,
+        this,
+        args,
+        constructing,
+        LegacyAccessorSlot::Setter,
+    )
+}
+
+/// Shared body of §B.2.2.4 and §B.2.2.5: walk the receiver's prototype chain
+/// and return the matching accessor slot of the first descriptor found. A
+/// data property anywhere on the chain stops the search with `undefined`, as
+/// does an exhausted chain.
+fn lookup_legacy_accessor<H: Host>(
+    machine: &mut Machine<'_, H>,
+    this: Value,
+    args: &[Value],
+    constructing: bool,
+    slot: LegacyAccessorSlot,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    reject_construction(
+        constructing,
+        match slot {
+            LegacyAccessorSlot::Getter => "Object.prototype.__lookupGetter__ is not a constructor",
+            LegacyAccessorSlot::Setter => "Object.prototype.__lookupSetter__ is not a constructor",
+        },
+    )?;
+    let object = machine.value_to_object(this)?;
+    let key = machine.observable_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let mut current = Some(object);
+    while let Some(object) = current {
+        if let Some(property) = machine.own_descriptor(object, &key)? {
+            return Ok(BuiltinOutcome::Value(match property {
+                Property::Accessor { getter, setter, .. } => match slot {
+                    LegacyAccessorSlot::Getter => getter,
+                    LegacyAccessorSlot::Setter => setter,
+                }
+                .unwrap_or(Value::UNDEFINED),
+                Property::Data { .. } => Value::UNDEFINED,
+            }));
+        }
+        current = machine.prototype_value(object)?;
+    }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 
 fn install_string_annex_b<H: Host>(heap: &mut Vec<HeapEntry>, builtins: &mut BuiltinTable<H>) {
@@ -2287,6 +2466,14 @@ mod tests {
             panic!("__proto__ has getter and setter functions");
         };
         functions.extend([proto_getter, proto_setter]);
+        for name in [
+            "__defineGetter__",
+            "__defineSetter__",
+            "__lookupGetter__",
+            "__lookupSetter__",
+        ] {
+            functions.push(machine.get_named_property(object_prototype, name).unwrap());
+        }
         let regexp_constructor = machine
             .intrinsics
             .global("RegExp")
@@ -2308,5 +2495,426 @@ mod tests {
         for function in functions {
             assert_type_error(machine.construct_value(function, &[]));
         }
+    }
+    static DEFINE_KEY_TRIED: AtomicBool = AtomicBool::new(false);
+
+    fn define_key_to_string(
+        machine: &mut Machine<'_, ControlledHost>,
+        _this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        DEFINE_KEY_TRIED.store(true, Ordering::SeqCst);
+        Ok(BuiltinOutcome::Value(allocate_string(
+            machine,
+            EcmaString::encode("key"),
+        )?))
+    }
+
+    fn getter_of_this(
+        _machine: &mut Machine<'_, ControlledHost>,
+        this: Value,
+        _args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        Ok(BuiltinOutcome::Value(this))
+    }
+
+    fn setter_records_on_this(
+        machine: &mut Machine<'_, ControlledHost>,
+        this: Value,
+        args: &[Value],
+        _constructing: bool,
+    ) -> Result<BuiltinOutcome, EvalFailure> {
+        machine.set_data_property(
+            this,
+            "seen",
+            args.first().copied().unwrap_or(Value::UNDEFINED),
+        )?;
+        Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+    }
+
+    fn assert_getter_slot(
+        machine: &mut Machine<'_, ControlledHost>,
+        object: Value,
+        name: &str,
+        expected: Value,
+    ) {
+        let Property::Accessor {
+            getter: Some(getter),
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        } = own_data_property(machine, object, name)
+        else {
+            panic!("{name} is a getter-only, non-enumerable, configurable accessor");
+        };
+        assert_eq!(getter, expected, "{name} holds the installed getter");
+    }
+
+    #[test]
+    fn object_annex_b_surface_has_spec_names_lengths_and_descriptors() {
+        let module = blank_program("<object annex b surface>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let prototype = machine.intrinsics.builtins.object_prototype();
+        for (name, length) in [
+            ("__defineGetter__", 2),
+            ("__defineSetter__", 2),
+            ("__lookupGetter__", 1),
+            ("__lookupSetter__", 1),
+        ] {
+            let Property::Data {
+                value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            } = own_data_property(&mut machine, prototype, name)
+            else {
+                panic!("{name} is a writable, non-enumerable, configurable data property");
+            };
+            let length_value = machine.get_named_property(value, "length").unwrap();
+            assert_eq!(
+                value_number(length_value),
+                f64::from(length),
+                "{name} length"
+            );
+            let name_value = machine.get_named_property(value, "name").unwrap();
+            assert_text_of(&mut machine, name_value, name);
+        }
+    }
+
+    #[test]
+    fn define_accessor_methods_install_single_slot_dispatching_accessors() {
+        let module = blank_program("<define accessor dispatch>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let object = ordinary_object(&mut machine);
+        let getter = native(&mut machine, "get slot", 0, getter_of_this);
+        let setter = native(&mut machine, "set slot", 1, setter_records_on_this);
+        let getter_key = text(&mut machine, "getter_slot");
+        call(
+            &mut machine,
+            object,
+            "__defineGetter__",
+            &[getter_key, getter],
+        )
+        .unwrap();
+        assert_getter_slot(&mut machine, object, "getter_slot", getter);
+        assert_eq!(
+            machine.get_named_property(object, "getter_slot").unwrap(),
+            object,
+            "reading the slot dispatches the getter with the receiver"
+        );
+        let setter_key = text(&mut machine, "setter_slot");
+        call(
+            &mut machine,
+            object,
+            "__defineSetter__",
+            &[setter_key, setter],
+        )
+        .unwrap();
+        let Property::Accessor {
+            getter: None,
+            setter: Some(setter_slot),
+            enumerable: false,
+            configurable: true,
+        } = own_data_property(&mut machine, object, "setter_slot")
+        else {
+            panic!("setter_slot is a setter-only, non-enumerable, configurable accessor");
+        };
+        assert_eq!(setter_slot, setter);
+        machine
+            .set_data_property(object, "setter_slot", Value::int32(42))
+            .unwrap();
+        let seen = machine.get_named_property(object, "seen").unwrap();
+        assert_eq!(
+            value_number(seen),
+            42.0,
+            "writing the slot dispatches the setter"
+        );
+    }
+
+    #[test]
+    fn define_setter_replaces_a_whole_descriptor_dropping_the_getter() {
+        let module = blank_program("<define setter replaces>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let object = ordinary_object(&mut machine);
+        let getter = native(&mut machine, "get both", 0, getter_of_this);
+        let setter = native(&mut machine, "set both", 1, setter_records_on_this);
+        let key = text(&mut machine, "both");
+        call(&mut machine, object, "__defineGetter__", &[key, getter]).unwrap();
+        call(&mut machine, object, "__defineSetter__", &[key, setter]).unwrap();
+        let Property::Accessor {
+            getter: None,
+            setter: Some(setter_slot),
+            enumerable: false,
+            configurable: true,
+        } = own_data_property(&mut machine, object, "both")
+        else {
+            panic!("the setter replaced the whole descriptor");
+        };
+        assert_eq!(setter_slot, setter);
+        assert_eq!(
+            machine.get_named_property(object, "both").unwrap(),
+            Value::UNDEFINED,
+            "the dropped getter no longer dispatches"
+        );
+        machine
+            .set_data_property(object, "both", Value::int32(7))
+            .unwrap();
+        let seen = machine.get_named_property(object, "seen").unwrap();
+        assert_eq!(value_number(seen), 7.0, "the surviving setter still runs");
+    }
+
+    #[test]
+    fn lookup_methods_walk_the_prototype_chain_and_distinguish_slots() {
+        let module = blank_program("<lookup chain>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let parent = ordinary_object(&mut machine);
+        let child = ordinary_object(&mut machine);
+        let proto_setter = proto_setter_function(&mut machine);
+        machine.call_value(proto_setter, child, &[parent]).unwrap();
+        let getter = native(&mut machine, "get inherited", 0, getter_of_this);
+        let setter = native(&mut machine, "set both", 1, setter_records_on_this);
+        let key = text(&mut machine, "inherited");
+        call(&mut machine, parent, "__defineGetter__", &[key, getter]).unwrap();
+        assert_eq!(
+            call(&mut machine, parent, "__lookupGetter__", &[key]).unwrap(),
+            getter,
+            "an own getter is found directly"
+        );
+        assert_eq!(
+            call(&mut machine, child, "__lookupGetter__", &[key]).unwrap(),
+            getter,
+            "an inherited getter is found through the chain"
+        );
+        assert_eq!(
+            call(&mut machine, child, "__lookupSetter__", &[key]).unwrap(),
+            Value::UNDEFINED,
+            "a getter-only slot reports no setter"
+        );
+        machine
+            .define_descriptor(
+                parent,
+                PropertyKey::Named(EcmaString::encode("both")),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: Some(setter),
+                    enumerable: false,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let key = text(&mut machine, "both");
+        assert_eq!(
+            call(&mut machine, child, "__lookupGetter__", &[key]).unwrap(),
+            getter
+        );
+        assert_eq!(
+            call(&mut machine, child, "__lookupSetter__", &[key]).unwrap(),
+            setter
+        );
+        machine
+            .set_data_property(parent, "data", Value::int32(1))
+            .unwrap();
+        let key = text(&mut machine, "data");
+        assert_eq!(
+            call(&mut machine, child, "__lookupGetter__", &[key]).unwrap(),
+            Value::UNDEFINED,
+            "a data property stops the search"
+        );
+        assert_eq!(
+            call(&mut machine, child, "__lookupSetter__", &[key]).unwrap(),
+            Value::UNDEFINED
+        );
+        let missing = text(&mut machine, "missing");
+        assert_eq!(
+            call(&mut machine, child, "__lookupGetter__", &[missing]).unwrap(),
+            Value::UNDEFINED,
+            "an exhausted chain reports undefined"
+        );
+    }
+
+    #[test]
+    fn define_getter_validates_callable_before_coercing_the_key() {
+        DEFINE_KEY_TRIED.store(false, Ordering::SeqCst);
+        let module = blank_program("<define callable order>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let receiver = ordinary_object(&mut machine);
+        let key = coerced_object(&mut machine, define_key_to_string);
+        assert_type_error(call(
+            &mut machine,
+            receiver,
+            "__defineGetter__",
+            &[key, Value::int32(7)],
+        ));
+        assert!(
+            !DEFINE_KEY_TRIED.load(Ordering::SeqCst),
+            "callable validation must precede key coercion"
+        );
+        assert_type_error(call(
+            &mut machine,
+            receiver,
+            "__defineSetter__",
+            &[key, Value::UNDEFINED],
+        ));
+        assert!(
+            !DEFINE_KEY_TRIED.load(Ordering::SeqCst),
+            "setter validation must also precede key coercion"
+        );
+        let getter = native(&mut machine, "get key", 0, getter_of_this);
+        call(&mut machine, receiver, "__defineGetter__", &[key, getter]).unwrap();
+        assert!(
+            DEFINE_KEY_TRIED.load(Ordering::SeqCst),
+            "a valid callable lets the key coercion run"
+        );
+        assert_getter_slot(&mut machine, receiver, "key", getter);
+    }
+
+    #[test]
+    fn define_accessor_methods_reject_non_configurable_redefinition() {
+        let module = blank_program("<define frozen slots>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let object = ordinary_object(&mut machine);
+        let getter = native(&mut machine, "get locked", 0, getter_of_this);
+        let setter = native(&mut machine, "set sealed", 1, setter_records_on_this);
+        machine
+            .define_descriptor(
+                object,
+                PropertyKey::Named(EcmaString::encode("locked")),
+                Property::Data {
+                    value: Value::UNDEFINED,
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            )
+            .unwrap();
+        machine
+            .define_descriptor(
+                object,
+                PropertyKey::Named(EcmaString::encode("sealed")),
+                Property::Accessor {
+                    getter: None,
+                    setter: None,
+                    enumerable: false,
+                    configurable: false,
+                },
+            )
+            .unwrap();
+        let key = text(&mut machine, "locked");
+        assert_type_error(call(
+            &mut machine,
+            object,
+            "__defineGetter__",
+            &[key, getter],
+        ));
+        let key = text(&mut machine, "sealed");
+        assert_type_error(call(
+            &mut machine,
+            object,
+            "__defineSetter__",
+            &[key, setter],
+        ));
+    }
+
+    #[test]
+    fn lookup_and_define_methods_accept_primitives_and_symbol_keys() {
+        let module = blank_program("<primitives and symbols>");
+        let mut host = ControlledHost { zone: "UTC" };
+        let mut machine = machine(&module, &mut host);
+        let getter = native(&mut machine, "get boxed", 0, getter_of_this);
+        let boxed_key = text(&mut machine, "boxed");
+        call(
+            &mut machine,
+            Value::int32(5),
+            "__defineGetter__",
+            &[boxed_key, getter],
+        )
+        .unwrap();
+        machine
+            .define_descriptor(
+                machine.intrinsics.number_prototype,
+                PropertyKey::Named(EcmaString::encode("inherited")),
+                Property::Accessor {
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            )
+            .unwrap();
+        let inherited_key = text(&mut machine, "inherited");
+        assert_eq!(
+            call(
+                &mut machine,
+                Value::int32(5),
+                "__lookupGetter__",
+                &[inherited_key]
+            )
+            .unwrap(),
+            getter,
+            "the lookup walks the boxed prototype chain"
+        );
+        assert_eq!(
+            call(
+                &mut machine,
+                Value::int32(5),
+                "__lookupSetter__",
+                &[inherited_key]
+            )
+            .unwrap(),
+            Value::UNDEFINED
+        );
+        let key = text(&mut machine, "k");
+        for name in [
+            "__defineGetter__",
+            "__defineSetter__",
+            "__lookupGetter__",
+            "__lookupSetter__",
+        ] {
+            assert_type_error(call(&mut machine, Value::UNDEFINED, name, &[key, getter]));
+            assert_type_error(call(&mut machine, Value::NULL, name, &[key, getter]));
+        }
+        let object = ordinary_object(&mut machine);
+        let symbol = machine
+            .allocate(HeapEntry::Symbol {
+                description: EcmaString::encode("sym"),
+            })
+            .expect("symbol allocation succeeds");
+        call(&mut machine, object, "__defineGetter__", &[symbol, getter]).unwrap();
+        let slot = machine
+            .runtime_slot(symbol)
+            .unwrap()
+            .expect("symbol has a heap slot");
+        let Property::Accessor {
+            getter: Some(getter_slot),
+            setter: None,
+            ..
+        } = machine
+            .own_descriptor(
+                object,
+                &PropertyKey::Symbol(u32::try_from(slot).expect("slot fits u32")),
+            )
+            .unwrap()
+            .expect("symbol-keyed accessor is installed")
+        else {
+            panic!("the symbol key holds the getter-only accessor");
+        };
+        assert_eq!(getter_slot, getter);
+        assert_eq!(
+            call(&mut machine, object, "__lookupGetter__", &[symbol]).unwrap(),
+            getter,
+            "the lookup resolves symbol keys"
+        );
+        assert_eq!(
+            call(&mut machine, object, "__lookupSetter__", &[symbol]).unwrap(),
+            Value::UNDEFINED
+        );
     }
 }

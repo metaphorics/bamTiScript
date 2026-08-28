@@ -61,14 +61,34 @@ fn async_disposable_stack_public_method<H: Host>(
     let dispose = machine
         .current_builtin_id()
         .is_some_and(|id| machine.intrinsics.builtins.get(id).name == "disposeAsync");
-    if dispose && disposed_stack(machine, this, DisposeHint::Async)? {
+    if dispose {
+        // Create the promise capability before receiver validation: an
+        // incompatible receiver rejects the promise with a TypeError rather
+        // than throwing synchronously (the sync `dispose` path keeps its
+        // synchronous TypeError).
         let promise = machine.create_promise()?;
-        machine
-            .fulfill_promise(promise, Value::UNDEFINED)
-            .map_err(EvalFailure::Runtime)?;
-        return Ok(BuiltinOutcome::Value(promise));
+        match disposed_stack(machine, this, DisposeHint::Async) {
+            Ok(true) => {
+                machine
+                    .fulfill_promise(promise, Value::UNDEFINED)
+                    .map_err(EvalFailure::Runtime)?;
+                Ok(BuiltinOutcome::Value(promise))
+            }
+            Ok(false) => {
+                machine.continue_async_disposal(this, None, None, promise)?;
+                Ok(BuiltinOutcome::Value(promise))
+            }
+            Err(EvalFailure::Throw(origin @ ThrowOrigin::TypeError { .. })) => {
+                machine
+                    .reject_promise(promise, Value::UNDEFINED, origin)
+                    .map_err(EvalFailure::Runtime)?;
+                Ok(BuiltinOutcome::Value(promise))
+            }
+            Err(failure) => Err(failure),
+        }
+    } else {
+        async_disposable_stack_method_handler(machine, this, args, constructing)
     }
-    async_disposable_stack_method_handler(machine, this, args, constructing)
 }
 
 pub(super) fn install<H: Host>(

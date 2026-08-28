@@ -246,6 +246,40 @@ pub(crate) fn descriptor_from_property(property: Property) -> PropertyDescriptor
     }
 }
 
+/// ECMA-262 CompletePropertyDescriptor. Fills only absent fields with the
+/// appropriate defaults while preserving the descriptor kind: accessor
+/// descriptors receive `undefined` for a missing get/set, data and generic
+/// descriptors receive `undefined`/`false` for a missing value/writable, and
+/// every kind receives `false` for a missing enumerable/configurable. Present
+/// fields are never altered, so an already-fully-populated descriptor is
+/// returned unchanged.
+pub(crate) fn complete_property_descriptor(
+    mut descriptor: PropertyDescriptor,
+) -> PropertyDescriptor {
+    if descriptor.is_accessor() {
+        if descriptor.getter.is_none() {
+            descriptor.getter = Some(Value::UNDEFINED);
+        }
+        if descriptor.setter.is_none() {
+            descriptor.setter = Some(Value::UNDEFINED);
+        }
+    } else {
+        if descriptor.value.is_none() {
+            descriptor.value = Some(Value::UNDEFINED);
+        }
+        if descriptor.writable.is_none() {
+            descriptor.writable = Some(false);
+        }
+    }
+    if descriptor.enumerable.is_none() {
+        descriptor.enumerable = Some(false);
+    }
+    if descriptor.configurable.is_none() {
+        descriptor.configurable = Some(false);
+    }
+    descriptor
+}
+
 pub(super) fn same_value<H: Host>(machine: &Machine<'_, H>, left: Value, right: Value) -> bool {
     match (left.decode(), right.decode()) {
         (Some(Decoded::Number(left)), Some(Decoded::Number(right))) => {
@@ -342,6 +376,11 @@ pub(crate) fn validate_and_apply_property_descriptor<H: Host>(
     descriptor: PropertyDescriptor,
     current: Option<Property>,
 ) -> Result<bool, EvalFailure> {
+    let descriptor = if current.is_none() {
+        complete_property_descriptor(descriptor)
+    } else {
+        descriptor
+    };
     let current_record = current.clone().map(descriptor_from_property);
     if !is_compatible_property_descriptor(machine, extensible, descriptor, current_record.as_ref())
     {
@@ -1152,5 +1191,103 @@ mod tests {
                 ]
             );
         });
+    }
+
+    #[test]
+    fn complete_fills_generic_descriptor_with_data_defaults() {
+        let generic = PropertyDescriptor {
+            enumerable: Some(true),
+            ..PropertyDescriptor::default()
+        };
+        let completed = complete_property_descriptor(generic);
+        // A generic descriptor is neither accessor nor data; completion treats
+        // it as data per ECMA-262 CompletePropertyDescriptor.
+        assert_eq!(completed.value, Some(Value::UNDEFINED));
+        assert_eq!(completed.writable, Some(false));
+        assert_eq!(completed.getter, None);
+        assert_eq!(completed.setter, None);
+        // Present enumerable is preserved; absent configurable defaults false.
+        assert_eq!(completed.enumerable, Some(true));
+        assert_eq!(completed.configurable, Some(false));
+    }
+
+    #[test]
+    fn complete_fills_data_descriptor_preserving_present_fields() {
+        let data_desc = PropertyDescriptor {
+            value: Some(Value::int32(42)),
+            writable: Some(true),
+            enumerable: Some(true),
+            ..PropertyDescriptor::default()
+        };
+        let completed = complete_property_descriptor(data_desc);
+        assert_eq!(completed.value, Some(Value::int32(42)));
+        assert_eq!(completed.writable, Some(true));
+        assert_eq!(completed.enumerable, Some(true));
+        assert_eq!(completed.configurable, Some(false));
+        assert_eq!(completed.getter, None);
+        assert_eq!(completed.setter, None);
+    }
+
+    #[test]
+    fn complete_fills_accessor_descriptor_preserving_present_fields() {
+        let getter = Value::int32(1); // placeholder callable-like value; semantics only need identity
+        let accessor_desc = PropertyDescriptor {
+            getter: Some(getter),
+            enumerable: Some(false),
+            ..PropertyDescriptor::default()
+        };
+        let completed = complete_property_descriptor(accessor_desc);
+        assert_eq!(completed.getter, Some(getter));
+        assert_eq!(completed.setter, Some(Value::UNDEFINED));
+        assert_eq!(completed.enumerable, Some(false));
+        assert_eq!(completed.configurable, Some(false));
+        // Accessor completion must not synthesize data fields.
+        assert_eq!(completed.value, None);
+        assert_eq!(completed.writable, None);
+    }
+
+    #[test]
+    fn complete_leaves_fully_populated_descriptors_unchanged() {
+        let getter = Value::int32(7);
+        let full_accessor = PropertyDescriptor {
+            getter: Some(getter),
+            setter: Some(Value::UNDEFINED),
+            enumerable: Some(true),
+            configurable: Some(false),
+            ..PropertyDescriptor::default()
+        };
+        let completed = complete_property_descriptor(full_accessor);
+        assert_eq!(completed.getter, Some(getter));
+        assert_eq!(completed.setter, Some(Value::UNDEFINED));
+        assert_eq!(completed.enumerable, Some(true));
+        assert_eq!(completed.configurable, Some(false));
+        assert_eq!(completed.value, None);
+        assert_eq!(completed.writable, None);
+
+        let full_data = PropertyDescriptor {
+            value: Some(Value::int32(9)),
+            writable: Some(false),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..PropertyDescriptor::default()
+        };
+        let completed = complete_property_descriptor(full_data);
+        assert_eq!(completed.value, Some(Value::int32(9)));
+        assert_eq!(completed.writable, Some(false));
+        assert_eq!(completed.enumerable, Some(true));
+        assert_eq!(completed.configurable, Some(true));
+        assert_eq!(completed.getter, None);
+        assert_eq!(completed.setter, None);
+    }
+
+    #[test]
+    fn complete_empty_descriptor_becomes_default_data_descriptor() {
+        let completed = complete_property_descriptor(PropertyDescriptor::default());
+        assert_eq!(completed.value, Some(Value::UNDEFINED));
+        assert_eq!(completed.writable, Some(false));
+        assert_eq!(completed.enumerable, Some(false));
+        assert_eq!(completed.configurable, Some(false));
+        assert_eq!(completed.getter, None);
+        assert_eq!(completed.setter, None);
     }
 }
