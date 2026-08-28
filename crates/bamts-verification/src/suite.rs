@@ -2903,13 +2903,15 @@ fn bind_compiler_observation(
 }
 
 fn compiler_snapshot_input(case: &str) -> Option<&str> {
-    let input = case
-        .strip_prefix("compiler/")
-        .or_else(|| case.strip_prefix("conformance/"))?;
-    if !input.starts_with("tests/cases/") {
-        return None;
-    }
-    if !is_safe_logical_path(input) {
+    let (input, partition) = if let Some(input) = case.strip_prefix("compiler/") {
+        (input, "tests/cases/compiler/")
+    } else {
+        (
+            case.strip_prefix("conformance/")?,
+            "tests/cases/conformance/",
+        )
+    };
+    if !input.starts_with(partition) || !is_safe_logical_path(input) {
         return None;
     }
     Some(input)
