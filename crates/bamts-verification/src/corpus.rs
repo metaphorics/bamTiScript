@@ -1377,6 +1377,9 @@ fn execute_worker_request(request: &WorkerRequest) -> Result<WorkerResponse> {
                 })
             }
         },
+        Err(error) if is_driver_fuel_exhaustion(&error) => Ok(WorkerResponse::Outcome(
+            timeout_outcome(Vec::new(), request.max_output_bytes),
+        )),
         Err(error) if is_unhandled_driver_throw(&error) => {
             Ok(WorkerResponse::Outcome(process_rejection_outcome(
                 Vec::new(),
@@ -1468,6 +1471,21 @@ fn is_unhandled_driver_throw(error: &driver::DriverError) -> bool {
         driver::DriverError::Native(bamts_runtime::NativeError::Runtime(
             bamts_runtime::RuntimeError {
                 kind: bamts_runtime::RuntimeErrorKind::UncaughtThrow { .. },
+                ..
+            }
+        ))
+    )
+}
+
+/// The driver's JIT lane runs under the CLI's bounded fuel contract. An
+/// exhausted budget is the in-process form of a case timeout, mirroring the
+/// interpreter lane's `FuelExhausted` mapping in `run_interpreter`.
+fn is_driver_fuel_exhaustion(error: &driver::DriverError) -> bool {
+    matches!(
+        error,
+        driver::DriverError::Native(bamts_runtime::NativeError::Runtime(
+            bamts_runtime::RuntimeError {
+                kind: bamts_runtime::RuntimeErrorKind::FuelExhausted { .. },
                 ..
             }
         ))
