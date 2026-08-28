@@ -856,9 +856,7 @@ pub fn merge_shards(
         if spec.count() as usize != paths.len() {
             return Err(schema("merge requires the complete shard matrix"));
         }
-        if !by_index.insert(spec.index(), slot).is_none()
-            && by_index.get(&spec.index()) != Some(&slot)
-        {
+        if by_index.insert(spec.index(), slot).is_some() {
             return Err(schema(format!("duplicate shard index {}", spec.index())));
         }
         let digest = reader.header().shard().catalog_digest().to_owned();
