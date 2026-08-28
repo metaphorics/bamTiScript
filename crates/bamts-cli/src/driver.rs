@@ -626,7 +626,11 @@ fn execute_tsc_project(
         Ok(project) => project,
         Err(error) => return Ok(project_compile_error_outcome(error, command, cwd)),
     };
-    let result = match compile_project(&project, &ProjectCompileOptions::default(), &filesystem) {
+    let compile_options = ProjectCompileOptions {
+        emit: !command.flag("listFilesOnly"),
+        ..ProjectCompileOptions::default()
+    };
+    let result = match compile_project(&project, &compile_options, &filesystem) {
         Ok(result) => result,
         Err(error) => return Ok(project_compile_error_outcome(error, command, cwd)),
     };
@@ -856,9 +860,23 @@ fn project_result_outcome(
     } else {
         TscDiagnosticFormat::PrettyFalse
     };
+    let mut stdout = if command.flag("listFilesOnly") {
+        Vec::new()
+    } else {
+        tsc_diagnostics::render(format, &diagnostics, &sources).into_bytes()
+    };
+    if command.flag("listFiles") || command.flag("listFilesOnly") {
+        for name in &names {
+            writeln!(stdout, "{name}").expect("writing to Vec cannot fail");
+        }
+    }
     CommandOutcome {
-        stdout: tsc_diagnostics::render(format, &diagnostics, &sources).into_bytes(),
-        exit_code: TscExitStatus::from_compilation(has_errors, result.emitted).code(),
+        stdout,
+        exit_code: if command.flag("listFilesOnly") {
+            TscExitStatus::Success.code()
+        } else {
+            TscExitStatus::from_compilation(has_errors, result.emitted).code()
+        },
         ..CommandOutcome::default()
     }
 }
@@ -2453,6 +2471,66 @@ exit 2
                 "error TS18003: No inputs were found in config file '{}'. Specified 'include' paths were '[\"../base/src/**/*.ts\"]' and 'exclude' paths were '[\"../base/build\"]'.\n",
                 fixture.0.join("app/tsconfig.json").display()
             ),
+        );
+    }
+    #[test]
+    fn tsc_project_lists_loaded_files_and_list_only_suppresses_emit() {
+        let fixture = TscFixture::new();
+        fixture.write(
+            "src/a.ts",
+            "import { b } from './b';\nexport const a = b;\n",
+        );
+        fixture.write("src/b.ts", "export const b = 1;\n");
+        fixture.write(
+            "list.json",
+            r#"{"files":["src/a.ts"],"compilerOptions":{"outDir":"list-dist"}}"#,
+        );
+        let listed = execute_tsc_in(
+            &parse_tsc_args(["--project", "list.json", "--listFiles"])
+                .expect("listFiles project parses"),
+            &fixture.0,
+        )
+        .expect("listFiles project executes");
+        assert_eq!(listed.exit_code, TscExitStatus::Success.code());
+        assert!(listed.stderr.is_empty());
+        assert!(fixture.0.join("list-dist/a.js").is_file());
+        assert!(fixture.0.join("list-dist/b.js").is_file());
+        let listed = String::from_utf8(listed.stdout).unwrap();
+        let dependency = fixture.0.join("src/b.ts").display().to_string();
+        let root = fixture.0.join("src/a.ts").display().to_string();
+        assert!(listed.contains(&dependency), "{listed}");
+        assert!(listed.contains(&root), "{listed}");
+
+        fixture.write(
+            "only.json",
+            r#"{"files":["src/a.ts"],"compilerOptions":{"outDir":"only-dist"}}"#,
+        );
+        let only = execute_tsc_in(
+            &parse_tsc_args(["--project", "only.json", "--listFilesOnly"])
+                .expect("listFilesOnly project parses"),
+            &fixture.0,
+        )
+        .expect("listFilesOnly project executes");
+        assert_eq!(only.exit_code, TscExitStatus::Success.code());
+        assert!(only.stderr.is_empty());
+        assert!(!fixture.0.join("only-dist").exists());
+        assert_eq!(
+            String::from_utf8(only.stdout).unwrap(),
+            format!("{dependency}\n{root}\n")
+        );
+
+        fixture.write("bad.ts", "export const broken = ;\n");
+        fixture.write("bad.json", r#"{"files":["bad.ts"]}"#);
+        let bad = execute_tsc_in(
+            &parse_tsc_args(["--project", "bad.json", "--listFilesOnly"])
+                .expect("bad listFilesOnly project parses"),
+            &fixture.0,
+        )
+        .expect("bad listFilesOnly project executes");
+        assert_eq!(bad.exit_code, TscExitStatus::Success.code());
+        assert_eq!(
+            String::from_utf8(bad.stdout).unwrap(),
+            format!("{}\n", fixture.0.join("bad.ts").display())
         );
     }
 

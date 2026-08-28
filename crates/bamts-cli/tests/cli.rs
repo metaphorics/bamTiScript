@@ -687,7 +687,6 @@ fn project_mode_rejects_unimplemented_options() {
     for (option, name) in [
         (vec!["--incremental"], "incremental"),
         (vec!["--target", "esnext"], "target"),
-        (vec!["--listFiles"], "listFiles"),
         (vec!["--ignoreConfig"], "ignoreConfig"),
     ] {
         let output = project
@@ -704,6 +703,42 @@ fn project_mode_rejects_unimplemented_options() {
         !project.path.join("dist").exists(),
         "option classification must precede project loading"
     );
+}
+
+#[test]
+fn project_mode_lists_files_and_list_only_skips_emit() {
+    let project = ScratchDirectory::new();
+    project.write("src/main.ts", "import './dependency.ts';\n");
+    project.write("src/dependency.ts", "export const answer = 42;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"files":["src/main.ts"],"compilerOptions":{"outDir":"dist"}}"#,
+    );
+
+    let only = project
+        .command()
+        .args(["-p", "tsconfig.json", "--listFilesOnly"])
+        .current_dir(&project.path)
+        .output()
+        .expect("listFilesOnly starts");
+    assert!(only.status.success(), "{}", stderr(&only));
+    let only_stdout = stdout(&only);
+    assert!(only_stdout.contains("dependency.ts"), "{only_stdout}");
+    assert!(only_stdout.contains("main.ts"), "{only_stdout}");
+    assert!(!project.path.join("dist").exists());
+
+    let listed = project
+        .command()
+        .args(["-p", "tsconfig.json", "--listFiles"])
+        .current_dir(&project.path)
+        .output()
+        .expect("listFiles starts");
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let listed_stdout = stdout(&listed);
+    assert!(listed_stdout.contains("dependency.ts"), "{listed_stdout}");
+    assert!(listed_stdout.contains("main.ts"), "{listed_stdout}");
+    assert!(project.path.join("dist/main.js").is_file());
+    assert!(project.path.join("dist/dependency.js").is_file());
 }
 
 #[test]

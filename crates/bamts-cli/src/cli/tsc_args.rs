@@ -350,6 +350,8 @@ const PROJECT_CONSUMED: &[&str] = &[
     "init",
     "inlineSourceMap",
     "jsx",
+    "listFiles",
+    "listFilesOnly",
     "noEmit",
     "noEmitOnError",
     "out",
