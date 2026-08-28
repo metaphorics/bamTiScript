@@ -25,13 +25,10 @@ use crate::{
 
 const EVIDENCE_SCHEMA: &str = "bamti.evidence/v2";
 const RUNNER_VERSION: &str = "a2.2";
-const LEGACY_RUNNER_VERSION: &str = "a2.1";
 
 /// Schema tag bound into every evidence header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceSchema {
-    #[serde(rename = "bamti.evidence/v1")]
-    V1,
     #[serde(rename = "bamti.evidence/v2")]
     V2,
 }
@@ -39,10 +36,7 @@ pub enum EvidenceSchema {
 impl EvidenceSchema {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::V1 => "bamti.evidence/v1",
-            Self::V2 => EVIDENCE_SCHEMA,
-        }
+        EVIDENCE_SCHEMA
     }
 }
 
@@ -133,17 +127,6 @@ impl RunBinding {
         if self.runner_version != RUNNER_VERSION {
             return Err(schema(format!(
                 "runner_version `{}` is not `{RUNNER_VERSION}`",
-                self.runner_version
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_legacy(&self) -> Result<()> {
-        self.validate_common()?;
-        if self.runner_version != LEGACY_RUNNER_VERSION {
-            return Err(schema(format!(
-                "legacy runner_version `{}` is not `{LEGACY_RUNNER_VERSION}`",
                 self.runner_version
             )));
         }
@@ -318,8 +301,7 @@ pub struct EvidenceHeader {
     schema: EvidenceSchema,
     shard: ShardIdentity,
     binding: RunBinding,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    execution: Option<ExecutionBinding>,
+    execution: ExecutionBinding,
 }
 
 impl EvidenceHeader {
@@ -332,28 +314,15 @@ impl EvidenceHeader {
             schema: EvidenceSchema::V2,
             shard,
             binding,
-            execution: Some(execution),
+            execution,
         };
         header.validate()?;
         Ok(header)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        match self.schema {
-            EvidenceSchema::V1 => {
-                if self.execution.is_some() {
-                    return Err(schema("legacy evidence cannot carry an execution binding"));
-                }
-                self.binding.validate_legacy()?;
-            }
-            EvidenceSchema::V2 => {
-                self.binding.validate()?;
-                self.execution
-                    .as_ref()
-                    .ok_or_else(|| schema("v2 evidence requires an execution binding"))?
-                    .validate()?;
-            }
-        }
+        self.binding.validate()?;
+        self.execution.validate()?;
         ShardSpec::new(self.shard.spec().index(), self.shard.spec().count())?;
         if self.shard.expected_count() == 0 || self.shard.catalog_len() == 0 {
             return Err(schema("evidence header cannot describe an empty shard"));
@@ -376,8 +345,8 @@ impl EvidenceHeader {
         &self.binding
     }
     #[must_use]
-    pub fn execution(&self) -> Option<&ExecutionBinding> {
-        self.execution.as_ref()
+    pub fn execution(&self) -> &ExecutionBinding {
+        &self.execution
     }
 
     pub fn unsharded(self) -> Result<Self> {
@@ -389,10 +358,7 @@ impl EvidenceHeader {
             self.shard.catalog_len(),
             self.shard.catalog_digest().to_owned(),
         )?;
-        let execution = self.execution.ok_or_else(|| {
-            schema("legacy evidence cannot be promoted to an unsharded v2 receipt")
-        })?;
-        Self::new(shard, self.binding, execution)
+        Self::new(shard, self.binding, self.execution)
     }
 }
 
@@ -881,9 +847,7 @@ pub fn merge_shards(
                 }
             }
         }
-        let actual_execution = reader.header().execution().ok_or_else(|| {
-            schema("legacy evidence cannot enter a v2 receipt matrix; recapture the shard")
-        })?;
+        let actual_execution = reader.header().execution();
         match &execution {
             None => execution = Some(actual_execution.clone()),
             Some(expected) => {
@@ -1386,6 +1350,9 @@ mod tests {
 
         type Mutate = fn(&str) -> String;
         let cases: &[(&str, Mutate)] = &[
+            ("legacy-schema", |text| {
+                text.replacen("bamti.evidence/v2", "bamti.evidence/v1", 1)
+            }),
             ("blank", |text| text.replace('\n', "\n\n")),
             ("trailing-junk", |text| {
                 let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
