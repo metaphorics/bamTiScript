@@ -48,11 +48,19 @@ Direct source-file compilation writes a native host executable. With `--outDir <
 
 Project mode writes JavaScript and declaration outputs from the corresponding `tsconfig.json` options.
 
+## Option classification by mode
+
+Every accepted compiler option is classified by dispatch mode before a project loads or a build runs. Options with a native mapping are forwarded into the compilation; every other accepted option fails closed with `error TS5047: Compiler option '--<name>' has no canonical native driver mapping.` on stderr and exit status 5 instead of being ignored.
+
+* Direct source-file compilation consumes `--allowJs`, `--checkJs`, `--declaration`, `--ignoreConfig`, `--jsx`, `--noEmit`, `--noEmitOnError`, `--out`, `--outDir`, `--outFile`, `--pretty`, and `--strict`, plus the `--help` and `--version` commands.
+* Project mode consumes the same emit and type-check options plus `--declarationMap`, `--inlineSourceMap`, `--rootDir`, and `--tsBuildInfoFile`, forwarding them as project configuration overrides. `--ignoreConfig` is direct-only and rejected in project mode.
+* Build mode consumes only `--build`, `--verbose`, `--dry`, `--force`, `--clean`, `--stopBuildOnErrors`, `--pretty`, `--help`, and `--version`. `--verbose` prints a `Building project '<config>'...` or `Project '<config>' is up to date` line per project; every other common option, including `--noEmit`, `--incremental`, `--builders`, and `--watch`, returns `TS5047`.
+
 ## Parsing behavior
 
 The parser accepts supported TypeScript 7.0.2 compiler option names and rejects unknown options instead of silently discarding them. Boolean options accept an omitted value, `true`, `false`, or `null`; on the command line, `null` leaves the flag unset. Response files use the `@path` form.
 
-Project mode accepts `--target` values from `es6` through `esnext`. `--target es5` returns `TS5108`. Direct native compilation fails closed with `TS5047` for accepted options that have no canonical native mapping, including `--target`.
+`--target es5` returns `TS5108` in every mode. A command-line `--target` has no canonical native mapping in any dispatch mode and returns `TS5047`; per-project targets come from the `tsconfig.json` `compilerOptions`.
 
 The previous `check`, `run`, `compile`, `explain`, `--target jit`, and `--target aot` interface is not part of the current public CLI.
 

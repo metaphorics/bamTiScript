@@ -44,7 +44,7 @@ use bamts_runtime::{Limits, run_linked_program_with_cancel};
 use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
 use crate::cli::{
     diagnostic_format::{self as tsc_diagnostics, TscDiagnosticFormat},
-    tsc_args::{ParsedTscCommand, TscExitStatus},
+    tsc_args::{ParsedTscCommand, TscDispatchMode, TscExitStatus},
 };
 use crate::context::ExecutionContext;
 use crate::diagnostics::{self, DiagnosticSource, TruncationNotice};
@@ -512,29 +512,8 @@ fn execute_tsc_in_context(
             ..CommandOutcome::default()
         });
     }
-    if let Some(option) = command.options.keys().find(|name| {
-        !matches!(
-            name.as_str(),
-            "allowJs"
-                | "checkJs"
-                | "declaration"
-                | "help"
-                | "jsx"
-                | "noEmit"
-                | "noEmitOnError"
-                | "ignoreConfig"
-                | "out"
-                | "outDir"
-                | "outFile"
-                | "pretty"
-                | "sourceMap"
-                | "strict"
-                | "version"
-        )
-    }) {
-        return Ok(not_implemented(&format!(
-            "Compiler option '--{option}' has no canonical native driver mapping."
-        )));
+    if let Some(option) = command.first_unsupported_option(TscDispatchMode::Direct) {
+        return Ok(unsupported_option_outcome(option));
     }
     if command
         .option_str("jsx")
@@ -626,6 +605,9 @@ fn execute_tsc_project(
     command: &ParsedTscCommand,
     cwd: &Path,
 ) -> Result<CommandOutcome, DriverError> {
+    if let Some(option) = command.first_unsupported_option(TscDispatchMode::Project) {
+        return Ok(unsupported_option_outcome(option));
+    }
     let filesystem = match OsFileSystem::new(cwd) {
         Ok(filesystem) => filesystem,
         Err(error) => return Ok(project_error_outcome(error.to_string())),
@@ -657,6 +639,9 @@ fn execute_tsc_build(
     command: &ParsedTscCommand,
     cwd: &Path,
 ) -> Result<CommandOutcome, DriverError> {
+    if let Some(option) = command.first_unsupported_option(TscDispatchMode::Build) {
+        return Ok(unsupported_option_outcome(option));
+    }
     let filesystem = match OsFileSystem::new(cwd) {
         Ok(filesystem) => filesystem,
         Err(error) => return Ok(project_error_outcome(error.to_string())),
@@ -736,6 +721,23 @@ fn execute_tsc_build(
     let mut has_errors = false;
     let mut outputs_generated = false;
     for project in report.projects {
+        if command.flag("verbose") && !command.flag("dry") {
+            if project.result.up_to_date {
+                writeln!(
+                    stdout,
+                    "Project '{}' is up to date",
+                    project.config_path.display()
+                )
+                .expect("writing to Vec cannot fail");
+            } else {
+                writeln!(
+                    stdout,
+                    "Building project '{}'...",
+                    project.config_path.display()
+                )
+                .expect("writing to Vec cannot fail");
+            }
+        }
         let outcome = project_result_outcome(command, &project.result);
         stdout.extend_from_slice(&outcome.stdout);
         has_errors |= outcome.exit_code != TscExitStatus::Success.code();
@@ -880,6 +882,12 @@ fn not_implemented(message: &str) -> CommandOutcome {
         exit_code: TscExitStatus::NotImplemented.code(),
         ..CommandOutcome::default()
     }
+}
+
+fn unsupported_option_outcome(option: &str) -> CommandOutcome {
+    not_implemented(&format!(
+        "Compiler option '--{option}' has no canonical native driver mapping."
+    ))
 }
 
 fn levels(args: &CliArgs, project_root: &Path) -> Result<LintTable, DriverError> {

@@ -274,6 +274,129 @@ impl ParsedTscCommand {
     pub const fn parse_exit_status(&self) -> TscExitStatus {
         TscExitStatus::Success
     }
+
+    /// First parsed option the dispatch mode cannot consume, in stable
+    /// (alphabetical) option order. Every parse-table entry classifies in
+    /// every mode, so an accepted option can never silently disappear: the
+    /// driver turns `Some` into the stable TS5047 not-implemented failure
+    /// before loading or executing anything.
+    #[must_use]
+    pub fn first_unsupported_option(&self, mode: TscDispatchMode) -> Option<&str> {
+        self.options
+            .keys()
+            .find(|name| classify_option(name, mode) == ModeOptionClassification::Unsupported)
+            .map(String::as_str)
+    }
+}
+
+/// The dispatch mode whose option surface classifies a parsed command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TscDispatchMode {
+    /// Explicit source files compiled by the native driver.
+    Direct,
+    /// `-p` / `--project` / tsconfig-discovery project compilation.
+    Project,
+    /// `--build` reference-closure compilation.
+    Build,
+}
+
+/// How one dispatch mode consumes a parsed compiler option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeOptionClassification {
+    /// The mode reads the option: a dispatch control or a native
+    /// `ProjectOptionOverrides` / `ProjectBuildOptions` mapping.
+    Consumed,
+    /// The mode has no canonical native mapping. The driver must fail
+    /// closed with the stable TS5047 diagnostic instead of ignoring the
+    /// option.
+    Unsupported,
+}
+
+/// Options `Direct` dispatch consumes. `project` and `init` classify as
+/// consumed because dispatch routes them before classification runs
+/// (`--init` initializes the config, `-p` selects project mode); listing
+/// them keeps classification total over the parse table.
+const DIRECT_CONSUMED: &[&str] = &[
+    "allowJs",
+    "checkJs",
+    "declaration",
+    "help",
+    "ignoreConfig",
+    "init",
+    "jsx",
+    "noEmit",
+    "noEmitOnError",
+    "out",
+    "outDir",
+    "outFile",
+    "pretty",
+    "project",
+    "sourceMap",
+    "strict",
+    "version",
+];
+
+/// Options `Project` dispatch consumes: the dispatch controls plus every
+/// `ProjectOptionOverrides` mapping the driver forwards into project
+/// loading. `ignoreConfig` is deliberately absent: it only guards the
+/// direct files-plus-config conflict, which project dispatch never
+/// reaches, so project mode rejects it.
+const PROJECT_CONSUMED: &[&str] = &[
+    "allowJs",
+    "checkJs",
+    "declaration",
+    "declarationMap",
+    "help",
+    "init",
+    "inlineSourceMap",
+    "jsx",
+    "noEmit",
+    "noEmitOnError",
+    "out",
+    "outDir",
+    "outFile",
+    "pretty",
+    "project",
+    "rootDir",
+    "sourceMap",
+    "strict",
+    "tsBuildInfoFile",
+    "version",
+];
+
+/// Options `Build` dispatch consumes: the build controls plus the dispatch
+/// commands and `pretty` outcome formatting. `verbose` reports per-project
+/// build status; `dry`, `force`, `clean`, and `stopBuildOnErrors` drive the
+/// reference-closure build. Common emit and watch options have no build
+/// mapping and are rejected.
+const BUILD_CONSUMED: &[&str] = &[
+    "build",
+    "clean",
+    "dry",
+    "force",
+    "help",
+    "pretty",
+    "stopBuildOnErrors",
+    "verbose",
+    "version",
+];
+
+/// Classifies one canonical option name for a dispatch mode. Names outside
+/// the mode's consumed set — including options the parser only admits in
+/// other modes — classify as unsupported so the driver fails closed.
+/// Consumed sets stay ASCII-sorted for `binary_search`.
+#[must_use]
+pub fn classify_option(name: &str, mode: TscDispatchMode) -> ModeOptionClassification {
+    let consumed = match mode {
+        TscDispatchMode::Direct => DIRECT_CONSUMED,
+        TscDispatchMode::Project => PROJECT_CONSUMED,
+        TscDispatchMode::Build => BUILD_CONSUMED,
+    };
+    if consumed.binary_search(&name).is_ok() {
+        ModeOptionClassification::Consumed
+    } else {
+        ModeOptionClassification::Unsupported
+    }
 }
 
 /// Parse TypeScript 7.0.2 `tsc` argv. The first token is stripped when it is a
@@ -1443,5 +1566,70 @@ mod tests {
         ]));
         assert!(!api_transport_requested(["tsc", "--apidx"]));
         assert!(!api_transport_requested([] as [&str; 0]));
+    }
+
+    #[test]
+    fn mode_classification_covers_representative_options() {
+        use TscDispatchMode::{Build, Direct, Project};
+        assert_eq!(
+            classify_option("outDir", Project),
+            ModeOptionClassification::Consumed
+        );
+        assert_eq!(
+            classify_option("target", Project),
+            ModeOptionClassification::Unsupported
+        );
+        assert_eq!(
+            classify_option("verbose", Build),
+            ModeOptionClassification::Consumed
+        );
+        assert_eq!(
+            classify_option("noEmit", Build),
+            ModeOptionClassification::Unsupported
+        );
+        assert_eq!(
+            classify_option("ignoreConfig", Direct),
+            ModeOptionClassification::Consumed
+        );
+        assert_eq!(
+            classify_option("ignoreConfig", Project),
+            ModeOptionClassification::Unsupported
+        );
+        assert_eq!(
+            classify_option("strict", Direct),
+            ModeOptionClassification::Consumed
+        );
+    }
+
+    #[test]
+    fn first_unsupported_option_reports_the_stable_first_failure() {
+        let command = parse(&["--watch", "--incremental"]);
+        assert_eq!(
+            command.first_unsupported_option(TscDispatchMode::Direct),
+            Some("incremental")
+        );
+    }
+
+    #[test]
+    fn direct_mode_classifies_even_unset_null_options() {
+        let command = parse(&["--watch", "null"]);
+        assert_eq!(
+            command.first_unsupported_option(TscDispatchMode::Direct),
+            Some("watch")
+        );
+    }
+
+    #[test]
+    fn consumed_sets_only_reference_parser_table_names() {
+        for name in DIRECT_CONSUMED
+            .iter()
+            .chain(PROJECT_CONSUMED.iter())
+            .chain(BUILD_CONSUMED.iter())
+        {
+            assert!(
+                lookup_option(name, false).is_some() || lookup_option(name, true).is_some(),
+                "consumed name `{name}` is missing from the parse table"
+            );
+        }
     }
 }

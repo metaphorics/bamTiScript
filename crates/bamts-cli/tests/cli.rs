@@ -537,11 +537,7 @@ fn check_reports_dependency_errors() {
     assert!(!output.status.success());
     assert_eq!(output.status.code(), Some(1));
     let stdout = stdout(&output);
-    assert!(
-        stdout.contains("dependency.ts"),
-        "{}",
-        stdout
-    );
+    assert!(stdout.contains("dependency.ts"), "{}", stdout);
 }
 
 #[test]
@@ -592,7 +588,6 @@ fn check_applies_project_lint_config_to_dependencies() {
     assert!(stdout.contains("BAMTS-W017"), "{stdout}");
 }
 
-
 #[test]
 fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     let project = ScratchDirectory::new();
@@ -609,6 +604,259 @@ fn check_renders_multi_file_diagnostics_in_stable_source_order() {
     let first_position = stdout.find("first.ts").expect("first diagnostic");
     let second_position = stdout.find("second.ts").expect("second diagnostic");
     assert!(first_position < second_position, "{stdout}");
+}
+
+fn assert_not_implemented(output: &Output, option: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout(output),
+        stderr(output)
+    );
+    assert_eq!(
+        stderr(output),
+        format!(
+            "error TS5047: Compiler option '--{option}' has no canonical native driver mapping.\n"
+        )
+    );
+    assert!(stdout(output).is_empty(), "{}", stdout(output));
+}
+
+fn assert_parse_failure(output: &Output, code: u32, message: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout(output),
+        stderr(output)
+    );
+    assert!(stderr(output).is_empty());
+    let out = stdout(output);
+    assert!(out.contains(&format!("error TS{code}: {message}")), "{out}");
+}
+
+#[test]
+fn project_mode_forwards_native_option_overrides() {
+    let project = ScratchDirectory::new();
+    project.write("src/main.ts", "export const answer = 42;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"files":["src/main.ts"],"compilerOptions":{"rootDir":"src","outDir":"config-out","declaration":true}}"#,
+    );
+
+    let forwarded = project
+        .command()
+        .args([
+            "-p",
+            "tsconfig.json",
+            "--outDir",
+            "cli-out",
+            "--declaration",
+            "false",
+            "--pretty",
+            "false",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("project compile starts");
+
+    assert_success(&forwarded, "project compile with CLI overrides");
+    assert!(project.path.join("cli-out/main.js").is_file());
+    assert!(
+        !project.path.join("cli-out/main.d.ts").exists(),
+        "the declaration override must disable the config declaration"
+    );
+    assert!(
+        !project.path.join("config-out").exists(),
+        "config outDir must not be used while the CLI override applies"
+    );
+}
+
+#[test]
+fn project_mode_rejects_unimplemented_options() {
+    let project = ScratchDirectory::new();
+    project.write("src/main.ts", "export const answer = 42;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"files":["src/main.ts"],"compilerOptions":{"outDir":"dist"}}"#,
+    );
+
+    for (option, name) in [
+        (vec!["--incremental"], "incremental"),
+        (vec!["--target", "esnext"], "target"),
+        (vec!["--listFiles"], "listFiles"),
+        (vec!["--ignoreConfig"], "ignoreConfig"),
+    ] {
+        let output = project
+            .command()
+            .args(["-p", "tsconfig.json", "--pretty", "false"])
+            .args(&option)
+            .current_dir(&project.path)
+            .output()
+            .expect("project option gate starts");
+        assert_not_implemented(&output, name);
+    }
+
+    assert!(
+        !project.path.join("dist").exists(),
+        "option classification must precede project loading"
+    );
+}
+
+#[test]
+fn build_mode_rejects_unimplemented_options() {
+    let project = ScratchDirectory::new();
+    project.write("src/main.ts", "export const answer = 42;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"files":["src/main.ts"],"compilerOptions":{"rootDir":"src","outDir":"dist"}}"#,
+    );
+
+    for (option, name) in [
+        (vec!["--watch"], "watch"),
+        (vec!["--builders", "4"], "builders"),
+        (vec!["--noEmit"], "noEmit"),
+        (vec!["--incremental"], "incremental"),
+    ] {
+        let output = project
+            .command()
+            .args(["--build", "tsconfig.json"])
+            .args(&option)
+            .current_dir(&project.path)
+            .output()
+            .expect("build option gate starts");
+        assert_not_implemented(&output, name);
+    }
+
+    assert!(
+        !project.path.join("dist").exists(),
+        "option classification must precede any build work"
+    );
+}
+
+#[test]
+fn build_mode_consumes_build_controls_and_reports_verbose_status() {
+    let project = ScratchDirectory::new();
+    project.write("src/main.ts", "export const answer = 42;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"files":["src/main.ts"],"compilerOptions":{"composite":true,"rootDir":"src","outDir":"dist"}}"#,
+    );
+
+    let building = project
+        .command()
+        .args(["--build", "--verbose", "--pretty", "false"])
+        .current_dir(&project.path)
+        .output()
+        .expect("verbose first build starts");
+    assert_success(&building, "verbose first build");
+    let building_out = stdout(&building);
+    assert!(
+        building_out.contains("Building project '"),
+        "{building_out}"
+    );
+    assert!(project.path.join("dist/main.js").is_file());
+
+    let forced = project
+        .command()
+        .args([
+            "--build",
+            "--force",
+            "--stopBuildOnErrors",
+            "false",
+            "--pretty",
+            "false",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("forced rebuild starts");
+    assert_success(&forced, "forced rebuild consumes build controls");
+
+    let up_to_date = project
+        .command()
+        .args(["--build", "--verbose", "--pretty", "false"])
+        .current_dir(&project.path)
+        .output()
+        .expect("verbose up-to-date build starts");
+    assert_success(&up_to_date, "verbose up-to-date build");
+    let up_to_date_out = stdout(&up_to_date);
+    assert!(up_to_date_out.contains("is up to date"), "{up_to_date_out}");
+    assert!(up_to_date_out.contains("tsconfig.json"), "{up_to_date_out}");
+}
+
+#[test]
+fn direct_mode_preserves_its_option_surface() {
+    let project = ScratchDirectory::new();
+    project.write("hello.ts", include_str!("fixtures/hello.ts"));
+
+    let consumed = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "hello.ts",
+            "--strict",
+            "--pretty",
+            "false",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct compile starts");
+    assert_success(&consumed, "direct compile with consumed options");
+
+    let rejected = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--incremental"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct rejection starts");
+    assert_not_implemented(&rejected, "incremental");
+
+    let unset_watch = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--watch", "null"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct null watch starts");
+    assert_not_implemented(&unset_watch, "watch");
+}
+
+#[test]
+fn mode_conflict_boundaries_fail_at_parse_time() {
+    let project = ScratchDirectory::new();
+    project.write("main.ts", "export const value = 1;\n");
+
+    let run = |args: &[&str]| {
+        project
+            .command()
+            .args(args)
+            .current_dir(&project.path)
+            .output()
+            .expect("conflict command starts")
+    };
+
+    assert_parse_failure(
+        &run(&["--dry", "main.ts"]),
+        6388,
+        "Compiler option 'dry' may only be used with '--build'.",
+    );
+    assert_parse_failure(
+        &run(&["--build", "--target", "esnext"]),
+        6387,
+        "Compiler option 'target' may not be used with '--build'.",
+    );
+    assert_parse_failure(
+        &run(&["-p", "tsconfig.json", "main.ts"]),
+        5042,
+        "Option 'project' cannot be mixed with source files on a command line.",
+    );
+    assert_parse_failure(
+        &run(&["--build", "--clean", "--verbose"]),
+        6370,
+        "Options 'clean' and 'verbose' cannot be combined.",
+    );
 }
 
 fn bamts_binary() -> &'static str {
@@ -760,7 +1008,6 @@ impl ScratchDirectory {
             .output()
             .expect("bamts type-check starts")
     }
-
 
     fn emit(&self, entrypoint: &str, output: &Path) -> Output {
         self.command()
