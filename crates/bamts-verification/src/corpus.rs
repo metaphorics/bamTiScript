@@ -885,6 +885,7 @@ impl CorpusFailure {
             | driver::DriverError::ProjectConfig { .. }
             | driver::DriverError::LintConfig { .. }
             | driver::DriverError::WriteTscConfig { .. }
+            | driver::DriverError::ShowConfigRender { .. }
             | driver::DriverError::MissingEntrypoint
             | driver::DriverError::MultipleCompileInputs
             | driver::DriverError::UnsupportedCompileTarget(_)
