@@ -595,7 +595,6 @@ pub(crate) fn print_with_jsx_plan(
         } else if let Some(file) = source_map.file() {
             code.push_str(&SourceMap::url_comment(&format!("{file}.map")));
         }
-        code.push_str(options.newline.as_str());
     }
     let emitted = EmittedFile { code, source_map };
     match surface {
