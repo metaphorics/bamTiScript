@@ -4,8 +4,8 @@ use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_array, allocate_string, define_data, install_function, range_error,
-    to_integer_or_infinity, type_error, uri_error, value_number,
+    allocate_array, allocate_string, define_data, install_constructor_function, install_function,
+    range_error, to_integer_or_infinity, type_error, uri_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, IterationKind, Machine, PropertyKey, PropertyMap};
@@ -16,7 +16,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.string_prototype();
-    let constructor = install_function(heap, builtins, "String", 1, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "String", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode("String"), constructor);
     for (name, length, handler) in [

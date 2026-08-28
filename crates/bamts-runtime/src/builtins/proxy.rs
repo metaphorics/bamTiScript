@@ -87,7 +87,7 @@ pub(super) fn install<H: Host>(
     let constructor = install_function(heap, builtins, "Proxy", 2, constructor::<H>);
     let revocable = install_function(heap, builtins, "revocable", 2, revocable::<H>);
     define_data(heap, constructor, "revocable", revocable);
-    globals.insert(EcmaString::from_utf8("Proxy"), constructor);
+    globals.insert(EcmaString::encode("Proxy"), constructor);
 }
 
 fn constructor<H: Host>(
@@ -132,7 +132,7 @@ fn revocable<H: Host>(
     for (name, value) in [("proxy", proxy), ("revoke", revoker)] {
         machine.define_descriptor(
             result,
-            PropertyKey::Named(EcmaString::from_utf8(name)),
+            PropertyKey::Named(EcmaString::encode(name)),
             Property::Data {
                 value,
                 writable: true,
@@ -151,7 +151,7 @@ fn proxy_revoker<H: Host>(
     let name = allocate_string(machine, EcmaString::default())?;
     let mut properties = PropertyMap::default();
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("length")),
+        PropertyKey::Named(EcmaString::encode("length")),
         Property::Data {
             value: Value::int32(0),
             writable: false,
@@ -160,7 +160,7 @@ fn proxy_revoker<H: Host>(
         },
     );
     properties.insert(
-        PropertyKey::Named(EcmaString::from_utf8("name")),
+        PropertyKey::Named(EcmaString::encode("name")),
         Property::Data {
             value: name,
             writable: false,
@@ -250,7 +250,7 @@ fn get_method<H: Host>(
     handler: Value,
     name: &'static str,
 ) -> Result<Option<Value>, EvalFailure> {
-    let key = PropertyKey::Named(EcmaString::from_utf8(name));
+    let key = PropertyKey::Named(EcmaString::encode(name));
     let method = machine.internal_get(handler, &key, handler)?;
     if matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
         return Ok(None);
@@ -292,7 +292,7 @@ fn trap_property_key_list<H: Host>(
     if !machine.is_object(source) {
         return Err(type_error("Proxy ownKeys trap result is not an object"));
     }
-    let length_key = PropertyKey::Named(EcmaString::from_utf8("length"));
+    let length_key = PropertyKey::Named(EcmaString::encode("length"));
     let length_value = machine.internal_get(source, &length_key, source)?;
     let length = to_integer_or_infinity(machine, length_value)?.clamp(0.0, 9_007_199_254_740_991.0);
     if length > f64::from(machine.limits.max_argument_count) {
@@ -306,7 +306,7 @@ fn trap_property_key_list<H: Host>(
     let mut keys = Vec::with_capacity(length as usize);
     let mut seen = BTreeSet::new();
     for index in 0..length as usize {
-        let index_key = PropertyKey::Named(EcmaString::from_utf8(&index.to_string()));
+        let index_key = PropertyKey::Named(EcmaString::encode(&index.to_string()));
         let value = machine.internal_get(source, &index_key, source)?;
         let key = proxy_key(machine, value)?;
         if !seen.insert(key.clone()) {
@@ -746,16 +746,19 @@ mod tests {
         length: u32,
         handler: BuiltinHandler<TestHost>,
     ) -> Value {
-        let id = machine.intrinsics.builtins.register(BuiltinDef {
-            name,
-            length,
-            handler,
-        });
+        let id = machine
+            .intrinsics
+            .builtins
+            .register_constructor(BuiltinDef {
+                name,
+                length,
+                handler,
+            });
         native_function(&mut machine.heap, id, name, length)
     }
 
     fn key(name: &str) -> PropertyKey {
-        PropertyKey::Named(EcmaString::from_utf8(name))
+        PropertyKey::Named(EcmaString::encode(name))
     }
 
     fn is_type_error<T>(result: Result<T, EvalFailure>) -> bool {
@@ -1027,8 +1030,8 @@ mod tests {
             machine.set_data_property(handler, "ownKeys", trap).unwrap();
             let proxy = create(machine, target, handler).unwrap();
 
-            let fixed_a = allocate_string(machine, EcmaString::from_utf8("fixed")).unwrap();
-            let fixed_b = allocate_string(machine, EcmaString::from_utf8("fixed")).unwrap();
+            let fixed_a = allocate_string(machine, EcmaString::encode("fixed")).unwrap();
+            let fixed_b = allocate_string(machine, EcmaString::encode("fixed")).unwrap();
             let duplicate = allocate_array(machine, vec![fixed_a, fixed_b]).unwrap();
             machine
                 .set_data_property(handler, "result", duplicate)
@@ -1042,8 +1045,8 @@ mod tests {
             assert!(is_type_error(own_property_keys(machine, proxy)));
 
             machine.internal_prevent_extensions(target).unwrap();
-            let fixed = allocate_string(machine, EcmaString::from_utf8("fixed")).unwrap();
-            let extra = allocate_string(machine, EcmaString::from_utf8("extra")).unwrap();
+            let fixed = allocate_string(machine, EcmaString::encode("fixed")).unwrap();
+            let extra = allocate_string(machine, EcmaString::encode("extra")).unwrap();
             let extra_result = allocate_array(machine, vec![fixed, extra]).unwrap();
             machine
                 .set_data_property(handler, "result", extra_result)

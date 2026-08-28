@@ -3,10 +3,7 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
-use super::property_descriptor::{
-    PropertyDescriptor, descriptor_from_property, from_property_descriptor, is_extensible,
-    same_value,
-};
+use super::property_descriptor::{PropertyDescriptor, from_property_descriptor, same_value};
 use super::{allocate_array, allocate_string, install_function, type_error};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
@@ -132,7 +129,11 @@ fn symbol_value(index: u32) -> Value {
 /// `ToObject` is represented by raw primitive values on several runtime paths.
 /// String exotic own keys therefore need their virtual indices and `length`
 /// merged with stored keys before the ES `[[OwnPropertyKeys]]` consumers run.
-fn own_keys<H: Host>(
+/// The ordinary `[[OwnPropertyKeys]]` core, including the string-exotic
+/// virtual-index merge for (boxed) strings. Invoked BY
+/// `Machine::internal_own_property_keys`; user-facing callers must go through
+/// the canonical method.
+pub(super) fn own_keys<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
 ) -> Result<Vec<PropertyKey>, EvalFailure> {
@@ -180,48 +181,14 @@ fn own_keys<H: Host>(
         .collect())
 }
 
+/// `[[GetOwnProperty]]` seam: every Object-static descriptor read dispatches
+/// through the canonical method (trap-bearing for proxies).
 fn own_descriptor<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
     key: &PropertyKey,
-) -> Result<Option<Property>, EvalFailure> {
-    if let Some(descriptor) = machine.own_descriptor(object, key)? {
-        return Ok(Some(descriptor));
-    }
-    let primitive = machine.unbox_primitive_or_self(object)?;
-    let Some(index) = machine
-        .runtime_slot(primitive)
-        .map_err(EvalFailure::Runtime)?
-    else {
-        return Ok(None);
-    };
-    let HeapEntry::String(text) = &machine.heap[index] else {
-        return Ok(None);
-    };
-    let PropertyKey::Named(name) = key else {
-        return Ok(None);
-    };
-    if name.eq_ascii("length") {
-        return Ok(Some(Property::Data {
-            value: crate::number_value(text.len_units() as f64),
-            writable: false,
-            enumerable: false,
-            configurable: false,
-        }));
-    }
-    let Some(offset) = crate::array_index(name).map(|offset| offset as usize) else {
-        return Ok(None);
-    };
-    if offset >= text.len_units() {
-        return Ok(None);
-    }
-    let value = machine.get_property_key(object, key)?;
-    Ok(Some(Property::Data {
-        value,
-        writable: false,
-        enumerable: true,
-        configurable: false,
-    }))
+) -> Result<Option<PropertyDescriptor>, EvalFailure> {
+    machine.internal_get_own_property(object, key)
 }
 
 fn enumerable_string_keys<H: Host>(
@@ -229,12 +196,12 @@ fn enumerable_string_keys<H: Host>(
     object: Value,
 ) -> Result<Vec<EcmaString>, EvalFailure> {
     let mut names = Vec::new();
-    for key in own_keys(machine, object)? {
+    for key in machine.internal_own_property_keys(object)? {
         let PropertyKey::Named(name) = key else {
             continue;
         };
         if own_descriptor(machine, object, &PropertyKey::Named(name.clone()))?
-            .is_some_and(|descriptor| descriptor.enumerable())
+            .is_some_and(|descriptor| descriptor.enumerable == Some(true))
         {
             names.push(name);
         }
@@ -257,9 +224,9 @@ fn assign<H: Host>(
         if matches!(source.decode(), Some(Decoded::Undefined | Decoded::Null)) {
             continue;
         }
-        for key in own_keys(machine, source)? {
+        for key in machine.internal_own_property_keys(source)? {
             if !own_descriptor(machine, source, &key)?
-                .is_some_and(|descriptor| descriptor.enumerable())
+                .is_some_and(|descriptor| descriptor.enumerable == Some(true))
             {
                 continue;
             }
@@ -326,7 +293,7 @@ fn get_own_property_descriptor<H: Host>(
     let source = argument(args, 0);
     require_object_coercible(source, "Cannot convert undefined or null to object")?;
     let key = machine.observable_property_key(argument(args, 1))?;
-    let descriptor = own_descriptor(machine, source, &key)?.map(descriptor_from_property);
+    let descriptor = own_descriptor(machine, source, &key)?;
     Ok(BuiltinOutcome::Value(from_property_descriptor(
         machine, descriptor,
     )?))
@@ -340,10 +307,10 @@ fn get_own_property_descriptors<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = argument(args, 0);
     require_object_coercible(source, "Cannot convert undefined or null to object")?;
-    let keys = own_keys(machine, source)?;
+    let keys = machine.internal_own_property_keys(source)?;
     let result = ordinary_object(machine, Some(machine.intrinsics.object_prototype))?;
     for key in keys {
-        let descriptor = own_descriptor(machine, source, &key)?.map(descriptor_from_property);
+        let descriptor = own_descriptor(machine, source, &key)?;
         let reified = from_property_descriptor(machine, descriptor)?;
         if reified != Value::UNDEFINED {
             create_data_property(machine, result, key, reified)?;
@@ -361,7 +328,7 @@ fn get_own_property_names<H: Host>(
     let source = argument(args, 0);
     require_object_coercible(source, "Cannot convert undefined or null to object")?;
     let mut names = Vec::new();
-    for key in own_keys(machine, source)? {
+    for key in machine.internal_own_property_keys(source)? {
         if let PropertyKey::Named(name) = key {
             names.push(allocate_string(machine, name)?);
         }
@@ -377,7 +344,8 @@ fn get_own_property_symbols<H: Host>(
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let source = argument(args, 0);
     require_object_coercible(source, "Cannot convert undefined or null to object")?;
-    let symbols = own_keys(machine, source)?
+    let symbols = machine
+        .internal_own_property_keys(source)?
         .into_iter()
         .filter_map(|key| match key {
             PropertyKey::Symbol(index) => Some(symbol_value(index)),
@@ -399,7 +367,9 @@ fn get_prototype_of<H: Host>(
         "Cannot convert undefined or null to object",
     )?;
     Ok(BuiltinOutcome::Value(
-        machine.prototype_value(object)?.unwrap_or(Value::NULL),
+        machine
+            .internal_get_prototype_of(object)?
+            .unwrap_or(Value::NULL),
     ))
 }
 
@@ -437,7 +407,7 @@ fn is_extensible_method<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let value = argument(args, 0);
-    let result = machine.is_object(value) && is_extensible(machine, value)?;
+    let result = machine.is_object(value) && machine.internal_is_extensible(value)?;
     Ok(BuiltinOutcome::Value(Value::boolean(result)))
 }
 
@@ -447,44 +417,11 @@ enum IntegrityLevel {
     Frozen,
 }
 
-fn set_extensible<H: Host>(
-    machine: &mut Machine<'_, H>,
-    object: Value,
-    value: bool,
-) -> Result<bool, EvalFailure> {
-    let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
-        return Ok(false);
-    };
-    let extensible = match &mut machine.heap[index] {
-        HeapEntry::Object { extensible, .. }
-        | HeapEntry::Array { extensible, .. }
-        | HeapEntry::Function { extensible, .. }
-        | HeapEntry::Script { extensible, .. }
-        | HeapEntry::RegExp { extensible, .. }
-        | HeapEntry::Date { extensible, .. }
-        | HeapEntry::Collection { extensible, .. }
-        | HeapEntry::BuiltinIterator { extensible, .. }
-        | HeapEntry::Generator { extensible, .. }
-        | HeapEntry::AsyncGenerator { extensible, .. }
-        | HeapEntry::Promise { extensible, .. }
-        | HeapEntry::DisposableStack { extensible, .. }
-        | HeapEntry::Timeout { extensible, .. }
-        | HeapEntry::NativeFunction { extensible, .. }
-        | HeapEntry::ProcessEnv { extensible, .. } => extensible,
-        HeapEntry::ModuleNamespace { .. }
-        | HeapEntry::ExternalModuleNamespace { .. }
-        | HeapEntry::Iterator { .. } => return Ok(!value),
-        _ => return Ok(false),
-    };
-    *extensible = value;
-    Ok(true)
-}
-
 fn prevent_extensions_object<H: Host>(
     machine: &mut Machine<'_, H>,
     object: Value,
 ) -> Result<bool, EvalFailure> {
-    set_extensible(machine, object, false)
+    machine.internal_prevent_extensions(object)
 }
 
 fn set_integrity_level<H: Host>(
@@ -495,21 +432,20 @@ fn set_integrity_level<H: Host>(
     if !prevent_extensions_object(machine, object)? {
         return Ok(false);
     }
-    let keys = own_keys(machine, object)?;
+    let keys = machine.internal_own_property_keys(object)?;
     for key in keys {
         let mut descriptor = PropertyDescriptor {
             configurable: Some(false),
             ..PropertyDescriptor::default()
         };
         if matches!(level, IntegrityLevel::Frozen)
-            && matches!(
-                own_descriptor(machine, object, &key)?,
-                Some(Property::Data { .. })
-            )
+            && own_descriptor(machine, object, &key)?.is_some_and(|descriptor| descriptor.is_data())
         {
             descriptor.writable = Some(false);
         }
-        super::object::apply_property_descriptor(machine, object, key, descriptor)?;
+        if !machine.internal_define_own_property(object, key, descriptor)? {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -519,16 +455,17 @@ fn test_integrity_level<H: Host>(
     object: Value,
     level: IntegrityLevel,
 ) -> Result<bool, EvalFailure> {
-    if is_extensible(machine, object)? {
+    if machine.internal_is_extensible(object)? {
         return Ok(false);
     }
-    for key in own_keys(machine, object)? {
+    for key in machine.internal_own_property_keys(object)? {
         let Some(descriptor) = own_descriptor(machine, object, &key)? else {
             continue;
         };
-        if descriptor.configurable()
+        if descriptor.configurable == Some(true)
             || (matches!(level, IntegrityLevel::Frozen)
-                && matches!(descriptor, Property::Data { writable: true, .. }))
+                && descriptor.is_data()
+                && descriptor.writable == Some(true))
         {
             return Ok(false);
         }
@@ -614,7 +551,11 @@ fn set_prototype_of<H: Host>(
     if !machine.is_object(object) {
         return Ok(BuiltinOutcome::Value(object));
     }
-    machine.set_prototype_value(object, (prototype != Value::NULL).then_some(prototype))?;
+    if !machine
+        .internal_set_prototype_of(object, (prototype != Value::NULL).then_some(prototype))?
+    {
+        return Err(type_error("Cannot set prototype: object is not extensible"));
+    }
     Ok(BuiltinOutcome::Value(object))
 }
 
@@ -853,7 +794,7 @@ mod tests {
                 )
                 .unwrap();
             value(freeze(machine, Value::UNDEFINED, &[frozen], false).unwrap());
-            assert!(!is_extensible(machine, frozen).unwrap());
+            assert!(!machine.internal_is_extensible(frozen).unwrap());
             assert!(matches!(
                 machine
                     .own_descriptor(frozen, &PropertyKey::Named(EcmaString::encode("data")))
@@ -932,7 +873,7 @@ mod tests {
             let callback = native_function(&mut machine.heap, callback_id, "parity", 2);
             let grouped =
                 value(group_by(machine, Value::UNDEFINED, &[iterable, callback], false).unwrap());
-            assert_eq!(machine.prototype_value(grouped).unwrap(), None);
+            assert_eq!(machine.internal_get_prototype_of(grouped).unwrap(), None);
             let odd = machine.get_named_property(grouped, "1").unwrap();
             let even = machine.get_named_property(grouped, "0").unwrap();
             assert_eq!(array(machine, odd), vec![Value::int32(1), Value::int32(3)]);
@@ -1154,7 +1095,7 @@ mod tests {
                 )
                 .unwrap();
             machine
-                .set_prototype_value(target, Some(prototype))
+                .internal_set_prototype_of(target, Some(prototype))
                 .unwrap();
             let source = test_object(machine);
             machine

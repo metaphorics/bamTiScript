@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use bamts_bytecode::{Constant, EcmaString, EcmaStringBuilder};
 use bamts_native::Value;
 
-use super::{allocate_array, allocate_string, heap_index, install_function, type_error};
+use super::{
+    allocate_array, allocate_string, heap_index, install_constructor_function, install_function,
+    type_error,
+};
 use crate::intrinsics::{BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -38,7 +41,8 @@ pub(super) fn install<H: Host>(
 
     for (name, length) in ERROR_TYPES {
         let prototype = prototype_of(heap, globals, name);
-        let constructor = install_function(heap, builtins, name, length, error_constructor::<H>);
+        let constructor =
+            install_constructor_function(heap, builtins, name, length, error_constructor::<H>);
         builtins.set_constructor_prototype(heap, constructor, prototype);
         builtins.set_error_prototype(heap, constructor, prototype);
         if name == "Error" {
@@ -178,7 +182,7 @@ pub(super) fn error_constructor<H: Host>(
         && machine.is_object(options)
     {
         let key = PropertyKey::Named(EcmaString::encode("cause"));
-        if machine.has_property(options, &key)? {
+        if machine.internal_has_property(options, &key)? {
             let cause = machine.get_named_property(options, "cause")?;
             define_own(machine, object, "cause", cause)?;
         }
@@ -356,7 +360,7 @@ fn append_cause_chain<H: Host>(
     let mut seen = vec![root];
 
     for _ in 0..MAX_CAUSE_DEPTH {
-        if !machine.is_object(current) || !machine.has_property(current, &cause_key)? {
+        if !machine.is_object(current) || !machine.internal_has_property(current, &cause_key)? {
             return Ok(());
         }
         let cause = machine.get_named_property(current, "cause")?;

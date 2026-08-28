@@ -4,7 +4,9 @@ use std::mem::size_of;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, SlotId, Value};
 
-use super::{define_data, define_to_string_tag, install_function, type_error};
+use super::{
+    define_data, define_to_string_tag, install_constructor_function, install_function, type_error,
+};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     CallbackException, EvalFailure, HeapEntry, Host, Machine, MicrotaskJob, PropertyMap,
@@ -30,7 +32,8 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let weak_ref_prototype = ordinary(heap, Some(builtins.object_prototype()));
-    let weak_ref = install_function(heap, builtins, "WeakRef", 1, weak_ref_constructor::<H>);
+    let weak_ref =
+        install_constructor_function(heap, builtins, "WeakRef", 1, weak_ref_constructor::<H>);
     builtins.set_constructor_prototype(heap, weak_ref, weak_ref_prototype);
     builtins.set_weak_ref_prototype(weak_ref_prototype);
     let deref = install_function(heap, builtins, "deref", 0, weak_ref_deref::<H>);
@@ -44,7 +47,7 @@ pub(super) fn install<H: Host>(
     globals.insert(EcmaString::encode("WeakRef"), weak_ref);
 
     let registry_prototype = ordinary(heap, Some(builtins.object_prototype()));
-    let registry = install_function(
+    let registry = install_constructor_function(
         heap,
         builtins,
         "FinalizationRegistry",

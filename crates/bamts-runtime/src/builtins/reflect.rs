@@ -51,7 +51,7 @@ pub(super) fn install<H: Host>(
         define_data(heap, reflect, name, function);
     }
     define_to_string_tag(heap, reflect, builtins.symbol_to_string_tag(), "Reflect");
-    globals.insert(EcmaString::from_utf8("Reflect"), reflect);
+    globals.insert(EcmaString::encode("Reflect"), reflect);
 }
 
 fn argument(args: &[Value], index: usize) -> Value {
@@ -406,7 +406,7 @@ mod tests {
     fn symbol(machine: &mut Machine<'_, TestHost>, description: &str) -> Value {
         machine
             .allocate(HeapEntry::Symbol {
-                description: EcmaString::from_utf8(description),
+                description: EcmaString::encode(description),
             })
             .expect("symbol allocation succeeds")
     }
@@ -438,7 +438,7 @@ mod tests {
             ("set", 3),
             ("setPrototypeOf", 2),
         ] {
-            let key = PropertyKey::Named(EcmaString::from_utf8(name));
+            let key = PropertyKey::Named(EcmaString::encode(name));
             let Some(Property::Data {
                 value,
                 writable: true,
@@ -502,7 +502,7 @@ mod tests {
         machine
             .define_descriptor(
                 key,
-                PropertyKey::Named(EcmaString::from_utf8("toString")),
+                PropertyKey::Named(EcmaString::encode("toString")),
                 Property::Accessor {
                     getter: Some(throwing),
                     setter: None,
@@ -579,7 +579,7 @@ mod tests {
         machine
             .define_descriptor(
                 target,
-                PropertyKey::Named(EcmaString::from_utf8("value")),
+                PropertyKey::Named(EcmaString::encode("value")),
                 Property::Accessor {
                     getter: Some(getter),
                     setter: Some(setter),
@@ -588,7 +588,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let key = allocate_string(&mut machine, EcmaString::from_utf8("value")).unwrap();
+        let key = allocate_string(&mut machine, EcmaString::encode("value")).unwrap();
         assert_eq!(
             call_reflect(&mut machine, "get", &[target, key]).unwrap(),
             target
@@ -622,7 +622,7 @@ mod tests {
         let prototype = ordinary_object(&mut machine);
         let mut properties = PropertyMap::default();
         properties.insert(
-            PropertyKey::Named(EcmaString::from_utf8("prototype")),
+            PropertyKey::Named(EcmaString::encode("prototype")),
             Property::Data {
                 value: prototype,
                 writable: true,
@@ -652,7 +652,7 @@ mod tests {
         machine
             .define_descriptor(
                 throwing_args,
-                PropertyKey::Named(EcmaString::from_utf8("length")),
+                PropertyKey::Named(EcmaString::encode("length")),
                 Property::Accessor {
                     getter: Some(late),
                     setter: None,
@@ -678,7 +678,7 @@ mod tests {
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let target = ordinary_object(&mut machine);
-        let key = allocate_string(&mut machine, EcmaString::from_utf8("fixed")).unwrap();
+        let key = allocate_string(&mut machine, EcmaString::encode("fixed")).unwrap();
         let descriptor = ordinary_object(&mut machine);
         machine
             .set_data_property(descriptor, "value", Value::int32(42))
@@ -746,7 +746,7 @@ mod tests {
             call_reflect(&mut machine, "isExtensible", &[target]).unwrap(),
             Value::FALSE
         );
-        let new_key = allocate_string(&mut machine, EcmaString::from_utf8("new")).unwrap();
+        let new_key = allocate_string(&mut machine, EcmaString::encode("new")).unwrap();
         let new_descriptor = ordinary_object(&mut machine);
         assert_eq!(
             call_reflect(
@@ -807,7 +807,7 @@ mod tests {
         machine
             .define_descriptor(
                 target,
-                PropertyKey::Named(EcmaString::from_utf8("boom")),
+                PropertyKey::Named(EcmaString::encode("boom")),
                 Property::Accessor {
                     getter: Some(throwing),
                     setter: None,
@@ -816,7 +816,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let boom = allocate_string(&mut machine, EcmaString::from_utf8("boom")).unwrap();
+        let boom = allocate_string(&mut machine, EcmaString::encode("boom")).unwrap();
         assert!(matches!(
             call_reflect(&mut machine, "get", &[target, boom]),
             Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -828,7 +828,7 @@ mod tests {
         machine
             .define_descriptor(
                 key,
-                PropertyKey::Named(EcmaString::from_utf8("toString")),
+                PropertyKey::Named(EcmaString::encode("toString")),
                 Property::Accessor {
                     getter: Some(throwing),
                     setter: None,
@@ -848,7 +848,7 @@ mod tests {
         machine
             .define_descriptor(
                 descriptor,
-                PropertyKey::Named(EcmaString::from_utf8("enumerable")),
+                PropertyKey::Named(EcmaString::encode("enumerable")),
                 Property::Accessor {
                     getter: Some(throwing),
                     setter: None,

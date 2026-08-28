@@ -668,6 +668,15 @@ fn trace_entry(
         | HeapEntry::ExternalModuleNamespace { .. }
         | HeapEntry::Symbol { .. }
         | HeapEntry::PrivateName { .. } => {}
+        HeapEntry::Proxy { record } => {
+            record.for_each_value(|value| mark_value(heap, marks, work, value));
+        }
+        HeapEntry::ProxyRevoker {
+            record, properties, ..
+        } => {
+            record.for_each_value(|value| mark_value(heap, marks, work, value));
+            trace_properties_and_prototype(properties, None, heap, marks, work);
+        }
         HeapEntry::WeakRef { .. } | HeapEntry::FinalizationRegistry { .. } => {
             crate::intrinsics::builtins::weakref_finalization::trace_strong_edges(entry, |value| {
                 mark_value(heap, marks, work, value);

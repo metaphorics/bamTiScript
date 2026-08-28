@@ -41,6 +41,10 @@ pub(crate) struct BuiltinDef<H: Host> {
 }
 pub(crate) struct BuiltinTable<H: Host> {
     defs: Vec<BuiltinDef<H>>,
+    /// Index-aligned constructability flags. `register` defaults to `false`
+    /// (a missed constructor marking fails safe: `new X()` throws); explicit
+    /// constructor registrations opt in via `register_constructor`.
+    constructable: Vec<bool>,
     object_prototype: Value,
     function_prototype: Value,
     array_prototype: Value,
@@ -107,6 +111,7 @@ impl<H: Host> BuiltinTable<H> {
     ) -> Self {
         Self {
             defs: Vec::new(),
+            constructable: Vec::new(),
             object_prototype,
             function_prototype,
             array_prototype,
@@ -166,7 +171,27 @@ impl<H: Host> BuiltinTable<H> {
     pub(crate) fn register(&mut self, def: BuiltinDef<H>) -> BuiltinId {
         let id = BuiltinId(self.defs.len());
         self.defs.push(def);
+        self.constructable.push(false);
         id
+    }
+    /// Registers a builtin callable as a constructor: `new X()` dispatches to
+    /// its handler. The explicit opt-in keeps non-constructable status the
+    /// default for every method, static, and accessor installation.
+    pub(crate) fn register_constructor(&mut self, def: BuiltinDef<H>) -> BuiltinId {
+        let id = self.register(def);
+        self.constructable[id.0] = true;
+        id
+    }
+    /// Whether the builtin registered under `id` has `[[Construct]]`. This is
+    /// the single source of truth consumed by `Machine::is_constructor`.
+    pub(crate) fn is_constructable(&self, id: BuiltinId) -> bool {
+        self.constructable.get(id.0).copied().unwrap_or(false)
+    }
+    /// Marks an already-registered builtin as constructable. Used where the
+    /// registration itself lives in a leaf that must stay edit-free (the
+    /// `Proxy` constructor).
+    pub(crate) fn set_constructable(&mut self, id: BuiltinId, constructable: bool) {
+        self.constructable[id.0] = constructable;
     }
     pub(crate) fn get(&self, id: BuiltinId) -> &BuiltinDef<H> {
         self.defs
@@ -600,6 +625,7 @@ impl<H: Host> BuiltinTable<H> {
     fn for_each_value(&self, mut visit: impl FnMut(Value)) {
         let Self {
             defs: _,
+            constructable: _,
             object_prototype,
             function_prototype,
             array_prototype,
@@ -941,6 +967,8 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::PrivateName { .. } => "Symbol",
                     HeapEntry::Date { .. } => "Date",
                     HeapEntry::Object { .. } if self.is_error_object(index)? => "Error",
+                    HeapEntry::Proxy { .. } => "Object",
+                    HeapEntry::ProxyRevoker { .. } => "Function",
                     _ => "Object",
                 })
             }
@@ -1613,7 +1641,6 @@ mod tests {
         let machine = Machine::new(&module, &mut host, Limits::default());
         let names = [
             "eval",
-            "Proxy",
             "Reflect",
             "Intl",
             "Iterator",

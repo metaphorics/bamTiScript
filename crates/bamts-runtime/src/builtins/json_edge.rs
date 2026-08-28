@@ -443,7 +443,7 @@ fn walk_reviver<H: Host>(
             )?;
             let key = PropertyKey::Named(name);
             if child == Value::UNDEFINED {
-                machine.delete_property(live, &key)?;
+                machine.internal_delete(live, &key)?;
             } else {
                 create_data_property(machine, live, key, child)?;
             }
@@ -475,7 +475,7 @@ fn walk_reviver<H: Host>(
             )?;
             let key = PropertyKey::Named(name);
             if child == Value::UNDEFINED {
-                machine.delete_property(live, &key)?;
+                machine.internal_delete(live, &key)?;
             } else {
                 create_data_property(machine, live, key, child)?;
             }

@@ -9,7 +9,10 @@ use super::arraybuffer::to_index;
 use super::typedarray_all::{
     ElementKind, LengthSlot, ViewBuffer, storage_from_value, value_from_storage,
 };
-use super::{builtin_property, define_data, heap_index, install_function, range_error, type_error};
+use super::{
+    builtin_property, define_data, heap_index, install_constructor_function, install_function,
+    range_error, type_error,
+};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
 
@@ -103,7 +106,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor = install_function(heap, builtins, "DataView", 1, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "DataView", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     builtins.set_dataview_prototype(prototype);
     define_data(heap, prototype, "constructor", constructor);
@@ -1167,7 +1170,7 @@ mod tests {
             );
             assert!(
                 machine
-                    .delete_property(view, &PropertyKey::Named(EcmaString::encode("marker")))
+                    .internal_delete(view, &PropertyKey::Named(EcmaString::encode("marker")))
                     .unwrap()
             );
             assert_eq!(

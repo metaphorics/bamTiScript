@@ -5,7 +5,8 @@ use bamts_bytecode::EcmaString;
 use bamts_native::Value;
 
 use super::{
-    allocate_string, define_data, install_function, range_error, type_error, value_number,
+    allocate_string, define_data, install_constructor_function, install_function, range_error,
+    type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap};
@@ -488,7 +489,7 @@ pub(super) fn install<H: Host>(
         prototype: Some(builtins.object_prototype()),
         extensible: true,
     };
-    let constructor = install_function(heap, builtins, "Date", 7, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "Date", 7, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     builtins.set_date_prototype(prototype);
 

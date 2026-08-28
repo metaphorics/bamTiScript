@@ -17,11 +17,11 @@ pub(crate) struct PropertyDescriptor {
 }
 
 impl PropertyDescriptor {
-    pub(super) fn is_accessor(self) -> bool {
+    pub(crate) fn is_accessor(self) -> bool {
         self.getter.is_some() || self.setter.is_some()
     }
 
-    pub(super) fn is_data(self) -> bool {
+    pub(crate) fn is_data(self) -> bool {
         self.value.is_some() || self.writable.is_some()
     }
 
@@ -107,7 +107,7 @@ fn descriptor_field<H: Host>(
     name: &str,
 ) -> Result<Option<Value>, EvalFailure> {
     let key = PropertyKey::Named(EcmaString::encode(name));
-    if !machine.has_property(descriptor, &key)? {
+    if !machine.internal_has_property(descriptor, &key)? {
         return Ok(None);
     }
     machine.get_property_key(descriptor, &key).map(Some)
@@ -420,7 +420,14 @@ pub(crate) fn is_extensible<H: Host>(
         | HeapEntry::DisposableStack { extensible, .. }
         | HeapEntry::Timeout { extensible, .. }
         | HeapEntry::NativeFunction { extensible, .. }
-        | HeapEntry::ProcessEnv { extensible, .. } => *extensible,
+        | HeapEntry::ProcessEnv { extensible, .. }
+        | HeapEntry::TypedArray { extensible, .. }
+        | HeapEntry::ArrayBuffer { extensible, .. }
+        | HeapEntry::SharedArrayBuffer { extensible, .. }
+        | HeapEntry::DataView { extensible, .. }
+        | HeapEntry::WeakRef { extensible, .. }
+        | HeapEntry::FinalizationRegistry { extensible, .. }
+        | HeapEntry::ProxyRevoker { extensible, .. } => *extensible,
         HeapEntry::ModuleNamespace { .. } | HeapEntry::ExternalModuleNamespace { .. } => false,
         _ => false,
     })
@@ -433,10 +440,10 @@ pub(super) fn collect_property_descriptors<H: Host>(
     descriptors: Value,
 ) -> Result<Vec<(PropertyKey, PropertyDescriptor)>, EvalFailure> {
     let mut definitions = Vec::new();
-    for key in machine.own_property_keys(descriptors)? {
+    for key in machine.internal_own_property_keys(descriptors)? {
         if !machine
-            .own_descriptor(descriptors, &key)?
-            .is_some_and(|property| property.enumerable())
+            .internal_get_own_property(descriptors, &key)?
+            .is_some_and(|descriptor| descriptor.enumerable == Some(true))
         {
             continue;
         }

@@ -1734,6 +1734,22 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         args.as_ref(),
                     );
                 }
+                Ok(CalleeKind::Proxy) => {
+                    let outcome = crate::builtins::proxy::call(
+                        &mut self.machine.borrow_mut(),
+                        callee,
+                        this,
+                        args.as_ref(),
+                    );
+                    return self.eval_outcome(outcome);
+                }
+                Ok(CalleeKind::ProxyRevoker) => {
+                    let outcome = crate::builtins::proxy::call_revoker(
+                        &mut self.machine.borrow_mut(),
+                        callee,
+                    );
+                    return self.eval_outcome(outcome);
+                }
                 Ok(CalleeKind::Builtin { id }) => {
                     let result = {
                         self.machine
@@ -2054,7 +2070,12 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
     }
 
     fn get_ascii(&self, object: Value, name: &str) -> InvokeOutcome {
-        let outcome = self.machine.borrow_mut().resolve_get_ascii(object, name);
+        let key = crate::PropertyKey::Named(bamts_bytecode::EcmaString::encode(name));
+        let outcome = self
+            .machine
+            .borrow_mut()
+            .internal_get(object, &key, object)
+            .map(crate::GetOutcome::Value);
         self.get_outcome(outcome, object)
     }
 
@@ -2099,11 +2120,16 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             Ok(key) => key,
             Err(failure) => return Err(self.failure_outcome(failure)),
         };
-        let method =
-            match self.get_outcome(self.machine.borrow_mut().resolve_get(source, &key), source) {
-                InvokeOutcome::Value(method) => method,
-                outcome => return Err(outcome),
-            };
+        let method = match self.get_outcome(
+            self.machine
+                .borrow_mut()
+                .internal_get(source, &key, source)
+                .map(crate::GetOutcome::Value),
+            source,
+        ) {
+            InvokeOutcome::Value(method) => method,
+            outcome => return Err(outcome),
+        };
         if !matches!(method.decode(), Some(Decoded::Undefined | Decoded::Null)) {
             let callable = match self.machine.borrow().is_callable(method) {
                 Ok(callable) => callable,
@@ -2130,11 +2156,16 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             Ok(key) => key,
             Err(failure) => return Err(self.failure_outcome(failure)),
         };
-        let method =
-            match self.get_outcome(self.machine.borrow_mut().resolve_get(source, &key), source) {
-                InvokeOutcome::Value(method) => method,
-                outcome => return Err(outcome),
-            };
+        let method = match self.get_outcome(
+            self.machine
+                .borrow_mut()
+                .internal_get(source, &key, source)
+                .map(crate::GetOutcome::Value),
+            source,
+        ) {
+            InvokeOutcome::Value(method) => method,
+            outcome => return Err(outcome),
+        };
         let callable = match self.machine.borrow().is_callable(method) {
             Ok(callable) => callable,
             Err(failure) => return Err(self.failure_outcome(failure)),
@@ -2172,7 +2203,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             Ok(key) => key,
             Err(failure) => return self.failure_outcome(failure),
         };
-        let method = self.machine.borrow_mut().resolve_get(source, &key);
+        let method = self
+            .machine
+            .borrow_mut()
+            .internal_get(source, &key, source)
+            .map(crate::GetOutcome::Value);
         let mut method = match self.get_outcome(method, source) {
             InvokeOutcome::Value(method) => method,
             other => return other,
@@ -2187,7 +2222,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                 Ok(key) => key,
                 Err(failure) => return self.failure_outcome(failure),
             };
-            let fallback = self.machine.borrow_mut().resolve_get(source, &key);
+            let fallback = self
+                .machine
+                .borrow_mut()
+                .internal_get(source, &key, source)
+                .map(crate::GetOutcome::Value);
             method = match self.get_outcome(fallback, source) {
                 InvokeOutcome::Value(method) => method,
                 other => return other,
@@ -3308,6 +3347,24 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                     Err(failure) => self.fail(failure),
                 }
             }
+            Ok(CalleeKind::Proxy) => {
+                let outcome = crate::builtins::proxy::construct(
+                    &mut self.machine.borrow_mut(),
+                    callee,
+                    arguments.as_ref(),
+                    new_target,
+                );
+                self.outcome_result(self.eval_outcome(outcome))
+            }
+            Ok(CalleeKind::ProxyRevoker) => {
+                self.pending_throw.set(Some(PendingThrow {
+                    value: Value::UNDEFINED,
+                    origin: ThrowOrigin::TypeError {
+                        operation: "construct",
+                    },
+                }));
+                HelperResult::throw(Value::UNDEFINED)
+            }
             Ok(CalleeKind::Runtime {
                 target,
                 captures,
@@ -3333,7 +3390,7 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
                         .allocate_constructed_receiver(new_target);
                     match allocated {
                         Ok(value) => value,
-                        Err(kind) => return self.fatal(kind),
+                        Err(failure) => return self.fail(failure),
                     }
                 };
                 let outcome = self.invoke_runtime(
@@ -3859,14 +3916,9 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                             Err(failure) => break 'result self.fail(failure),
                         }
                     };
-                    let outcome = self.machine.borrow_mut().resolve_get(object, &key);
+                    let outcome = self.machine.borrow_mut().internal_get(object, &key, object);
                     match outcome {
-                        Ok(GetOutcome::Value(value)) => self.validated(value),
-                        Ok(GetOutcome::Text(text)) => self.allocated(HeapEntry::String(text)),
-                        Ok(GetOutcome::Getter(getter)) => {
-                            let outcome = self.invoke_callee(getter, object, &[], Value::UNDEFINED);
-                            self.outcome_result(outcome)
-                        }
+                        Ok(value) => self.validated(value),
                         Err(failure) => self.fail(failure),
                     }
                 }
@@ -3878,16 +3930,20 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                             Err(failure) => break 'result self.fail(failure),
                         }
                     };
-                    let outcome = self.machine.borrow_mut().resolve_set(object, key, value);
+                    let outcome = self
+                        .machine
+                        .borrow_mut()
+                        .internal_set(object, key, value, object);
                     match outcome {
-                        Ok(SetOutcome::Done) => HelperResult::normal(Value::UNDEFINED),
-                        Ok(SetOutcome::Setter(setter)) => {
-                            let outcome =
-                                self.invoke_callee(setter, object, &[value], Value::UNDEFINED);
-                            match outcome {
-                                InvokeOutcome::Value(_) => HelperResult::normal(Value::UNDEFINED),
-                                other => self.outcome_result(other),
-                            }
+                        Ok(true) => HelperResult::normal(Value::UNDEFINED),
+                        Ok(false) => {
+                            self.pending_throw.set(Some(PendingThrow {
+                                value: Value::UNDEFINED,
+                                origin: ThrowOrigin::TypeError {
+                                    operation: "assign to read only property",
+                                },
+                            }));
+                            HelperResult::throw(Value::UNDEFINED)
                         }
                         Err(failure) => self.fail(failure),
                     }
@@ -3900,7 +3956,7 @@ impl<'m, 'h, H: Host> NativeOps for NativeEngine<'m, 'h, H> {
                             Err(failure) => break 'result self.fail(failure),
                         }
                     };
-                    let deleted = self.machine.borrow_mut().delete_property(object, &key);
+                    let deleted = self.machine.borrow_mut().internal_delete(object, &key);
                     match deleted {
                         Ok(deleted) => HelperResult::normal(Value::boolean(deleted)),
                         Err(failure) => self.fail(failure),

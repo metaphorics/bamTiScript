@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
-use super::{define_data, define_to_string_tag, install_function};
+use super::{define_data, define_to_string_tag, install_constructor_function, install_function};
 use crate::intrinsics::BuiltinOutcome;
 use crate::intrinsics::BuiltinTable;
 use crate::{
@@ -93,7 +93,7 @@ pub(super) fn install<H: Host>(
         then_reject::<H>,
     );
 
-    let constructor = install_function(heap, builtins, "Promise", 1, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "Promise", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode("Promise"), constructor);
     let queue_microtask =
@@ -321,7 +321,11 @@ fn constructor<H: Host>(
             .constructed_prototype(new_target)
             .unwrap_or(default_prototype);
         if prototype != default_prototype {
-            machine.set_prototype_value(promise, Some(prototype))?;
+            if !machine.internal_set_prototype_of(promise, Some(prototype))? {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "cannot set promise prototype",
+                }));
+            }
         }
     }
     let record = machine.create_promise_resolver(promise)?;
@@ -1847,7 +1851,7 @@ mod tests {
         // The promise must inherit from the subclass prototype, not
         // Promise.prototype directly.
         assert_eq!(
-            machine.prototype_value(promise).unwrap(),
+            machine.internal_get_prototype_of(promise).unwrap(),
             Some(subclass_prototype)
         );
         // Subclass methods are visible on the instance.

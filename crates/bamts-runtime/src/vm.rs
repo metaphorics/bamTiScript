@@ -190,11 +190,7 @@ fn run_in_this_context<H: Host>(
             .and_then(|module| module.exports.get(&EcmaString::encode("runInThisContext")))
             .expect("node:vm installs runInThisContext")
             .value;
-        Some(
-            machine
-                .constructed_prototype(function)
-                .map_err(EvalFailure::Runtime)?,
-        )
+        Some(machine.constructed_prototype(function)?)
     } else {
         None
     };
@@ -233,11 +229,7 @@ fn run_in_new_context<H: Host>(
         let function = machine.registry.external[&EcmaString::encode("node:vm")].exports
             [&EcmaString::encode("runInNewContext")]
             .value;
-        Some(
-            machine
-                .constructed_prototype(function)
-                .map_err(EvalFailure::Runtime)?,
-        )
+        Some(machine.constructed_prototype(function)?)
     } else {
         None
     };
@@ -968,7 +960,7 @@ mod tests {
             .unwrap();
         assert!(
             machine
-                .delete_property(context, &PropertyKey::Named(EcmaString::encode("global")))
+                .internal_delete(context, &PropertyKey::Named(EcmaString::encode("global")))
                 .unwrap()
         );
         contextify_global(&mut machine, context).unwrap();

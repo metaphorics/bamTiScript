@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use bamts_bytecode::{DisposeHint, EcmaString};
 use bamts_native::Value;
 
-use super::{builtin_property, define_data, define_to_string_tag, heap_index, install_function};
+use super::{
+    builtin_property, define_data, define_to_string_tag, heap_index, install_constructor_function,
+    install_function,
+};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::vm::explicit_resource::{
     ASYNC_DISPOSABLE_STACK_CONSTRUCTOR, ASYNC_DISPOSABLE_STACK_INSTALLS,
@@ -121,7 +124,7 @@ pub(super) fn install<H: Host>(
                 )
             }
         };
-        let constructor = install_function(
+        let constructor = install_constructor_function(
             heap,
             builtins,
             descriptor.name,

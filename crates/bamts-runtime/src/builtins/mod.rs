@@ -1,4 +1,5 @@
 use super::{BuiltinDef, BuiltinOutcome, BuiltinTable, native_function, push};
+use crate::GetOutcome;
 use crate::{
     EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap, ThrowOrigin,
 };
@@ -14,7 +15,8 @@ mod number;
 mod object;
 mod object_statics;
 mod promise;
-mod property_descriptor;
+pub(crate) mod property_descriptor;
+pub(crate) mod proxy;
 mod regexp;
 pub(crate) use regexp::{canonical_source, initial_regexp_properties};
 mod annex_b;
@@ -76,6 +78,10 @@ pub(crate) fn install<H: Host>(
     json_edge::install(heap, globals, builtins);
     install_errors(heap, globals, builtins);
     error_edge::install(heap, globals, builtins);
+    proxy::install(heap, globals, builtins);
+    if let Some(id) = builtins.id_named("Proxy") {
+        builtins.set_constructable(id, true);
+    }
     uri::install(heap, globals, builtins);
     disposable_stack::install(heap, globals, builtins);
 }
@@ -87,6 +93,25 @@ fn install_function<H: Host>(
     handler: super::BuiltinHandler<H>,
 ) -> Value {
     let id = builtins.register(BuiltinDef {
+        name,
+        length,
+        handler,
+    });
+    let definition = builtins.get(id);
+    native_function(heap, id, definition.name, definition.length)
+}
+
+/// Installs a builtin **constructor** (`[[Construct]]` present). Method,
+/// static, and accessor installs keep using `install_function`, which
+/// registers non-constructable by default.
+pub(crate) fn install_constructor_function<H: Host>(
+    heap: &mut Vec<HeapEntry>,
+    builtins: &mut BuiltinTable<H>,
+    name: &'static str,
+    length: u32,
+    handler: super::BuiltinHandler<H>,
+) -> Value {
+    let id = builtins.register_constructor(BuiltinDef {
         name,
         length,
         handler,
@@ -265,7 +290,8 @@ fn install_boolean<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.boolean_prototype();
-    let constructor = install_function(heap, builtins, "Boolean", 1, boolean_constructor::<H>);
+    let constructor =
+        install_constructor_function(heap, builtins, "Boolean", 1, boolean_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode("Boolean"), constructor);
     let value_of = install_function(heap, builtins, "valueOf", 0, boolean_value_of::<H>);
@@ -627,7 +653,8 @@ fn install_error_type<H: Host>(
             configurable: true,
         },
     );
-    let constructor = install_function(heap, builtins, name, length, error_constructor::<H>);
+    let constructor =
+        install_constructor_function(heap, builtins, name, length, error_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     builtins.set_error_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
@@ -717,7 +744,7 @@ fn error_constructor<H: Host>(
         .filter(|value| *value != Value::UNDEFINED)
     {
         let cause_key = PropertyKey::Named(EcmaString::encode("cause"));
-        if machine.has_property(options, &cause_key)? {
+        if machine.internal_has_property(options, &cause_key)? {
             let cause = machine.get_named_property(options, "cause")?;
             define_error_field(machine, object, "cause", cause)?;
         }
@@ -769,7 +796,109 @@ fn error_to_string<H: Host>(
     Ok(BuiltinOutcome::Value(allocate_string(machine, text)?))
 }
 impl<'a, H: Host> Machine<'a, H> {
-    fn prototype_value(&self, object: Value) -> Result<Option<Value>, EvalFailure> {
+    // ---- canonical internal methods -------------------------------------
+    //
+    // Every user-observable property, prototype, and extensibility operation
+    // enters through exactly one of these entries. Each keyed method carries a
+    // head Proxy check wrapped by `with_proxy_dispatch`, so trapped AND
+    // transparent forwarding is depth-charged; otherwise it runs the ordinary
+    // core. `[[Call]]` is `call_value`, `[[Construct]]` is
+    // `internal_construct`, `[[HasProperty]]` is `internal_has_property`, and
+    // `[[Delete]]` is `internal_delete` (defined beside the dispatch in
+    // lib.rs).
+
+    /// `[[Get]]` — the single canonical property read.
+    pub(crate) fn internal_get(
+        &mut self,
+        object: Value,
+        key: &PropertyKey,
+        receiver: Value,
+    ) -> Result<Value, EvalFailure> {
+        if !matches!(key, PropertyKey::Private(_)) && self.heap_entry_is_proxy_value(object) {
+            return self.with_proxy_dispatch(|machine| proxy::get(machine, object, key, receiver));
+        }
+        let outcome = if let PropertyKey::Named(name) = key
+            && let Ok(name) = name.to_utf8_strict()
+            && name.is_ascii()
+        {
+            self.resolve_get_ascii(object, &name, receiver)?
+        } else {
+            self.resolve_get(object, key, receiver)?
+        };
+        match outcome {
+            GetOutcome::Value(value) => Ok(value),
+            GetOutcome::Text(text) => self
+                .allocate(HeapEntry::String(text))
+                .map_err(EvalFailure::Runtime),
+            GetOutcome::Getter(getter) => self.call_value(getter, receiver, &[]),
+        }
+    }
+
+    /// `[[Set]]` — the single canonical property write. Returns a boolean on
+    /// every path; `false` is data, not an error. Throw-on-false belongs to
+    /// the language operation, never here.
+    pub(crate) fn internal_set(
+        &mut self,
+        object: Value,
+        key: PropertyKey,
+        value: Value,
+        receiver: Value,
+    ) -> Result<bool, EvalFailure> {
+        if !matches!(key, PropertyKey::Private(_)) && self.heap_entry_is_proxy_value(object) {
+            return self
+                .with_proxy_dispatch(|machine| proxy::set(machine, object, key, value, receiver));
+        }
+        self.resolve_set(object, key, value, receiver)
+    }
+
+    /// `[[GetOwnProperty]]` returning the transient descriptor record.
+    pub(crate) fn internal_get_own_property(
+        &mut self,
+        object: Value,
+        key: &PropertyKey,
+    ) -> Result<Option<property_descriptor::PropertyDescriptor>, EvalFailure> {
+        if !matches!(key, PropertyKey::Private(_)) && self.heap_entry_is_proxy_value(object) {
+            return self
+                .with_proxy_dispatch(|machine| proxy::get_own_property(machine, object, key));
+        }
+        Ok(self
+            .own_descriptor(object, key)?
+            .map(property_descriptor::descriptor_from_property))
+    }
+
+    /// `[[DefineOwnProperty]]` — OrdinaryDefineOwnProperty for non-proxy
+    /// receivers, validating and applying through the single `define_descriptor`
+    /// seam.
+    pub(crate) fn internal_define_own_property(
+        &mut self,
+        object: Value,
+        key: PropertyKey,
+        descriptor: property_descriptor::PropertyDescriptor,
+    ) -> Result<bool, EvalFailure> {
+        if !matches!(key, PropertyKey::Private(_)) && self.heap_entry_is_proxy_value(object) {
+            return self.with_proxy_dispatch(|machine| {
+                proxy::define_own_property(machine, object, key, descriptor)
+            });
+        }
+        let current = self.own_descriptor(object, &key)?;
+        let extensible = property_descriptor::is_extensible(self, object)?;
+        property_descriptor::validate_and_apply_property_descriptor(
+            self,
+            Some((object, key)),
+            extensible,
+            descriptor,
+            current,
+        )
+    }
+
+    /// `[[GetPrototypeOf]]`.
+    pub(crate) fn internal_get_prototype_of(
+        &mut self,
+        object: Value,
+    ) -> Result<Option<Value>, EvalFailure> {
+        if self.heap_entry_is_proxy_value(object) {
+            return self.with_proxy_dispatch(|machine| proxy::get_prototype_of(machine, object));
+        }
         let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
             return Ok(None);
         };
@@ -785,12 +914,107 @@ impl<'a, H: Host> Machine<'a, H> {
             )))
         })
     }
-    fn set_prototype_value(
+
+    /// `[[SetPrototypeOf]]` — OrdinarySetPrototypeOf with the SameValue fast
+    /// path, extensibility gate, and cycle guard.
+    pub(crate) fn internal_set_prototype_of(
         &mut self,
         object: Value,
         prototype: Option<Value>,
-    ) -> Result<(), EvalFailure> {
-        self.set_prototype(object, prototype.unwrap_or(Value::NULL))
+    ) -> Result<bool, EvalFailure> {
+        if self.heap_entry_is_proxy_value(object) {
+            return self.with_proxy_dispatch(|machine| {
+                proxy::set_prototype_of(machine, object, prototype)
+            });
+        }
+        let current = self
+            .internal_get_prototype_of(object)?
+            .unwrap_or(Value::NULL);
+        let proposed = prototype.unwrap_or(Value::NULL);
+        if self.same_value(proposed, current) {
+            return Ok(true);
+        }
+        if !property_descriptor::is_extensible(self, object)? {
+            return Ok(false);
+        }
+        let mut node = proposed;
+        while !matches!(node.decode(), Some(Decoded::Null)) {
+            if node == object {
+                return Ok(false);
+            }
+            match self.internal_get_prototype_of(node)? {
+                Some(next) => node = next,
+                None => break,
+            }
+        }
+        self.set_prototype(object, proposed)?;
+        Ok(true)
+    }
+
+    /// `[[IsExtensible]]`.
+    pub(crate) fn internal_is_extensible(&mut self, object: Value) -> Result<bool, EvalFailure> {
+        if self.heap_entry_is_proxy_value(object) {
+            return self.with_proxy_dispatch(|machine| proxy::is_extensible(machine, object));
+        }
+        property_descriptor::is_extensible(self, object)
+    }
+
+    /// `[[PreventExtensions]]`.
+    pub(crate) fn internal_prevent_extensions(
+        &mut self,
+        object: Value,
+    ) -> Result<bool, EvalFailure> {
+        if self.heap_entry_is_proxy_value(object) {
+            return self.with_proxy_dispatch(|machine| proxy::prevent_extensions(machine, object));
+        }
+        let Some(index) = self.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        let extensible = match &mut self.heap[index] {
+            HeapEntry::Object { extensible, .. }
+            | HeapEntry::Generator { extensible, .. }
+            | HeapEntry::AsyncGenerator { extensible, .. }
+            | HeapEntry::AsyncFromSync { extensible, .. }
+            | HeapEntry::Script { extensible, .. }
+            | HeapEntry::Array { extensible, .. }
+            | HeapEntry::Function { extensible, .. }
+            | HeapEntry::NativeFunction { extensible, .. }
+            | HeapEntry::RegExp { extensible, .. }
+            | HeapEntry::Date { extensible, .. }
+            | HeapEntry::BuiltinIterator { extensible, .. }
+            | HeapEntry::Collection { extensible, .. }
+            | HeapEntry::TypedArray { extensible, .. }
+            | HeapEntry::ArrayBuffer { extensible, .. }
+            | HeapEntry::SharedArrayBuffer { extensible, .. }
+            | HeapEntry::DataView { extensible, .. }
+            | HeapEntry::Promise { extensible, .. }
+            | HeapEntry::WeakRef { extensible, .. }
+            | HeapEntry::FinalizationRegistry { extensible, .. }
+            | HeapEntry::DisposableStack { extensible, .. }
+            | HeapEntry::ProxyRevoker { extensible, .. }
+            | HeapEntry::Timeout { extensible, .. } => extensible,
+            HeapEntry::ModuleNamespace { .. }
+            | HeapEntry::ExternalModuleNamespace { .. }
+            | HeapEntry::Iterator { .. } => return Ok(true),
+            _ => return Ok(false),
+        };
+        *extensible = false;
+        Ok(true)
+    }
+
+    /// `[[OwnPropertyKeys]]` — integer indices ascending, then strings in
+    /// insertion order, then symbols in insertion order; proxies dispatch the
+    /// ownKeys trap and preserve its order verbatim.
+    pub(crate) fn internal_own_property_keys(
+        &mut self,
+        object: Value,
+    ) -> Result<Vec<PropertyKey>, EvalFailure> {
+        if self.heap_entry_is_proxy_value(object) {
+            return self.with_proxy_dispatch(|machine| proxy::own_property_keys(machine, object));
+        }
+        // The string-exotic virtual-index merge lives in the ordinary core so
+        // trap order stays verbatim for proxies.
+        object_statics::own_keys(self, object)
     }
     fn call_truthy(
         &mut self,
@@ -883,6 +1107,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 ..
             }
             | HeapEntry::DisposableStack {
+                properties,
+                extensible,
+                ..
+            }
+            | HeapEntry::ProxyRevoker {
                 properties,
                 extensible,
                 ..
@@ -2197,7 +2426,7 @@ mod tests {
                 .expect("data descriptor definition succeeds");
             assert!(
                 machine
-                    .delete_property(object, &data_key)
+                    .internal_delete(object, &data_key)
                     .expect("delete succeeds"),
                 "configurable data descriptor is removed"
             );
@@ -2215,7 +2444,7 @@ mod tests {
                 .expect("accessor descriptor definition succeeds");
             assert!(
                 machine
-                    .delete_property(object, &accessor_key)
+                    .internal_delete(object, &accessor_key)
                     .expect("delete succeeds"),
                 "configurable accessor descriptor is removed"
             );

@@ -4,7 +4,8 @@ use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_array, builtin_property, define_data, heap_index, install_function, type_error,
+    allocate_array, builtin_property, define_data, heap_index, install_constructor_function,
+    install_function, type_error,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::vm::async_iterators::{ASYNC_FROM_SYNC_METHODS, ASYNC_GENERATOR_METHODS};
@@ -33,7 +34,7 @@ fn install_map<H: Host>(
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_map_prototype(prototype);
-    let constructor = install_function(heap, builtins, "Map", 0, map_constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "Map", 0, map_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
         ("set", 2, map_set::<H> as BuiltinHandler<H>),
@@ -66,7 +67,7 @@ fn install_set<H: Host>(
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_set_prototype(prototype);
     super::set_methods::install(heap, builtins, prototype);
-    let constructor = install_function(heap, builtins, "Set", 0, set_constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "Set", 0, set_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
         ("add", 1, set_add::<H> as BuiltinHandler<H>),
@@ -97,7 +98,8 @@ fn install_weak_map<H: Host>(
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_weak_map_prototype(prototype);
-    let constructor = install_function(heap, builtins, "WeakMap", 0, weak_map_constructor::<H>);
+    let constructor =
+        install_constructor_function(heap, builtins, "WeakMap", 0, weak_map_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
         ("set", 2, weak_map_set::<H> as BuiltinHandler<H>),
@@ -118,7 +120,8 @@ fn install_weak_set<H: Host>(
 ) {
     let prototype = ordinary(heap, Some(builtins.object_prototype()));
     builtins.set_weak_set_prototype(prototype);
-    let constructor = install_function(heap, builtins, "WeakSet", 0, weak_set_constructor::<H>);
+    let constructor =
+        install_constructor_function(heap, builtins, "WeakSet", 0, weak_set_constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
         ("add", 1, weak_set_add::<H> as BuiltinHandler<H>),
@@ -1291,6 +1294,8 @@ fn require_weak_key<H: Host>(machine: &Machine<'_, H>, key: Value) -> Result<(),
         | HeapEntry::Timeout { .. }
         | HeapEntry::WeakRef { .. }
         | HeapEntry::FinalizationRegistry { .. }
+        | HeapEntry::Proxy { .. }
+        | HeapEntry::ProxyRevoker { .. }
         | HeapEntry::NativeFunction { .. } => true,
         // Primitives and internal bookkeeping entries are not valid keys.
         HeapEntry::Vacant

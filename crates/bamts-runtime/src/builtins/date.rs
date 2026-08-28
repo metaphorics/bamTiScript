@@ -643,7 +643,7 @@ mod tests {
         // The instance must inherit from the subclass prototype, not directly
         // from Date.prototype.
         assert_eq!(
-            machine.prototype_value(instance).unwrap(),
+            machine.internal_get_prototype_of(instance).unwrap(),
             Some(sub_prototype),
             "subclass instance must carry the subclass prototype"
         );

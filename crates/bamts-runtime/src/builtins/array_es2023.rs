@@ -1236,7 +1236,7 @@ mod tests {
                 ]
             );
             assert_eq!(
-                machine.prototype_value(sorted).unwrap(),
+                machine.internal_get_prototype_of(sorted).unwrap(),
                 Some(machine.intrinsics.array_prototype)
             );
 
@@ -1424,7 +1424,7 @@ mod tests {
             );
             for copy in [reversed, sorted, spliced, replaced] {
                 assert_eq!(
-                    machine.prototype_value(copy).unwrap(),
+                    machine.internal_get_prototype_of(copy).unwrap(),
                     Some(machine.intrinsics.array_prototype)
                 );
                 for index in 0..3 {

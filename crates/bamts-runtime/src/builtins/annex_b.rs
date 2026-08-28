@@ -239,7 +239,7 @@ fn lookup_legacy_accessor<H: Host>(
                 Property::Data { .. } => Value::UNDEFINED,
             }));
         }
-        current = machine.prototype_value(object)?;
+        current = machine.internal_get_prototype_of(object)?;
     }
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
@@ -872,7 +872,9 @@ fn proto_getter<H: Host>(
     )?;
     let object = machine.value_to_object(this)?;
     Ok(BuiltinOutcome::Value(
-        machine.prototype_value(object)?.unwrap_or(Value::NULL),
+        machine
+            .internal_get_prototype_of(object)?
+            .unwrap_or(Value::NULL),
     ))
 }
 
@@ -886,7 +888,7 @@ fn ordinary_set_prototype_of<H: Host>(
     object: Value,
     prototype: Option<Value>,
 ) -> Result<bool, EvalFailure> {
-    if machine.prototype_value(object)? == prototype {
+    if machine.internal_get_prototype_of(object)? == prototype {
         return Ok(true);
     }
     let Some(index) = machine.runtime_slot(object).map_err(EvalFailure::Runtime)? else {
@@ -914,7 +916,11 @@ fn ordinary_set_prototype_of<H: Host>(
         | HeapEntry::Timeout { extensible, .. }
         | HeapEntry::WeakRef { extensible, .. }
         | HeapEntry::FinalizationRegistry { extensible, .. }
+        | HeapEntry::ProxyRevoker { extensible, .. }
         | HeapEntry::NativeFunction { extensible, .. } => *extensible,
+        HeapEntry::Proxy { .. } => {
+            return machine.internal_is_extensible(object);
+        }
         HeapEntry::Vacant
         | HeapEntry::String(_)
         | HeapEntry::BigInt(_)
@@ -938,13 +944,15 @@ fn ordinary_set_prototype_of<H: Host>(
         if value == object {
             return Ok(false);
         }
-        candidate = machine.prototype_value(value)?;
+        candidate = machine.internal_get_prototype_of(value)?;
         traversed += 1;
         if traversed > machine.heap.len() {
             return Ok(false);
         }
     }
-    machine.set_prototype_value(object, prototype)?;
+    if !machine.internal_set_prototype_of(object, prototype)? {
+        return Err(type_error("Cannot set prototype: object is not extensible"));
+    }
     Ok(true)
 }
 
@@ -1760,7 +1768,7 @@ mod tests {
             Err(EvalFailure::Throw(ThrowOrigin::TypeError { .. }))
         ));
         let object = ordinary_object(&mut machine);
-        let before = machine.prototype_value(object).unwrap();
+        let before = machine.internal_get_prototype_of(object).unwrap();
         let symbol = machine
             .allocate(HeapEntry::Symbol {
                 description: EcmaString::encode("s"),
@@ -1778,7 +1786,7 @@ mod tests {
                 "non-Object non-null values are a silent no-op"
             );
             assert_eq!(
-                machine.prototype_value(object).unwrap(),
+                machine.internal_get_prototype_of(object).unwrap(),
                 before,
                 "a no-op leaves the prototype untouched"
             );
@@ -1805,12 +1813,15 @@ mod tests {
             machine.call_value(setter, object, &[parent]).unwrap(),
             Value::UNDEFINED
         );
-        assert_eq!(machine.prototype_value(object).unwrap(), Some(parent));
+        assert_eq!(
+            machine.internal_get_prototype_of(object).unwrap(),
+            Some(parent)
+        );
         assert_eq!(
             machine.call_value(setter, object, &[Value::NULL]).unwrap(),
             Value::UNDEFINED
         );
-        assert_eq!(machine.prototype_value(object).unwrap(), None);
+        assert_eq!(machine.internal_get_prototype_of(object).unwrap(), None);
         // Re-setting the current prototype is a no-op success.
         let kept = ordinary_object(&mut machine);
         assert_eq!(
@@ -1840,7 +1851,10 @@ mod tests {
         let first = ordinary_object(&mut machine);
         let second = ordinary_object(&mut machine);
         machine.call_value(setter, first, &[second]).unwrap();
-        assert_eq!(machine.prototype_value(first).unwrap(), Some(second));
+        assert_eq!(
+            machine.internal_get_prototype_of(first).unwrap(),
+            Some(second)
+        );
         assert!(
             matches!(
                 machine.call_value(setter, second, &[first]),
@@ -1850,9 +1864,9 @@ mod tests {
         );
         // The failed write leaves the previous prototype in place.
         let untouched = ordinary_object(&mut machine);
-        let untouched_prototype = machine.prototype_value(untouched).unwrap();
+        let untouched_prototype = machine.internal_get_prototype_of(untouched).unwrap();
         assert_eq!(
-            machine.prototype_value(second).unwrap(),
+            machine.internal_get_prototype_of(second).unwrap(),
             untouched_prototype
         );
     }
@@ -1882,7 +1896,7 @@ mod tests {
             "a frozen target rejects a new prototype"
         );
         assert_eq!(
-            machine.prototype_value(object).unwrap(),
+            machine.internal_get_prototype_of(object).unwrap(),
             Some(object_prototype)
         );
     }
@@ -1902,7 +1916,7 @@ mod tests {
                 "extensible {kind} accepts a new prototype"
             );
             assert_eq!(
-                machine.prototype_value(target).unwrap(),
+                machine.internal_get_prototype_of(target).unwrap(),
                 Some(replacement),
                 "{kind} stores the new prototype"
             );
@@ -1928,7 +1942,7 @@ mod tests {
                 "non-extensible {kind} rejects a new prototype"
             );
             assert_eq!(
-                machine.prototype_value(target).unwrap(),
+                machine.internal_get_prototype_of(target).unwrap(),
                 Some(original),
                 "rejection preserves the {kind} prototype"
             );
@@ -1950,7 +1964,10 @@ mod tests {
                 Value::UNDEFINED,
                 "non-extensible {kind} accepts its current prototype"
             );
-            assert_eq!(machine.prototype_value(target).unwrap(), Some(current));
+            assert_eq!(
+                machine.internal_get_prototype_of(target).unwrap(),
+                Some(current)
+            );
         }
     }
 

@@ -429,6 +429,15 @@ impl<H: Host> Machine<'_, H> {
                         }
                         Ok(format!("{{ {} }}", parts.join(", ")))
                     }
+                    HeapEntry::Proxy { record } => {
+                        let _ = record;
+                        if self.is_callable(value)? {
+                            Ok("[Function]".to_owned())
+                        } else {
+                            Ok("{}".to_owned())
+                        }
+                    }
+                    HeapEntry::ProxyRevoker { .. } => Ok("[Function]".to_owned()),
                     HeapEntry::NativeFunction { .. } | HeapEntry::Function { .. } => {
                         Ok("[Function]".to_owned())
                     }

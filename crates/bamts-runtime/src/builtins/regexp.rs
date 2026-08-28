@@ -6,8 +6,8 @@ use bamts_native::Value;
 
 use super::annex_b::record_legacy_match;
 use super::{
-    allocate_array, allocate_string, builtin_property, define_data, heap_index, install_function,
-    type_error,
+    allocate_array, allocate_string, builtin_property, define_data, heap_index,
+    install_constructor_function, install_function, type_error,
 };
 use crate::intrinsics::regexp::{Match, Regex, RegexErrorKind, STEP_BUDGET, canonical_flags};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
@@ -19,7 +19,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
-    let constructor = install_function(heap, builtins, "RegExp", 2, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "RegExp", 2, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     for (name, length, handler) in [
         ("exec", 1, exec::<H> as BuiltinHandler<H>),
@@ -941,7 +941,7 @@ mod tests {
         };
 
         assert_eq!(
-            machine.prototype_value(instance).unwrap(),
+            machine.internal_get_prototype_of(instance).unwrap(),
             Some(custom_prototype),
             "subclass instance must inherit the custom prototype"
         );
@@ -975,7 +975,7 @@ mod tests {
         };
 
         assert_eq!(
-            machine.prototype_value(instance).unwrap(),
+            machine.internal_get_prototype_of(instance).unwrap(),
             Some(regexp_prototype),
             "non-object newTarget.prototype must fall back to %RegExp.prototype%"
         );

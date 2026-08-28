@@ -47,6 +47,7 @@ mod host_objects;
 mod intrinsics;
 mod native;
 mod vm;
+pub(crate) use intrinsics::builtins;
 
 pub use native::{
     NativeEngine, NativeError, TieredRunReport, UnitTieringSummary, run_linked_program,
@@ -1331,6 +1332,17 @@ enum HeapEntry {
         /// stated explicitly at every call site.
         prototype: Option<Value>,
     },
+    Proxy {
+        record: builtins::proxy::ProxyRecord,
+    },
+    /// A `Proxy.revocable` revoker. It stays callable and expandable, so it
+    /// carries the ordinary property/prototype header; revocation only takes
+    /// the retained proxy edge (see `ProxyRevokerRecord::for_each_value`).
+    ProxyRevoker {
+        record: builtins::proxy::ProxyRevokerRecord,
+        properties: PropertyMap,
+        extensible: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1399,6 +1411,8 @@ impl HeapEntry {
                 NativeCallable::Builtin(_) => 1,
                 NativeCallable::Bound(bound) => bound.arguments.len().saturating_add(1),
             },
+            Self::Proxy { .. } => 1,
+            Self::ProxyRevoker { properties, .. } => properties.charge_bytes().saturating_add(1),
             Self::Generator { state, .. } => match state {
                 GeneratorState::SuspendedStart(start) => start
                     .captures
@@ -1708,6 +1722,8 @@ enum CalleeKind {
         id: intrinsics::BuiltinId,
     },
     Bound,
+    Proxy,
+    ProxyRevoker,
     NotCallable,
 }
 
@@ -3815,7 +3831,7 @@ impl<'a, H: Host> Machine<'a, H> {
         key: Value,
     ) -> Result<bool, EvalFailure> {
         let key = self.to_property_key(key)?;
-        if !self.has_property(object, &key)? {
+        if !self.internal_has_property(object, &key)? {
             return Ok(false);
         }
         let unscopables_key =
@@ -5268,7 +5284,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let Some(attributes) = attributes else {
             return Ok(());
         };
-        for key in self.own_property_keys(attributes)? {
+        for key in self.internal_own_property_keys(attributes)? {
             if !self.own_property_is_enumerable(attributes, &key)? {
                 continue;
             }
@@ -5651,29 +5667,10 @@ impl<'a, H: Host> Machine<'a, H> {
                             continue;
                         }
                     };
-                    match self.resolve_get(object, &key) {
-                        Ok(GetOutcome::Value(value)) => {
+                    match self.internal_get(object, &key, object) {
+                        Ok(value) => {
                             self.write_register(frame_index, dst.get(), value);
                             self.frames[frame_index].pc = pc + 1;
-                        }
-                        Ok(GetOutcome::Text(text)) => {
-                            let value = self
-                                .allocate(HeapEntry::String(text))
-                                .map_err(|kind| self.error_at(kind, function_index, pc))?;
-                            self.write_register(frame_index, dst.get(), value);
-                            self.frames[frame_index].pc = pc + 1;
-                        }
-                        Ok(GetOutcome::Getter(getter)) => {
-                            self.frames[frame_index].pc = pc + 1;
-                            self.execute_call(CallRequest {
-                                callee: getter,
-                                this_value: object,
-                                arguments: &[],
-                                destination: Some(dst.get()),
-                                call_pc: pc,
-                                constructed: None,
-                                new_target: Value::UNDEFINED,
-                            })?;
                         }
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
@@ -5689,19 +5686,15 @@ impl<'a, H: Host> Machine<'a, H> {
                             continue;
                         }
                     };
-                    match self.resolve_set(object, key, value) {
-                        Ok(SetOutcome::Done) => self.frames[frame_index].pc = pc + 1,
-                        Ok(SetOutcome::Setter(setter)) => {
-                            self.frames[frame_index].pc = pc + 1;
-                            self.execute_call(CallRequest {
-                                callee: setter,
-                                this_value: object,
-                                arguments: &[value],
-                                destination: None,
-                                call_pc: pc,
-                                constructed: None,
-                                new_target: Value::UNDEFINED,
-                            })?;
+                    match self.internal_set(object, key, value, object) {
+                        Ok(true) => self.frames[frame_index].pc = pc + 1,
+                        Ok(false) => {
+                            self.resolve_failure(
+                                EvalFailure::Throw(ThrowOrigin::TypeError {
+                                    operation: "assign to read only property",
+                                }),
+                                pc,
+                            )?;
                         }
                         Err(failure) => self.resolve_failure(failure, pc)?,
                     }
@@ -5716,7 +5709,7 @@ impl<'a, H: Host> Machine<'a, H> {
                             continue;
                         }
                     };
-                    match self.delete_property(object, &key) {
+                    match self.internal_delete(object, &key) {
                         Ok(deleted) => {
                             self.write_register(frame_index, dst.get(), Value::boolean(deleted));
                             self.frames[frame_index].pc = pc + 1;
@@ -6609,7 +6602,7 @@ impl<'a, H: Host> Machine<'a, H> {
         let name = self.constant_text(module, name).to_owned();
         let key = PropertyKey::Named(name);
         let global = self.context_global.unwrap_or(self.global_object);
-        if self.has_property(global, &key)? {
+        if self.internal_has_property(global, &key)? {
             return self.get_property_key(global, &key).map(Some);
         }
         Ok(None)
@@ -6686,6 +6679,14 @@ impl<'a, H: Host> Machine<'a, H> {
                     NativeCallable::Builtin(id) => Ok(CalleeKind::Builtin { id: *id }),
                     NativeCallable::Bound(_) => Ok(CalleeKind::Bound),
                 },
+                HeapEntry::Proxy { record } => {
+                    if record.is_callable() {
+                        Ok(CalleeKind::Proxy)
+                    } else {
+                        Ok(CalleeKind::NotCallable)
+                    }
+                }
+                HeapEntry::ProxyRevoker { .. } => Ok(CalleeKind::ProxyRevoker),
                 _ => Ok(CalleeKind::NotCallable),
             },
             None => Ok(CalleeKind::NotCallable),
@@ -7002,6 +7003,71 @@ impl<'a, H: Host> Machine<'a, H> {
         self.native_depth -= 1;
     }
 
+    /// Charges one `native_depth` slot for a proxy dispatch hop. Proxy-to-proxy
+    /// forwarding never grows `frames.len()`, so without this charge a deep
+    /// chain of transparent proxies would exhaust the process stack while the
+    /// `frames.len() + native_depth` ceiling still had room.
+    pub(crate) fn enter_proxy_dispatch(&mut self) -> Result<(), EvalFailure> {
+        if self.frames.len().saturating_add(self.native_depth) >= self.limits.max_call_depth {
+            return Err(EvalFailure::Runtime(RuntimeErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            }));
+        }
+        self.native_depth += 1;
+        Ok(())
+    }
+
+    pub(crate) fn leave_proxy_dispatch(&mut self) {
+        self.native_depth -= 1;
+    }
+
+    /// Runs `f` with one proxy-dispatch slot charged, releasing it on both the
+    /// `Ok` and `Err` paths. Every proxy entry is `Result`-based, so no
+    /// unwinding is relied upon and depth accounting stays balanced.
+    pub(crate) fn with_proxy_dispatch<T>(
+        &mut self,
+        f: impl FnOnce(&mut Machine<'a, H>) -> Result<T, EvalFailure>,
+    ) -> Result<T, EvalFailure> {
+        self.enter_proxy_dispatch()?;
+        let result = f(self);
+        self.leave_proxy_dispatch();
+        result
+    }
+
+    /// Answers whether `value` has `[[Construct]]`. Builtin callees consult the
+    /// realm's registration metadata (`BuiltinTable::is_constructable`), bound
+    /// callees recurse into their target, runtime closures consult the
+    /// compiler-emitted `FunctionFlags::is_constructable` bit, and proxies
+    /// answer from the snapshot `ProxyCreate` took of their target.
+    pub(crate) fn is_constructor(&self, value: Value) -> Result<bool, EvalFailure> {
+        let Some(index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(false);
+        };
+        match &self.heap[index] {
+            HeapEntry::Function {
+                module, function, ..
+            } => {
+                let flags = self.module_code(*module).functions()[function.get() as usize].flags();
+                Ok(flags.is_constructable)
+            }
+            HeapEntry::NativeFunction { callable, .. } => match callable {
+                NativeCallable::Builtin(id) => Ok(self.intrinsics.builtins.is_constructable(*id)),
+                NativeCallable::Bound(bound) => self.is_constructor(bound.target),
+            },
+            HeapEntry::Proxy { record } => Ok(record.is_constructor()),
+            _ => Ok(false),
+        }
+    }
+
+    /// Whether `value` is a `HeapEntry::Proxy` (the dispatch head; revokers are
+    /// ordinary callable objects, not proxies).
+    pub(crate) fn heap_entry_is_proxy_value(&self, value: Value) -> bool {
+        matches!(
+            self.runtime_slot(value),
+            Ok(Some(index)) if matches!(self.heap[index], HeapEntry::Proxy { .. })
+        )
+    }
+
     fn execute_call(&mut self, request: CallRequest<'_>) -> Result<(), RuntimeError> {
         let CallRequest {
             callee,
@@ -7144,6 +7210,29 @@ impl<'a, H: Host> Machine<'a, H> {
                     }
                     arguments = Cow::Owned(bound.arguments);
                 }
+                Ok(CalleeKind::Proxy) => {
+                    let arguments = arguments.as_ref().to_vec();
+                    match crate::builtins::proxy::call(self, callee, this_value, &arguments) {
+                        Ok(value) => {
+                            if let Some(register) = destination {
+                                self.write_register(self.frames.len() - 1, register, value);
+                            }
+                            return Ok(());
+                        }
+                        Err(failure) => return self.resolve_failure(failure, call_pc),
+                    }
+                }
+                Ok(CalleeKind::ProxyRevoker) => {
+                    match crate::builtins::proxy::call_revoker(self, callee) {
+                        Ok(value) => {
+                            if let Some(register) = destination {
+                                self.write_register(self.frames.len() - 1, register, value);
+                            }
+                            return Ok(());
+                        }
+                        Err(failure) => return self.resolve_failure(failure, call_pc),
+                    }
+                }
                 Ok(CalleeKind::NotCallable) => return self.throw_type("call", call_pc),
                 Err(kind) => return Err(self.error_here_at(kind, call_pc)),
             }
@@ -7168,6 +7257,18 @@ impl<'a, H: Host> Machine<'a, H> {
             new_target = bound.new_target;
             callee = bound.target;
             arguments = Cow::Owned(bound.arguments);
+        }
+        if matches!(
+            self.callee_kind(callee),
+            Ok(CalleeKind::Proxy | CalleeKind::ProxyRevoker)
+        ) {
+            return match self.internal_construct(callee, arguments.as_ref(), new_target) {
+                Ok(value) => {
+                    self.write_register(self.frames.len() - 1, destination, value);
+                    Ok(())
+                }
+                Err(failure) => self.resolve_failure(failure, call_pc),
+            };
         }
         let index = match self.runtime_slot(callee) {
             Ok(Some(index)) => index,
@@ -7216,9 +7317,10 @@ impl<'a, H: Host> Machine<'a, H> {
         {
             return self.throw_type("construct", call_pc);
         }
-        let object = self
-            .allocate_constructed_receiver(new_target)
-            .map_err(|kind| self.error_here_at(kind, call_pc))?;
+        let object = match self.allocate_constructed_receiver(new_target) {
+            Ok(object) => object,
+            Err(failure) => return self.resolve_failure(failure, call_pc),
+        };
         self.execute_call(CallRequest {
             callee,
             this_value: object,
@@ -7230,19 +7332,29 @@ impl<'a, H: Host> Machine<'a, H> {
         })
     }
 
-    pub(crate) fn constructed_prototype(&self, callee: Value) -> Result<Value, RuntimeErrorKind> {
+    pub(crate) fn constructed_prototype(&mut self, callee: Value) -> Result<Value, EvalFailure> {
         let index = self
-            .runtime_slot(callee)?
-            .ok_or(RuntimeErrorKind::InvalidValue { value: callee })?;
-        Ok(match self.own_data_property(index, "prototype") {
-            Some(value) if self.is_object(value) => value,
-            _ => self.intrinsics.object_prototype,
+            .runtime_slot(callee)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                value: callee,
+            }))?;
+        let prototype = self.internal_get(
+            self.value_for_runtime_index(index)?,
+            &PropertyKey::Named(EcmaString::encode("prototype")),
+            callee,
+        )?;
+        Ok(if self.is_object(prototype) {
+            prototype
+        } else {
+            self.intrinsics.object_prototype
         })
     }
 
-    fn allocate_constructed_receiver(&mut self, callee: Value) -> Result<Value, RuntimeErrorKind> {
+    fn allocate_constructed_receiver(&mut self, callee: Value) -> Result<Value, EvalFailure> {
         let prototype = self.constructed_prototype(callee)?;
         self.allocate_constructed_receiver_with(prototype)
+            .map_err(EvalFailure::Runtime)
     }
 
     pub(crate) fn allocate_constructed_receiver_with(
@@ -7342,13 +7454,11 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn get_property_ascii(&mut self, object: Value, name: &str) -> Result<Value, EvalFailure> {
         debug_assert!(name.is_ascii());
-        match self.resolve_get_ascii(object, name)? {
-            GetOutcome::Value(value) => Ok(value),
-            GetOutcome::Text(text) => self
-                .allocate(HeapEntry::String(text))
-                .map_err(EvalFailure::Runtime),
-            GetOutcome::Getter(getter) => self.call_value(getter, object, &[]),
-        }
+        self.internal_get(
+            object,
+            &PropertyKey::Named(EcmaString::encode(name)),
+            object,
+        )
     }
 
     pub(crate) fn get_property_key(
@@ -7356,13 +7466,21 @@ impl<'a, H: Host> Machine<'a, H> {
         object: Value,
         key: &PropertyKey,
     ) -> Result<Value, EvalFailure> {
-        match self.resolve_get(object, key)? {
-            GetOutcome::Value(value) => Ok(value),
-            GetOutcome::Text(text) => self
-                .allocate(HeapEntry::String(text))
-                .map_err(EvalFailure::Runtime),
-            GetOutcome::Getter(getter) => self.call_value(getter, object, &[]),
+        self.internal_get(object, key, object)
+    }
+
+    pub(crate) fn set_data_property_key(
+        &mut self,
+        object: Value,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        if !self.internal_set(object, key, value, object)? {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "assign to read only property",
+            }));
         }
+        Ok(())
     }
 
     pub(crate) fn set_data_property(
@@ -7372,21 +7490,6 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
     ) -> Result<(), EvalFailure> {
         self.set_data_property_key(object, PropertyKey::Named(EcmaString::encode(name)), value)
-    }
-
-    pub(crate) fn set_data_property_key(
-        &mut self,
-        object: Value,
-        key: PropertyKey,
-        value: Value,
-    ) -> Result<(), EvalFailure> {
-        match self.resolve_set(object, key, value)? {
-            SetOutcome::Done => Ok(()),
-            SetOutcome::Setter(setter) => {
-                self.call_value(setter, object, &[value])?;
-                Ok(())
-            }
-        }
     }
 
     /// `CreateDataProperty` — defines an own data property directly, bypassing
@@ -7416,23 +7519,6 @@ impl<'a, H: Host> Machine<'a, H> {
             self.callee_kind(value).map_err(EvalFailure::Runtime)?,
             CalleeKind::NotCallable
         ))
-    }
-
-    pub(crate) fn is_constructor(&self, value: Value) -> Result<bool, EvalFailure> {
-        match self.callee_kind(value).map_err(EvalFailure::Runtime)? {
-            CalleeKind::Runtime { target, .. } => Ok(self.module_code(target.module).functions()
-                [target.function.get() as usize]
-                .flags()
-                .is_constructable),
-            CalleeKind::Builtin { .. } => Ok(true),
-            CalleeKind::Bound => {
-                let bound = self
-                    .flatten_bound(value, Value::UNDEFINED, &[], value)
-                    .map_err(EvalFailure::Runtime)?;
-                self.is_constructor(bound.target)
-            }
-            CalleeKind::NotCallable => Ok(false),
-        }
     }
 
     pub(crate) fn box_primitive(&mut self, value: Value) -> Result<Value, EvalFailure> {
@@ -7579,10 +7665,11 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(self.own_get(index, key).is_some())
     }
 
-    pub(crate) fn construct_value(
+    pub(crate) fn internal_construct(
         &mut self,
         callee: Value,
         arguments: &[Value],
+        new_target: Value,
     ) -> Result<Value, EvalFailure> {
         match self.callee_kind(callee).map_err(EvalFailure::Runtime)? {
             CalleeKind::Builtin { id } => {
@@ -7591,7 +7678,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     Value::UNDEFINED,
                     arguments,
                     true,
-                    callee,
+                    new_target,
                 )? {
                     intrinsics::BuiltinOutcome::Value(value) => Ok(value),
                     _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -7612,9 +7699,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         operation: "construct",
                     }));
                 }
-                let object = self
-                    .allocate_constructed_receiver(callee)
-                    .map_err(EvalFailure::Runtime)?;
+                let object = self.allocate_constructed_receiver(new_target)?;
                 let stop_depth = self.frames.len();
                 let return_to = self.frames.last().map(|frame| ReturnTo {
                     destination: None,
@@ -7626,7 +7711,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     captures: &captures,
                     context,
                     this_value: object,
-                    new_target: callee,
+                    new_target,
                     arguments,
                     return_to,
                 })
@@ -7654,14 +7739,30 @@ impl<'a, H: Host> Machine<'a, H> {
             }
             CalleeKind::Bound => {
                 let bound = self
-                    .flatten_bound(callee, Value::UNDEFINED, arguments, Value::UNDEFINED)
+                    .flatten_bound(callee, Value::UNDEFINED, arguments, new_target)
                     .map_err(EvalFailure::Runtime)?;
-                self.construct_value(bound.target, &bound.arguments)
+                self.internal_construct(bound.target, &bound.arguments, bound.new_target)
             }
-            CalleeKind::NotCallable => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "construct",
-            })),
+            CalleeKind::Proxy => {
+                crate::builtins::proxy::construct(self, callee, arguments, new_target)
+            }
+            CalleeKind::ProxyRevoker | CalleeKind::NotCallable => {
+                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "construct",
+                }))
+            }
         }
+    }
+
+    /// `construct_value` is the `new_target = callee` construct entry used by
+    /// engine-internal construction; the canonical entry is
+    /// [`Machine::internal_construct`].
+    pub(crate) fn construct_value(
+        &mut self,
+        callee: Value,
+        arguments: &[Value],
+    ) -> Result<Value, EvalFailure> {
+        self.internal_construct(callee, arguments, callee)
     }
 
     pub(crate) fn call_value(
@@ -7786,6 +7887,17 @@ impl<'a, H: Host> Machine<'a, H> {
                     callee = bound.target;
                     this_value = bound.this_value;
                     arguments = Cow::Owned(bound.arguments);
+                }
+                CalleeKind::Proxy => {
+                    return crate::builtins::proxy::call(
+                        self,
+                        callee,
+                        this_value,
+                        arguments.as_ref(),
+                    );
+                }
+                CalleeKind::ProxyRevoker => {
+                    return crate::builtins::proxy::call_revoker(self, callee);
                 }
                 CalleeKind::NotCallable => {
                     return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
@@ -7981,7 +8093,12 @@ impl<'a, H: Host> Machine<'a, H> {
 
     // ---- property get ------------------------------------------------------
 
-    fn resolve_get(&mut self, object: Value, key: &PropertyKey) -> Result<GetOutcome, EvalFailure> {
+    fn resolve_get(
+        &mut self,
+        object: Value,
+        key: &PropertyKey,
+        receiver: Value,
+    ) -> Result<GetOutcome, EvalFailure> {
         let slot = self.runtime_slot(object).map_err(EvalFailure::Runtime)?;
         let start = match slot {
             Some(index) => {
@@ -8036,6 +8153,13 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(GetOutcome::Value(Value::UNDEFINED));
         };
         for _ in 0..=self.heap.len() {
+            if !matches!(key, PropertyKey::Private(_))
+                && matches!(self.heap[node], HeapEntry::Proxy { .. })
+            {
+                let value =
+                    self.internal_get(self.value_for_runtime_index(node)?, key, receiver)?;
+                return Ok(GetOutcome::Value(value));
+            }
             if let PropertyKey::Named(name) = key
                 && let HeapEntry::TypedArray { .. } = &self.heap[node]
                 && let Some(typed_index) = typedarray_all::typed_array_index(name)
@@ -8058,7 +8182,12 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(GetOutcome::Value(Value::UNDEFINED))
     }
 
-    fn resolve_get_ascii(&mut self, object: Value, name: &str) -> Result<GetOutcome, EvalFailure> {
+    fn resolve_get_ascii(
+        &mut self,
+        object: Value,
+        name: &str,
+        receiver: Value,
+    ) -> Result<GetOutcome, EvalFailure> {
         debug_assert!(name.is_ascii());
         let slot = self.runtime_slot(object).map_err(EvalFailure::Runtime)?;
         let start = match slot {
@@ -8113,6 +8242,14 @@ impl<'a, H: Host> Machine<'a, H> {
             return Ok(GetOutcome::Value(Value::UNDEFINED));
         };
         for _ in 0..=self.heap.len() {
+            if matches!(self.heap[node], HeapEntry::Proxy { .. }) {
+                let value = self.internal_get(
+                    self.value_for_runtime_index(node)?,
+                    &PropertyKey::Named(EcmaString::encode(name)),
+                    receiver,
+                )?;
+                return Ok(GetOutcome::Value(value));
+            }
             if let HeapEntry::TypedArray { .. } = &self.heap[node]
                 && let Some(typed_index) = typedarray_all::typed_array_index_ascii(name)
             {
@@ -8133,7 +8270,6 @@ impl<'a, H: Host> Machine<'a, H> {
         }
         Ok(GetOutcome::Value(Value::UNDEFINED))
     }
-
     fn found_outcome(&mut self, found: Found) -> Result<GetOutcome, EvalFailure> {
         match found {
             Found::Value(Value::UNINITIALIZED) => {
@@ -8177,6 +8313,7 @@ impl<'a, H: Host> Machine<'a, H> {
             _ => None,
         }
     }
+
     fn own_get_ascii(&self, index: usize, name: &str) -> Option<Found> {
         debug_assert!(name.is_ascii());
         let slot = |value| self.runtime_slot(value).ok().flatten();
@@ -8213,6 +8350,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::DisposableStack { properties, .. }
             | HeapEntry::Timeout { properties, .. }
+            | HeapEntry::ProxyRevoker { properties, .. }
             | HeapEntry::ArrayBuffer { properties, .. }
             | HeapEntry::SharedArrayBuffer { properties, .. } => {
                 property_lookup_ascii(properties, name)
@@ -8333,6 +8471,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PromiseResolver { .. }
             | HeapEntry::PromiseAll { .. }
             | HeapEntry::AsyncActivation { .. }
+            | HeapEntry::Proxy { .. }
             | HeapEntry::PromiseAllElement { .. } => None,
             HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
         }
@@ -8377,6 +8516,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::DisposableStack { properties, .. }
             | HeapEntry::Timeout { properties, .. }
             | HeapEntry::ArrayBuffer { properties, .. }
+            | HeapEntry::ProxyRevoker { properties, .. }
             | HeapEntry::SharedArrayBuffer { properties, .. } => property_lookup(properties, key),
             HeapEntry::DataView { properties, .. } => property_lookup(properties, key),
             HeapEntry::Array {
@@ -8523,6 +8663,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::PromiseResolver { .. }
             | HeapEntry::PromiseAll { .. }
             | HeapEntry::AsyncActivation { .. }
+            | HeapEntry::Proxy { .. }
             | HeapEntry::PromiseAllElement { .. } => None,
             HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
         }
@@ -8565,6 +8706,7 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    #[cfg(test)]
     fn own_data_property(&self, index: usize, name: &str) -> Option<Value> {
         let properties = match &self.heap[index] {
             HeapEntry::Object { properties, .. }
@@ -8587,6 +8729,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::WeakRef { properties, .. }
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::DisposableStack { properties, .. }
+            | HeapEntry::ProxyRevoker { properties, .. }
             | HeapEntry::Timeout { properties, .. } => properties,
             _ => return None,
         };
@@ -8619,6 +8762,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::DisposableStack { prototype, .. }
             | HeapEntry::Timeout { prototype, .. }
             | HeapEntry::ProcessEnv { prototype, .. } => *prototype,
+            HeapEntry::ProxyRevoker { .. } => Some(self.intrinsics.function_prototype),
             HeapEntry::NativeFunction { prototype, .. } => {
                 prototype.or(Some(self.intrinsics.function_prototype))
             }
@@ -8641,15 +8785,15 @@ impl<'a, H: Host> Machine<'a, H> {
         ))
     }
 
-    fn super_base(&self, home: Value) -> Result<Value, EvalFailure> {
+    fn super_base(&mut self, home: Value) -> Result<Value, EvalFailure> {
         let home_index = self
             .runtime_slot(home)
             .map_err(EvalFailure::Runtime)?
             .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "super home object is not an object",
             }))?;
-        match self.prototype_index(home_index)? {
-            Some(base_index) => self.value_for_runtime_index(base_index),
+        match self.internal_get_prototype_of(self.value_for_runtime_index(home_index)?)? {
+            Some(base) => Ok(base),
             None => Ok(Value::NULL),
         }
     }
@@ -8686,102 +8830,155 @@ impl<'a, H: Host> Machine<'a, H> {
         object: Value,
         key: PropertyKey,
         value: Value,
-    ) -> Result<SetOutcome, EvalFailure> {
-        match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
-            Some(index) => {
-                if matches!(self.heap[index], HeapEntry::ModuleNamespace { .. }) {
-                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "assign to module namespace",
-                    }));
-                }
-                if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
-                    let PropertyKey::Named(name) = &key else {
-                        return Ok(SetOutcome::Done);
-                    };
-                    let Ok(name) = name.to_utf8_strict() else {
-                        return Ok(SetOutcome::Done);
-                    };
-                    let text = self.to_string(value)?;
-                    let text = crate::host_objects::env_value_text_lossy(&text);
-                    self.host.set_env(&name, &text);
-                    return Ok(SetOutcome::Done);
-                }
-                if matches!(self.heap[index], HeapEntry::TypedArray { .. })
-                    && matches!(&key, PropertyKey::Named(name) if typedarray_all::typed_array_index(name).is_some())
-                {
-                    self.set_own_data(index, key, value)?;
-                    return Ok(SetOutcome::Done);
-                }
-                if let Some(setter) = self.find_setter(index, &key)? {
-                    return Ok(match setter {
-                        Some(setter) => SetOutcome::Setter(setter),
-                        None => SetOutcome::Done,
-                    });
-                }
-                self.set_own_data(index, key, value)?;
-                Ok(SetOutcome::Done)
+        receiver: Value,
+    ) -> Result<bool, EvalFailure> {
+        let index = match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
+            Some(index) => index,
+            None => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set property on primitive",
+                }));
             }
-            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "set property on primitive",
-            })),
+        };
+        if matches!(self.heap[index], HeapEntry::ModuleNamespace { .. }) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "assign to module namespace",
+            }));
         }
-    }
-
-    fn find_setter(
-        &self,
-        index: usize,
-        key: &PropertyKey,
-    ) -> Result<Option<Option<Value>>, EvalFailure> {
-        if self.own_has_non_accessor(index, key) {
-            return Ok(None);
+        if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
+            let PropertyKey::Named(name) = &key else {
+                return Ok(true);
+            };
+            let Ok(name) = name.to_utf8_strict() else {
+                return Ok(true);
+            };
+            let text = self.to_string(value)?;
+            let text = crate::host_objects::env_value_text_lossy(&text);
+            self.host.set_env(&name, &text);
+            return Ok(true);
         }
-        let mut node = index;
+        if matches!(self.heap[index], HeapEntry::TypedArray { .. })
+            && matches!(&key, PropertyKey::Named(name) if typedarray_all::typed_array_index(name).is_some())
+        {
+            self.set_own_data(index, key, value)?;
+            return Ok(true);
+        }
+        let mut node_index = index;
         let mut guard = 0;
         loop {
-            let accessor = match &self.heap[node] {
-                HeapEntry::Object { properties, .. }
-                | HeapEntry::Generator { properties, .. }
-                | HeapEntry::AsyncGenerator { properties, .. }
-                | HeapEntry::AsyncFromSync { properties, .. }
-                | HeapEntry::Script { properties, .. }
-                | HeapEntry::Array { properties, .. }
-                | HeapEntry::Function { properties, .. }
-                | HeapEntry::NativeFunction { properties, .. }
-                | HeapEntry::RegExp { properties, .. }
-                | HeapEntry::Date { properties, .. }
-                | HeapEntry::BuiltinIterator { properties, .. }
-                | HeapEntry::Collection { properties, .. }
-                | HeapEntry::TypedArray { properties, .. }
-                | HeapEntry::ArrayBuffer { properties, .. }
-                | HeapEntry::SharedArrayBuffer { properties, .. }
-                | HeapEntry::DataView { properties, .. }
-                | HeapEntry::Promise { properties, .. }
-                | HeapEntry::WeakRef { properties, .. }
-                | HeapEntry::FinalizationRegistry { properties, .. }
-                | HeapEntry::DisposableStack { properties, .. }
-                | HeapEntry::Timeout { properties, .. } => match properties.get(key) {
-                    Some(Property::Accessor { setter, .. }) => Some(Some(*setter)),
-                    Some(Property::Data { .. }) => Some(None),
-                    None => None,
-                },
-                _ => None,
-            };
-            match accessor {
-                Some(Some(setter)) => return Ok(Some(setter)),
-                Some(None) => return Ok(None),
-                None => {}
+            if !matches!(key, PropertyKey::Private(_))
+                && matches!(self.heap[node_index], HeapEntry::Proxy { .. })
+            {
+                return self.internal_set(
+                    self.value_for_runtime_index(node_index)?,
+                    key,
+                    value,
+                    receiver,
+                );
             }
-            match self.prototype_index(node)? {
-                Some(next) => {
-                    node = next;
-                    guard += 1;
-                    if guard > self.heap.len() + 1 {
-                        return Ok(None);
+            let node = self.value_for_runtime_index(node_index)?;
+            if let Some(descriptor) = self.own_descriptor(node, &key)? {
+                return Ok(match descriptor {
+                    Property::Accessor {
+                        setter: Some(setter),
+                        ..
+                    } => {
+                        self.call_value(setter, receiver, &[value])?;
+                        true
                     }
-                }
-                None => return Ok(None),
+                    Property::Accessor { setter: None, .. } => false,
+                    Property::Data { writable: true, .. } => {
+                        return self.ordinary_set_receiver(receiver, key, value);
+                    }
+                    Property::Data {
+                        writable: false, ..
+                    } => false,
+                });
+            }
+            match self.prototype_index(node_index)? {
+                Some(next) => node_index = next,
+                None => break,
+            }
+            guard += 1;
+            if guard > self.heap.len() + 1 {
+                break;
             }
         }
+        self.ordinary_set_receiver(receiver, key, value)
+    }
+
+    /// OrdinarySetWithOwnDescriptor's receiver tail: inspect the receiver's own
+    /// descriptor and either update its value in place, reject, or create a
+    /// fully attributed data property. A non-object receiver rejects.
+    fn ordinary_set_receiver(
+        &mut self,
+        receiver: Value,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, EvalFailure> {
+        if !self.is_object(receiver) {
+            return Ok(false);
+        }
+        let Some(existing) = self.internal_get_own_property(receiver, &key)? else {
+            // (d) absent — CreateDataProperty with full attributes. Ordinary
+            // receivers take the stored-property path so Array element writes
+            // and TypedArray virtual writes land in the right slot.
+            if !self.internal_is_extensible(receiver)? {
+                return Ok(false);
+            }
+            if self.heap_entry_is_proxy_value(receiver) {
+                return self
+                    .internal_define_own_property(
+                        receiver,
+                        key,
+                        crate::builtins::property_descriptor::PropertyDescriptor {
+                            value: Some(value),
+                            writable: Some(true),
+                            enumerable: Some(true),
+                            configurable: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .map(|_| true);
+            }
+            let index = self
+                .runtime_slot(receiver)
+                .map_err(EvalFailure::Runtime)?
+                .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set property on primitive",
+                }))?;
+            self.set_own_data(index, key, value)?;
+            return Ok(true);
+        };
+        if existing.is_accessor() || existing.writable == Some(false) {
+            return Ok(false);
+        }
+        // (c) existing writable data — value-only update, attributes preserved.
+        if self.heap_entry_is_proxy_value(receiver) {
+            return self
+                .internal_define_own_property(
+                    receiver,
+                    key,
+                    crate::builtins::property_descriptor::PropertyDescriptor {
+                        value: Some(value),
+                        writable: Some(true),
+                        enumerable: Some(existing.enumerable == Some(true)),
+                        configurable: Some(existing.configurable == Some(true)),
+                        ..Default::default()
+                    },
+                )
+                .map(|_| true);
+        }
+        // Ordinary receiver: the stored-property fast path keeps the exact
+        // attributes and handles Array element / TypedArray virtual writes.
+        let index = self
+            .runtime_slot(receiver)
+            .map_err(EvalFailure::Runtime)?
+            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "set property on primitive",
+            }))?;
+        self.set_own_data(index, key, value)?;
+        Ok(true)
     }
 
     pub(crate) fn set_super(
@@ -8791,53 +8988,68 @@ impl<'a, H: Host> Machine<'a, H> {
         key: PropertyKey,
         value: Value,
     ) -> Result<SetOutcome, EvalFailure> {
-        let receiver_index = self
-            .runtime_slot(receiver)
-            .map_err(EvalFailure::Runtime)?
-            .ok_or(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "set super property on primitive",
-            }))?;
-        let mut base = self.super_base(home)?;
+        let base = self.super_base(home)?;
         if base == Value::NULL {
             return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "set super property through null prototype",
             }));
         }
-
-        let inherited = loop {
-            if let Some(descriptor) = self.own_descriptor(base, &key)? {
-                break Some(descriptor);
+        let mut node = base;
+        let mut guard = 0;
+        loop {
+            if !matches!(key, PropertyKey::Private(_)) && self.heap_entry_is_proxy_value(node) {
+                return if self.internal_set(node, key, value, receiver)? {
+                    Ok(SetOutcome::Done)
+                } else {
+                    Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "assign to read only super property",
+                    }))
+                };
             }
-            let base_index = self
-                .runtime_slot(base)
-                .map_err(EvalFailure::Runtime)?
-                .expect("non-null super base is an object");
-            let Some(prototype_index) = self.prototype_index(base_index)? else {
-                break None;
+            if let Some(descriptor) = self.own_descriptor(node, &key)? {
+                match descriptor {
+                    Property::Accessor {
+                        setter: Some(setter),
+                        ..
+                    } => return Ok(SetOutcome::Setter(setter)),
+                    Property::Accessor { setter: None, .. } => {
+                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "set super property without setter",
+                        }));
+                    }
+                    Property::Data {
+                        writable: false, ..
+                    } => {
+                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                            operation: "assign to read only super property",
+                        }));
+                    }
+                    Property::Data { writable: true, .. } => break,
+                }
+            }
+            let Some(index) = self.runtime_slot(node).map_err(EvalFailure::Runtime)? else {
+                break;
             };
-            base = self.value_for_runtime_index(prototype_index)?;
-        };
-
-        match inherited {
-            Some(Property::Accessor {
-                setter: Some(setter),
-                ..
-            }) => Ok(SetOutcome::Setter(setter)),
-            Some(Property::Accessor { setter: None, .. }) => {
-                Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "set super property without setter",
-                }))
+            match self.prototype_index(index)? {
+                Some(next) => node = self.value_for_runtime_index(next)?,
+                None => break,
             }
-            Some(Property::Data {
-                writable: false, ..
-            }) => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                operation: "assign to read only super property",
-            })),
-            Some(Property::Data { writable: true, .. }) | None => {
-                self.set_own_data(receiver_index, key, value)?;
-                Ok(SetOutcome::Done)
+            guard += 1;
+            if guard > self.heap.len() + 1 {
+                break;
             }
         }
+        if !self.is_object(receiver) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "set super property on primitive",
+            }));
+        }
+        if !self.ordinary_set_receiver(receiver, key, value)? {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "assign to read only super property",
+            }));
+        }
+        Ok(SetOutcome::Done)
     }
 
     pub(crate) fn get_super(
@@ -8847,54 +9059,7 @@ impl<'a, H: Host> Machine<'a, H> {
         key: &PropertyKey,
     ) -> Result<Value, EvalFailure> {
         let base = self.super_base(home)?;
-        match self.resolve_get(base, key)? {
-            GetOutcome::Value(value) => Ok(value),
-            GetOutcome::Text(text) => self
-                .allocate(HeapEntry::String(text))
-                .map_err(EvalFailure::Runtime),
-            GetOutcome::Getter(getter) => self.call_value(getter, receiver, &[]),
-        }
-    }
-
-    fn own_has_non_accessor(&self, index: usize, key: &PropertyKey) -> bool {
-        match &self.heap[index] {
-            HeapEntry::Array { elements, .. } => {
-                if let PropertyKey::Named(name) = key {
-                    if name.eq_ascii("length") {
-                        return true;
-                    }
-                    if let Some(offset) = array_index(name) {
-                        return elements
-                            .get(offset as usize)
-                            .is_some_and(|element| *element != Value::HOLE);
-                    }
-                }
-                false
-            }
-            HeapEntry::TypedArray { .. } => key
-                .as_string()
-                .and_then(typedarray_all::typed_array_index)
-                .flatten()
-                .is_some_and(|offset| {
-                    self.typed_array_length_at(index)
-                        .is_some_and(|length| offset < length)
-                }),
-            HeapEntry::Function { .. } => {
-                (key.eq_ascii("length") || key.eq_ascii("name"))
-                    && match key {
-                        PropertyKey::Named(name) if name.eq_ascii("length") => {
-                            self.own_data_property(index, "length").is_none()
-                        }
-                        PropertyKey::Named(_) => self.own_data_property(index, "name").is_none(),
-                        _ => false,
-                    }
-            }
-            HeapEntry::WeakRef { properties, .. }
-            | HeapEntry::FinalizationRegistry { properties, .. } => {
-                matches!(properties.get(key), Some(Property::Data { .. }))
-            }
-            _ => false,
-        }
+        self.internal_get(base, key, receiver)
     }
 
     fn set_own_data(
@@ -9074,6 +9239,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 properties,
                 extensible,
                 ..
+            }
+            | HeapEntry::ProxyRevoker {
+                properties,
+                extensible,
+                ..
             } => (Some(properties), *extensible, false),
             HeapEntry::Array {
                 elements,
@@ -9131,6 +9301,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::DisposableStack { properties, .. }
             | HeapEntry::WeakRef { properties, .. }
             | HeapEntry::FinalizationRegistry { properties, .. }
+            | HeapEntry::ProxyRevoker { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
                 usize::from(!properties.contains_key(&key)) * key.charge_bytes()
             }
@@ -9153,6 +9324,11 @@ impl<'a, H: Host> Machine<'a, H> {
                     usize::from(!properties.contains_key(&key)) * key.charge_bytes()
                 }
             },
+            HeapEntry::Proxy { .. } => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "set property on proxy",
+                }));
+            }
             HeapEntry::String(_) | HeapEntry::BigInt(_) => {
                 return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "set property on primitive",
@@ -9208,6 +9384,7 @@ impl<'a, H: Host> Machine<'a, H> {
             | HeapEntry::WeakRef { properties, .. }
             | HeapEntry::FinalizationRegistry { properties, .. }
             | HeapEntry::DisposableStack { properties, .. }
+            | HeapEntry::ProxyRevoker { properties, .. }
             | HeapEntry::Timeout { properties, .. } => {
                 let descriptor = match properties.get(&key) {
                     Some(Property::Data {
@@ -9424,6 +9601,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         properties,
                         extensible,
                         ..
+                    }
+                    | HeapEntry::ProxyRevoker {
+                        properties,
+                        extensible,
+                        ..
                     } => {
                         let existing = properties.get(&key);
                         if existing.is_some_and(|property| !property.configurable())
@@ -9469,6 +9651,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Promise { properties, .. }
                     | HeapEntry::WeakRef { properties, .. }
                     | HeapEntry::FinalizationRegistry { properties, .. }
+                    | HeapEntry::ProxyRevoker { properties, .. }
                     | HeapEntry::DisposableStack { properties, .. } => properties,
                     _ => unreachable!("validated object cannot change heap entry kind"),
                 };
@@ -9501,7 +9684,16 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn delete_property(&mut self, object: Value, key: &PropertyKey) -> Result<bool, EvalFailure> {
+    pub(crate) fn internal_delete(
+        &mut self,
+        object: Value,
+        key: &PropertyKey,
+    ) -> Result<bool, EvalFailure> {
+        if !matches!(key, PropertyKey::Private(_)) && self.heap_entry_is_proxy_value(object) {
+            return self.with_proxy_dispatch(|machine| {
+                crate::builtins::proxy::delete(machine, object, key)
+            });
+        }
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
                 if let PropertyKey::Named(name) = key
@@ -9534,6 +9726,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::WeakRef { properties, .. }
                     | HeapEntry::FinalizationRegistry { properties, .. }
                     | HeapEntry::DisposableStack { properties, .. }
+                    | HeapEntry::ProxyRevoker { properties, .. }
                     | HeapEntry::Timeout { properties, .. } => {
                         let Some(property) = properties.get(key) else {
                             return Ok(true);
@@ -9545,6 +9738,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         properties.remove(key);
                         released
                     }
+                    HeapEntry::Proxy { .. } => 0,
                     HeapEntry::Array {
                         elements,
                         properties,
@@ -9601,9 +9795,20 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
-    fn has_property(&mut self, object: Value, key: &PropertyKey) -> Result<bool, EvalFailure> {
+    pub(crate) fn internal_has_property(
+        &mut self,
+        object: Value,
+        key: &PropertyKey,
+    ) -> Result<bool, EvalFailure> {
         match self.runtime_slot(object).map_err(EvalFailure::Runtime)? {
             Some(index) => {
+                if !matches!(key, PropertyKey::Private(_))
+                    && matches!(self.heap[index], HeapEntry::Proxy { .. })
+                {
+                    return self.with_proxy_dispatch(|machine| {
+                        crate::builtins::proxy::has_property(machine, object, key)
+                    });
+                }
                 if matches!(self.heap[index], HeapEntry::ProcessEnv { .. }) {
                     let PropertyKey::Named(name) = key else {
                         return Ok(false);
@@ -9618,6 +9823,10 @@ impl<'a, H: Host> Machine<'a, H> {
                 let mut node = index;
                 let mut guard = 0;
                 loop {
+                    if matches!(self.heap[node], HeapEntry::Proxy { .. }) {
+                        return self
+                            .internal_has_property(self.value_for_runtime_index(node)?, key);
+                    }
                     if self.own_get(node, key).is_some() {
                         return Ok(true);
                     }
@@ -11406,6 +11615,8 @@ impl<'a, H: Host> Machine<'a, H> {
     fn own_property_keys(&self, src: Value) -> Result<Vec<PropertyKey>, EvalFailure> {
         match self.runtime_slot(src).map_err(EvalFailure::Runtime)? {
             Some(index) => match &self.heap[index] {
+                HeapEntry::Proxy { .. } => Ok(Vec::new()),
+                HeapEntry::ProxyRevoker { properties, .. } => Ok(ordered_property_keys(properties)),
                 HeapEntry::TypedArray { properties, .. } => {
                     let length = self.typed_array_length_at(index).unwrap_or_default();
                     Ok((0..length)
@@ -11511,13 +11722,20 @@ impl<'a, H: Host> Machine<'a, H> {
     }
 
     fn own_property_is_enumerable(
-        &self,
+        &mut self,
         src: Value,
         key: &PropertyKey,
     ) -> Result<bool, EvalFailure> {
         let Some(index) = self.runtime_slot(src).map_err(EvalFailure::Runtime)? else {
             return Ok(false);
         };
+        if matches!(self.heap[index], HeapEntry::Proxy { .. })
+            && !matches!(key, PropertyKey::Private(_))
+        {
+            return Ok(self
+                .internal_get_own_property(src, key)?
+                .is_some_and(|descriptor| descriptor.enumerable == Some(true)));
+        }
         Ok(match &self.heap[index] {
             HeapEntry::Array {
                 elements,
@@ -11578,9 +11796,9 @@ impl<'a, H: Host> Machine<'a, H> {
         })
     }
 
-    fn enumerable_keys(&self, src: Value) -> Result<Vec<EcmaString>, EvalFailure> {
+    fn enumerable_keys(&mut self, src: Value) -> Result<Vec<EcmaString>, EvalFailure> {
         let mut names = Vec::new();
-        for key in self.own_property_keys(src)? {
+        for key in self.internal_own_property_keys(src)? {
             if !self.own_property_is_enumerable(src, &key)? {
                 continue;
             }
@@ -11999,7 +12217,7 @@ impl<'a, H: Host> Machine<'a, H> {
             BinaryOp::InstanceOf => self.instance_of(left, right).map(Value::boolean),
             BinaryOp::In => {
                 let key = self.to_property_key(left)?;
-                self.has_property(right, &key).map(Value::boolean)
+                self.internal_has_property(right, &key).map(Value::boolean)
             }
             BinaryOp::Add => self.add(left, right),
             BinaryOp::Subtract
@@ -12168,6 +12386,11 @@ impl<'a, H: Host> Machine<'a, H> {
                         HeapEntry::BigInt(_) => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                             operation: "convert bigint to number",
                         })),
+                        HeapEntry::Proxy { .. } | HeapEntry::ProxyRevoker { .. } => {
+                            Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                                operation: "convert proxy to number",
+                            }))
+                        }
                         HeapEntry::Array { elements, .. } if elements.is_empty() => {
                             Ok(Value::int32(0))
                         }
@@ -12264,7 +12487,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     | HeapEntry::Iterator { .. }
                     | HeapEntry::Timeout { .. }
                     | HeapEntry::WeakRef { .. }
-                    | HeapEntry::FinalizationRegistry { .. } => true,
+                    | HeapEntry::FinalizationRegistry { .. }
+                    | HeapEntry::Proxy { .. }
+                    | HeapEntry::ProxyRevoker { .. } => true,
                     HeapEntry::Vacant => unreachable!("runtime_slot rejects vacant slots"),
                 },
                 Ok(None) => true,
@@ -12286,6 +12511,14 @@ impl<'a, H: Host> Machine<'a, H> {
                     HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. } => "function",
                     HeapEntry::Symbol { .. } => "symbol",
                     HeapEntry::PrivateName { .. } => "object",
+                    HeapEntry::Proxy { .. } => {
+                        if self.is_callable(value).unwrap_or(false) {
+                            "function"
+                        } else {
+                            "object"
+                        }
+                    }
+                    HeapEntry::ProxyRevoker { .. } => "function",
                     HeapEntry::Object { .. }
                     | HeapEntry::Generator { .. }
                     | HeapEntry::AsyncGenerator { .. }
@@ -12436,52 +12669,43 @@ impl<'a, H: Host> Machine<'a, H> {
         value: Value,
         constructor: Value,
     ) -> Result<bool, EvalFailure> {
-        match self
-            .runtime_slot(constructor)
-            .map_err(EvalFailure::Runtime)?
-        {
-            Some(index) => {
-                if !matches!(
-                    self.heap[index],
-                    HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
-                ) {
-                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                        operation: "instanceof",
-                    }));
-                }
-                let target = match self.own_get_ascii(index, "prototype") {
-                    Some(Found::Value(value)) if self.is_object(value) => value,
-                    _ => {
-                        return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                            operation: "instanceof prototype is not an object",
-                        }));
-                    }
-                };
-                let target_slot = self.runtime_slot(target).map_err(EvalFailure::Runtime)?;
-                let mut node = match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
-                    Some(node) => node,
-                    None => return Ok(false),
-                };
-                let mut guard = 0;
-                loop {
-                    if Some(node) == target_slot {
-                        return Ok(true);
-                    }
-                    match self.prototype_index(node)? {
-                        Some(next) => {
-                            node = next;
-                            guard += 1;
-                            if guard > self.heap.len() + 1 {
-                                return Ok(false);
-                            }
-                        }
-                        None => return Ok(false),
-                    }
-                }
-            }
-            None => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+        if !self.is_callable(constructor)? {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                 operation: "instanceof",
-            })),
+            }));
+        }
+        let prototype_key = PropertyKey::Named(EcmaString::encode("prototype"));
+        let prototype = self.internal_get(constructor, &prototype_key, constructor)?;
+        if !self.is_object(prototype) {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "instanceof prototype is not an object",
+            }));
+        }
+        let target_slot = self.runtime_slot(prototype).map_err(EvalFailure::Runtime)?;
+        let mut node = match self.runtime_slot(value).map_err(EvalFailure::Runtime)? {
+            Some(node) => node,
+            None => return Ok(false),
+        };
+        let mut guard = 0;
+        loop {
+            if Some(node) == target_slot {
+                return Ok(true);
+            }
+            match self.internal_get_prototype_of(self.value_for_runtime_index(node)?)? {
+                Some(next) => {
+                    node = self
+                        .runtime_slot(next)
+                        .map_err(EvalFailure::Runtime)?
+                        .ok_or(EvalFailure::Runtime(RuntimeErrorKind::InvalidValue {
+                            value: next,
+                        }))?;
+                    guard += 1;
+                    if guard > self.heap.len() + 1 {
+                        return Ok(false);
+                    }
+                }
+                None => return Ok(false),
+            }
         }
     }
 
@@ -12537,6 +12761,10 @@ impl<'a, H: Host> Machine<'a, H> {
                     Some(index) => match &self.heap[index] {
                         HeapEntry::String(text) => Ok(text.clone()),
                         HeapEntry::BigInt(text) => Ok(EcmaString::encode(text)),
+                        HeapEntry::Proxy { .. } => Ok(EcmaString::encode("[object Object]")),
+                        HeapEntry::ProxyRevoker { .. } => {
+                            Ok(EcmaString::encode("function () { [native code] }"))
+                        }
                         HeapEntry::Object { .. }
                         | HeapEntry::Generator { .. }
                         | HeapEntry::AsyncGenerator { .. }
@@ -13353,7 +13581,7 @@ VmPeak:	64000 kB";
                     Value::UNDEFINED,
                     "{name}"
                 );
-                assert!(machine.delete_property(typed, &key).unwrap(), "{name}");
+                assert!(machine.internal_delete(typed, &key).unwrap(), "{name}");
                 assert!(
                     machine
                         .define_descriptor(
@@ -13379,7 +13607,7 @@ VmPeak:	64000 kB";
                 machine.get_property_key(typed, &ordinary).unwrap(),
                 Value::int32(7)
             );
-            assert!(machine.delete_property(typed, &ordinary).unwrap());
+            assert!(machine.internal_delete(typed, &ordinary).unwrap());
         });
     }
 
@@ -13407,7 +13635,7 @@ VmPeak:	64000 kB";
             let index = machine.runtime_slot(global).unwrap().unwrap();
             assert!(
                 machine
-                    .delete_property(
+                    .internal_delete(
                         global,
                         &PropertyKey::Named(EcmaString::encode("globalThis")),
                     )
@@ -13452,7 +13680,7 @@ VmPeak:	64000 kB";
             assert_accounted(machine);
 
             let global_this = PropertyKey::Named(EcmaString::encode("globalThis"));
-            assert!(machine.delete_property(global, &global_this).unwrap());
+            assert!(machine.internal_delete(global, &global_this).unwrap());
             assert_accounted(machine);
 
             let replacement =
@@ -13476,7 +13704,7 @@ VmPeak:	64000 kB";
                 .unwrap();
             assert_accounted(machine);
 
-            assert!(machine.delete_property(global, &replacement).unwrap());
+            assert!(machine.internal_delete(global, &replacement).unwrap());
             assert_accounted(machine);
             machine
                 .set_data_property_key(global, global_this, global)
@@ -13944,7 +14172,7 @@ VmPeak:	64000 kB";
                 machine
                     .set_own_data(index, data.clone(), Value::int32(1))
                     .unwrap();
-                assert!(machine.delete_property(object, &data).unwrap());
+                assert!(machine.internal_delete(object, &data).unwrap());
                 machine
                     .define_accessor(
                         object,
@@ -13953,7 +14181,7 @@ VmPeak:	64000 kB";
                         AccessorKind::Getter,
                     )
                     .unwrap();
-                assert!(machine.delete_property(object, &accessor).unwrap());
+                assert!(machine.internal_delete(object, &accessor).unwrap());
                 assert_eq!(machine.slot_bytes[index], baseline_slot);
                 assert_eq!(machine.heap_bytes, baseline_heap);
                 machine.assert_heap_ledger();
@@ -16923,7 +17151,7 @@ VmPeak:	64000 kB";
         );
 
         machine
-            .delete_property(source, &PropertyKey::Named(EcmaString::encode("next")))
+            .internal_delete(source, &PropertyKey::Named(EcmaString::encode("next")))
             .unwrap();
         machine
             .set_data_property(source, "next", Value::int32(1))
@@ -17028,7 +17256,7 @@ VmPeak:	64000 kB";
             _args: &[Value],
             _constructing: bool,
         ) -> Result<intrinsics::BuiltinOutcome, EvalFailure> {
-            machine.delete_property(this, &PropertyKey::Named(EcmaString::encode("next")))?;
+            machine.internal_delete(this, &PropertyKey::Named(EcmaString::encode("next")))?;
             Ok(intrinsics::BuiltinOutcome::Value(Value::int32(1)))
         }
 
@@ -17337,7 +17565,7 @@ VmPeak:	64000 kB";
             "own property must report non-enumerable"
         );
         assert!(
-            machine.delete_property(object, &key).unwrap(),
+            machine.internal_delete(object, &key).unwrap(),
             "configurable DefineDataProperty must be deletable"
         );
         assert!(machine.own_descriptor(object, &key).unwrap().is_none());
@@ -17760,7 +17988,7 @@ VmPeak:	64000 kB";
                     extensible: true,
                 })
                 .unwrap();
-            assert!(machine.has_property(object, &name).unwrap());
+            assert!(machine.internal_has_property(object, &name).unwrap());
             assert!(
                 !machine.with_has_binding(object, key).unwrap(),
                 "inherited unscopables entry must block the inherited candidate"
@@ -21170,7 +21398,7 @@ VmPeak:	64000 kB";
             );
             assert!(
                 machine
-                    .delete_property(env, &PropertyKey::Named(EcmaString::encode("BAMTS_MODE")))
+                    .internal_delete(env, &PropertyKey::Named(EcmaString::encode("BAMTS_MODE")))
                     .unwrap()
             );
             assert_eq!(
@@ -25880,9 +26108,9 @@ VmPeak:	64000 kB";
             assert!(machine.has_own_property_key(string, &zero).unwrap());
             assert!(machine.has_own_property_key(string, &one).unwrap());
             assert!(!machine.has_own_property_key(string, &two).unwrap());
-            assert!(machine.has_property(string, &length).unwrap());
-            assert!(machine.has_property(string, &zero).unwrap());
-            assert!(!machine.has_property(string, &two).unwrap());
+            assert!(machine.internal_has_property(string, &length).unwrap());
+            assert!(machine.internal_has_property(string, &zero).unwrap());
+            assert!(!machine.internal_has_property(string, &two).unwrap());
 
             assert_eq!(
                 machine.get_property_key(string, &length).unwrap(),
@@ -25917,9 +26145,9 @@ VmPeak:	64000 kB";
             assert!(machine.has_own_property_key(boxed, &zero).unwrap());
             assert!(machine.has_own_property_key(boxed, &one).unwrap());
             assert!(!machine.has_own_property_key(boxed, &two).unwrap());
-            assert!(machine.has_property(boxed, &length).unwrap());
-            assert!(machine.has_property(boxed, &zero).unwrap());
-            assert!(!machine.has_property(boxed, &two).unwrap());
+            assert!(machine.internal_has_property(boxed, &length).unwrap());
+            assert!(machine.internal_has_property(boxed, &zero).unwrap());
+            assert!(!machine.internal_has_property(boxed, &two).unwrap());
 
             assert_eq!(
                 machine.get_property_key(boxed, &length).unwrap(),

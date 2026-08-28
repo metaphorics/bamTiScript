@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::arraybuffer::{ArrayBufferHandle, SharedBlock};
 use super::{
     allocate_string, builtin_property, define_data, define_frozen_data, heap_index,
-    install_function, range_error, type_error,
+    install_constructor_function, install_function, range_error, type_error,
 };
 use crate::intrinsics::builtins::bigint::{self, BigIntValue};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
@@ -714,7 +714,7 @@ pub(super) fn install<H: Host>(
 ) {
     let shared_prototype = super::super::ordinary_prototype(heap, builtins.object_prototype());
     let shared_constructor =
-        install_function(heap, builtins, "%TypedArray%", 0, abstract_constructor::<H>);
+        install_constructor_function(heap, builtins, "%TypedArray%", 0, abstract_constructor::<H>);
     builtins.set_constructor_prototype(heap, shared_constructor, shared_prototype);
     builtins.set_typedarray_constructor(shared_constructor);
     builtins.set_typedarray_prototype(shared_prototype);
@@ -838,7 +838,8 @@ pub(super) fn install<H: Host>(
 
     for kind in ElementKind::ALL {
         let prototype = super::super::ordinary_prototype(heap, shared_prototype);
-        let constructor = install_function(heap, builtins, kind.name(), 3, constructor::<H>);
+        let constructor =
+            install_constructor_function(heap, builtins, kind.name(), 3, constructor::<H>);
         builtins.set_constructor_prototype(heap, constructor, prototype);
         let HeapEntry::NativeFunction {
             prototype: parent, ..
@@ -3308,7 +3309,7 @@ mod tests {
                 .id_named("SyntaxError")
                 .expect("SyntaxError is installed");
             assert_eq!(
-                machine.prototype_value(error).unwrap(),
+                machine.internal_get_prototype_of(error).unwrap(),
                 Some(machine.intrinsics.error_prototype(syntax_error))
             );
 

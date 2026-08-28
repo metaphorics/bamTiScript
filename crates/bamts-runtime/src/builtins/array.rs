@@ -5,8 +5,8 @@ use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_array, allocate_string, define_data, install_function, range_error,
-    to_integer_or_infinity, type_error, value_number,
+    allocate_array, allocate_string, define_data, install_constructor_function, install_function,
+    range_error, to_integer_or_infinity, type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
@@ -19,7 +19,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.array_prototype();
-    let constructor = install_function(heap, builtins, "Array", 1, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "Array", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode("Array"), constructor);
     for (name, length, handler) in [
@@ -1712,7 +1712,7 @@ mod tests {
             "Array.prototype[Symbol.unscopables] must be configurable"
         );
         assert_eq!(
-            machine.prototype_value(unscopables).unwrap(),
+            machine.internal_get_prototype_of(unscopables).unwrap(),
             None,
             "unscopables object must have a null prototype"
         );

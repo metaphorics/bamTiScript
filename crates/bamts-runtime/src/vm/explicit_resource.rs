@@ -1808,7 +1808,7 @@ mod tests {
             );
             let owned = PropertyKey::Named(EcmaString::encode("owned"));
             assert!(machine.has_own_property_key(stack, &owned).unwrap());
-            assert!(machine.delete_property(stack, &owned).unwrap());
+            assert!(machine.internal_delete(stack, &owned).unwrap());
             assert!(!machine.has_own_property_key(stack, &owned).unwrap());
 
             let custom_prototype = object(machine);

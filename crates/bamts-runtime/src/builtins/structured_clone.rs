@@ -418,6 +418,9 @@ fn build_plan<H: Host>(
             HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. } => {
                 return Err(DataCloneError::Callable.into());
             }
+            HeapEntry::Proxy { .. } | HeapEntry::ProxyRevoker { .. } => {
+                return Err(DataCloneError::Callable.into());
+            }
             HeapEntry::Symbol { .. } | HeapEntry::PrivateName { .. } => {
                 return Err(DataCloneError::Symbol.into());
             }

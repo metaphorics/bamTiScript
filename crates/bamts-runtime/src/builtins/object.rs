@@ -9,8 +9,8 @@ use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 
 use super::{
-    allocate_string, define_data, install_function, range_error, to_integer_or_infinity,
-    type_error, value_number,
+    allocate_string, define_data, install_constructor_function, install_function, range_error,
+    to_integer_or_infinity, type_error, value_number,
 };
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
@@ -24,7 +24,7 @@ pub(super) fn install<H: Host>(
     builtins: &mut BuiltinTable<H>,
 ) {
     let prototype = builtins.object_prototype();
-    let constructor = install_function(heap, builtins, "Object", 1, constructor::<H>);
+    let constructor = install_constructor_function(heap, builtins, "Object", 1, constructor::<H>);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode("Object"), constructor);
 
@@ -71,9 +71,7 @@ fn constructor<H: Host>(
     // fallback to %Object.prototype% remains inside constructed_prototype for a
     // valid constructor whose [["prototype"]] is missing or non-object.
     if new_target != Value::UNDEFINED && new_target != object_constructor {
-        let prototype = machine
-            .constructed_prototype(new_target)
-            .map_err(EvalFailure::Runtime)?;
+        let prototype = machine.constructed_prototype(new_target)?;
         let value = machine
             .allocate_constructed_receiver_with(prototype)
             .map_err(EvalFailure::Runtime)?;
@@ -313,7 +311,7 @@ fn is_prototype_of<H: Host>(
     _constructing: bool,
 ) -> Result<BuiltinOutcome, EvalFailure> {
     let mut value = args.first().copied().unwrap_or(Value::UNDEFINED);
-    while let Some(prototype) = machine.prototype_value(value)? {
+    while let Some(prototype) = machine.internal_get_prototype_of(value)? {
         if prototype == this {
             return Ok(BuiltinOutcome::Value(Value::TRUE));
         }
@@ -483,7 +481,7 @@ fn function_bind<H: Host>(
             configurable: true,
         },
     );
-    let bound_prototype = machine.prototype_value(this)?;
+    let bound_prototype = machine.internal_get_prototype_of(this)?;
     let value = machine
         .allocate(HeapEntry::native_function(
             NativeCallable::Bound(Box::new(BoundCallable {
@@ -586,8 +584,10 @@ mod tests {
             Value::int32(42)
         );
         let child = ordinary_object(&mut machine);
-        machine.set_prototype_value(child, Some(target)).unwrap();
-        assert!(machine.has_property(child, &property_key).unwrap());
+        machine
+            .internal_set_prototype_of(child, Some(target))
+            .unwrap();
+        assert!(machine.internal_has_property(child, &property_key).unwrap());
         let names = call_object(&mut machine, "getOwnPropertyNames", &[target]).unwrap();
         assert!(machine.array_elements(names).unwrap().unwrap().is_empty());
         let symbols = call_object(&mut machine, "getOwnPropertySymbols", &[target]).unwrap();
@@ -636,7 +636,7 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            machine.delete_property(this, &PropertyKey::Named(EcmaString::encode("next")))?;
+            machine.internal_delete(this, &PropertyKey::Named(EcmaString::encode("next")))?;
             Ok(BuiltinOutcome::Value(Value::int32(1)))
         }
 
@@ -690,7 +690,7 @@ mod tests {
             _args: &[Value],
             _constructing: bool,
         ) -> Result<BuiltinOutcome, EvalFailure> {
-            machine.delete_property(this, &PropertyKey::Named(EcmaString::encode("10")))?;
+            machine.internal_delete(this, &PropertyKey::Named(EcmaString::encode("10")))?;
             Ok(BuiltinOutcome::Value(Value::int32(1)))
         }
 
@@ -1928,7 +1928,7 @@ mod tests {
                 .is_some_and(|name| name.eq_ascii("bound probe"))
         );
         assert_eq!(
-            machine.prototype_value(bound).unwrap(),
+            machine.internal_get_prototype_of(bound).unwrap(),
             Some(machine.intrinsics.function_prototype)
         );
         assert!(
@@ -1995,7 +1995,10 @@ mod tests {
         assert!(machine.run_loop(1).unwrap().is_none());
         let instance = machine.read_register(0, 0);
 
-        assert_eq!(machine.prototype_value(instance).unwrap(), Some(prototype));
+        assert_eq!(
+            machine.internal_get_prototype_of(instance).unwrap(),
+            Some(prototype)
+        );
         assert!(machine.instance_of(instance, bound).unwrap());
         assert!(machine.instance_of(instance, target).unwrap());
     }
@@ -2059,7 +2062,7 @@ mod tests {
         };
         assert_ne!(from_object, existing);
         assert_eq!(
-            machine.prototype_value(from_object).unwrap(),
+            machine.internal_get_prototype_of(from_object).unwrap(),
             Some(custom_prototype)
         );
         assert!(
@@ -2086,7 +2089,7 @@ mod tests {
         };
         assert!(machine.is_object(from_primitive));
         assert_eq!(
-            machine.prototype_value(from_primitive).unwrap(),
+            machine.internal_get_prototype_of(from_primitive).unwrap(),
             Some(custom_prototype)
         );
         // Fresh ordinary object — not a boxed Number.
@@ -2198,7 +2201,7 @@ mod tests {
         };
         assert_ne!(fallback, existing);
         assert_eq!(
-            machine.prototype_value(fallback).unwrap(),
+            machine.internal_get_prototype_of(fallback).unwrap(),
             Some(machine.intrinsics.object_prototype)
         );
     }
@@ -2294,7 +2297,7 @@ mod tests {
         };
         assert_ne!(fresh_obj, existing);
         assert_eq!(
-            machine.prototype_value(fresh_obj).unwrap(),
+            machine.internal_get_prototype_of(fresh_obj).unwrap(),
             Some(custom_prototype)
         );
 
@@ -2315,7 +2318,7 @@ mod tests {
         };
         assert_ne!(fresh_prim, boxed);
         assert_eq!(
-            machine.prototype_value(fresh_prim).unwrap(),
+            machine.internal_get_prototype_of(fresh_prim).unwrap(),
             Some(custom_prototype)
         );
         let fresh_slot = machine.runtime_slot(fresh_prim).unwrap().unwrap();
@@ -2377,7 +2380,7 @@ mod tests {
                 .is_some_and(|text| text.eq_ascii("[object Function]"))
         );
         assert_eq!(
-            machine.prototype_value(bound).unwrap(),
+            machine.internal_get_prototype_of(bound).unwrap(),
             Some(machine.intrinsics.function_prototype)
         );
         assert!(
@@ -3158,7 +3161,7 @@ mod tests {
         // that chain and make `target.bind` resolve to `undefined`.
         let custom_prototype = ordinary_object(&mut machine);
         machine
-            .set_prototype_value(
+            .internal_set_prototype_of(
                 custom_prototype,
                 Some(machine.intrinsics.function_prototype),
             )
@@ -3180,7 +3183,7 @@ mod tests {
         // The bound function must inherit the target's prototype, not the
         // default %Function.prototype%.
         assert_eq!(
-            machine.prototype_value(bound).unwrap(),
+            machine.internal_get_prototype_of(bound).unwrap(),
             Some(custom_prototype),
             "bound function must inherit target's prototype"
         );
@@ -3195,7 +3198,7 @@ mod tests {
         let bound = call_method(&mut machine, target, "bind", &[]).unwrap();
         // A builtin has prototype: None, which falls back to %Function.prototype%.
         assert_eq!(
-            machine.prototype_value(bound).unwrap(),
+            machine.internal_get_prototype_of(bound).unwrap(),
             Some(machine.intrinsics.function_prototype),
             "bound builtin must still get %Function.prototype%"
         );
