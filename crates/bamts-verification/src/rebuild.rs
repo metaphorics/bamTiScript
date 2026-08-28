@@ -1296,7 +1296,12 @@ mod tests {
         let mut keys: Vec<ObligationKey> = rows.iter().map(|row| row.key().clone()).collect();
         keys.sort();
         let shard = ShardIdentity::plan(ShardSpec::unsharded(), &keys).expect("plan");
-        let header = crate::evidence::EvidenceHeader::new(shard, binding).expect("header");
+        let header = crate::evidence::EvidenceHeader::new(
+            shard,
+            binding,
+            crate::evidence::ExecutionBinding::local_for_tests(),
+        )
+        .expect("header");
         publish_evidence(path, header, rows, PublishMode::Replace).expect("publish receipt");
     }
 

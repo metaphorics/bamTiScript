@@ -23,20 +23,26 @@ use crate::{
     shard::{ObligationKey, ShardIdentity, ShardSpec, hex_digest, require_sha256, require_token},
 };
 
-const EVIDENCE_SCHEMA: &str = "bamti.evidence/v1";
-const RUNNER_VERSION: &str = "a2.1";
+const EVIDENCE_SCHEMA: &str = "bamti.evidence/v2";
+const RUNNER_VERSION: &str = "a2.2";
+const LEGACY_RUNNER_VERSION: &str = "a2.1";
 
 /// Schema tag bound into every evidence header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceSchema {
     #[serde(rename = "bamti.evidence/v1")]
     V1,
+    #[serde(rename = "bamti.evidence/v2")]
+    V2,
 }
 
 impl EvidenceSchema {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        EVIDENCE_SCHEMA
+        match self {
+            Self::V1 => "bamti.evidence/v1",
+            Self::V2 => EVIDENCE_SCHEMA,
+        }
     }
 }
 
@@ -123,16 +129,32 @@ impl RunBinding {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        require_sha256("authority_digest", &self.authority_digest)?;
-        require_sha256("candidate_tree_digest", &self.candidate_tree_digest)?;
-        require_sha256("candidate_binary_digest", &self.candidate_binary_digest)?;
-        require_sha256("harness_digest", &self.harness_digest)?;
+        self.validate_common()?;
         if self.runner_version != RUNNER_VERSION {
             return Err(schema(format!(
                 "runner_version `{}` is not `{RUNNER_VERSION}`",
                 self.runner_version
             )));
         }
+        Ok(())
+    }
+
+    fn validate_legacy(&self) -> Result<()> {
+        self.validate_common()?;
+        if self.runner_version != LEGACY_RUNNER_VERSION {
+            return Err(schema(format!(
+                "legacy runner_version `{}` is not `{LEGACY_RUNNER_VERSION}`",
+                self.runner_version
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_common(&self) -> Result<()> {
+        require_sha256("authority_digest", &self.authority_digest)?;
+        require_sha256("candidate_tree_digest", &self.candidate_tree_digest)?;
+        require_sha256("candidate_binary_digest", &self.candidate_binary_digest)?;
+        require_sha256("harness_digest", &self.harness_digest)?;
         if self.environment.len() != NORMALIZED_ENV.len()
             || self
                 .environment
@@ -194,6 +216,100 @@ impl RunBinding {
             && self.runner_version == other.runner_version
     }
 }
+/// Exact workflow execution that produced one receipt matrix.
+///
+/// Content digests bind the candidate; this binding additionally prevents
+/// shards from another workflow, rerun, commit, host, or runtime image from
+/// being merged into the same receipt set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionBinding {
+    workflow: String,
+    run_id: String,
+    run_attempt: u32,
+    source_sha: String,
+    job: String,
+    host: String,
+    runtime: String,
+}
+
+impl ExecutionBinding {
+    pub fn new(
+        workflow: impl Into<String>,
+        run_id: impl Into<String>,
+        run_attempt: u32,
+        source_sha: impl Into<String>,
+        job: impl Into<String>,
+        host: impl Into<String>,
+        runtime: impl Into<String>,
+    ) -> Result<Self> {
+        let binding = Self {
+            workflow: workflow.into(),
+            run_id: run_id.into(),
+            run_attempt,
+            source_sha: source_sha.into(),
+            job: job.into(),
+            host: host.into(),
+            runtime: runtime.into(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_for_tests() -> Self {
+        Self {
+            workflow: "local-test".to_owned(),
+            run_id: "local-test".to_owned(),
+            run_attempt: 1,
+            source_sha: "0000000000000000000000000000000000000000".to_owned(),
+            job: "local-test".to_owned(),
+            host: "local-test".to_owned(),
+            runtime: "local-test".to_owned(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("workflow", self.workflow.as_str()),
+            ("run_id", self.run_id.as_str()),
+            ("job", self.job.as_str()),
+            ("host", self.host.as_str()),
+            ("runtime", self.runtime.as_str()),
+        ] {
+            require_token(field, value)?;
+        }
+        if self.run_attempt == 0 {
+            return Err(schema("run_attempt must be greater than zero"));
+        }
+        if self.source_sha.len() != 40
+            || !self
+                .source_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(schema(
+                "source_sha must be a lowercase 40-character Git SHA",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn first_mismatch_field(&self, actual: &Self) -> Option<&'static str> {
+        [
+            ("workflow", self.workflow == actual.workflow),
+            ("run_id", self.run_id == actual.run_id),
+            ("run_attempt", self.run_attempt == actual.run_attempt),
+            ("source_sha", self.source_sha == actual.source_sha),
+            ("job", self.job == actual.job),
+            ("host", self.host == actual.host),
+            ("runtime", self.runtime == actual.runtime),
+        ]
+        .into_iter()
+        .find_map(|(field, matches)| (!matches).then_some(field))
+    }
+}
 
 /// Header bound to one shard of one catalog run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,26 +318,42 @@ pub struct EvidenceHeader {
     schema: EvidenceSchema,
     shard: ShardIdentity,
     binding: RunBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution: Option<ExecutionBinding>,
 }
 
 impl EvidenceHeader {
-    pub fn new(shard: ShardIdentity, binding: RunBinding) -> Result<Self> {
-        binding.validate()?;
-        if shard.expected_count() == 0 {
-            return Err(schema("evidence header cannot describe an empty shard"));
-        }
-        Ok(Self {
-            schema: EvidenceSchema::V1,
+    pub fn new(
+        shard: ShardIdentity,
+        binding: RunBinding,
+        execution: ExecutionBinding,
+    ) -> Result<Self> {
+        let header = Self {
+            schema: EvidenceSchema::V2,
             shard,
             binding,
-        })
+            execution: Some(execution),
+        };
+        header.validate()?;
+        Ok(header)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.schema != EvidenceSchema::V1 {
-            return Err(schema("unsupported evidence schema"));
+        match self.schema {
+            EvidenceSchema::V1 => {
+                if self.execution.is_some() {
+                    return Err(schema("legacy evidence cannot carry an execution binding"));
+                }
+                self.binding.validate_legacy()?;
+            }
+            EvidenceSchema::V2 => {
+                self.binding.validate()?;
+                self.execution
+                    .as_ref()
+                    .ok_or_else(|| schema("v2 evidence requires an execution binding"))?
+                    .validate()?;
+            }
         }
-        self.binding.validate()?;
         ShardSpec::new(self.shard.spec().index(), self.shard.spec().count())?;
         if self.shard.expected_count() == 0 || self.shard.catalog_len() == 0 {
             return Err(schema("evidence header cannot describe an empty shard"));
@@ -243,6 +375,10 @@ impl EvidenceHeader {
     pub fn binding(&self) -> &RunBinding {
         &self.binding
     }
+    #[must_use]
+    pub fn execution(&self) -> Option<&ExecutionBinding> {
+        self.execution.as_ref()
+    }
 
     pub fn unsharded(self) -> Result<Self> {
         let spec = ShardSpec::unsharded();
@@ -253,7 +389,10 @@ impl EvidenceHeader {
             self.shard.catalog_len(),
             self.shard.catalog_digest().to_owned(),
         )?;
-        Self::new(shard, self.binding)
+        let execution = self.execution.ok_or_else(|| {
+            schema("legacy evidence cannot be promoted to an unsharded v2 receipt")
+        })?;
+        Self::new(shard, self.binding, execution)
     }
 }
 
@@ -695,6 +834,7 @@ pub fn merge_shards(
     let mut heads: Vec<Option<EvidenceRow>> = Vec::with_capacity(paths.len());
     let mut by_index: BTreeMap<u32, usize> = BTreeMap::new();
     let mut binding = None;
+    let mut execution = None;
     let mut catalog_digest = None;
     let mut shard_count = None;
     for (slot, path) in paths.iter().enumerate() {
@@ -743,6 +883,20 @@ pub fn merge_shards(
                 }
             }
         }
+        let actual_execution = reader.header().execution().ok_or_else(|| {
+            schema("legacy evidence cannot enter a v2 receipt matrix; recapture the shard")
+        })?;
+        match &execution {
+            None => execution = Some(actual_execution.clone()),
+            Some(expected) => {
+                if let Some(field) = expected.first_mismatch_field(actual_execution) {
+                    return Err(VerificationError::new(
+                        ErrorCode::Digest,
+                        format!("merged shard execution binding differs at `{field}`"),
+                    ));
+                }
+            }
+        }
         let head = reader.next_row()?;
         readers.push(reader);
         heads.push(head);
@@ -767,6 +921,7 @@ pub fn merge_shards(
             expected_digest,
         )?,
         binding.ok_or_else(|| schema("merge produced no run binding"))?,
+        execution.ok_or_else(|| schema("merge produced no execution binding"))?,
     )?;
     let parent = dest
         .parent()
@@ -1031,7 +1186,8 @@ mod tests {
 
     fn write_unsharded(path: &Path, catalog: &[ObligationKey], rows: &[EvidenceRow]) {
         let shard = ShardIdentity::plan(ShardSpec::unsharded(), catalog).expect("plan");
-        let header = EvidenceHeader::new(shard, binding()).expect("header");
+        let header = EvidenceHeader::new(shard, binding(), ExecutionBinding::local_for_tests())
+            .expect("header");
         publish_evidence(path, header, rows, PublishMode::Replace).expect("publish");
     }
 
@@ -1053,9 +1209,29 @@ mod tests {
         rows: &[EvidenceRow],
         binding: RunBinding,
     ) {
+        write_shard_with_execution(
+            path,
+            catalog,
+            index,
+            count,
+            rows,
+            binding,
+            ExecutionBinding::local_for_tests(),
+        );
+    }
+
+    fn write_shard_with_execution(
+        path: &Path,
+        catalog: &[ObligationKey],
+        index: u32,
+        count: u32,
+        rows: &[EvidenceRow],
+        binding: RunBinding,
+        execution: ExecutionBinding,
+    ) {
         let spec = ShardSpec::new(index, count).expect("spec");
         let shard = ShardIdentity::plan(spec, catalog).expect("plan");
-        let header = EvidenceHeader::new(shard, binding).expect("header");
+        let header = EvidenceHeader::new(shard, binding, execution).expect("header");
         let owned: Vec<EvidenceRow> = spec
             .member_indices(catalog.len())
             .map(|member| rows[member].clone())
@@ -1154,6 +1330,49 @@ mod tests {
                 b"prior-ledger"
             );
         }
+    }
+
+    #[test]
+    fn merge_shards_rejects_foreign_workflow_attempt() {
+        let catalog = keys(4);
+        let rows: Vec<EvidenceRow> = (0..4)
+            .map(|index| row(index, TerminalState::Pass))
+            .collect();
+        let scratch = Scratch::new("foreign-attempt");
+        let first = scratch.file("attempt-2-shard-0.jsonl");
+        let second = scratch.file("attempt-3-shard-1.jsonl");
+        let execution = ExecutionBinding::new(
+            ".github/workflows/ci.yml",
+            "41",
+            2,
+            "0123456789abcdef0123456789abcdef01234567",
+            "conformance",
+            "runner-1",
+            "node-v24.18.0 rustc-1.91.0",
+        )
+        .expect("execution");
+        let foreign = ExecutionBinding::new(
+            ".github/workflows/ci.yml",
+            "41",
+            3,
+            "0123456789abcdef0123456789abcdef01234567",
+            "conformance",
+            "runner-1",
+            "node-v24.18.0 rustc-1.91.0",
+        )
+        .expect("foreign execution");
+        write_shard_with_execution(&first, &catalog, 0, 2, &rows, binding(), execution);
+        write_shard_with_execution(&second, &catalog, 1, 2, &rows, binding(), foreign);
+
+        let error = merge_shards(
+            &[first, second],
+            &catalog,
+            &scratch.file("merged.jsonl"),
+            PublishMode::Replace,
+        )
+        .expect_err("mixed workflow attempts must fail");
+        assert_eq!(error.code(), ErrorCode::Digest);
+        assert!(error.to_string().contains("run_attempt"));
     }
 
     #[test]
@@ -1260,7 +1479,8 @@ mod tests {
         let before = fs::read(&dest).expect("before");
 
         let shard = ShardIdentity::plan(ShardSpec::unsharded(), &catalog).expect("plan");
-        let header = EvidenceHeader::new(shard, binding()).expect("header");
+        let header = EvidenceHeader::new(shard, binding(), ExecutionBinding::local_for_tests())
+            .expect("header");
         let err = publish_streaming_with_fault(
             &dest,
             header.clone(),

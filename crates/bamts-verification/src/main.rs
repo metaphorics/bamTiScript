@@ -16,7 +16,7 @@ use bamts_verification::{
         regenerate_completion_program, verify_completion,
     },
     diagnostic_catalog::{self, CatalogError},
-    evidence::PublishMode,
+    evidence::{ExecutionBinding, PublishMode},
     formal_bridge::{
         LaneStatus, audit_formal_artifacts, qualify_replay_canary, ready_lane_records,
         regenerate_canonical_fixture, run_replay_canary_child,
@@ -227,16 +227,37 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
                     "--receipt",
                     "--runner",
                     "--platform",
+                    "--workflow",
+                    "--run-id",
+                    "--run-attempt",
+                    "--source-sha",
+                    "--job",
+                    "--host",
+                    "--runtime",
                 ],
                 &[],
             )?;
             let shard = parse_shard(&required_flag(&flags.values, "--shard", "suite run")?)?;
+            let run_attempt = required_flag(&flags.values, "--run-attempt", "suite run")?
+                .parse::<u32>()
+                .map_err(|_| usage("suite run --run-attempt must be an unsigned integer"))?;
+            let execution = ExecutionBinding::new(
+                required_flag(&flags.values, "--workflow", "suite run")?,
+                required_flag(&flags.values, "--run-id", "suite run")?,
+                run_attempt,
+                required_flag(&flags.values, "--source-sha", "suite run")?,
+                required_flag(&flags.values, "--job", "suite run")?,
+                required_flag(&flags.values, "--host", "suite run")?,
+                required_flag(&flags.values, "--runtime", "suite run")?,
+            )
+            .map_err(|error| usage(error.to_string()))?;
             Ok(Command::SuiteRun(SuiteRunRequest {
                 catalog: required_flag(&flags.values, "--catalog", "suite run")?,
                 shard,
                 receipt: PathBuf::from(required_flag(&flags.values, "--receipt", "suite run")?),
                 runner: required_flag(&flags.values, "--runner", "suite run")?,
                 platform: required_flag(&flags.values, "--platform", "suite run")?,
+                execution,
             }))
         }
         "merge" => {
@@ -261,10 +282,12 @@ fn parse_suite_command(arguments: &mut impl Iterator<Item = OsString>) -> Result
     }
 }
 
+/// Parses low-level suite coordinates as zero-based `<index>/<count>`.
+/// `ts_conformance --shards` is intentionally a separate one-based surface.
 fn parse_shard(value: &str) -> Result<ShardSpec> {
     let (index, count) = value
         .split_once('/')
-        .ok_or_else(|| usage("`--shard` must use `<index>/<count>`"))?;
+        .ok_or_else(|| usage("`--shard` must use zero-based `<index>/<count>`"))?;
     let index = index
         .parse::<u32>()
         .map_err(|_| usage("`--shard` index must be an unsigned integer"))?;
@@ -1269,6 +1292,20 @@ mod tests {
             "jit",
             "--platform",
             "ubuntu-latest",
+            "--workflow",
+            ".github/workflows/ci.yml",
+            "--run-id",
+            "41",
+            "--run-attempt",
+            "2",
+            "--source-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--job",
+            "conformance",
+            "--host",
+            "GitHub Actions 1",
+            "--runtime",
+            "node-v24.18.0 rustc-1.91.0",
         ])
         .expect("suite run command");
         let Command::SuiteRun(request) = command else {
@@ -1279,6 +1316,21 @@ mod tests {
         assert_eq!(request.receipt, PathBuf::from("receipts/2.jsonl"));
         assert_eq!(request.runner, "jit");
         assert_eq!(request.platform, "ubuntu-latest");
+        assert_eq!(
+            request.execution.first_mismatch_field(
+                &ExecutionBinding::new(
+                    ".github/workflows/ci.yml",
+                    "41",
+                    2,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "conformance",
+                    "GitHub Actions 1",
+                    "node-v24.18.0 rustc-1.91.0",
+                )
+                .expect("binding")
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1321,6 +1373,20 @@ mod tests {
             "jit",
             "--platform",
             "ubuntu-latest",
+            "--workflow",
+            ".github/workflows/ci.yml",
+            "--run-id",
+            "41",
+            "--run-attempt",
+            "2",
+            "--source-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--job",
+            "conformance",
+            "--host",
+            "GitHub Actions 1",
+            "--runtime",
+            "node-v24.18.0 rustc-1.91.0",
         ])
         .expect_err("out-of-range shard");
         assert_eq!(error.code(), ErrorCode::Usage);
@@ -1380,6 +1446,16 @@ mod tests {
                 receipt: PathBuf::from("unused.jsonl"),
                 runner: "compiler".to_owned(),
                 platform: "ubuntu-latest".to_owned(),
+                execution: ExecutionBinding::new(
+                    "local-test",
+                    "local-test",
+                    1,
+                    "0000000000000000000000000000000000000000",
+                    "local-test",
+                    "local-test",
+                    "local-test",
+                )
+                .expect("binding"),
             }),
         )
         .expect_err("completion suite validates run catalog");

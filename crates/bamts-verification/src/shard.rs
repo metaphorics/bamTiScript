@@ -465,6 +465,15 @@ mod tests {
 
         assert_eq!(ShardSpec::new(0, 0).unwrap_err().code(), ErrorCode::Schema);
         assert_eq!(ShardSpec::new(1, 1).unwrap_err().code(), ErrorCode::Schema);
+        assert_eq!(
+            ShardSpec::new(0, 4).expect("first low-level shard").index(),
+            0
+        );
+        assert_eq!(
+            ShardSpec::new(3, 4).expect("last low-level shard").index(),
+            3
+        );
+        assert!(ShardSpec::new(4, 4).is_err());
         assert_eq!(validate_catalog(&[]).unwrap_err().code(), ErrorCode::Schema);
         let keys = catalog(3);
         let spec = ShardSpec::new(0, 4).expect("index in range of count");

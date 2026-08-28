@@ -38,8 +38,8 @@ use crate::{
     catalog::{self, CatalogCell},
     classification::{self, ClassificationState, NonPassState},
     evidence::{
-        EvidenceHeader, EvidenceReader, EvidenceRow, EvidenceWriter, PublishMode, RunBinding,
-        TerminalState, WorkingDirectoryPolicy, merge_shards,
+        EvidenceHeader, EvidenceReader, EvidenceRow, EvidenceWriter, ExecutionBinding, PublishMode,
+        RunBinding, TerminalState, WorkingDirectoryPolicy, merge_shards,
     },
     lane::{
         LaneBinding, LaneExecutor, LaneOutcome, LaneProcessResult, LaneRequest, LaneResponse,
@@ -68,6 +68,7 @@ pub struct SuiteRunRequest {
     pub receipt: PathBuf,
     pub runner: String,
     pub platform: String,
+    pub execution: ExecutionBinding,
 }
 
 /// Inputs for a deterministic receipt merge.
@@ -734,7 +735,7 @@ pub fn run_suite(root: &Path, request: &SuiteRunRequest) -> Result<SuiteReport> 
     let keys: Vec<ObligationKey> = obligations.iter().map(|entry| entry.key.clone()).collect();
     let shard = ShardIdentity::plan(request.shard, &keys)?;
     let binding = current_run_binding(root, &request.catalog)?;
-    let header = EvidenceHeader::new(shard.clone(), binding)?;
+    let header = EvidenceHeader::new(shard.clone(), binding, request.execution.clone())?;
     let members: Vec<usize> = request.shard.member_indices(keys.len()).collect();
     let lane_binding = {
         let run = LaneBinding::fresh()?;
@@ -1759,6 +1760,7 @@ mod tests {
         let header = EvidenceHeader::new(
             ShardIdentity::plan(spec, keys).expect("plan"),
             binding_for_tests(root),
+            ExecutionBinding::local_for_tests(),
         )
         .expect("header");
         let path = root.join(name);
@@ -1880,9 +1882,11 @@ mod tests {
                     ShardIdentity::plan(ShardSpec::new(index, 3).expect("spec"), &keys)
                         .expect("plan"),
                     binding,
+                    ExecutionBinding::local_for_tests(),
                 )
                 .expect("header");
-                let file = File::create(stale.join(format!("stale-{index}.jsonl"))).expect("file");
+                let file =
+                    File::create(stale.join(format!("shard-{index}.jsonl"))).expect("shard file");
                 let mut writer = EvidenceWriter::new(file, header).expect("writer");
                 for row in &obligations {
                     writer.write_row(row).expect("write");
@@ -1958,6 +1962,7 @@ mod tests {
         let header = EvidenceHeader::new(
             ShardIdentity::plan(ShardSpec::new(0, 1).expect("spec"), &wrong_keys).expect("plan"),
             binding_for_tests(&root),
+            ExecutionBinding::local_for_tests(),
         )
         .expect("header");
         let file = File::create(wrong_mode.join("only.jsonl")).expect("file");
@@ -2063,6 +2068,7 @@ mod tests {
                 receipt: receipt.clone(),
                 runner: "perf".to_owned(),
                 platform: "ubuntu-latest".to_owned(),
+                execution: ExecutionBinding::local_for_tests(),
             },
         )
         .expect("missing adapter is blocking evidence, not an abort");

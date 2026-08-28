@@ -2532,8 +2532,8 @@ mod tests {
         assert!(parse_shards("5/4").is_err());
         assert!(parse_shards("1/0").is_err());
         assert!(parse_shards("abc").is_err());
-        assert_eq!(parse_shards("1/1").unwrap(), (1, 1));
-        assert_eq!(parse_shards("2/3").unwrap(), (2, 3));
+        assert_eq!(parse_shards("1/4").unwrap(), (1, 4));
+        assert_eq!(parse_shards("4/4").unwrap(), (4, 4));
     }
 
     #[test]

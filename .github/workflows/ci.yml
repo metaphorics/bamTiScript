@@ -191,7 +191,7 @@ jobs:
         run: cargo run --locked -p bamts-verification --bin bamts-verification -- formal audit --gates G1,G2,G5,G3,G4
 
   conformance:
-    name: Conformance shard ${{ matrix.shard }}/4
+    name: Conformance receipt shard ${{ matrix.shard }}/4
     needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -205,50 +205,97 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-
       - name: Assert source commit
         run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
-
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
           package-manager-cache: false
-
       - name: Install npm dependencies
         run: npm ci
-
-      - name: Assert Node version
-        run: test "$(node --version)" = "v24.18.0"
-
       - name: Install Rust toolchain
         run: |
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
-
       - name: Sync snapshot
+        run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+      - name: Write strict conformance receipt
         run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            sync --verify-pin --write-snapshot
-
-      - name: Run conformance shard
-        run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            ci --mode pr --status included --shards ${{ matrix.shard }}/4 \
-            | tee "conformance-${{ matrix.shard }}.log"
-
-      - name: Upload conformance log
+          set -euo pipefail
+          zero=$(( ${{ matrix.shard }} - 1 ))
+          receipt="verification/evidence/pr/typescript-7.0.2/compiler/x86_64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/${zero}.jsonl"
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite run \
+            --catalog typescript-7.0.2 --shard "${zero}/4" \
+            --receipt "$receipt" --runner compiler --platform x86_64-unknown-linux-gnu \
+            --workflow .github/workflows/ci.yml --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --source-sha "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" \
+            --job conformance --host ubuntu-24.04-x64 \
+            --runtime "node-v24.18.0;rust-$(rustc --version)"
+      - name: Upload strict conformance receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: conformance-shard-${{ matrix.shard }}-${{ github.run_attempt }}
-          path: conformance-${{ matrix.shard }}.log
+          name: pr-typescript-compiler-x64-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard }}
+          path: verification/evidence/pr/typescript-7.0.2/compiler/x86_64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/*.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
+  conformance-accounting:
+    name: Conformance receipt accounting
+    needs: conformance
+    if: always() && needs.conformance.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Install npm dependencies
+        run: npm ci
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
+          rustup default "$TOOLCHAIN"
+      - name: Download this attempt receipts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: pr-typescript-compiler-x64-${{ github.run_id }}-${{ github.run_attempt }}-shard-*
+          path: target/receipts
+          merge-multiple: true
+      - name: Merge complete compatible matrix
+        run: |
+          set -euo pipefail
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+            --catalog typescript-7.0.2 --receipts target/receipts \
+            --out verification/evidence/pr-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl
+      - name: Check canonical merged receipt
+        run: |
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+            --catalog typescript-7.0.2 --receipts target/receipts \
+            --out verification/evidence/pr-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl --check
+      - name: Upload canonical merged receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-merged-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verification/evidence/pr-merged/*.jsonl
           if-no-files-found: error
           retention-days: 14
 
   perf-bh1:
     name: Performance (BH1)
-    needs: [quality, preflight, corpus, formal, conformance]
+    needs: [quality, preflight, corpus, formal, conformance-accounting]
     # Fork pull-request code never reaches BH1. After the upstream jobs succeed, run on BH1:
     # cargo run --locked -p bamts-verification --bin bh1_jit -- provision --repo metaphorics/bamTiScript --pr PR --run RUN_ID --attempt RUN_ATTEMPT --head-sha HEAD_SHA --runner-group-id GROUP_ID
     # The host tool provisions the unique run-attempt label and a one-job JIT runner.

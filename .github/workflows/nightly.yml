@@ -63,7 +63,7 @@ jobs:
             audit-ledger --require-complete
 
   conformance-x64:
-    name: Conformance x64 shard ${{ matrix.shard }}/16
+    name: Conformance x64 receipt shard ${{ matrix.shard }}/16
     needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -77,49 +77,91 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-
       - name: Assert source commit
         run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
-
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
           package-manager-cache: false
-
       - name: Install npm dependencies
         run: npm ci
-
-      - name: Assert Node version
-        run: test "$(node --version)" = "v24.18.0"
-
       - name: Install Rust toolchain
         run: |
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
-
       - name: Sync snapshot
+        run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+      - name: Write strict nightly receipt
         run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            sync --verify-pin --write-snapshot
-
-      - name: Run conformance shard
-        run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            ci --mode nightly --status included --backend all --shards ${{ matrix.shard }}/16 \
-            | tee "nightly-conformance-${{ matrix.shard }}-of-16.log"
-
-      - name: Upload conformance log
+          set -euo pipefail
+          zero=$(( ${{ matrix.shard }} - 1 ))
+          receipt="verification/evidence/nightly/typescript-7.0.2/compiler/x86_64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/${zero}.jsonl"
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite run \
+            --catalog typescript-7.0.2 --shard "${zero}/16" \
+            --receipt "$receipt" --runner compiler --platform x86_64-unknown-linux-gnu \
+            --workflow .github/workflows/nightly.yml --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --source-sha "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" \
+            --job conformance-x64 --host ubuntu-24.04-x64 \
+            --runtime "node-v24.18.0;rust-$(rustc --version)"
+      - name: Upload strict nightly receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: nightly-conformance-x64-${{ matrix.shard }}-${{ github.run_attempt }}
-          path: nightly-conformance-${{ matrix.shard }}-of-16.log
+          name: nightly-typescript-compiler-x64-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard }}
+          path: verification/evidence/nightly/typescript-7.0.2/compiler/x86_64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/*.jsonl
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+
+  conformance-x64-accounting:
+    name: Nightly x64 receipt accounting
+    needs: conformance-x64
+    if: always() && needs.conformance-x64.result != 'skipped'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+      - run: npm ci
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
+          rustup default "$TOOLCHAIN"
+      - name: Download this attempt receipts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: nightly-typescript-compiler-x64-${{ github.run_id }}-${{ github.run_attempt }}-shard-*
+          path: target/receipts
+          merge-multiple: true
+      - name: Merge complete compatible matrix
+        run: |
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+            --catalog typescript-7.0.2 --receipts target/receipts \
+            --out verification/evidence/nightly-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl
+      - name: Check canonical nightly receipt
+        run: |
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+            --catalog typescript-7.0.2 --receipts target/receipts \
+            --out verification/evidence/nightly-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl --check
+      - name: Upload canonical nightly receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nightly-merged-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verification/evidence/nightly-merged/*.jsonl
+          if-no-files-found: error
+          retention-days: 30
 
   report-aarch64:
-    name: AArch64 report ${{ matrix.backend }}
+    name: AArch64 receipt ${{ matrix.backend }}
     needs: preflight
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
@@ -128,63 +170,91 @@ jobs:
       matrix:
         backend: [interpreter, jit, aot]
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-
       - name: Assert source commit
         run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
-
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
           package-manager-cache: false
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Assert Node version
-        run: test "$(node --version)" = "v24.18.0"
-
+      - run: npm ci
       - name: Install Rust toolchain
         run: |
           TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy,rust-src
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
           rustup default "$TOOLCHAIN"
-
       - name: Sync snapshot
+        run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+      - name: Write strict AArch64 receipt
         run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            sync --verify-pin --write-snapshot
-
-      - name: Run report
-        id: report
-        continue-on-error: true
-        run: |
-          cargo run --locked -p bamts-verification --bin ts_conformance -- \
-            ci --mode nightly --status included --backend ${{ matrix.backend }} --shards 1/1 \
-            | tee "nightly-aarch64-${{ matrix.backend }}.log"
-
-      - name: Report summary
-        if: always()
-        run: |
-          if [ "${{ steps.report.outcome }}" = "success" ]; then
-            echo "::notice::AArch64 ${{ matrix.backend }} nightly report completed"
-          else
-            echo "::warning::AArch64 ${{ matrix.backend }} nightly report recorded differences (non-blocking)"
-          fi
-
-      - name: Upload report log
-        if: always()
+          set -euo pipefail
+          receipt="verification/evidence/nightly/test262/${{ matrix.backend }}/aarch64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/0.jsonl"
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite run \
+            --catalog test262 --shard 0/1 --receipt "$receipt" \
+            --runner "${{ matrix.backend }}" --platform aarch64-unknown-linux-gnu \
+            --workflow .github/workflows/nightly.yml --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --source-sha "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" \
+            --job report-aarch64 --host ubuntu-24.04-aarch64 \
+            --runtime "node-v24.18.0;rust-$(rustc --version)"
+      - name: Upload strict AArch64 receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: nightly-aarch64-${{ matrix.backend }}-${{ github.run_attempt }}
-          path: nightly-aarch64-${{ matrix.backend }}.log
-          if-no-files-found: warn
-          retention-days: 14
+          name: nightly-test262-${{ matrix.backend }}-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verification/evidence/nightly/test262/${{ matrix.backend }}/aarch64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/0.jsonl
+          if-no-files-found: error
+          retention-days: 30
+
+  report-aarch64-accounting:
+    name: AArch64 receipt accounting ${{ matrix.backend }}
+    needs: report-aarch64
+    if: always() && needs.report-aarch64.result != 'skipped'
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [interpreter, jit, aot]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Assert source commit
+        run: test "$(git rev-parse HEAD)" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - run: npm ci
+      - name: Install Rust toolchain
+        run: |
+          TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rust-src
+          rustup default "$TOOLCHAIN"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: nightly-test262-${{ matrix.backend }}-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/receipts
+          merge-multiple: true
+      - name: Merge complete compatible matrix
+        run: |
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+            --catalog test262 --receipts target/receipts \
+            --out verification/evidence/nightly-merged/test262-${{ matrix.backend }}-aarch64-unknown-linux-gnu.jsonl
+      - name: Check canonical AArch64 receipt
+        run: |
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+            --catalog test262 --receipts target/receipts \
+            --out verification/evidence/nightly-merged/test262-${{ matrix.backend }}-aarch64-unknown-linux-gnu.jsonl --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nightly-merged-${{ matrix.backend }}-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verification/evidence/nightly-merged/*.jsonl
+          if-no-files-found: error
+          retention-days: 30
 
   corpus:
     name: Corpus

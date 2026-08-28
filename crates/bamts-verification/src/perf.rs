@@ -848,12 +848,20 @@ pub struct Scorecard {
     pub fixtures: BTreeMap<String, FixtureScore>,
 }
 
-/// Comparator measurements for one pinned fixture.
+/// Comparator measurements and their retained raw evidence for one pinned fixture.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixtureScore {
     pub wall_ms: Quantiles,
+    #[serde(default)]
+    pub wall_ms_max: f64,
+    #[serde(default)]
+    pub wall_ms_samples: Vec<f64>,
     pub rss_bytes: Quantiles,
+    #[serde(default)]
+    pub rss_bytes_max: u64,
+    #[serde(default)]
+    pub rss_bytes_samples: Vec<u64>,
     pub argv: Vec<String>,
     pub exit_code: i32,
 }
@@ -873,6 +881,8 @@ struct ScorecardFixture {
     path: &'static str,
     exit_code: i32,
 }
+
+const SCORECARD_REPEATS: usize = 30;
 
 const SCORECARD_FIXTURES: [ScorecardFixture; 5] = [
     ScorecardFixture {
@@ -1267,7 +1277,7 @@ pub fn load_scorecard(path: &Path) -> Result<Scorecard> {
         .map_err(|error| PerfError::harness(format!("{}: {error}", path.display())))
 }
 
-/// Validates a scorecard against its host and comparator contracts.
+/// Validates a scorecard against its host, comparator, and raw-evidence contracts.
 pub fn validate_scorecard(card: &Scorecard, host: &HostManifest, comparator: &str) -> Result<()> {
     if card.schema != PERF_SCHEMA_VERSION {
         return Err(PerfError::harness(format!(
@@ -1306,9 +1316,9 @@ pub fn validate_scorecard(card: &Scorecard, host: &HostManifest, comparator: &st
             &host.conditions,
         ));
     }
-    if card.repeats != 30 {
+    if card.repeats as usize != SCORECARD_REPEATS {
         return Err(PerfError::harness(format!(
-            "scorecard repeats must be 30, found {}",
+            "scorecard repeats must be {SCORECARD_REPEATS}, found {}",
             card.repeats
         )));
     }
@@ -1341,6 +1351,7 @@ pub fn validate_scorecard(card: &Scorecard, host: &HostManifest, comparator: &st
         }
         validate_positive_quantiles(fixture.id, "wall_ms", score.wall_ms)?;
         validate_positive_quantiles(fixture.id, "rss_bytes", score.rss_bytes)?;
+        validate_scorecard_raw_evidence(fixture.id, score)?;
     }
     Ok(())
 }
@@ -1373,6 +1384,81 @@ fn validate_positive_quantiles(id: &str, name: &str, values: Quantiles) -> Resul
         return Err(PerfError::harness(format!(
             "scorecard fixture `{id}` {name} quantiles must satisfy p50 <= p95 <= p99, found {}, {}, {}",
             values.p50, values.p95, values.p99
+        )));
+    }
+    Ok(())
+}
+
+/// Maximum of a raw sample set (`f64::NEG_INFINITY` when empty).
+#[must_use]
+fn sample_max(samples: &[f64]) -> f64 {
+    samples.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Validates the retained raw sample matrix for one fixture and requires the
+/// authored derived values to be exactly the nearest-rank statistics of that
+/// evidence.
+fn validate_scorecard_raw_evidence(id: &str, score: &FixtureScore) -> Result<()> {
+    if score.wall_ms_samples.len() != SCORECARD_REPEATS
+        || score.rss_bytes_samples.len() != SCORECARD_REPEATS
+    {
+        return Err(PerfError::harness(format!(
+            "scorecard fixture `{id}` must retain exactly {SCORECARD_REPEATS} raw wall and \
+             {SCORECARD_REPEATS} raw RSS samples, found {} wall and {} RSS",
+            score.wall_ms_samples.len(),
+            score.rss_bytes_samples.len()
+        )));
+    }
+    for (index, sample) in score.wall_ms_samples.iter().enumerate() {
+        if !sample.is_finite() || *sample <= 0.0 {
+            return Err(PerfError::harness(format!(
+                "scorecard fixture `{id}` wall_ms_samples[{index}] must be finite and positive, found {sample}"
+            )));
+        }
+    }
+    for (index, sample) in score.rss_bytes_samples.iter().enumerate() {
+        if *sample == 0 {
+            return Err(PerfError::harness(format!(
+                "scorecard fixture `{id}` rss_bytes_samples[{index}] must be positive, found {sample}"
+            )));
+        }
+    }
+    let wall_quantiles = Quantiles::from_samples(&score.wall_ms_samples);
+    if score.wall_ms != wall_quantiles {
+        return Err(PerfError::harness(format!(
+            "scorecard fixture `{id}` wall_ms quantiles must be the nearest-rank quantiles of the retained raw samples, found {:?}, expected {:?}",
+            score.wall_ms, wall_quantiles
+        )));
+    }
+    let wall_max = sample_max(&score.wall_ms_samples);
+    if score.wall_ms_max != wall_max {
+        return Err(PerfError::harness(format!(
+            "scorecard fixture `{id}` wall_ms_max must be the maximum of the retained raw samples, found {}, expected {wall_max}",
+            score.wall_ms_max
+        )));
+    }
+    let rss_view: Vec<f64> = score
+        .rss_bytes_samples
+        .iter()
+        .map(|&bytes| bytes as f64)
+        .collect();
+    let rss_quantiles = Quantiles::from_samples(&rss_view);
+    if score.rss_bytes != rss_quantiles {
+        return Err(PerfError::harness(format!(
+            "scorecard fixture `{id}` rss_bytes quantiles must be the nearest-rank quantiles of the retained raw samples, found {:?}, expected {:?}",
+            score.rss_bytes, rss_quantiles
+        )));
+    }
+    let rss_max = score
+        .rss_bytes_samples
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or_default();
+    if score.rss_bytes_max != rss_max {
+        return Err(PerfError::harness(format!(
+            "scorecard fixture `{id}` rss_bytes_max must be the maximum of the retained raw samples, found {}, expected {rss_max}",
+            score.rss_bytes_max
         )));
     }
     Ok(())
@@ -1436,7 +1522,7 @@ pub fn capture_scorecard(options: &ScorecardOptions) -> Result<Scorecard> {
 
     let manifest = load_manifest(&options.manifest_path)?;
     verify_bench_fixture_hashes(&options.workspace_root, &manifest)?;
-    let repeats = 30;
+    let repeats = SCORECARD_REPEATS as u32;
     let mut fixtures = BTreeMap::new();
     for fixture in manifest
         .fixtures
@@ -1464,8 +1550,8 @@ pub fn capture_scorecard(options: &ScorecardOptions) -> Result<Scorecard> {
         }
         let argv = canonical_scorecard_argv(relative);
         let command_argv = canonical_scorecard_argv(&fixture_path.to_string_lossy());
-        let mut wall = Vec::with_capacity(repeats as usize);
-        let mut rss = Vec::with_capacity(repeats as usize);
+        let mut wall = Vec::with_capacity(SCORECARD_REPEATS);
+        let mut rss = Vec::with_capacity(SCORECARD_REPEATS);
         for _ in 0..repeats {
             let started = Instant::now();
             let mut child = Command::new("node_modules/typescript/bin/tsc")
@@ -1497,13 +1583,18 @@ pub fn capture_scorecard(options: &ScorecardOptions) -> Result<Scorecard> {
                 )));
             }
             wall.push(started.elapsed().as_secs_f64() * 1_000.0);
-            rss.push(require_positive_peak_rss(&fixture.id, peak)? as f64);
+            rss.push(require_positive_peak_rss(&fixture.id, peak)?);
         }
+        let rss_view: Vec<f64> = rss.iter().map(|&bytes| bytes as f64).collect();
         fixtures.insert(
             fixture.id.clone(),
             FixtureScore {
                 wall_ms: Quantiles::from_samples(&wall),
-                rss_bytes: Quantiles::from_samples(&rss),
+                wall_ms_max: sample_max(&wall),
+                wall_ms_samples: wall,
+                rss_bytes: Quantiles::from_samples(&rss_view),
+                rss_bytes_max: rss.iter().copied().max().unwrap_or_default(),
+                rss_bytes_samples: rss,
                 argv,
                 exit_code: contract.exit_code,
             },
@@ -1972,20 +2063,36 @@ mod tests {
         }
     }
 
+    fn sample_wall_samples() -> Vec<f64> {
+        (0..SCORECARD_REPEATS)
+            .map(|index| 100.0 + index as f64)
+            .collect()
+    }
+
+    fn sample_rss_samples() -> Vec<u64> {
+        (1..=SCORECARD_REPEATS as u64).collect()
+    }
+
     fn sample_scorecard(host: &HostManifest) -> Scorecard {
-        let quantiles = Quantiles {
-            p50: 1.0,
-            p95: 2.0,
-            p99: 3.0,
-        };
+        let wall = sample_wall_samples();
+        let rss = sample_rss_samples();
+        let rss_view: Vec<f64> = rss.iter().map(|&bytes| bytes as f64).collect();
+        let wall_ms = Quantiles::from_samples(&wall);
+        let rss_bytes = Quantiles::from_samples(&rss_view);
+        let wall_ms_max = sample_max(&wall);
+        let rss_bytes_max = rss.iter().copied().max().unwrap_or_default();
         let fixtures = SCORECARD_FIXTURES
             .iter()
             .map(|fixture| {
                 (
                     fixture.id.to_owned(),
                     FixtureScore {
-                        wall_ms: quantiles,
-                        rss_bytes: quantiles,
+                        wall_ms,
+                        wall_ms_max,
+                        wall_ms_samples: wall.clone(),
+                        rss_bytes,
+                        rss_bytes_max,
+                        rss_bytes_samples: rss.clone(),
                         argv: canonical_scorecard_argv(fixture.path),
                         exit_code: fixture.exit_code,
                     },
@@ -2001,7 +2108,7 @@ mod tests {
             conditions_expected: host.conditions.clone(),
             conditions_observed: sample_observed_conditions(),
             conditions_match: true,
-            repeats: 30,
+            repeats: SCORECARD_REPEATS as u32,
             fixtures,
         }
     }
@@ -2138,6 +2245,139 @@ mod tests {
         let host = sample_host();
         let mut card = sample_scorecard(&host);
         card.fixtures.get_mut("bench-checker-ts").unwrap().exit_code = 0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+    }
+
+    #[test]
+    fn validate_scorecard_requires_exact_raw_sample_matrices() {
+        let host = sample_host();
+        let mut card = sample_scorecard(&host);
+        validate_scorecard(&card, &host, "typescript@7.0.2").unwrap();
+
+        card.fixtures
+            .get_mut("bench-checker-ts")
+            .unwrap()
+            .wall_ms_samples
+            .truncate(SCORECARD_REPEATS - 1);
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-dom-dts")
+            .unwrap()
+            .wall_ms_samples
+            .push(999.0);
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-empty-ts")
+            .unwrap()
+            .rss_bytes_samples
+            .truncate(SCORECARD_REPEATS - 1);
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-herebyfile")
+            .unwrap()
+            .rss_bytes_samples
+            .push(1);
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        for score in card.fixtures.values_mut() {
+            score.wall_ms_samples.clear();
+            score.rss_bytes_samples.clear();
+        }
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+    }
+
+    #[test]
+    fn scorecard_without_raw_samples_fails_closed() {
+        let host = sample_host();
+        let card = sample_scorecard(&host);
+        let mut value = serde_json::to_value(&card).unwrap();
+        for fixture in value["fixtures"].as_object_mut().unwrap().values_mut() {
+            let fixture = fixture.as_object_mut().unwrap();
+            for field in [
+                "wall_ms_max",
+                "wall_ms_samples",
+                "rss_bytes_max",
+                "rss_bytes_samples",
+            ] {
+                fixture.remove(field);
+            }
+        }
+        let legacy: Scorecard = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            validate_scorecard(&legacy, &host, "typescript@7.0.2")
+                .unwrap_err()
+                .code,
+            PerfErrorCode::HarnessError
+        );
+    }
+
+    #[test]
+    fn validate_scorecard_rejects_invalid_and_tampered_raw_evidence() {
+        let host = sample_host();
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-checker-ts")
+            .unwrap()
+            .wall_ms_samples[0] = f64::NAN;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-checker-ts")
+            .unwrap()
+            .wall_ms_samples[0] = -1.0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-dom-dts")
+            .unwrap()
+            .wall_ms_samples[0] = 0.0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-empty-ts")
+            .unwrap()
+            .rss_bytes_samples[0] = 0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-herebyfile")
+            .unwrap()
+            .wall_ms
+            .p95 += 0.5;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-jsx-complexity")
+            .unwrap()
+            .wall_ms_max += 1.0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-checker-ts")
+            .unwrap()
+            .rss_bytes
+            .p50 -= 1.0;
+        assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
+
+        let mut card = sample_scorecard(&host);
+        card.fixtures
+            .get_mut("bench-dom-dts")
+            .unwrap()
+            .rss_bytes_max += 1;
         assert!(validate_scorecard(&card, &host, "typescript@7.0.2").is_err());
     }
 

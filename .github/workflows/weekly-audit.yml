@@ -128,21 +128,31 @@ jobs:
         run: |
           set -euo pipefail
           cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
-      - name: Run weekly-audit shard
+      - name: Run weekly-audit receipt shard
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target/weekly
-          cargo run --locked -p bamts-verification --bin ts_conformance -- ci --mode weekly-audit --status all --backend all --shards ${{ matrix.shard }}/32 2>&1 | tee target/weekly/shard-${{ matrix.shard }}.log
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+          # ts_conformance --shards is one-based; low-level suite --shard is zero-based.
+          zero=$(( ${{ matrix.shard }} - 1 ))
+          receipt="verification/evidence/weekly/typescript-7.0.2/compiler/x86_64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/${zero}.jsonl"
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite run \
+            --catalog typescript-7.0.2 --shard "${zero}/32" \
+            --receipt "$receipt" --runner compiler --platform x86_64-unknown-linux-gnu \
+            --workflow .github/workflows/weekly-audit.yml --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --source-sha "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" \
+            --job audit --host ubuntu-24.04-x64 \
+            --runtime "node-v24.18.0;rust-$(rustc --version)"
+      - name: Upload strict weekly receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: weekly-shard-${{ matrix.shard }}-${{ github.run_attempt }}
-          path: target/weekly/shard-${{ matrix.shard }}.log
+          name: weekly-typescript-compiler-x64-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard }}
+          path: verification/evidence/weekly/typescript-7.0.2/compiler/x86_64-unknown-linux-gnu/${{ github.run_id }}/${{ github.run_attempt }}/*.jsonl
           if-no-files-found: error
           retention-days: 30
 
   accounting:
-    name: Weekly audit accounting
+    name: Weekly audit receipt accounting
     needs: audit
     if: always() && needs.audit.result != 'skipped'
     runs-on: ubuntu-24.04
@@ -159,58 +169,37 @@ jobs:
           node-version: 24.18.0
           package-manager-cache: false
       - name: Install Node dependencies
-        shell: bash
         run: npm ci
-      - name: Assert Node version
-        shell: bash
-        run: '[[ "$(node --version)" == "v24.18.0" ]]'
       - name: Install Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
           channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy --component rust-src
+          rustup toolchain install "$channel" --profile minimal --component rust-src
           rustup default "$channel"
-      - name: Download shard logs
+      - name: Download this attempt receipts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: weekly-shard-*
-          path: target/weekly
+          pattern: weekly-typescript-compiler-x64-${{ github.run_id }}-${{ github.run_attempt }}-shard-*
+          path: target/receipts
           merge-multiple: true
-      - name: Verify and summarize shard logs
+      - name: Merge complete compatible matrix
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          shards=(target/weekly/shard-*.log)
-          if [[ "${#shards[@]}" -ne 32 ]]; then
-            echo "Expected 32 shard-*.log files, found ${#shards[@]}" >&2
-            exit 1
-          fi
-          {
-            echo "## Weekly audit shard evidence"
-            echo
-            echo "Collected ${#shards[@]} shard logs."
-            echo
-            echo "### Rollups"
-            for file in "${shards[@]}"; do
-              echo "#### $(basename "$file")"
-              sed -n '/^rollup /p' "$file"
-            done
-          } | tee target/weekly/weekly-audit-summary.md >> "$GITHUB_STEP_SUMMARY"
-      - name: Resync suite for authoritative ledger audit
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+            --catalog typescript-7.0.2 --receipts target/receipts \
+            --out verification/evidence/weekly-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl
+      - name: Check canonical merged receipt
         shell: bash
         run: |
-          set -euo pipefail
-          cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
-      - name: Rerun authoritative ledger audit
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo run --locked -p bamts-verification --bin ts_conformance -- audit-ledger --require-complete
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+          cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
+            --catalog typescript-7.0.2 --receipts target/receipts \
+            --out verification/evidence/weekly-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl --check
+      - name: Upload weekly merged receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: weekly-audit-accounting-${{ github.run_attempt }}
-          path: target/weekly
+          name: weekly-merged-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verification/evidence/weekly-merged/*.jsonl
           if-no-files-found: error
           retention-days: 30
