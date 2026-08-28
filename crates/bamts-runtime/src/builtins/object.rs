@@ -503,11 +503,11 @@ mod tests {
     use super::super::allocate_array;
     use super::super::property_descriptor::same_value;
     use super::super::test_support::{
-        TestHost, blank_program, ordinary_object, program_with_flags,
+        TestHost, blank_program, constructable_program, ordinary_object,
     };
     use super::*;
     use crate::{Limits, RuntimeErrorKind, ThrowOrigin};
-    use bamts_bytecode::{FunctionFlags, FunctionId, ModuleId};
+    use bamts_bytecode::{FunctionId, ModuleId};
 
     fn data_descriptor(machine: &mut Machine<'_, TestHost>, value: Value) -> Value {
         let descriptor = ordinary_object(machine);
@@ -1962,13 +1962,7 @@ mod tests {
 
     #[test]
     fn bound_constructor_uses_target_prototype_and_instanceof() {
-        let module = program_with_flags(
-            "<test>",
-            FunctionFlags {
-                is_constructable: true,
-                ..FunctionFlags::default()
-            },
-        );
+        let module = constructable_program("<test>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let prototype = ordinary_object(&mut machine);
