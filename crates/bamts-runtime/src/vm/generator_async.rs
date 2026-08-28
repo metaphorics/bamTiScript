@@ -478,6 +478,7 @@ mod tests {
                     FunctionFlags {
                         is_async: false,
                         is_generator: true,
+                        is_constructable: false,
                     },
                     vec![
                         Instruction::LoadConst {
@@ -618,6 +619,7 @@ mod tests {
                     FunctionFlags {
                         is_async: true,
                         is_generator: false,
+                        is_constructable: false,
                     },
                     vec![
                         Instruction::LoadConst {
@@ -669,6 +671,7 @@ mod tests {
                     FunctionFlags {
                         is_async: true,
                         is_generator: false,
+                        is_constructable: false,
                     },
                     vec![
                         Instruction::LoadConst {
@@ -740,6 +743,7 @@ mod tests {
                     FunctionFlags {
                         is_async: true,
                         is_generator: false,
+                        is_constructable: false,
                     },
                     vec![
                         Instruction::Await {
@@ -800,6 +804,7 @@ mod tests {
                     FunctionFlags {
                         is_async: false,
                         is_generator: true,
+                        is_constructable: false,
                     },
                     vec![
                         Instruction::Suspend {

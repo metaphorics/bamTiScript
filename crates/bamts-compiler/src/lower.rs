@@ -6375,6 +6375,7 @@ impl<'a> FunctionContext<'a> {
         let flags = FunctionFlags {
             is_async: arrow.is_async,
             is_generator: false,
+            is_constructable: false,
         };
         let captures =
             self.compute_captures(&arrow.parameters, LoweredBody::Arrow(&arrow.body), true);
@@ -6399,7 +6400,13 @@ impl<'a> FunctionContext<'a> {
         name: Option<String>,
         function: &FunctionLike,
     ) -> Result<Register, LowerError> {
-        let closure = self.build_function_value(builder, range, name, function)?;
+        let flags = FunctionFlags {
+            is_async: function.is_async,
+            is_generator: function.is_generator,
+            is_constructable: !function.is_async && !function.is_generator,
+        };
+        let closure =
+            self.build_function_value_with_flags(builder, range, name, function, flags)?;
         if !function.is_async && !function.is_generator {
             let prototype = self.alloc_register(range)?;
             self.emit(range, Instruction::CreateObject { dst: prototype })?;
@@ -6435,7 +6442,19 @@ impl<'a> FunctionContext<'a> {
         let flags = FunctionFlags {
             is_async: function.is_async,
             is_generator: function.is_generator,
+            is_constructable: false,
         };
+        self.build_function_value_with_flags(builder, range, name, function, flags)
+    }
+
+    fn build_function_value_with_flags(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        name: Option<String>,
+        function: &FunctionLike,
+        flags: FunctionFlags,
+    ) -> Result<Register, LowerError> {
         let body = function
             .body
             .as_ref()
@@ -8193,7 +8212,13 @@ impl<'a> FunctionContext<'a> {
             Some(name) => Some(builder.intern(Constant::String(EcmaString::encode(name)), range)?),
             None => None,
         };
-        let assembled = inner.into_function(name_constant, FunctionFlags::default());
+        let assembled = inner.into_function(
+            name_constant,
+            FunctionFlags {
+                is_constructable: true,
+                ..FunctionFlags::default()
+            },
+        );
         builder.fill_function(id, assembled);
         Ok(())
     }
@@ -13581,6 +13606,30 @@ mod tests {
             key_name(prototype_key),
             "prototype",
             "the forward link is stored under the key \"prototype\""
+        );
+    }
+    #[test]
+    fn lowering_marks_only_ecmascript_constructors_constructable() {
+        let ordinary = lower_js("function Base() {}");
+        assert_eq!(
+            ordinary
+                .functions()
+                .iter()
+                .filter(|function| function.flags().is_constructable)
+                .count(),
+            1,
+            "the declaration is constructable and the module entry is not"
+        );
+
+        let mixed = lower_js("const arrow = () => 1; const object = { method() {} }; class C {}");
+        assert_eq!(
+            mixed
+                .functions()
+                .iter()
+                .filter(|function| function.flags().is_constructable)
+                .count(),
+            1,
+            "only the class constructor is constructable"
         );
     }
     #[test]

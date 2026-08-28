@@ -7210,9 +7210,9 @@ impl<'a, H: Host> Machine<'a, H> {
         if let HeapEntry::Function {
             module, function, ..
         } = self.heap[index]
-            && self.module_code(module).functions()[function.get() as usize]
+            && !self.module_code(module).functions()[function.get() as usize]
                 .flags()
-                .is_async
+                .is_constructable
         {
             return self.throw_type("construct", call_pc);
         }
@@ -7418,6 +7418,23 @@ impl<'a, H: Host> Machine<'a, H> {
         ))
     }
 
+    pub(crate) fn is_constructor(&self, value: Value) -> Result<bool, EvalFailure> {
+        match self.callee_kind(value).map_err(EvalFailure::Runtime)? {
+            CalleeKind::Runtime { target, .. } => Ok(self.module_code(target.module).functions()
+                [target.function.get() as usize]
+                .flags()
+                .is_constructable),
+            CalleeKind::Builtin { .. } => Ok(true),
+            CalleeKind::Bound => {
+                let bound = self
+                    .flatten_bound(value, Value::UNDEFINED, &[], value)
+                    .map_err(EvalFailure::Runtime)?;
+                self.is_constructor(bound.target)
+            }
+            CalleeKind::NotCallable => Ok(false),
+        }
+    }
+
     pub(crate) fn box_primitive(&mut self, value: Value) -> Result<Value, EvalFailure> {
         let prototype = match value.decode() {
             Some(Decoded::Boolean(_)) => self.intrinsics.boolean_prototype,
@@ -7590,7 +7607,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 let flags = self.module_code(target.module).functions()
                     [target.function.get() as usize]
                     .flags();
-                if flags.is_async || flags.is_generator {
+                if !flags.is_constructable {
                     return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                         operation: "construct",
                     }));
@@ -12981,7 +12998,10 @@ mod tests {
             0,
             parameters,
             registers,
-            FunctionFlags::default(),
+            FunctionFlags {
+                is_constructable: true,
+                ..FunctionFlags::default()
+            },
             code,
             handlers,
         )
@@ -13001,6 +13021,7 @@ mod tests {
             FunctionFlags {
                 is_async: false,
                 is_generator: true,
+                is_constructable: false,
             },
             code,
             handlers,
@@ -13021,6 +13042,7 @@ mod tests {
             FunctionFlags {
                 is_async: true,
                 is_generator: false,
+                is_constructable: false,
             },
             code,
             handlers,
@@ -13041,6 +13063,7 @@ mod tests {
             FunctionFlags {
                 is_async: true,
                 is_generator: true,
+                is_constructable: false,
             },
             code,
             handlers,
@@ -13059,7 +13082,10 @@ mod tests {
             captures,
             parameters,
             registers,
-            FunctionFlags::default(),
+            FunctionFlags {
+                is_constructable: true,
+                ..FunctionFlags::default()
+            },
             code,
             Vec::new(),
         )
@@ -19331,6 +19357,53 @@ VmPeak:	64000 kB";
             vec![entry, ctor],
         );
         assert_eq!(run_ok(&module).value, Value::TRUE);
+    }
+
+    #[test]
+    fn construct_rejects_callable_nonconstructable_function() {
+        let entry = function(
+            0,
+            3,
+            vec![
+                Instruction::CreateArray { dst: reg(2) },
+                Instruction::CreateClosure {
+                    dst: reg(0),
+                    function: FunctionId::new(1),
+                    captures: reg(2),
+                },
+                Instruction::CreateArray { dst: reg(1) },
+                Instruction::Construct {
+                    dst: reg(2),
+                    callee: reg(0),
+                    arguments: reg(1),
+                },
+                Instruction::Halt,
+            ],
+            vec![],
+        );
+        let target = Function::new(
+            None,
+            0,
+            0,
+            1,
+            FunctionFlags::default(),
+            vec![Instruction::Halt],
+            vec![],
+        );
+        let module = verified(vec![], vec![entry, target]);
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .expect_err("nonconstructable function must reject new");
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::UncaughtThrow {
+                origin: ThrowOrigin::TypeError {
+                    operation: "construct"
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

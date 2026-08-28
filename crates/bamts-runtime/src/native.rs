@@ -5426,6 +5426,7 @@ mod tests {
             FunctionFlags {
                 is_async: true,
                 is_generator: false,
+                is_constructable: false,
             },
             code,
             Vec::new(),
@@ -8655,6 +8656,7 @@ mod tests {
             FunctionFlags {
                 is_async: false,
                 is_generator: true,
+                is_constructable: false,
             },
             code,
             Vec::new(),

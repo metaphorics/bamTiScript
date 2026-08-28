@@ -535,22 +535,6 @@ fn attach<H: Host>(
     Ok(())
 }
 
-// A pragmatic `IsConstructor`: the engine's construct dispatcher rejects plain
-// receivers anyway, and any callable runtime/builtin/bound target is treated
-// as constructable for the ArrayCreate fallback decision.
-fn is_constructor<H: Host>(
-    machine: &mut Machine<'_, H>,
-    value: Value,
-) -> Result<bool, EvalFailure> {
-    let Some(index) = machine.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
-        return Ok(false);
-    };
-    Ok(matches!(
-        machine.heap[index],
-        HeapEntry::Function { .. } | HeapEntry::NativeFunction { .. }
-    ))
-}
-
 /// GetMethod: nullish reads return `None`; non-callable non-nullish reads are
 /// a TypeError.
 fn get_method<H: Host>(
@@ -970,7 +954,7 @@ fn from_async_run<H: Host>(
     record_put(machine, record, FIELD_MAPPER, mapper)?;
     record_put(machine, record, FIELD_THIS_ARG, this_arg)?;
     record_put(machine, record, FIELD_K, crate::number_value(0.0))?;
-    let construct = is_constructor(machine, ctor)?;
+    let construct = machine.is_constructor(ctor)?;
     if let Some(handle) = iterator_handle {
         // Construct(ctor) comes after GetIteratorFromMethod per 23.1.2.2.
         let array = if construct {
