@@ -94,7 +94,7 @@ export interface LoadNativeAddonOptions {
   readonly stage?: (bytes: Buffer) => string;
   readonly cache?: {
     get value(): NativeAddon | undefined;
-    set value(value: NativeAddon | undefined): void;
+    set value(value: NativeAddon | undefined);
   };
 }
 
@@ -257,6 +257,10 @@ export interface Service {
     params?: RpcParams,
     options?: RequestOptions,
   ): Promise<Result>;
+  quickInfo<Result extends JsonValue = JsonValue>(
+    params?: RpcParams,
+    options?: RequestOptions,
+  ): Promise<Result>;
   references<Result extends JsonValue = JsonValue>(
     params?: RpcParams,
     options?: RequestOptions,
@@ -307,6 +311,10 @@ export class Session implements Service {
     options?: RequestOptions,
   ): Promise<Result>;
   definition<Result extends JsonValue = JsonValue>(
+    params?: RpcParams,
+    options?: RequestOptions,
+  ): Promise<Result>;
+  quickInfo<Result extends JsonValue = JsonValue>(
     params?: RpcParams,
     options?: RequestOptions,
   ): Promise<Result>;

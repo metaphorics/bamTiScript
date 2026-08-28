@@ -45,6 +45,8 @@ export type SymbolKind =
   | "import"
   | "namespace";
 
+export type QuickInfoKind = SymbolKind | "property";
+
 export interface Completion {
   readonly name: string;
   readonly kind: SymbolKind;
@@ -63,6 +65,14 @@ export interface DocumentEdit extends Location {
 export interface RenameResult {
   readonly symbol: string;
   readonly edits: readonly DocumentEdit[];
+}
+
+export interface QuickInfo {
+  readonly name: string;
+  readonly kind: QuickInfoKind;
+  readonly typeDisplay: string;
+  readonly display: string;
+  readonly range: TextRange;
 }
 
 export interface Diagnostic {
@@ -105,6 +115,7 @@ export interface ServiceApi {
   snapshot(params?: Readonly<Record<string, never>>, options?: RequestOptions): Promise<ProjectSnapshot>;
   completions(params: PositionParams, options?: RequestOptions): Promise<readonly Completion[]>;
   definition(params: PositionParams, options?: RequestOptions): Promise<Location | null>;
+  quickInfo(params: PositionParams, options?: RequestOptions): Promise<QuickInfo | null>;
   references(params: PositionParams, options?: RequestOptions): Promise<readonly Location[]>;
   rename(params: RenameParams, options?: RequestOptions): Promise<RenameResult>;
   diagnostics(params: PathParams, options?: RequestOptions): Promise<readonly Diagnostic[]>;

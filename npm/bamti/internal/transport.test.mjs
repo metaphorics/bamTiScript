@@ -22,6 +22,9 @@ registerHooks({
 const { Transport } = await import("./transport.js");
 const { runExecutable } = await import("../native-runner.js");
 const api = await import("../index.js");
+const { SERVICE_METHODS } = await import("./session.js");
+const { createAsyncService } = await import("../unstable/async.js");
+const { createSerialService } = await import("../unstable/sync.js");
 
 const PUBLIC_EXPORTS = [
   ".",
@@ -61,6 +64,29 @@ function requestCollector(child) {
   const requests = [];
   child.stdin.on("data", (chunk) => requests.push(...decoder.push(chunk)));
   return requests;
+}
+
+function requestFixture() {
+  const children = [];
+  const requests = [];
+  const decoder = new FrameDecoder();
+  const transport = new Transport({
+    binary: "/virtual/bamts",
+    disposeTimeoutMs: 0,
+    spawnChild() {
+      const child = new FakeChild();
+      child.stdin.on("data", (chunk) => requests.push(...decoder.push(chunk)));
+      children.push(child);
+      return child;
+    },
+  });
+  return { transport, children, requests };
+}
+
+async function awaitRequests(requests, count) {
+  while (requests.length < count) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
 }
 
 test("manifest publishes thirteen subpaths and the tsc executable", async () => {
@@ -116,6 +142,160 @@ test("persistent transport correlates fragmented out-of-order responses", async 
   await Promise.all([firstCrash, secondCrash]);
   assert.equal(transport.inFlight, 0);
   await transport.dispose();
+});
+
+test("session publishes exactly the ten service methods including quickInfo", () => {
+  assert.deepEqual(SERVICE_METHODS, [
+    "open",
+    "update",
+    "close",
+    "snapshot",
+    "completions",
+    "definition",
+    "quickInfo",
+    "references",
+    "rename",
+    "diagnostics",
+  ]);
+});
+
+test("session quickInfo returns the populated symbol description over service/quickInfo", async () => {
+  const { transport, children, requests } = requestFixture();
+  const session = new api.Session({ transport });
+  try {
+    const pending = session.quickInfo({ path: "input.ts", position: 6 });
+    await awaitRequests(requests, 1);
+    children[0].stdout.write(
+      encodeFrame({
+        jsonrpc: "2.0",
+        id: requests[0].id,
+        result: { root: "/virtual", methods: [...SERVICE_METHODS] },
+      }),
+    );
+    await awaitRequests(requests, 2);
+    assert.deepEqual(
+      requests.map(({ method }) => method),
+      ["initialize", "service/quickInfo"],
+    );
+    assert.deepEqual(requests[1].params, { path: "input.ts", position: 6 });
+    children[0].stdout.write(
+      encodeFrame({
+        jsonrpc: "2.0",
+        id: requests[1].id,
+        result: {
+          name: "answer",
+          kind: "const",
+          typeDisplay: "42",
+          display: "const answer: 42",
+          range: { start: 6, end: 12 },
+        },
+      }),
+    );
+    assert.deepEqual(await pending, {
+      name: "answer",
+      kind: "const",
+      typeDisplay: "42",
+      display: "const answer: 42",
+      range: { start: 6, end: 12 },
+    });
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("session quickInfo resolves null when no symbol sits under the position", async () => {
+  const { transport, children, requests } = requestFixture();
+  const session = new api.Session({ transport });
+  try {
+    const pending = session.quickInfo({ path: "input.ts", position: 0 });
+    await awaitRequests(requests, 1);
+    children[0].stdout.write(
+      encodeFrame({
+        jsonrpc: "2.0",
+        id: requests[0].id,
+        result: { root: "/virtual", methods: [...SERVICE_METHODS] },
+      }),
+    );
+    await awaitRequests(requests, 2);
+    assert.equal(requests[1].method, "service/quickInfo");
+    assert.deepEqual(requests[1].params, { path: "input.ts", position: 0 });
+    children[0].stdout.write(
+      encodeFrame({ jsonrpc: "2.0", id: requests[1].id, result: null }),
+    );
+    assert.equal(await pending, null);
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("async and serial services wire quickInfo with the exact method name and request shape", async () => {
+  const asyncFixture = requestFixture();
+  const serialFixture = requestFixture();
+  const asyncService = createAsyncService({ transport: asyncFixture.transport });
+  const serialService = createSerialService({ transport: serialFixture.transport });
+  try {
+    const asyncPending = asyncService.quickInfo({ path: "input.ts", position: 6 });
+    const serialPending = serialService.quickInfo({ path: "input.ts", position: 6 });
+    await awaitRequests(asyncFixture.requests, 1);
+    await awaitRequests(serialFixture.requests, 1);
+    asyncFixture.children[0].stdout.write(
+      encodeFrame({
+        jsonrpc: "2.0",
+        id: asyncFixture.requests[0].id,
+        result: { root: "/virtual", methods: [...SERVICE_METHODS] },
+      }),
+    );
+    serialFixture.children[0].stdout.write(
+      encodeFrame({
+        jsonrpc: "2.0",
+        id: serialFixture.requests[0].id,
+        result: { root: "/virtual", methods: [...SERVICE_METHODS] },
+      }),
+    );
+    await awaitRequests(asyncFixture.requests, 2);
+    await awaitRequests(serialFixture.requests, 2);
+    assert.deepEqual(
+      asyncFixture.requests.map(({ method }) => method),
+      ["initialize", "service/quickInfo"],
+    );
+    assert.deepEqual(
+      serialFixture.requests.map(({ method }) => method),
+      ["initialize", "service/quickInfo"],
+    );
+    assert.deepEqual(asyncFixture.requests[1].params, {
+      path: "input.ts",
+      position: 6,
+      async: true,
+    });
+    assert.deepEqual(serialFixture.requests[1].params, { path: "input.ts", position: 6 });
+    asyncFixture.children[0].stdout.write(
+      encodeFrame({
+        jsonrpc: "2.0",
+        id: asyncFixture.requests[1].id,
+        result: {
+          name: "answer",
+          kind: "const",
+          typeDisplay: "42",
+          display: "const answer: 42",
+          range: { start: 6, end: 12 },
+        },
+      }),
+    );
+    serialFixture.children[0].stdout.write(
+      encodeFrame({ jsonrpc: "2.0", id: serialFixture.requests[1].id, result: null }),
+    );
+    assert.deepEqual(await asyncPending, {
+      name: "answer",
+      kind: "const",
+      typeDisplay: "42",
+      display: "const answer: 42",
+      range: { start: 6, end: 12 },
+    });
+    assert.equal(await serialPending, null);
+  } finally {
+    await asyncService.dispose();
+    await serialService.dispose();
+  }
 });
 
 test("tsc executable forwards arguments and records the CLI exit status", async () => {

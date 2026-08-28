@@ -8,6 +8,7 @@ export const SERVICE_METHODS = [
   "snapshot",
   "completions",
   "definition",
+  "quickInfo",
   "references",
   "rename",
   "diagnostics",
