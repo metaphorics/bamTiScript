@@ -10,9 +10,10 @@ use std::{
 use crate::source::Utf16Pos;
 
 use super::{
-    Completion, DiagnosticEntry, DocumentSnapshot, Location, RenameResult, ServiceError,
+    Completion, DiagnosticEntry, DocumentSnapshot, Location, QuickInfo, RenameResult, ServiceError,
     ServiceSnapshot, filesystem::FileSystem, sync::SyncService,
 };
+
 pub use bamts_cancel::CancellationToken;
 
 /// Async facade over the exact synchronous implementation. It contributes only
@@ -114,6 +115,17 @@ impl<F: FileSystem> AsyncService<F> {
         let _permit = self.begin(cancellation)?;
         self.sync
             .definition_with_cancel(path, position, cancellation.clone())
+    }
+
+    pub async fn quick_info(
+        &self,
+        path: impl AsRef<Path>,
+        position: Utf16Pos,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<QuickInfo>, ServiceError> {
+        let _permit = self.begin(cancellation)?;
+        self.sync
+            .quick_info_with_cancel(path, position, cancellation.clone())
     }
 
     pub async fn references(

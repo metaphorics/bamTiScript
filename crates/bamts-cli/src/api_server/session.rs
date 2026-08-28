@@ -16,8 +16,8 @@ use bamts_compiler::{
     diagnostic::DiagnosticSeverity,
     public_ast::{self, NodeRef},
     service::{
-        Completion, DiagnosticEntry, DocumentSnapshot, Location, RenameResult, ServiceError,
-        ServiceSnapshot,
+        Completion, DiagnosticEntry, DocumentSnapshot, Location, QuickInfo, QuickInfoKind,
+        RenameResult, ServiceError, ServiceSnapshot,
         r#async::{AsyncService, CancellationToken},
         filesystem::{FileSystem, OsFileSystem},
         sync::SyncService,
@@ -168,6 +168,7 @@ impl Session {
             "service/snapshot" => self.snapshot(params, cancellation),
             "service/completions" => self.completions(params, cancellation),
             "service/definition" => self.definition(params, cancellation),
+            "service/quickInfo" => self.quick_info(params, cancellation),
             "service/references" => self.references(params, cancellation),
             "service/rename" => self.rename(params, cancellation),
             "service/diagnostics" => self.diagnostics(params, cancellation),
@@ -350,6 +351,29 @@ impl Session {
         }
         .map_err(|error| service_error(&error))?;
         Ok(location.as_ref().map_or(Value::Null, location_value))
+    }
+
+    fn quick_info(
+        &self,
+        params: Option<&Value>,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, ApiError> {
+        let object = params_object(params)?;
+        let path = require_str(object, "path")?.to_owned();
+        let position = require_position(object)?;
+        let compiler = self.compiler()?;
+        let info = if wants_async(object) {
+            complete_now(compiler.r#async.quick_info(&path, position, cancellation))?
+        } else {
+            compiler
+                .sync
+                .quick_info_with_cancel(&path, position, cancellation.clone())
+        }
+        .map_err(|error| service_error(&error))?;
+        match info {
+            Some(info) => Ok(quick_info_value(&info)),
+            None => Ok(Value::Null),
+        }
     }
 
     fn references(
@@ -1102,14 +1126,15 @@ fn clone_node_value(node: NodeRef<'_>, id: Option<NodeId>) -> Result<Value, ApiE
     Ok(canonical_node_match!(node, cloned_from_node(id)))
 }
 
-/// The nine mandatory service methods, reported by `initialize`.
-pub(crate) const SERVICE_METHODS: [&str; 9] = [
+/// The ten mandatory service methods, reported by `initialize`.
+pub(crate) const SERVICE_METHODS: [&str; 10] = [
     "service/open",
     "service/update",
     "service/close",
     "service/snapshot",
     "service/completions",
     "service/definition",
+    "service/quickInfo",
     "service/references",
     "service/rename",
     "service/diagnostics",
@@ -1202,6 +1227,16 @@ fn location_value(location: &Location) -> Value {
     json!({ "path": path_text(&location.path), "range": range_value(location.range) })
 }
 
+fn quick_info_value(info: &QuickInfo) -> Value {
+    json!({
+        "name": info.name,
+        "kind": quick_info_kind_name(info.kind),
+        "typeDisplay": info.type_display,
+        "display": info.display(),
+        "range": range_value(info.range),
+    })
+}
+
 fn rename_value(result: &RenameResult) -> Value {
     let edits: Vec<Value> = result
         .edit
@@ -1232,6 +1267,13 @@ const fn severity_name(severity: DiagnosticSeverity) -> &'static str {
     match severity {
         DiagnosticSeverity::Error => "error",
         DiagnosticSeverity::Warning => "warning",
+    }
+}
+
+const fn quick_info_kind_name(kind: QuickInfoKind) -> &'static str {
+    match kind {
+        QuickInfoKind::Symbol(kind) => symbol_kind_name(kind),
+        QuickInfoKind::Property => "property",
     }
 }
 

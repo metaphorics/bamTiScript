@@ -5,11 +5,11 @@ use std::{
 };
 
 use crate::{
-    checker::{SymbolId, SymbolKind},
+    checker::{SymbolId, SymbolKind, render_type},
     diagnostic::DiagnosticSeverity,
     scanner,
     source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos},
-    syntax::{Token, TokenKind},
+    syntax::{Token, TokenKind, VariableKind},
 };
 
 use super::{DocumentSnapshot, ServiceError, ServiceState, filesystem::FileSystem};
@@ -54,6 +54,48 @@ pub struct DiagnosticEntry {
     pub message: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuickInfoKind {
+    Symbol(SymbolKind),
+    Property,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuickInfo {
+    pub name: String,
+    pub kind: QuickInfoKind,
+    pub type_display: String,
+    pub range: TextRange,
+}
+
+impl QuickInfo {
+    #[must_use]
+    pub fn display(&self) -> String {
+        let kind = match self.kind {
+            QuickInfoKind::Symbol(SymbolKind::Variable(VariableKind::Const)) => "const",
+            QuickInfoKind::Symbol(SymbolKind::Variable(VariableKind::Let)) => "let",
+            QuickInfoKind::Symbol(SymbolKind::Variable(VariableKind::Var)) => "var",
+            QuickInfoKind::Symbol(SymbolKind::Variable(VariableKind::Using)) => "using",
+            QuickInfoKind::Symbol(SymbolKind::Variable(VariableKind::AwaitUsing)) => "await using",
+            QuickInfoKind::Symbol(SymbolKind::Function) => "function",
+            QuickInfoKind::Symbol(SymbolKind::Class) => "class",
+            QuickInfoKind::Symbol(SymbolKind::Interface) => "interface",
+            QuickInfoKind::Symbol(SymbolKind::TypeAlias) => "type",
+            QuickInfoKind::Symbol(SymbolKind::Enum) => "enum",
+            QuickInfoKind::Symbol(SymbolKind::EnumMember) => "enum member",
+            QuickInfoKind::Symbol(SymbolKind::Parameter) => "parameter",
+            QuickInfoKind::Symbol(SymbolKind::TypeParameter) => "type parameter",
+            QuickInfoKind::Symbol(SymbolKind::Import) => "alias",
+            QuickInfoKind::Symbol(SymbolKind::Namespace) => "namespace",
+            QuickInfoKind::Symbol(SymbolKind::IntrinsicValue | SymbolKind::IntrinsicType) => {
+                "symbol"
+            }
+            QuickInfoKind::Property => "property",
+        };
+        format!("{kind} {}: {}", self.name, self.type_display)
+    }
+}
+
 impl<F: FileSystem> ServiceState<F> {
     pub fn completions(
         &mut self,
@@ -92,6 +134,33 @@ impl<F: FileSystem> ServiceState<F> {
         Ok(Some(Location {
             path: document.path().to_path_buf(),
             range: document.semantic().symbol(symbol).range(),
+        }))
+    }
+
+    pub fn quick_info(
+        &mut self,
+        path: impl AsRef<Path>,
+        position: Utf16Pos,
+    ) -> Result<Option<QuickInfo>, ServiceError> {
+        let document = self.ensure_document(path.as_ref())?;
+        let symbol = symbol_at(&document, position)?;
+        let Some(token) = token_at(&document, position) else {
+            return Ok(None);
+        };
+        let Some(symbol) = symbol else {
+            return Ok(property_quick_info(&document, token));
+        };
+        let model = document.semantic();
+        let target = model.symbol(symbol);
+        let type_id = model.symbol_type(symbol);
+        if matches!(model.types().get(type_id), crate::checker::Type::Error) {
+            return Ok(None);
+        }
+        Ok(Some(QuickInfo {
+            name: target.name().to_owned(),
+            kind: QuickInfoKind::Symbol(target.kind()),
+            type_display: render_type(model, type_id),
+            range: token.range(),
         }))
     }
 
@@ -223,66 +292,75 @@ fn symbol_at(
     let Some(token) = token_at(document, position) else {
         return Ok(None);
     };
-    let Some(name) = identifier_text(document, token) else {
+    if identifier_text(document, token).is_none() {
         return Ok(None);
-    };
+    }
     let model = document.semantic();
 
     if let Some((index, _)) = model
         .symbols()
         .iter()
         .enumerate()
-        .find(|(_, symbol)| symbol.name() == name && symbol.range() == token.range())
+        .find(|(_, symbol)| symbol.range() == token.range())
     {
-        return Ok(Some(SymbolId::new(index as u32)));
+        let index = u32::try_from(index).expect("symbol table exceeds u32");
+        return Ok(Some(SymbolId::new(index)));
     }
 
-    let mut matching = model
-        .symbols()
+    Ok(model
+        .symbol_references()
         .iter()
-        .enumerate()
-        .filter(|(_, symbol)| symbol.name() == name);
-    let first = matching
-        .next()
-        .map(|(index, _)| SymbolId::new(index as u32));
-    if matching.next().is_none() {
-        Ok(first)
-    } else {
-        Ok(None)
-    }
+        .find_map(|(range, symbol)| (*range == token.range()).then_some(*symbol)))
 }
 
 fn reference_locations(document: &DocumentSnapshot, symbol: SymbolId) -> Vec<Location> {
     let model = document.semantic();
-    let declaration = model.symbol(symbol);
-    let semantic_reference_count = model
-        .references()
-        .filter(|(_, target)| *target == symbol)
-        .count();
-    let mut candidates = document
-        .source()
-        .tokens()
-        .iter()
-        .filter(|token| identifier_text(document, token).as_deref() == Some(declaration.name()))
-        .map(Token::range)
-        .collect::<Vec<_>>();
-
-    // The checker owns symbol identity. Lexical ranges are used only when their
-    // cardinality exactly matches its declaration-plus-reference fact; otherwise
-    // the service returns the declaration rather than inventing references.
-    if candidates.len() != semantic_reference_count + 1 {
-        candidates.clear();
-        candidates.push(declaration.range());
-    }
-    candidates.sort_by_key(|range| (range.start(), range.end()));
-    candidates.dedup();
-    candidates
+    let mut ranges = Vec::with_capacity(model.symbol_references().len() + 1);
+    ranges.push(model.symbol(symbol).range());
+    ranges.extend(
+        model
+            .symbol_references()
+            .iter()
+            .filter_map(|(range, target)| (*target == symbol).then_some(*range)),
+    );
+    ranges.sort_by_key(|range| (range.start(), range.end()));
+    ranges.dedup();
+    ranges
         .into_iter()
         .map(|range| Location {
             path: document.path().to_path_buf(),
             range,
         })
         .collect()
+}
+
+fn property_quick_info(document: &DocumentSnapshot, token: &Token) -> Option<QuickInfo> {
+    let tokens = document.source().tokens();
+    let index = tokens
+        .iter()
+        .position(|candidate| candidate.range() == token.range())?;
+    let previous = index.checked_sub(1).and_then(|index| tokens.get(index))?;
+    if !matches!(previous.kind(), TokenKind::Dot | TokenKind::QuestionDot) {
+        return None;
+    }
+
+    let model = document.semantic();
+    let (_, type_id) = model
+        .typed_expressions()
+        .iter()
+        .filter(|(range, _)| {
+            range.start() < token.range().start() && range.end() == token.range().end()
+        })
+        .min_by_key(|(range, _)| range.len())?;
+    if matches!(model.types().get(*type_id), crate::checker::Type::Error) {
+        return None;
+    }
+    Some(QuickInfo {
+        name: identifier_text(document, token)?,
+        kind: QuickInfoKind::Property,
+        type_display: render_type(model, *type_id),
+        range: token.range(),
+    })
 }
 
 fn token_at(document: &DocumentSnapshot, position: Utf16Pos) -> Option<&Token> {
@@ -451,5 +529,116 @@ mod tests {
             Err(ServiceError::InvalidRename(_))
         ));
         fs::remove_dir_all(root).expect("remove root");
+    }
+    #[test]
+    fn quick_info_renders_primitives_functions_and_unions() {
+        let (root, mut state) = state(
+            "const value: number = 1;\nfunction greet(name: string): string { return name; }\nconst choice: number | string = value;\n",
+        );
+        let value = state
+            .quick_info("a.ts", Utf16Pos::new(6))
+            .expect("quick info")
+            .expect("value");
+        assert_eq!(value.type_display, "number");
+        assert_eq!(value.display(), "const value: number");
+        let function = state
+            .quick_info("a.ts", Utf16Pos::new(34))
+            .expect("quick info")
+            .expect("function");
+        assert_eq!(function.type_display, "(name: string) => string");
+        assert_eq!(
+            function.display(),
+            "function greet: (name: string) => string"
+        );
+        let union = state
+            .quick_info("a.ts", Utf16Pos::new(85))
+            .expect("quick info")
+            .expect("union");
+        assert_eq!(union.type_display, "number | string");
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn quick_info_uses_reference_token_range_and_returns_none_for_whitespace() {
+        let (root, mut state) = state("const answer: number = 1;\nanswer;\n");
+        let info = state
+            .quick_info("a.ts", Utf16Pos::new(30))
+            .expect("quick info")
+            .expect("reference");
+        assert_eq!(info.range.start(), Utf16Pos::new(26));
+        assert_eq!(info.range.end(), Utf16Pos::new(32));
+        assert!(
+            state
+                .quick_info("a.ts", Utf16Pos::new(25))
+                .expect("whitespace")
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn semantic_ranges_distinguish_shadowed_symbols() {
+        let (root, mut state) =
+            state("const value: number = 1;\n{ const value: string = \"x\"; value; }\nvalue;\n");
+        let inner = state
+            .quick_info("a.ts", Utf16Pos::new(54))
+            .expect("quick info")
+            .expect("inner reference");
+        let outer = state
+            .quick_info("a.ts", Utf16Pos::new(63))
+            .expect("quick info")
+            .expect("outer reference");
+        assert_eq!(inner.type_display, "string");
+        assert_eq!(outer.type_display, "number");
+        assert_eq!(
+            state
+                .references("a.ts", Utf16Pos::new(54))
+                .expect("inner references")
+                .into_iter()
+                .map(|location| location.range.start())
+                .collect::<Vec<_>>(),
+            [Utf16Pos::new(33), Utf16Pos::new(54)]
+        );
+        assert_eq!(
+            state
+                .references("a.ts", Utf16Pos::new(63))
+                .expect("outer references")
+                .into_iter()
+                .map(|location| location.range.start())
+                .collect::<Vec<_>>(),
+            [Utf16Pos::new(6), Utf16Pos::new(63)]
+        );
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn quick_info_reports_member_property_type() {
+        let (root, mut state) =
+            state("const value: number = 1;\nconst object = { value: \"x\" };\nobject.value;\n");
+        let property = state
+            .quick_info("a.ts", Utf16Pos::new(63))
+            .expect("quick info")
+            .expect("property reference");
+        assert_eq!(property.kind, QuickInfoKind::Property);
+        assert_eq!(property.type_display, "string");
+        assert_eq!(property.display(), "property value: string");
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn quick_info_honors_utf16_positions_and_cancellation() {
+        let (root, mut state) = state("const value: number = 1;\n😀; value;\n");
+        let info = state
+            .quick_info("a.ts", Utf16Pos::new(29))
+            .expect("quick info")
+            .expect("reference");
+        assert_eq!(info.name, "value");
+        let cancellation = bamts_cancel::CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            state.quick_info_with_cancel("a.ts", Utf16Pos::new(29), &cancellation),
+            Err(ServiceError::Cancelled)
+        ));
+        std::fs::remove_dir_all(root).expect("remove root");
     }
 }

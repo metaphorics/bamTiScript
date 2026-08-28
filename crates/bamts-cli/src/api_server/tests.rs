@@ -903,7 +903,7 @@ fn public_ast_rejects_stale_ids_ranges_predicates_and_escaped_paths() {
 }
 
 #[test]
-fn initialize_reports_all_nine_service_methods_once() {
+fn initialize_reports_all_ten_service_methods_once() {
     let root = temp_root("methods");
     let mut input = frame(&init(&root));
     input.extend(frame(&format!(
@@ -916,7 +916,7 @@ fn initialize_reports_all_nine_service_methods_once() {
     let methods = responses[0]["result"]["methods"]
         .as_array()
         .expect("methods");
-    assert_eq!(methods.len(), 9);
+    assert_eq!(methods.len(), 10);
     for method in SERVICE_METHODS {
         assert!(
             methods.contains(&json!(method)),
@@ -949,18 +949,24 @@ fn service_state_persists_across_requests() {
         r#"{"id":7,"method":"service/definition","params":{"path":"a.ts","position":6}}"#,
     ));
     input.extend(frame(
-        r#"{"id":8,"method":"service/references","params":{"path":"a.ts","position":6}}"#,
+        r#"{"id":8,"method":"service/quickInfo","params":{"path":"a.ts","position":6}}"#,
     ));
     input.extend(frame(
-            r#"{"id":9,"method":"service/rename","params":{"path":"a.ts","position":6,"newName":"beta"}}"#,
-        ));
+        r#"{"id":9,"method":"service/quickInfo","params":{"path":"a.ts","position":5}}"#,
+    ));
     input.extend(frame(
-        r#"{"id":10,"method":"service/close","params":{"path":"a.ts"}}"#,
+        r#"{"id":10,"method":"service/references","params":{"path":"a.ts","position":6}}"#,
+    ));
+    input.extend(frame(
+        r#"{"id":11,"method":"service/rename","params":{"path":"a.ts","position":6,"newName":"beta"}}"#,
+    ));
+    input.extend(frame(
+        r#"{"id":12,"method":"service/close","params":{"path":"a.ts"}}"#,
     ));
 
     let responses = run(input);
     fs::remove_dir_all(&root).expect("remove root");
-    assert_eq!(responses.len(), 10);
+    assert_eq!(responses.len(), 12);
 
     assert_eq!(responses[1]["result"]["version"], json!(1));
     assert_eq!(responses[2]["result"]["version"], json!(2));
@@ -980,7 +986,7 @@ fn service_state_persists_across_requests() {
     );
     assert_eq!(documents[0]["open"], json!(true));
 
-    for (index, response) in responses.iter().enumerate().skip(4).take(5) {
+    for (index, response) in responses.iter().enumerate().skip(4).take(7) {
         assert!(
             response.get("error").is_none(),
             "response {index} failed: {response}"
@@ -988,12 +994,23 @@ fn service_state_persists_across_requests() {
     }
     assert!(responses[4]["result"].is_array(), "diagnostics is a list");
     assert!(responses[5]["result"].is_array(), "completions is a list");
-    assert!(responses[7]["result"].is_array(), "references is a list");
+    assert_eq!(
+        responses[7]["result"],
+        json!({
+            "name": "alpha",
+            "kind": "const",
+            "typeDisplay": "2",
+            "display": "const alpha: 2",
+            "range": { "start": 6, "end": 11 },
+        })
+    );
+    assert_eq!(responses[8]["result"], Value::Null);
+    assert!(responses[9]["result"].is_array(), "references is a list");
     assert!(
-        responses[8]["result"]["symbol"].is_string(),
+        responses[10]["result"]["symbol"].is_string(),
         "rename names its symbol"
     );
-    assert_eq!(responses[9]["result"]["closed"], json!(true));
+    assert_eq!(responses[11]["result"]["closed"], json!(true));
 }
 
 #[test]

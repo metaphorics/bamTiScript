@@ -29,7 +29,8 @@ use crate::{
 use filesystem::{FileMetadata, FileSystem, FileSystemError};
 
 pub use language_service::{
-    Completion, DiagnosticEntry, DocumentEdit, Location, RenameEdit, RenameResult,
+    Completion, DiagnosticEntry, DocumentEdit, Location, QuickInfo, QuickInfoKind, RenameEdit,
+    RenameResult,
 };
 
 /// A public service request failure. Compiler diagnostics remain ordinary query data.
@@ -430,6 +431,18 @@ impl<F: FileSystem> ServiceState<F> {
         self.ensure_document_with_cancel(path, cancel)?;
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
         self.references(path, position)
+    }
+
+    pub fn quick_info_with_cancel(
+        &mut self,
+        path: impl AsRef<Path>,
+        position: crate::source::Utf16Pos,
+        cancel: &CancellationToken,
+    ) -> Result<Option<QuickInfo>, ServiceError> {
+        let path = path.as_ref();
+        self.ensure_document_with_cancel(path, cancel)?;
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        self.quick_info(path, position)
     }
 
     pub fn rename_with_cancel(

@@ -202,6 +202,7 @@ impl Session {
                 }
                 "textDocument/completion" => self.completion(id.value(), params),
                 "textDocument/definition" => self.definition(id.value(), params),
+                "textDocument/hover" => self.hover(id.value(), params),
                 "textDocument/references" => self.references(id.value(), params),
                 "textDocument/rename" => self.rename(id.value(), params),
                 _ => error_response(id.value(), -32601, "Method not found"),
@@ -266,6 +267,7 @@ impl Session {
                     "textDocumentSync": { "openClose": true, "change": 1 },
                     "completionProvider": { "triggerCharacters": ["."] },
                     "definitionProvider": true,
+                    "hoverProvider": true,
                     "referencesProvider": true,
                     "renameProvider": true
                 },
@@ -508,6 +510,27 @@ impl Session {
         }
     }
 
+    fn hover(&mut self, id: Value, params: &Value) -> Value {
+        let Some((path, position)) = self.doc_position(params) else {
+            return error_response(id, -32602, "Invalid params");
+        };
+        match self.state.quick_info(&path, position) {
+            Ok(Some(info)) => {
+                let mut result = json!({
+                    "contents": { "kind": "plaintext", "value": info.display() }
+                });
+                if let Some(snapshot) = self.snapshots.get(&path)
+                    && let Some(range) = lsp_range(snapshot.source().source_text(), info.range)
+                {
+                    result["range"] = range;
+                }
+                json!({ "jsonrpc": "2.0", "id": id, "result": result })
+            }
+            Ok(None) => json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }),
+            Err(error) => error_response(id, -32603, &error.to_string()),
+        }
+    }
+
     fn references(&mut self, id: Value, params: &Value) -> Value {
         let Some((path, position)) = self.doc_position(params) else {
             return error_response(id, -32602, "Invalid params");
@@ -590,10 +613,8 @@ impl Session {
         let line = u32::try_from(position.get("line").and_then(Value::as_u64)?).ok()?;
         let character = u32::try_from(position.get("character").and_then(Value::as_u64)?).ok()?;
         let snapshot = self.snapshots.get(&path)?;
-        Some((
-            path.clone(),
-            lsp_position(snapshot.source().source_text().as_str(), line, character),
-        ))
+        let position = lsp_position(snapshot.source().source_text().as_str(), line, character)?;
+        Some((path.clone(), position))
     }
 }
 
@@ -606,38 +627,49 @@ fn lsp_range(source: &SourceText, range: TextRange) -> Option<Value> {
     }))
 }
 
-fn lsp_position(source: &str, line: u32, character: u32) -> Utf16Pos {
-    let mut current_line = 0u32;
-    let mut current_character = 0u32;
+fn lsp_position(source: &str, line: u32, character: u32) -> Option<Utf16Pos> {
+    let requested_line = usize::try_from(line).ok()?;
+    let requested_character = usize::try_from(character).ok()?;
+    let mut current_line = 0usize;
+    let mut current_character = 0usize;
     let mut utf16 = 0usize;
     let mut chars = source.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if current_line == line && current_character >= character {
-            return Utf16Pos::new(utf16);
+
+    loop {
+        let Some(ch) = chars.next() else {
+            return (current_line == requested_line).then_some(Utf16Pos::new(utf16));
+        };
+        let ends_line = matches!(ch, '\r' | '\n' | '\u{2028}' | '\u{2029}');
+        if current_line == requested_line && ends_line {
+            return Some(Utf16Pos::new(utf16));
         }
-        if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
+        if ends_line {
+            let width = if ch == '\r' && chars.peek() == Some(&'\n') {
                 chars.next();
-                utf16 = utf16.saturating_add(2);
+                2
             } else {
-                utf16 = utf16.saturating_add(1);
+                1
+            };
+            utf16 += width;
+            current_line += 1;
+            current_character = 0;
+            continue;
+        }
+
+        let width = ch.len_utf16();
+        if current_line == requested_line {
+            if current_character == requested_character {
+                return Some(Utf16Pos::new(utf16));
             }
-            current_line = current_line.saturating_add(1);
-            current_character = 0;
-            continue;
+            if current_character < requested_character
+                && requested_character < current_character + width
+            {
+                return None;
+            }
+            current_character += width;
         }
-        if ch == '\n' || ch == '\u{2028}' || ch == '\u{2029}' {
-            current_line = current_line.saturating_add(1);
-            current_character = 0;
-            utf16 = utf16.saturating_add(1);
-            continue;
-        }
-        if current_line == line {
-            current_character = current_character.saturating_add(ch.len_utf16() as u32);
-        }
-        utf16 = utf16.saturating_add(ch.len_utf16());
+        utf16 += width;
     }
-    Utf16Pos::new(utf16)
 }
 
 fn completion_kind(kind: SymbolKind) -> u32 {
@@ -1173,27 +1205,140 @@ mod tests {
     }
 
     #[test]
+    fn hover_reports_quick_info_with_queried_range_and_null_whitespace() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("hover.ts");
+        let source = "const answer = 1;\nlet copy = answer;\n";
+        std::fs::write(&file, source).expect("seed");
+        let uri = path_to_uri(&file);
+        // `answer` on line 1 spans characters 11..17; character 5 on line 0
+        // is whitespace between tokens.
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                open_document(&uri, source),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "textDocument/hover",
+                    "params": {
+                        "textDocument": { "uri": uri },
+                        "position": { "line": 1, "character": 12 }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "textDocument/hover",
+                    "params": {
+                        "textDocument": { "uri": uri },
+                        "position": { "line": 0, "character": 5 }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "method": "textDocument/hover",
+                    "params": {
+                        "textDocument": { "uri": uri },
+                        "position": { "line": 99, "character": 0 }
+                    }
+                }),
+            ],
+        );
+        let hover = results_with_id(&messages, &json!(10));
+        assert_eq!(hover.len(), 1);
+        let result = &hover[0]["result"];
+        assert_eq!(result["contents"]["kind"], "plaintext");
+        let display = result["contents"]["value"].as_str().expect("display");
+        assert!(
+            display.contains("answer"),
+            "display names the symbol: {display}"
+        );
+        assert_eq!(
+            result["range"],
+            json!({
+                "start": { "line": 1, "character": 11 },
+                "end": { "line": 1, "character": 17 }
+            })
+        );
+        let whitespace = results_with_id(&messages, &json!(11));
+        assert_eq!(whitespace.len(), 1);
+        assert_eq!(whitespace[0]["result"], Value::Null);
+        let invalid = results_with_id(&messages, &json!(12));
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0]["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn hover_positions_use_utf16_units_past_non_bmp_text() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("astral.ts");
+        // `😀` is one code point but two UTF-16 units, so the reference `s`
+        // sits at characters 25..26 in LSP coordinates.
+        let source = "let s = \"😀\"; let copy = s;";
+        std::fs::write(&file, source).expect("seed");
+        let uri = path_to_uri(&file);
+        let (_, messages) = lifecycle_traffic(
+            root.path(),
+            &[
+                open_document(&uri, source),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 20,
+                    "method": "textDocument/hover",
+                    "params": {
+                        "textDocument": { "uri": uri },
+                        "position": { "line": 0, "character": 25 }
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 21,
+                    "method": "textDocument/hover",
+                    "params": {
+                        "textDocument": { "uri": uri },
+                        "position": { "line": 0, "character": 10 }
+                    }
+                }),
+            ],
+        );
+        let hover = results_with_id(&messages, &json!(20));
+        assert_eq!(hover.len(), 1);
+        let result = &hover[0]["result"];
+        assert_eq!(result["contents"]["kind"], "plaintext");
+        let display = result["contents"]["value"].as_str().expect("display");
+        assert!(!display.is_empty(), "display is non-empty: {display}");
+        assert_eq!(
+            result["range"],
+            json!({
+                "start": { "line": 0, "character": 25 },
+                "end": { "line": 0, "character": 26 }
+            })
+        );
+        let invalid = results_with_id(&messages, &json!(21));
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0]["error"]["code"], json!(-32602));
+    }
+
+    #[test]
     fn lsp_position_counts_utf16_units() {
         let source = "a😀b";
-        assert_eq!(lsp_position(source, 0, 0), Utf16Pos::new(0));
-        assert_eq!(lsp_position(source, 0, 1), Utf16Pos::new(1));
-        assert_eq!(lsp_position(source, 0, 3), Utf16Pos::new(3));
+        assert_eq!(lsp_position(source, 0, 0), Some(Utf16Pos::new(0)));
+        assert_eq!(lsp_position(source, 0, 1), Some(Utf16Pos::new(1)));
+        assert_eq!(lsp_position(source, 0, 2), None);
+        assert_eq!(lsp_position(source, 0, 3), Some(Utf16Pos::new(3)));
     }
 
     #[test]
     fn lsp_position_respects_lines_and_utf16_units() {
         let source = "a😀\r\n😀b\nok";
-        // Line 0: "a😀" is 3 UTF-16 units, then "\r\n" is 2.
-        assert_eq!(lsp_position(source, 1, 0), Utf16Pos::new(5));
-        // A position inside the surrogate pair snaps to its end.
-        assert_eq!(lsp_position(source, 1, 1), Utf16Pos::new(7));
-        assert_eq!(lsp_position(source, 1, 2), Utf16Pos::new(7));
-        // Line 2: 4 + 1 (bare \n) + 3 + 1 = 9.
-        assert_eq!(lsp_position(source, 2, 0), Utf16Pos::new(9));
-        // Positions past the end of a line clamp to the line end.
-        assert_eq!(lsp_position(source, 2, 100), Utf16Pos::new(11));
-        // Lines past the end of the file clamp to the source end.
-        assert_eq!(lsp_position(source, 9, 0), Utf16Pos::new(11));
+        assert_eq!(lsp_position(source, 1, 0), Some(Utf16Pos::new(5)));
+        assert_eq!(lsp_position(source, 1, 1), None);
+        assert_eq!(lsp_position(source, 1, 2), Some(Utf16Pos::new(7)));
+        assert_eq!(lsp_position(source, 2, 0), Some(Utf16Pos::new(9)));
+        assert_eq!(lsp_position(source, 2, 100), Some(Utf16Pos::new(11)));
+        assert_eq!(lsp_position(source, 9, 0), None);
     }
 
     #[test]
@@ -1214,6 +1359,7 @@ mod tests {
             [
                 "completionProvider",
                 "definitionProvider",
+                "hoverProvider",
                 "positionEncoding",
                 "referencesProvider",
                 "renameProvider",
@@ -1448,7 +1594,7 @@ mod tests {
             &[json!({
                 "jsonrpc": "2.0",
                 "id": 21,
-                "method": "textDocument/hover",
+                "method": "textDocument/typeDefinition",
                 "params": {}
             })],
         );

@@ -7,7 +7,7 @@ use std::{
 use crate::source::Utf16Pos;
 
 use super::{
-    Completion, DiagnosticEntry, DocumentSnapshot, Location, RenameResult, ServiceError,
+    Completion, DiagnosticEntry, DocumentSnapshot, Location, QuickInfo, RenameResult, ServiceError,
     ServiceSnapshot, ServiceState, filesystem::FileSystem,
 };
 
@@ -137,6 +137,26 @@ impl<F: FileSystem> SyncService<F> {
             .write()
             .map_err(|_| ServiceError::LockPoisoned)?
             .definition_with_cancel(path, position, &cancel)
+    }
+
+    pub fn quick_info(
+        &self,
+        path: impl AsRef<Path>,
+        position: Utf16Pos,
+    ) -> Result<Option<QuickInfo>, ServiceError> {
+        self.quick_info_with_cancel(path, position, CancellationToken::new())
+    }
+
+    pub fn quick_info_with_cancel(
+        &self,
+        path: impl AsRef<Path>,
+        position: Utf16Pos,
+        cancel: CancellationToken,
+    ) -> Result<Option<QuickInfo>, ServiceError> {
+        self.state
+            .write()
+            .map_err(|_| ServiceError::LockPoisoned)?
+            .quick_info_with_cancel(path, position, &cancel)
     }
 
     pub fn references(

@@ -41,6 +41,10 @@ pub mod overloads;
 #[path = "checker/relations.rs"]
 pub mod relations;
 
+#[path = "checker/type_display.rs"]
+mod type_display;
+pub use type_display::render_type;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
