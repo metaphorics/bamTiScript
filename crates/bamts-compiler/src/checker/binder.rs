@@ -36,10 +36,10 @@ use super::{
     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
     IMPORT_CONFLICTS_WITH_LOCAL, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
     MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
-    NEW_TARGET_OUTSIDE_FUNCTION, PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST,
-    PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
-    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
-    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+    NEW_TARGET_OUTSIDE_FUNCTION, PARAMETER_DECORATOR_NOT_SUPPORTED,
+    PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
+    SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+    STRICT_NULL_MEMBER_ACCESS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
     SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE,
     TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
     USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
@@ -62,15 +62,15 @@ use super::{
     INVALID_INDEXED_ACCESS_KEY_MESSAGE, MEMBER_NOT_ACCESSIBLE_MESSAGE,
     MISSING_METHOD_RETURN_TYPE_MESSAGE, MIXED_EXPORT_ASSIGNMENT_MESSAGE,
     NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
-    PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
-    PROPERTY_NOT_INITIALIZED_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
-    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
-    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
-    SUPER_REFERENCE_NON_DERIVED_MESSAGE, TYPE_ALIAS_CIRCULAR_MESSAGE,
-    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
-    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
-    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
-    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE,
+    PROPERTY_DOES_NOT_EXIST_MESSAGE, PROPERTY_NOT_INITIALIZED_MESSAGE,
+    SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
+    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
+    SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_REFERENCE_NON_DERIVED_MESSAGE,
+    TYPE_ALIAS_CIRCULAR_MESSAGE, TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
+    UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
+    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
+    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -4427,6 +4427,26 @@ enum SuperCallContext {
     NonConstructor,
 }
 
+/// The innermost function-like home a `super.x` member access can legally
+/// appear in, innermost last.
+///
+/// TypeScript permits a `super` member access inside class members (methods,
+/// accessors, constructors, property initializers, static blocks) and inside
+/// object-literal methods; a base class member has no base type to read the
+/// member from. Plain functions and the module top level have no member home.
+/// Arrow functions push nothing, so the enclosing member home stays visible
+/// through them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuperMemberHome {
+    /// Inside a member of a class. `derived` records whether that class has
+    /// a base class.
+    ClassMember { derived: bool },
+    /// Inside an object-literal method or accessor.
+    ObjectMember,
+    /// Inside any other function, which has no member home.
+    NonMemberFunction,
+}
+
 /// Answers [`GuardResolver`] from the binder's already-resolved facts.
 ///
 /// It borrows only the fields guard interpretation reads, so the narrowing
@@ -4597,6 +4617,11 @@ pub(crate) struct Binder<'src> {
     /// Enclosing function contexts for `super(...)` call legality, innermost
     /// last. Empty means top level, which behaves as
     /// [`SuperCallContext::NonConstructor`].
+    /// Enclosing member homes for `super.x` member access legality, innermost
+    /// last. Empty (or [`SuperMemberHome::NonMemberFunction`] at the top)
+    /// means the access has no member home. Arrow functions never push, so a
+    /// member home stays visible through them.
+    super_member_homes: Vec<SuperMemberHome>,
     super_call_contexts: Vec<SuperCallContext>,
     /// Legal `super()` presence for active derived constructor bodies.
     derived_constructor_super_presence: Vec<bool>,
@@ -4728,6 +4753,7 @@ impl<'src> Binder<'src> {
             class_declaration_symbols: HashMap::new(),
             class_owner_stack: Vec::new(),
             class_base_symbols: HashMap::new(),
+            super_member_homes: Vec::new(),
             jsx_element_types: HashMap::new(),
             jsx_callables: HashMap::new(),
             jsx_factory_signatures: HashMap::new(),
@@ -7960,7 +7986,14 @@ impl<'src> Binder<'src> {
                         AMBIENT_IMPLEMENTATION_MESSAGE,
                     );
                 }
-                self.resolve_function(&function.function, scope, true, true, self.types.any());
+                self.resolve_function(
+                    &function.function,
+                    scope,
+                    true,
+                    true,
+                    self.types.any(),
+                    SuperMemberHome::NonMemberFunction,
+                );
             }
             Statement::Class(class) => self.resolve_class(class, scope),
             Statement::Interface(interface) => {
@@ -8249,6 +8282,20 @@ impl<'src> Binder<'src> {
                     .get(&statement.id())
                     .copied()
                     .unwrap_or(scope);
+                // `declare namespace`, `declare module`, and every namespace
+                // body in a declaration file are ambient contexts: only
+                // declarations may appear in their statement lists.
+                if self.ambient_stack.last().copied().unwrap_or(false) || self.is_declaration_file {
+                    for body_statement in &namespace.body.data().statements {
+                        if !Self::is_declaration_statement(body_statement.data()) {
+                            self.emit(
+                                STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+                                body_statement.range(),
+                                STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
+                            );
+                        }
+                    }
+                }
                 self.active_namespace_declarations.push(statement.id());
                 self.resolve_statements(&namespace.body.data().statements, child);
                 let popped = self.active_namespace_declarations.pop();
@@ -8308,7 +8355,14 @@ impl<'src> Binder<'src> {
             ) => self.resolve_statement(inner, scope),
             crate::syntax::ExportDeclaration::Default(default) => match &default.value {
                 crate::syntax::ExportDefaultValue::Function(function) => {
-                    self.resolve_function(function, scope, true, true, self.types.any());
+                    self.resolve_function(
+                        function,
+                        scope,
+                        true,
+                        true,
+                        self.types.any(),
+                        SuperMemberHome::NonMemberFunction,
+                    );
                 }
                 crate::syntax::ExportDefaultValue::Class(class) => self.resolve_class(class, scope),
                 crate::syntax::ExportDefaultValue::Expression(expression) => {
@@ -8680,12 +8734,14 @@ impl<'src> Binder<'src> {
         new_target_allowed: bool,
         is_declaration: bool,
         this_type: TypeId,
+        member_home: SuperMemberHome,
     ) {
         let scope = self.new_scope(ScopeKind::Function, Some(parent));
         let new_target_marker = self.new_target_contexts.len();
         self.new_target_contexts.push(new_target_allowed);
         self.super_call_contexts
             .push(SuperCallContext::NonConstructor);
+        self.super_member_homes.push(member_home);
         self.bind_implicit_function_values(&function.parameters, scope);
         let function_symbol = function.name.as_ref().map(|name| {
             let symbol_scope = if is_declaration { parent } else { scope };
@@ -8703,7 +8759,7 @@ impl<'src> Binder<'src> {
             if self.is_this_parameter(parameter) {
                 continue;
             }
-            self.resolve_parameter(parameter, scope);
+            self.resolve_non_constructor_parameter(parameter, scope);
         }
         let annotated_return_type = function
             .return_type
@@ -8800,6 +8856,8 @@ impl<'src> Binder<'src> {
         self.new_target_contexts.truncate(new_target_marker);
         let popped_context = self.super_call_contexts.pop();
         debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
+        let popped_home = self.super_member_homes.pop();
+        debug_assert_eq!(popped_home, Some(member_home));
     }
 
     pub(crate) fn bind_type_parameters(
@@ -8931,6 +8989,29 @@ impl<'src> Binder<'src> {
             self.emit(code, decorator.range(), message);
             self.resolve_expr(&decorator.data().expression, scope);
         }
+    }
+
+    fn reject_disallowed_parameter_property(
+        &mut self,
+        parameter: &'src crate::syntax::ParameterNode,
+    ) {
+        let modifiers = &parameter.data().modifiers;
+        if modifiers.accessibility.is_some() || modifiers.is_readonly || modifiers.is_override {
+            self.emit(
+                PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
+                parameter.range(),
+                PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE,
+            );
+        }
+    }
+
+    fn resolve_non_constructor_parameter(
+        &mut self,
+        parameter: &'src crate::syntax::ParameterNode,
+        scope: ScopeId,
+    ) {
+        self.reject_disallowed_parameter_property(parameter);
+        self.resolve_parameter(parameter, scope);
     }
 
     fn resolve_parameter(&mut self, parameter: &'src crate::syntax::ParameterNode, scope: ScopeId) {
@@ -10476,7 +10557,15 @@ impl<'src> Binder<'src> {
                     );
                 }
                 let this_type = self.class_this_type(scope, method.modifiers.is_static);
-                self.resolve_function(&method.function, scope, false, true, this_type);
+                let derived = self.class_derived_stack.last().copied().unwrap_or(false);
+                self.resolve_function(
+                    &method.function,
+                    scope,
+                    false,
+                    true,
+                    this_type,
+                    SuperMemberHome::ClassMember { derived },
+                );
             }
             ClassMember::Constructor(constructor) => {
                 if ambient {
@@ -10511,6 +10600,8 @@ impl<'src> Binder<'src> {
                 if track_super {
                     self.derived_constructor_super_presence.push(false);
                 }
+                self.super_member_homes
+                    .push(SuperMemberHome::ClassMember { derived });
                 self.super_call_contexts.push(if derived {
                     SuperCallContext::DerivedConstructor
                 } else {
@@ -10540,9 +10631,14 @@ impl<'src> Binder<'src> {
                 self.this_context.pop();
                 self.new_target_contexts.truncate(new_target_marker);
                 self.super_call_contexts.pop();
+                let popped_home = self.super_member_homes.pop();
+                debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
             }
             ClassMember::Property(property) => {
                 self.resolve_property_name(&property.name, scope);
+                let derived = self.class_derived_stack.last().copied().unwrap_or(false);
+                self.super_member_homes
+                    .push(SuperMemberHome::ClassMember { derived });
                 let type_id = self.class_property_type(
                     property.type_annotation.as_ref(),
                     property.initializer.as_deref(),
@@ -10550,6 +10646,8 @@ impl<'src> Binder<'src> {
                     scope,
                     true,
                 );
+                let popped_home = self.super_member_homes.pop();
+                debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
                 if let Some(name) = self.property_key(&property.name)
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
@@ -10558,6 +10656,9 @@ impl<'src> Binder<'src> {
             }
             ClassMember::AutoAccessor(accessor) => {
                 self.resolve_property_name(&accessor.name, scope);
+                let derived = self.class_derived_stack.last().copied().unwrap_or(false);
+                self.super_member_homes
+                    .push(SuperMemberHome::ClassMember { derived });
                 let type_id = self.class_property_type(
                     accessor.type_annotation.as_ref(),
                     accessor.initializer.as_deref(),
@@ -10565,6 +10666,8 @@ impl<'src> Binder<'src> {
                     scope,
                     true,
                 );
+                let popped_home = self.super_member_homes.pop();
+                debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
                 if let Some(name) = self.property_key(&accessor.name)
                     && let Some(&symbol) = self.scopes[scope.0 as usize].values.get(&name)
                 {
@@ -10575,8 +10678,13 @@ impl<'src> Binder<'src> {
                 let child = self.new_scope(ScopeKind::Block, Some(scope));
                 let new_target_marker = self.new_target_contexts.len();
                 self.new_target_contexts.push(false);
+                let derived = self.class_derived_stack.last().copied().unwrap_or(false);
+                self.super_member_homes
+                    .push(SuperMemberHome::ClassMember { derived });
                 self.bind_statements(&block.data().statements, child);
                 self.resolve_statements(&block.data().statements, child);
+                let popped_home = self.super_member_homes.pop();
+                debug_assert_eq!(popped_home, Some(SuperMemberHome::ClassMember { derived }));
                 self.new_target_contexts.truncate(new_target_marker);
             }
             _ => {}
@@ -10608,9 +10716,14 @@ impl<'src> Binder<'src> {
                     self.resolve_object_member(member.data(), scope);
                 }
             }
-            Expression::Function(function) => {
-                self.resolve_function(&function.function, scope, true, false, self.types.any())
-            }
+            Expression::Function(function) => self.resolve_function(
+                &function.function,
+                scope,
+                true,
+                false,
+                self.types.any(),
+                SuperMemberHome::NonMemberFunction,
+            ),
             Expression::Class(class) => {
                 let type_id = self.resolve_class_expression(&class.class, scope);
                 if self.node_types.insert(expression.id(), type_id).is_none() {
@@ -10624,7 +10737,7 @@ impl<'src> Binder<'src> {
                     .push(SuperCallContext::NonConstructor);
                 self.bind_type_parameters(arrow.type_parameters.as_ref(), child);
                 for parameter in &arrow.parameters {
-                    self.resolve_parameter(parameter, child);
+                    self.resolve_non_constructor_parameter(parameter, child);
                 }
                 let expected_return_type = arrow.return_type.as_ref().map(|annotation| {
                     let return_type = self.resolve_type(&annotation.data().type_node, child);
@@ -10710,7 +10823,9 @@ impl<'src> Binder<'src> {
                 self.check_new(new, scope, expression.range());
             }
             Expression::Member(member) => {
-                if !matches!(member.object.data(), Expression::Super) {
+                if matches!(member.object.data(), Expression::Super) {
+                    self.check_super_member_access(member.object.range(), member.optional);
+                } else {
                     self.resolve_expr(&member.object, scope);
                 }
                 let object_symbol = self.resolved_expression_reference(&member.object);
@@ -11000,6 +11115,30 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Checks a `super.x` member access (or `super.x` assignment target)
+    /// against the enclosing member home.
+    ///
+    /// `super?.x` never forms a super property access, so it reports
+    /// [`BARE_SUPER_EXPRESSION`]. A base class member has no base type to read
+    /// the member from and reports [`SUPER_REFERENCE_NON_DERIVED`]. Derived
+    /// classes and object literals are legal. Plain functions and the top
+    /// level stay silent: no existing C-band code carries that diagnostic, and
+    /// minting one is out of scope.
+    fn check_super_member_access(&mut self, range: TextRange, optional: bool) {
+        if optional {
+            self.emit(BARE_SUPER_EXPRESSION, range, BARE_SUPER_EXPRESSION_MESSAGE);
+            return;
+        }
+        if self.super_member_homes.last() == Some(&SuperMemberHome::ClassMember { derived: false })
+        {
+            self.emit(
+                SUPER_REFERENCE_NON_DERIVED,
+                range,
+                SUPER_REFERENCE_NON_DERIVED_MESSAGE,
+            );
+        }
+    }
+
     fn check_super_call(&mut self, range: TextRange) {
         let context = self
             .super_call_contexts
@@ -11049,7 +11188,14 @@ impl<'src> Binder<'src> {
                     &method.name,
                 );
                 self.check_get_accessor(method.modifier, &method.function, &method.name);
-                self.resolve_function(&method.function, scope, false, false, self.types.any());
+                self.resolve_function(
+                    &method.function,
+                    scope,
+                    false,
+                    false,
+                    self.types.any(),
+                    SuperMemberHome::ObjectMember,
+                );
             }
             ObjectMember::Spread(spread) => self.resolve_expr(&spread.argument, scope),
             ObjectMember::Missing(_) => {}
@@ -12692,7 +12838,9 @@ impl<'src> Binder<'src> {
                 }
             }
             AssignmentTarget::Member(member) => {
-                if !matches!(member.object.data(), Expression::Super) {
+                if matches!(member.object.data(), Expression::Super) {
+                    self.check_super_member_access(member.object.range(), false);
+                } else {
                     self.resolve_expr(&member.object, scope);
                 }
                 let object_symbol = self.resolved_expression_reference(&member.object);
@@ -16276,12 +16424,13 @@ pub(crate) fn bind_source_with_environment_and_imports_with_cancel(
 mod tests {
     use super::{
         ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
-        ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, CONSTRUCTOR_TYPE_PARAMETERS,
-        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
-        FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-        PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
-        STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, ScopeId, ScopeKind, SymbolId, SymbolKind,
-        TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeParameterBounds, TypeTable, bind_source,
+        ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION,
+        CONSTRUCTOR_TYPE_PARAMETERS, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
+        FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
+        GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, PROPERTY_NOT_INITIALIZED, PropertyType,
+        SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+        SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
+        TupleShape, Type, TypeParameterBounds, TypeTable, bind_source,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -16403,6 +16552,161 @@ mod tests {
             !diagnostics
                 .iter()
                 .any(|d| d.code() == STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c052_statement_not_allowed_in_ambient_namespace() {
+        let (_, diagnostics) = bound("declare namespace N { if (true) { } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c052_statement_not_allowed_in_ambient_module() {
+        let (_, diagnostics) = bound("declare module \"M\" { if (true) { } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c052_statement_not_allowed_in_ambient_declaration_file_namespace() {
+        let (_, diagnostics) = bound_declaration("namespace N { if (true) { } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c052_runtime_namespace_allows_statements() {
+        let (_, diagnostics) = bound("namespace N { if (true) { } }\n");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_in_base_class_method() {
+        let (_, diagnostics) = bound("class Base { m() { super.x; } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_in_base_constructor() {
+        let (_, diagnostics) = bound("class Base { constructor() { super.x; } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_in_base_property_initializer() {
+        let (_, diagnostics) = bound("class Base { p = super.x; }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_in_base_static_block() {
+        let (_, diagnostics) = bound("class Base { static { super.x; } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_through_arrow_in_base_method() {
+        let (_, diagnostics) = bound("class Base { m() { const f = () => super.x; } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_assignment_in_base_method() {
+        let (_, diagnostics) = bound("class Base { m() { super.x = 1; } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_in_derived_class_is_allowed() {
+        let (_, diagnostics) =
+            bound("class Base { x = 1; }\nclass Derived extends Base { m() { super.x; } }\n");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_in_object_method_is_allowed() {
+        let (_, diagnostics) = bound("const o = { m() { super.x; } };\n");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c025_super_member_reference_in_nested_function_is_allowed() {
+        let (_, diagnostics) = bound("class Base { m() { function f() { super.x; } } }\n");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == SUPER_REFERENCE_NON_DERIVED),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn c024_super_optional_chain_is_bare_super() {
+        let (_, diagnostics) = bound("class Base { m() { super?.x; } }\n");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == BARE_SUPER_EXPRESSION),
             "{diagnostics:?}"
         );
     }

@@ -1193,6 +1193,7 @@ impl LoadState<'_> {
                             source,
                         },
                     })?;
+                    let source = source.with_declaration_file(is_declaration_path(&path));
                     self.session_bytes = accumulate_session_bytes(self.session_bytes, len)
                         .map_err(|total| ProgramLoadError::SessionTooLarge {
                             path: path.clone(),
@@ -5591,6 +5592,13 @@ mod tests {
                 .unwrap()
                 .path()
                 .ends_with("index.d.ts")
+        );
+        assert!(
+            program
+                .module(type_id)
+                .unwrap()
+                .source()
+                .is_declaration_file()
         );
         assert_eq!(
             program

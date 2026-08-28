@@ -313,6 +313,12 @@ const TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE: &str = "Type parameter has a circ
 /// Diagnostic emitted when a type alias expands directly or mutually to itself.
 pub const TYPE_ALIAS_CIRCULAR: DiagnosticCode = DiagnosticCode::new("BAMTS-C072");
 const TYPE_ALIAS_CIRCULAR_MESSAGE: &str = "Type alias circularly references itself.";
+/// Diagnostic emitted when a parameter property appears outside a constructor
+/// implementation.
+pub const PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR: DiagnosticCode =
+    DiagnosticCode::new("BAMTS-C080");
+const PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE: &str =
+    "A parameter property is only allowed in a constructor implementation.";
 
 /// One cooperative checker invocation was cancelled before completing.
 ///
@@ -2022,11 +2028,12 @@ mod tests {
         CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
         DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
         IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, MIXED_EXPORT_ASSIGNMENT,
-        PARAMETER_DECORATOR_NOT_SUPPORTED, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
-        ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
-        SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
-        TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
-        TypeTable, WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
+        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
+        PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
+        ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
+        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
+        WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -2770,7 +2777,7 @@ mod tests {
                 | BigInt64Array | BigUint64Array | Float16Array | Float32Array
                 | Float64Array | ArrayBuffer | SharedArrayBuffer | DataView
                 | Iterator | AsyncIterator | AbortSignal | URL | URLSearchParams
-                | TextEncoder | TextDecoder;",
+                | TextEncoder | TextDecoder | ImportMeta;",
         );
         assert!(
             !checker_codes(&result).contains(&CANNOT_FIND_TYPE.as_str()),
@@ -3781,6 +3788,34 @@ function check(options: Options = {}) {
         assert_eq!(
             checker_codes(&result),
             [PARAMETER_DECORATOR_NOT_SUPPORTED.as_str()]
+        );
+    }
+
+    #[test]
+    fn arrow_parameter_properties_are_rejected() {
+        let result = check_text("var v = (public x: string) => { };");
+        assert_eq!(
+            checker_codes(&result),
+            [PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR.as_str()]
+        );
+    }
+
+    #[test]
+    fn function_parameter_properties_are_rejected() {
+        let result = check_text("function f(public x: string) {}");
+        assert_eq!(
+            checker_codes(&result),
+            [PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR.as_str()]
+        );
+    }
+
+    #[test]
+    fn constructor_parameter_properties_are_allowed() {
+        let result = check_text("class C { constructor(public x: string) {} }");
+        assert!(
+            !checker_codes(&result).contains(&PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR.as_str()),
+            "{:?}",
+            checker_codes(&result)
         );
     }
 

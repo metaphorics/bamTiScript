@@ -201,4 +201,5 @@ const STANDARD_TYPES: &[&str] = &[
     "URLSearchParams",
     "TextEncoder",
     "TextDecoder",
+    "ImportMeta",
 ];
