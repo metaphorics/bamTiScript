@@ -1172,7 +1172,6 @@ const BUILD: &[OptionSpec] = &[
     flag("build", Some("b")),
     flag("verbose", Some("v")),
     flag("dry", Some("d")),
-
     flag("force", Some("f")),
     flag("clean", None),
     number_opt("builders", 1),

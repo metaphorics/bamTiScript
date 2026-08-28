@@ -1,20 +1,3 @@
-use std::error::Error;
-use std::ffi::{OsStr, OsString};
-use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-    mpsc::{self, Receiver, TryRecvError},
-};
-use serde::{
-    Serialize,
-    ser::{SerializeMap, SerializeSeq, Serializer},
-};
-use std::{thread, time::Duration};
 use bamts::discover_project;
 use bamts_compiler::CancellationToken;
 use bamts_compiler::lower::LowerOptions;
@@ -44,6 +27,23 @@ use bamts_compiler::{
     service::filesystem::OsFileSystem,
 };
 use bamts_runtime::{Limits, run_linked_program_with_cancel};
+use serde::{
+    Serialize,
+    ser::{SerializeMap, SerializeSeq, Serializer},
+};
+use std::error::Error;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+};
+use std::{thread, time::Duration};
 
 use crate::args::{ArgsError, CliArgs, ExecutionTarget, Mode};
 use crate::cli::{
@@ -1015,9 +1015,7 @@ fn unsupported_option_outcome(option: &str) -> CommandOutcome {
 /// trailing newline. The writer failure is the io error itself, and a JSON
 /// serialization failure (non-finite number) is reported as io::InvalidData
 /// through the same typed [`DriverError::ShowConfigRender`] channel.
-fn render_show_config_document<T: Serialize>(
-    document: &T,
-) -> Result<Vec<u8>, DriverError> {
+fn render_show_config_document<T: Serialize>(document: &T) -> Result<Vec<u8>, DriverError> {
     let mut buffer = Vec::new();
     let mut serializer = serde_json::Serializer::with_formatter(
         &mut buffer,
@@ -1031,7 +1029,6 @@ fn render_show_config_document<T: Serialize>(
     buffer.push(b'\n');
     Ok(buffer)
 }
-
 
 /// One typed key/value slot of the direct-route `--showConfig` document.
 /// Direct dispatch emits only options explicitly supplied on the command
@@ -1079,15 +1076,11 @@ impl Serialize for DirectShowConfig<'_> {
             })
             .collect();
         let mut state = serializer.serialize_map(Some(2))?;
-        state.serialize_entry(
-            "compilerOptions",
-            &SerializeMapEntries(options.iter()),
-        )?;
+        state.serialize_entry("compilerOptions", &SerializeMapEntries(options.iter()))?;
         state.serialize_entry("files", &files)?;
         state.end()
     }
 }
-
 
 /// Serializes a borrowed compiler-option sequence as a JSON object so the
 /// document keeps TypeScript's key order instead of a struct field order.
@@ -1165,8 +1158,11 @@ impl<'a> ProjectShowConfig<'a> {
                         root.push('/');
                     }
                     std::path::Component::Normal(segment) => {
-                        normals
-                            .push(segment.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+                        normals.push(
+                            segment
+                                .to_string_lossy()
+                                .replace(std::path::MAIN_SEPARATOR, "/"),
+                        );
                     }
                     std::path::Component::CurDir | std::path::Component::ParentDir => return None,
                 }
@@ -1177,13 +1173,19 @@ impl<'a> ProjectShowConfig<'a> {
             Some((root, normals))
         }
         let Some((base_root, base_normals)) = split_absolute(base) else {
-            return path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            return path
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
         };
         let Some((path_root, path_normals)) = split_absolute(path) else {
-            return path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            return path
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
         };
         if base_root != path_root {
-            return path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            return path
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
         }
         let shared = base_normals
             .iter()
@@ -1253,7 +1255,12 @@ impl Serialize for ProjectShowConfig<'_> {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|value| Self::relative_path(config_directory, Path::new(value.as_str().expect("include entry is a string"))))
+                .map(|value| {
+                    Self::relative_path(
+                        config_directory,
+                        Path::new(value.as_str().expect("include entry is a string")),
+                    )
+                })
                 .collect();
             state.serialize_entry("include", &paths)?;
         }
@@ -1262,7 +1269,12 @@ impl Serialize for ProjectShowConfig<'_> {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|value| Self::relative_path(config_directory, Path::new(value.as_str().expect("exclude entry is a string"))))
+                .map(|value| {
+                    Self::relative_path(
+                        config_directory,
+                        Path::new(value.as_str().expect("exclude entry is a string")),
+                    )
+                })
                 .collect();
             state.serialize_entry("exclude", &paths)?;
         }
@@ -1278,10 +1290,20 @@ impl Serialize for ProjectShowConfig<'_> {
 /// directory so the output matches TypeScript's `--showConfig` text.
 fn canonicalize_compiler_options(options: &JsonValue, config_directory: &Path) -> JsonValue {
     const ENUM_OPTIONS: &[&str] = &[
-        "target", "module", "jsx", "moduleResolution", "moduleDetection", "newLine",
+        "target",
+        "module",
+        "jsx",
+        "moduleResolution",
+        "moduleDetection",
+        "newLine",
     ];
     const PATH_FIELDS: &[&str] = &[
-        "baseUrl", "rootDir", "outDir", "declarationDir", "outFile", "tsBuildInfoFile",
+        "baseUrl",
+        "rootDir",
+        "outDir",
+        "declarationDir",
+        "outFile",
+        "tsBuildInfoFile",
     ];
     let Some(object) = options.as_object() else {
         return options.clone();
@@ -1317,12 +1339,13 @@ fn canonicalize_compiler_options(options: &JsonValue, config_directory: &Path) -
                         let relativized: Vec<JsonValue> = items
                             .iter()
                             .map(|item| {
-                                let text = item
-                                    .as_str()
-                                    .expect("typeRoots entry is a string");
+                                let text = item.as_str().expect("typeRoots entry is a string");
                                 JsonValue::String(Arc::from(
-                                    ProjectShowConfig::relative_path(config_directory, Path::new(text))
-                                        .as_str(),
+                                    ProjectShowConfig::relative_path(
+                                        config_directory,
+                                        Path::new(text),
+                                    )
+                                    .as_str(),
                                 ))
                             })
                             .collect();
@@ -1346,8 +1369,11 @@ fn canonicalize_compiler_options(options: &JsonValue, config_directory: &Path) -
                                                     .as_str()
                                                     .expect("paths target is a string");
                                                 JsonValue::String(Arc::from(
-                                                    ProjectShowConfig::relative_path(&base_url, Path::new(text))
-                                                        .as_str(),
+                                                    ProjectShowConfig::relative_path(
+                                                        &base_url,
+                                                        Path::new(text),
+                                                    )
+                                                    .as_str(),
                                                 ))
                                             })
                                             .collect();
@@ -1364,12 +1390,10 @@ fn canonicalize_compiler_options(options: &JsonValue, config_directory: &Path) -
                 }
             } else {
                 match value {
-                    JsonValue::Object(nested) => {
-                        canonicalize_compiler_options(
-                            &JsonValue::Object(nested.clone()),
-                            config_directory,
-                        )
-                    }
+                    JsonValue::Object(nested) => canonicalize_compiler_options(
+                        &JsonValue::Object(nested.clone()),
+                        config_directory,
+                    ),
                     other => other.clone(),
                 }
             };
@@ -1387,6 +1411,7 @@ fn canonicalize_compiler_options(options: &JsonValue, config_directory: &Path) -
 /// - `target` implies `module` (pre-es2022 targets → "es6"/"es2020",
 ///   esnext → "esnext") and `useDefineForClassFields: false` for
 ///   pre-es2022 targets.
+///
 /// Every implication applies only when the option is not explicitly set.
 fn implied_compiler_options(raw: &JsonObject) -> Vec<(String, JsonValue)> {
     let Some(options) = raw.get("compilerOptions").and_then(JsonValue::as_object) else {
@@ -1437,16 +1462,10 @@ fn implied_compiler_options(raw: &JsonObject) -> Vec<(String, JsonValue)> {
         if !set("useDefineForClassFields")
             && matches!(
                 target,
-                "es6" | "es2015"
-                    | "es2016" | "es2017"
-                    | "es2018" | "es2019"
-                    | "es2020" | "es2021"
+                "es6" | "es2015" | "es2016" | "es2017" | "es2018" | "es2019" | "es2020" | "es2021"
             )
         {
-            implied.push((
-                "useDefineForClassFields".to_owned(),
-                JsonValue::Bool(false),
-            ));
+            implied.push(("useDefineForClassFields".to_owned(), JsonValue::Bool(false)));
         }
     }
 
@@ -1486,29 +1505,25 @@ fn show_config_outcome<T: Serialize>(document: &T) -> Result<CommandOutcome, Dri
 fn direct_compiler_options(
     command: &ParsedTscCommand,
 ) -> impl Iterator<Item = (&'static str, DirectCompilerOption<'_>)> {
-    command
-        .options
-        .iter()
-        .filter_map(|(name, value)| {
-            // Dispatch controls are consumed by routing, not compiler state.
-            if matches!(
-                name.as_str(),
-                "help" | "version" | "init" | "showConfig" | "ignoreConfig" | "pretty" | "project"
-            ) {
-                return None;
-            }
-            let name = crate::cli::tsc_args::canonical_option_name(name)?;
-            let value = match value {
-                TscOptionValue::Bool(value) => DirectCompilerOption::Bool(*value),
-                TscOptionValue::String(value) => DirectCompilerOption::Text(value.as_str()),
-                TscOptionValue::Number(value) => DirectCompilerOption::Number(*value),
-                TscOptionValue::List(values) => DirectCompilerOption::Items(values.as_slice()),
-                TscOptionValue::Null => return None,
-            };
-            Some((name, value))
-        })
+    command.options.iter().filter_map(|(name, value)| {
+        // Dispatch controls are consumed by routing, not compiler state.
+        if matches!(
+            name.as_str(),
+            "help" | "version" | "init" | "showConfig" | "ignoreConfig" | "pretty" | "project"
+        ) {
+            return None;
+        }
+        let name = crate::cli::tsc_args::canonical_option_name(name)?;
+        let value = match value {
+            TscOptionValue::Bool(value) => DirectCompilerOption::Bool(*value),
+            TscOptionValue::String(value) => DirectCompilerOption::Text(value.as_str()),
+            TscOptionValue::Number(value) => DirectCompilerOption::Number(*value),
+            TscOptionValue::List(values) => DirectCompilerOption::Items(values.as_slice()),
+            TscOptionValue::Null => return None,
+        };
+        Some((name, value))
+    })
 }
-
 
 /// Shared serializer body over any referenced JSON value.
 struct JsonViewRef<'a>(&'a JsonValue);
@@ -1549,7 +1564,6 @@ impl Serialize for JsonViewRef<'_> {
         }
     }
 }
-
 
 fn levels(args: &CliArgs, project_root: &Path) -> Result<LintTable, DriverError> {
     let profile = if args.pedantic {
