@@ -120,13 +120,18 @@ impl<F: FileSystem> ServiceState<F> {
         }
         let document = self.ensure_document(path.as_ref())?;
         let symbol = symbol_at(&document, position)?.ok_or(ServiceError::RenameUnavailable)?;
-        let old_name = document.semantic().symbol(symbol).name();
+        let target = document.semantic().symbol(symbol);
+        let old_name = target.name();
         if document
             .semantic()
             .symbols()
             .iter()
             .enumerate()
-            .any(|(index, candidate)| index != symbol_index(symbol) && candidate.name() == new_name)
+            .any(|(index, candidate)| {
+                index != symbol_index(symbol)
+                    && candidate.scope() == target.scope()
+                    && candidate.name() == new_name
+            })
         {
             return Err(ServiceError::InvalidRename(format!(
                 "rename would conflict with existing symbol `{new_name}`"
@@ -405,6 +410,24 @@ mod tests {
                 .edits
                 .iter()
                 .all(|edit| edit.replacement == "result")
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_ignores_unrelated_nested_shadowing_declarations() {
+        let (root, mut state) =
+            state("const outer = 1; { const replacement = 2; replacement; } outer;");
+        let rename = state
+            .rename("a.ts", Utf16Pos::new(58), "replacement")
+            .expect("nested declaration is outside the target scope");
+        assert_eq!(rename.edit.edits.len(), 2);
+        assert!(
+            rename
+                .edit
+                .edits
+                .iter()
+                .all(|edit| edit.replacement == "replacement")
         );
         fs::remove_dir_all(root).expect("remove root");
     }
