@@ -1131,6 +1131,238 @@ fn direct_mode_preserves_its_option_surface() {
 }
 
 #[test]
+fn tsc_direct_emits_declaration_for_single_root() {
+    let project = ScratchDirectory::new();
+    project.write("hello.ts", "export const value: number = 1;\n");
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--declaration"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct declaration compile starts");
+
+    assert_success(&output, "direct declaration compile");
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("error TS"), "{}", stdout(&output));
+    let javascript =
+        fs::read_to_string(project.path.join("hello.js")).expect("javascript output is written");
+    assert_eq!(javascript, "export const value = 1;\n");
+    let declaration =
+        fs::read_to_string(project.path.join("hello.d.ts")).expect("declaration output is written");
+    assert_eq!(declaration, "export declare const value: number;\n");
+}
+
+#[test]
+fn tsc_direct_emits_source_map_trailer() {
+    let project = ScratchDirectory::new();
+    project.write("hello.ts", "export const value: number = 1;\n");
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--sourceMap"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct source map compile starts");
+
+    assert_success(&output, "direct source map compile");
+    let javascript =
+        fs::read_to_string(project.path.join("hello.js")).expect("javascript output is written");
+    assert!(
+        javascript.ends_with("//# sourceMappingURL=hello.js.map"),
+        "{javascript}"
+    );
+    let map_text =
+        fs::read_to_string(project.path.join("hello.js.map")).expect("map output is written");
+    let map: serde_json::Value = serde_json::from_str(&map_text).expect("map is valid JSON");
+    assert_eq!(map["version"], 3);
+    assert_eq!(map["file"], "hello.js");
+    assert_eq!(map["sources"], serde_json::json!(["hello.ts"]));
+    assert_eq!(map["names"], serde_json::json!([]));
+}
+
+#[test]
+fn tsc_direct_emits_combined_artifacts_without_declaration_map() {
+    let project = ScratchDirectory::new();
+    project.write("hello.ts", "export const value: number = 1;\n");
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--declaration", "--sourceMap"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct combined compile starts");
+
+    assert_success(&output, "direct combined compile");
+    assert!(project.path.join("hello.js").is_file());
+    assert!(project.path.join("hello.d.ts").is_file());
+    assert!(project.path.join("hello.js.map").is_file());
+    assert!(
+        !project.path.join("hello.d.ts.map").exists(),
+        "declarationMap stays off unless requested"
+    );
+    let declaration =
+        fs::read_to_string(project.path.join("hello.d.ts")).expect("declaration output is written");
+    assert!(!declaration.contains("sourceMappingURL"), "{declaration}");
+}
+
+#[test]
+fn tsc_direct_compiles_multi_root_program() {
+    let project = ScratchDirectory::new();
+    project.write("a.ts", "export const value = 1;\n");
+    project.write(
+        "b.ts",
+        "import { value } from \"./a\";\nexport const doubled = value * 2;\n",
+    );
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "a.ts", "b.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct multi-root compile starts");
+
+    assert_success(&output, "direct multi-root compile");
+    assert!(!stdout(&output).contains("error TS"), "{}", stdout(&output));
+    assert!(project.path.join("a.js").is_file());
+    assert!(project.path.join("b.js").is_file());
+    let imported = fs::read_to_string(project.path.join("b.js")).expect("b.js is written");
+    assert!(imported.contains("import { value }"), "{imported}");
+    assert!(imported.contains("doubled"), "{imported}");
+}
+
+#[test]
+fn tsc_direct_multi_root_reports_errors_and_still_emits() {
+    let project = ScratchDirectory::new();
+    project.write("a.ts", "export const value = 1;\n");
+    project.write("bad.ts", "export const broken: string = 1;\n");
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "a.ts", "bad.ts"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct multi-root error compile starts");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("bad.ts"), "{}", stdout(&output));
+    assert!(
+        project.path.join("a.js").is_file(),
+        "present roots still emit by default"
+    );
+    assert!(project.path.join("bad.js").is_file());
+}
+
+#[test]
+fn tsc_direct_reports_missing_root_like_typescript() {
+    let project = ScratchDirectory::new();
+    project.write("a.ts", "export const value = 1;\n");
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "a.ts", "missing.ts", "--declaration"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct missing-root compile starts");
+
+    assert_eq!(output.status.code(), Some(2));
+    let out = stdout(&output);
+    assert!(
+        out.contains("error TS6053: File 'missing.ts' not found."),
+        "{out}"
+    );
+    assert!(out.contains("Root file specified for compilation"), "{out}");
+    assert!(project.path.join("a.js").is_file());
+    assert!(project.path.join("a.d.ts").is_file());
+}
+
+#[test]
+fn tsc_direct_places_artifacts_under_out_dir() {
+    let project = ScratchDirectory::new();
+    project.write("hello.ts", "export const value: number = 1;\n");
+
+    let output = project
+        .command()
+        .args([
+            "--ignoreConfig",
+            "hello.ts",
+            "--declaration",
+            "--sourceMap",
+            "--outDir",
+            "out",
+        ])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct outDir compile starts");
+
+    assert_success(&output, "direct outDir compile");
+    let javascript = fs::read_to_string(project.path.join("out/hello.js"))
+        .expect("outDir javascript output is written");
+    assert!(javascript.ends_with("//# sourceMappingURL=hello.js.map"));
+    assert!(project.path.join("out/hello.d.ts").is_file());
+    let map_text = fs::read_to_string(project.path.join("out/hello.js.map"))
+        .expect("outDir map output is written");
+    let map: serde_json::Value = serde_json::from_str(&map_text).expect("map is valid JSON");
+    assert_eq!(map["sources"], serde_json::json!(["../hello.ts"]));
+}
+
+#[test]
+fn tsc_direct_ignores_config_document_for_artifacts() {
+    let project = ScratchDirectory::new();
+    project.write("hello.ts", "export const value = 1;\n");
+    project.write(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"declaration":true,"outDir":"config-out"}}"#,
+    );
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "hello.ts", "--sourceMap"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct ignoreConfig compile starts");
+
+    assert_success(&output, "direct ignoreConfig compile");
+    assert!(
+        !project.path.join("hello.d.ts").exists(),
+        "the ignored config must not enable declarations"
+    );
+    assert!(
+        !project.path.join("config-out").exists(),
+        "the ignored config outDir must not be used"
+    );
+}
+
+#[test]
+fn tsc_direct_multi_root_no_emit_checks_without_writing() {
+    let project = ScratchDirectory::new();
+    project.write("a.ts", "export const value = 1;\n");
+    project.write(
+        "b.ts",
+        "import { value } from \"./a\";\nexport const doubled = value * 2;\n",
+    );
+
+    let output = project
+        .command()
+        .args(["--ignoreConfig", "a.ts", "b.ts", "--noEmit"])
+        .current_dir(&project.path)
+        .output()
+        .expect("direct multi-root noEmit compile starts");
+
+    assert_success(&output, "direct multi-root noEmit compile");
+    assert!(!stdout(&output).contains("error TS"), "{}", stdout(&output));
+    assert!(!project.path.join("a.js").exists());
+    assert!(!project.path.join("b.js").exists());
+}
+
+#[test]
 fn mode_conflict_boundaries_fail_at_parse_time() {
     let project = ScratchDirectory::new();
     project.write("main.ts", "export const value = 1;\n");

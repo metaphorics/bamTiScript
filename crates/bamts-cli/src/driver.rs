@@ -536,25 +536,34 @@ fn execute_tsc_in_context(
     if let Some(option) = command.first_unsupported_option(TscDispatchMode::Direct) {
         return Ok(unsupported_option_outcome(option));
     }
-    if command
-        .option_str("jsx")
-        .is_some_and(|jsx| jsx != "preserve")
+    // JavaScript-artifact emission — declarations, source maps, and
+    // multi-root programs — routes through the canonical project pipeline
+    // over one inferred configuration-free project. The remaining
+    // single-root compile keeps the native executable driver, which only
+    // maps '--jsx preserve'.
+    let artifact_route = command.file_names.len() > 1
+        || (!command.flag("noEmit") && (command.flag("declaration") || command.flag("sourceMap")));
+    if !artifact_route
+        && command
+            .option_str("jsx")
+            .is_some_and(|jsx| jsx != "preserve")
     {
         return Ok(not_implemented(
             "Only '--jsx preserve' has a canonical native driver mapping.",
         ));
     }
-    if !command.flag("noEmit") && (command.flag("declaration") || command.flag("sourceMap")) {
-        return Ok(not_implemented(
-            "Declaration and source-map emission require canonical compiler outputs.",
-        ));
+    if !artifact_route {
+        return compile_tsc_native_roots(command, context);
     }
-    if command.file_names.len() > 1 {
-        return Ok(not_implemented(
-            "Direct multi-root programs require the canonical project loader.",
-        ));
-    }
+    compile_tsc_artifacts(command, cwd, context)
+}
 
+/// The native executable direct route: one entrypoint, lowered and linked
+/// without JavaScript-artifact emission.
+fn compile_tsc_native_roots(
+    command: &ParsedTscCommand,
+    context: &ExecutionContext,
+) -> Result<CommandOutcome, DriverError> {
     let mut stdout = Vec::new();
     let mut has_errors = false;
     let mut outputs_generated = false;
@@ -587,6 +596,72 @@ fn execute_tsc_in_context(
         ..CommandOutcome::default()
     })
 }
+
+/// The JavaScript-artifact direct route: all argv roots in one inferred
+/// project compiled through [`compile_project`]. Missing roots print
+/// TypeScript's TS6053 diagnostic with the argv spelling and the remaining
+/// roots still compile, matching TypeScript 7.0.2.
+fn compile_tsc_artifacts(
+    command: &ParsedTscCommand,
+    cwd: &Path,
+    context: &ExecutionContext,
+) -> Result<CommandOutcome, DriverError> {
+    let mut missing = Vec::new();
+    let mut roots = Vec::new();
+    for name in &command.file_names {
+        if context.resolve_path(name).is_file() {
+            roots.push(PathBuf::from(name));
+        } else {
+            missing.push(name.clone());
+        }
+    }
+    let mut stdout = Vec::new();
+    for name in &missing {
+        writeln!(
+            stdout,
+            "error TS6053: File '{name}' not found.\n  The file is in the program because:\n    Root file specified for compilation"
+        )
+        .expect("writing to Vec cannot fail");
+    }
+    if roots.is_empty() {
+        return Ok(CommandOutcome {
+            stdout,
+            exit_code: TscExitStatus::DiagnosticsPresentOutputsGenerated.code(),
+            ..CommandOutcome::default()
+        });
+    }
+    let filesystem = match OsFileSystem::new(cwd) {
+        Ok(filesystem) => filesystem,
+        Err(error) => return Ok(project_error_outcome(error.to_string())),
+    };
+    let request = ProjectLoadRequest {
+        config_path: None,
+        cwd: cwd.to_path_buf(),
+        overrides: project_overrides(command),
+        allow_missing_config: true,
+        source_files: Some(roots),
+    };
+    let project = match EffectiveProject::load(&request, &filesystem) {
+        Ok(project) => project,
+        Err(error) => return Ok(project_compile_error_outcome(error, command, cwd)),
+    };
+    let result = match compile_project(&project, &ProjectCompileOptions::default(), &filesystem) {
+        Ok(result) => result,
+        Err(error) => return Ok(project_compile_error_outcome(error, command, cwd)),
+    };
+    if !result.up_to_date {
+        publish_project_result(&result)?;
+    }
+    let mut outcome = project_result_outcome(command, &result);
+    let mut merged = std::mem::take(&mut stdout);
+    merged.append(&mut outcome.stdout);
+    outcome.stdout = merged;
+    if !missing.is_empty() {
+        outcome.exit_code = TscExitStatus::DiagnosticsPresentOutputsGenerated.code();
+    }
+    Ok(outcome)
+}
+
 fn initialize_tsc_config(context: &ExecutionContext) -> Result<CommandOutcome, DriverError> {
     let path = context.resolve_path("tsconfig.json");
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -641,6 +716,7 @@ fn execute_tsc_project(
         cwd: cwd.to_path_buf(),
         overrides: project_overrides(command),
         allow_missing_config: false,
+        source_files: None,
     };
     let project = match EffectiveProject::load(&request, &filesystem) {
         Ok(project) => project,
@@ -3207,15 +3283,27 @@ exit 2
     }
 
     #[test]
-    fn tsc_unmapped_direct_program_shapes_fail_closed() {
-        let multi_root =
-            execute_tsc(&parse_tsc_args(["--noEmit", "a.ts", "b.ts"]).expect("multi-root parses"))
-                .expect("multi-root returns a typed outcome");
-        assert_eq!(multi_root.exit_code, TscExitStatus::NotImplemented.code());
+    fn tsc_direct_multi_root_checks_and_native_jsx_fails_closed() {
+        let fixture = TscFixture::new();
+        fixture.write("a.ts", "export const value = 1;\n");
+        fixture.write(
+            "b.ts",
+            "import { value } from \"./a\";\nexport const doubled = value * 2;\n",
+        );
+        let multi_root = execute_tsc_in(
+            &parse_tsc_args(["--noEmit", "--pretty", "false", "a.ts", "b.ts"])
+                .expect("multi-root parses"),
+            &fixture.0,
+        )
+        .expect("multi-root returns a typed outcome");
+        assert_eq!(multi_root.exit_code, TscExitStatus::Success.code());
+        assert!(!String::from_utf8_lossy(&multi_root.stdout).contains("error TS"));
 
-        let jsx = execute_tsc(
+        fixture.write("component.tsx", "export const view = <div />;\n");
+        let jsx = execute_tsc_in(
             &parse_tsc_args(["--noEmit", "--jsx", "react", "component.tsx"])
                 .expect("JSX command parses"),
+            &fixture.0,
         )
         .expect("JSX command returns a typed outcome");
         assert_eq!(jsx.exit_code, TscExitStatus::NotImplemented.code());
