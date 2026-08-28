@@ -4699,6 +4699,26 @@ mod tests {
         )
     }
 
+    fn module_constructor(
+        captures: u32,
+        parameters: u32,
+        registers: u32,
+        code: Vec<Instruction>,
+    ) -> Function {
+        Function::new(
+            None,
+            captures,
+            parameters,
+            registers,
+            FunctionFlags {
+                is_constructable: true,
+                ..FunctionFlags::default()
+            },
+            code,
+            Vec::new(),
+        )
+    }
+
     fn program_module(
         name: &str,
         mut constants: Vec<Constant>,
@@ -7658,7 +7678,8 @@ mod tests {
                         Instruction::Return { value: reg(9) },
                     ],
                 ),
-                module_function(
+                module_constructor(
+                    0,
                     0,
                     6,
                     vec![
@@ -7801,7 +7822,8 @@ mod tests {
                 ),
                 // The constructed callee: return `new.target` (an object, so
                 // it overrides the allocated instance verbatim).
-                module_function(
+                module_constructor(
+                    0,
                     0,
                     1,
                     vec![
@@ -7810,15 +7832,7 @@ mod tests {
                     ],
                 ),
                 // The explicit `new.target`: any object identity suffices.
-                Function::new(
-                    None,
-                    0,
-                    1,
-                    1,
-                    FunctionFlags::default(),
-                    vec![Instruction::Return { value: reg(0) }],
-                    Vec::new(),
-                ),
+                module_constructor(0, 1, 1, vec![Instruction::Return { value: reg(0) }]),
             ],
         );
         assert_eq!(assert_parity(&module, || SilentHost), Value::TRUE);
@@ -7893,7 +7907,8 @@ mod tests {
                     ],
                 ),
                 // The bound target: return `new.target` (an object).
-                module_function(
+                module_constructor(
+                    0,
                     0,
                     1,
                     vec![
@@ -7902,15 +7917,7 @@ mod tests {
                     ],
                 ),
                 // The explicit `new.target`.
-                Function::new(
-                    None,
-                    0,
-                    1,
-                    1,
-                    FunctionFlags::default(),
-                    vec![Instruction::Return { value: reg(0) }],
-                    Vec::new(),
-                ),
+                module_constructor(0, 1, 1, vec![Instruction::Return { value: reg(0) }]),
             ],
         );
         assert_eq!(assert_parity(&module, || SilentHost), Value::TRUE);
@@ -8084,7 +8091,8 @@ mod tests {
                         Instruction::Return { value: reg(8) },
                     ],
                 ),
-                module_function(
+                module_constructor(
+                    0,
                     0,
                     1,
                     vec![
@@ -8092,7 +8100,8 @@ mod tests {
                         Instruction::Return { value: reg(0) },
                     ],
                 ),
-                module_function(
+                module_constructor(
+                    0,
                     0,
                     1,
                     vec![

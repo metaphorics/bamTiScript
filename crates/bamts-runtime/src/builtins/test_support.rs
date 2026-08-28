@@ -13,6 +13,10 @@ pub(super) struct TestHost;
 impl Host for TestHost {}
 
 pub(super) fn blank_program(name: &str) -> Program<Verified> {
+    program_with_flags(name, FunctionFlags::default())
+}
+
+pub(super) fn program_with_flags(name: &str, flags: FunctionFlags) -> Program<Verified> {
     let code = Module::new(
         vec![Constant::String(EcmaString::encode(name))],
         vec![Function::new(
@@ -20,7 +24,7 @@ pub(super) fn blank_program(name: &str) -> Program<Verified> {
             0,
             0,
             1,
-            FunctionFlags::default(),
+            flags,
             vec![Instruction::Halt],
             Vec::new(),
         )],
