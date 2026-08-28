@@ -14,7 +14,15 @@ pin = "7.0.2"
 url = "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz"
 digest_algorithm = "sha512"
 digest = "8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA=="
-commit = "1e4744d68260a7cb91b62b12edc3f6a2187faaf1"
+commit = "2bd066d87f5bafd315be9f40889d0a60b9e58e0b"
+
+[[source]]
+name = "typescript-7-compiler"
+pin = "typescript/v7.0.2"
+url = "https://github.com/microsoft/typescript-go/archive/2bd066d87f5bafd315be9f40889d0a60b9e58e0b.tar.gz"
+digest_algorithm = "sha256"
+digest = "5ccb47dbb3f68cd0da58b71e6f445eee36a50bd3e9f9f330cc23a97b88500119"
+commit = "2bd066d87f5bafd315be9f40889d0a60b9e58e0b"
 
 [[source]]
 name = "typescript-6.0"
@@ -147,11 +155,11 @@ digest = "67a4e156a3d4580b73eff41805d3237c909f96388158b3eed12afaa4f619d61c"
 
 [[source]]
 name = "typescript-primary-tests"
-pin = "1e4744d68260a7cb91b62b12edc3f6a2187faaf1"
-url = "https://github.com/microsoft/TypeScript/archive/1e4744d68260a7cb91b62b12edc3f6a2187faaf1.tar.gz"
+pin = "4d4f005c8541e0255a9d8791205fdce326e462bc"
+url = "https://github.com/microsoft/TypeScript/archive/4d4f005c8541e0255a9d8791205fdce326e462bc.tar.gz"
 digest_algorithm = "sha256"
-digest = "be1332d444bf5fcd8ed78f36ceefa2885ef0fba104af0bfe083e15336830b07b"
-commit = "1e4744d68260a7cb91b62b12edc3f6a2187faaf1"
+digest = "99cbcb9abf5308b15e90b991919b3f897918f5c19c13dce3a4d3cab618c64bf9"
+commit = "4d4f005c8541e0255a9d8791205fdce326e462bc"
 
 [[source]]
 name = "typescript-6.0-tests"

@@ -11,7 +11,7 @@ description = "Code generation (JIT/AOT) backend for BamTS"
 [dependencies]
 bamts-bytecode.workspace = true
 bamts-cancel.workspace = true
-bamts-native = { workspace = true, optional = true, features = ["jit-entry"] }
+bamts-native = { workspace = true, optional = true }
 cranelift-codegen = { version = "=0.134.2", default-features = false, features = ["std", "unwind", "all-native-arch"] }
 cranelift-frontend = "=0.134.2"
 cranelift-module = "=0.134.2"
@@ -30,7 +30,7 @@ bamts-runtime.workspace = true
 [features]
 default = []
 aot = ["dep:bamts-native", "dep:cranelift-object", "dep:sha2"]
-host-jit = ["dep:cranelift-jit", "dep:bamts-native", "dep:region", "dep:wasmtime-internal-jit-icache-coherence", "dep:libc"]
+host-jit = ["dep:cranelift-jit", "dep:bamts-native", "bamts-native/jit-entry", "dep:region", "dep:wasmtime-internal-jit-icache-coherence", "dep:libc"]
 
 [lints.rust]
 # `unsafe_code` is downgraded from the workspace `forbid` to `deny` so a single

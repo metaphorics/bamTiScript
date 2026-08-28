@@ -144,7 +144,7 @@ path = "perf/fixtures/upstream/checker.ts"
 sha256 = "f1752801dd8ebca0f7bce12a2f61e658c06c7c5a087159c22cf67eb7a7e0198d"
 bytes = 3151782
 origin = "typescript-suite"
-source_archive = "typescript-7-suite"
+source_archive = "typescript-primary-tests"
 source_path = "src/compiler/checker.ts"
 
 [[fixture]]
@@ -154,7 +154,7 @@ path = "perf/fixtures/upstream/dom.generated.d.ts"
 sha256 = "056acdb4168b9fde08093fa6917ff5e26cfe067c003c0a4c55d05a8a94d54b1c"
 bytes = 2348669
 origin = "typescript-suite"
-source_archive = "typescript-7-suite"
+source_archive = "typescript-primary-tests"
 source_path = "src/lib/dom.generated.d.ts"
 
 [[fixture]]
@@ -164,7 +164,7 @@ path = "perf/fixtures/upstream/Herebyfile.mjs"
 sha256 = "e0fa650f9c35a256ffd5c97db1a0588d7df5293b638e1f179a8231c4251c6e5d"
 bytes = 37354
 origin = "typescript-suite"
-source_archive = "typescript-7-suite"
+source_archive = "typescript-primary-tests"
 source_path = "Herebyfile.mjs"
 
 [[fixture]]
@@ -174,7 +174,7 @@ path = "perf/fixtures/upstream/jsxComplexSignatureHasApplicabilityError.tsx"
 sha256 = "e2d2d8d47230600f5fb59d5417399b1fde427877e7ac3bddd963b2cfff25fba0"
 bytes = 19275
 origin = "typescript-suite"
-source_archive = "typescript-7-suite"
+source_archive = "typescript-primary-tests"
 source_path = "tests/cases/compiler/jsxComplexSignatureHasApplicabilityError.tsx"
 
 [[fixture]]
@@ -234,8 +234,8 @@ id = "corpus-hookable"
 group = "corpus"
 path = "corpus/projects/hookable"
 spec = "corpus/specs/hookable.toml"
-tree_sha256 = "0d824b0c9f6c9494708a3cdae91e9e329da42c65ebbe75283e7611d2560685c1"
-file_count = 27
+tree_sha256 = "e5b22250cf026f2c3f98a45ecbc8cad0167b6b2ce27a7b39d3296752e9b9ecbd"
+file_count = 26
 origin = "corpus"
 
 [[fixture]]

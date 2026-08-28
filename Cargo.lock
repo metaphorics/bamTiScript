@@ -187,6 +187,7 @@ dependencies = [
  "bamts-native",
  "bamts-node",
  "bamts-runtime",
+ "getrandom 0.3.4",
  "libc",
  "quint-connect",
  "serde",
