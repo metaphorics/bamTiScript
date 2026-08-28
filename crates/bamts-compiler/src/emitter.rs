@@ -547,7 +547,6 @@ pub(crate) fn print_with_jsx_plan(
         );
     }
 
-
     let (map_source, _) = names.map_naming(surface);
     let mapped_source_name: &str = map_source.unwrap_or_else(|| names.source_name.as_ref());
     let mut emitter = Emitter {
