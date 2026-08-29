@@ -536,12 +536,14 @@ enum ExportWrapper {
 struct Rewriter<'a> {
     options: &'a TransformOptions,
     source_id: SourceId,
+    source_text: String,
     bank: NameBank,
     next_id: u32,
     next_temp: u32,
     diagnostics: Vec<Diagnostic>,
     replace_await: bool,
     used_helpers: BTreeSet<HelperKind>,
+    key_prelude: Vec<Stmt>,
 }
 
 impl<'a> Rewriter<'a> {
@@ -549,12 +551,27 @@ impl<'a> Rewriter<'a> {
         Self {
             options,
             source_id: file.source_id(),
+            source_text: file.source_text().as_str().to_owned(),
             bank: NameBank::new(file.source_text()),
             next_id: 1_000_000,
             next_temp: 0,
             diagnostics: Vec::new(),
             replace_await: false,
             used_helpers: BTreeSet::new(),
+            key_prelude: Vec::new(),
+        }
+    }
+
+    /// Raw source text of a token, with escapes kept verbatim.
+    fn token_text(&self, token: &Token) -> &str {
+        let range = token.range();
+        let start = range.start().get();
+        let end = range.end().get();
+        let start_byte = utf16_to_byte(&self.source_text, start);
+        let end_byte = utf16_to_byte(&self.source_text, end);
+        match (start_byte, end_byte) {
+            (Some(start), Some(end)) => self.source_text.get(start..end).unwrap_or(""),
+            _ => "",
         }
     }
 
@@ -664,7 +681,7 @@ impl<'a> Rewriter<'a> {
                 )]
             }
             Statement::Variable(declaration) => {
-                vec![self.rewrite_variable_statement(statement, declaration)]
+                self.rewrite_variable_statement(statement, declaration)
             }
             Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
                 inner,
@@ -951,7 +968,7 @@ impl<'a> Rewriter<'a> {
         &mut self,
         statement: &Stmt,
         declaration: &VariableDeclaration,
-    ) -> Stmt {
+    ) -> Vec<Stmt> {
         if matches!(
             declaration.kind,
             VariableKind::Using | VariableKind::AwaitUsing
@@ -969,19 +986,22 @@ impl<'a> Rewriter<'a> {
                 .iter()
                 .map(|declarator| self.rewrite_declarator_initializer(declarator))
                 .collect();
-            return self.node(
+            return vec![self.node(
                 statement.range(),
                 Statement::Variable(VariableDeclaration {
                     declarations,
                     ..declaration.clone()
                 }),
-            );
+            )];
         }
         let mut declarations = Vec::new();
+        self.key_prelude.clear();
         for declarator in &declaration.declarations {
             declarations.extend(self.lower_declarator(declaration.kind, declarator));
         }
-        self.node(
+        let key_prelude = std::mem::take(&mut self.key_prelude);
+        let mut statements = key_prelude;
+        statements.push(self.node(
             statement.range(),
             Statement::Variable(VariableDeclaration {
                 range: declaration.range,
@@ -992,7 +1012,8 @@ impl<'a> Rewriter<'a> {
                 },
                 declarations,
             }),
-        )
+        ));
+        statements
     }
 
     fn lower_declarator(
@@ -1062,7 +1083,6 @@ impl<'a> Rewriter<'a> {
             },
         )
     }
-
     fn lower_object_binding(
         &mut self,
         declarator: &VariableDeclaratorNode,
@@ -1080,6 +1100,23 @@ impl<'a> Rewriter<'a> {
         }
         let mut rest_names = Vec::new();
         for property in &object.properties {
+            let PropertyName::Computed(key) = &property.name else {
+                continue;
+            };
+            let temp = self.temp_ident();
+            let value = self.rewrite_expr(key);
+            let declaration = self.make_temp_declaration(temp.clone(), value, range);
+            self.key_prelude.push(declaration);
+            if let BindingPattern::Identifier(ident) = property.binding.data() {
+                let reference = self.node(temp.range(), Expression::Identifier(temp.clone()));
+                let member = self.member_computed(&rhs, &reference, range);
+                out.push(self.make_declarator(ident.clone(), Some(member), range));
+            }
+        }
+        for property in &object.properties {
+            if let PropertyName::Computed(_) = &property.name {
+                continue;
+            }
             if let BindingPattern::Rest(rest) = property.binding.data() {
                 if let BindingPattern::Identifier(ident) = rest.argument.data() {
                     let excluded = self.rest_exclude_literal(&rest_names, range);
@@ -1089,7 +1126,9 @@ impl<'a> Rewriter<'a> {
                 continue;
             }
             if let BindingPattern::Identifier(ident) = property.binding.data() {
-                let key = property_key_text(property);
+                let Some(key) = property_key_text(self, property) else {
+                    continue;
+                };
                 rest_names.push(key.clone());
                 let member = self.member_ident(&rhs, &key, range);
                 out.push(self.make_declarator(ident.clone(), Some(member), range));
@@ -1152,6 +1191,24 @@ impl<'a> Rewriter<'a> {
                 type_annotation: None,
                 initializer: initializer.map(Box::new),
             },
+        )
+    }
+
+    /// `object[<computed expression>]`.
+    fn member_computed(
+        &mut self,
+        object: &IdentifierNode,
+        key: &Expr,
+        range: TextRange,
+    ) -> Expr {
+        let object_expr = self.node(object.range(), Expression::Identifier(object.clone()));
+        self.node(
+            range,
+            Expression::Member(MemberExpression {
+                object: Box::new(object_expr),
+                property: MemberProperty::Computed(Box::new(key.clone())),
+                optional: false,
+            }),
         )
     }
 
@@ -3312,10 +3369,35 @@ fn is_super_call_expression(expression: &Expr) -> bool {
     };
     matches!(call.callee.data(), Expression::Super)
 }
-fn property_key_text(property: &ObjectBindingProperty) -> String {
+
+/// Converts a UTF-16 offset into a byte offset for plain-source text.
+fn utf16_to_byte(text: &str, offset: usize) -> Option<usize> {
+    if offset == 0 {
+        return Some(0);
+    }
+    let mut units = 0usize;
+    for (index, character) in text.char_indices() {
+        if units == offset {
+            return Some(index);
+        }
+        units += character.len_utf16();
+    }
+    if units == offset {
+        return Some(text.len());
+    }
+    None
+}
+
+fn property_key_text(rewriter: &mut Rewriter, property: &ObjectBindingProperty) -> Option<String> {
     match &property.name {
-        PropertyName::Identifier(ident) => format!("id{}", ident.id().get()),
-        _ => String::from("key"),
+        PropertyName::Identifier(ident) => {
+            Some(rewriter.token_text(ident.data().token()).to_owned())
+        }
+        PropertyName::String(literal) => {
+            let raw = rewriter.token_text(literal.data().token());
+            Some(raw.trim_matches(['"', '\'']).to_owned())
+        }
+        _ => None,
     }
 }
 
