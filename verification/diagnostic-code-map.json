@@ -396,22 +396,19 @@
       "evidence": "The right-hand side of an arithmetic operation must be numeric -> TS2363 via tsc --noEmit on \"enum E { a = `1` - `1` }\".",
       "status": "mapped",
       "tsCode": 2363
-    }
-    ,
+    },
     {
       "bamtsCode": "BAMTS-C045",
       "evidence": "A 'set' accessor parameter cannot have an initializer -> TS1052 via tsc --noEmit on \"class C { set foo(x = 1) {} }\".",
       "status": "mapped",
       "tsCode": 1052
-    }
-    ,
+    },
     {
       "bamtsCode": "BAMTS-C046",
       "evidence": "An implementation cannot be declared in ambient contexts -> TS1183 via tsc --noEmit on \"declare class C { get foo() {} }\".",
       "status": "mapped",
       "tsCode": 1183
-    }
-    ,
+    },
     {
       "bamtsCode": "BAMTS-C047",
       "evidence": "A 'get' accessor cannot have parameters -> TS1054 via tsc --noEmit on \"var v = { get foo(v: number) { } };\".",
@@ -423,22 +420,19 @@
       "evidence": "A 'get' accessor must return a value -> TS2378 via tsc --noEmit on \"var v = { get foo(v: number) { } };\".",
       "status": "mapped",
       "tsCode": 2378
-    }
-    ,
+    },
     {
       "bamtsCode": "BAMTS-C049",
       "evidence": "Function implementation name must match overload signature -> TS2389 via tsc --noEmit on \"class C { foo(); bar() {} }\".",
       "status": "mapped",
       "tsCode": 2389
-    }
-    ,
+    },
     {
       "bamtsCode": "BAMTS-C050",
       "evidence": "Type parameters cannot appear on a constructor declaration -> TS1092 via tsc --noEmit on \"class C { constructor<T>() { } }\".",
       "status": "mapped",
       "tsCode": 1092
-    }
-    ,
+    },
     {
       "bamtsCode": "BAMTS-C051",
       "evidence": "'export' modifier cannot appear on class elements -> TS1031 via tsc --noEmit on \"class C { export get Foo() { } }\".",
@@ -476,6 +470,12 @@
       "tsCode": 2339
     },
     {
+      "bamtsCode": "BAMTS-C066",
+      "evidence": "Cannot create an instance of an abstract class (direct abstract class, abstract-union constructor selection, and mixed constructor unions) -> TS2511 via tsc --noEmit on the upstream abstractClassUnionInstantiation reference case (new cls1()/new cls2() rows).",
+      "status": "mapped",
+      "tsCode": 2511
+    },
+    {
       "bamtsCode": "BAMTS-C070",
       "evidence": "Unused @ts-expect-error directive -> TS2578 via tsc --noEmit when the following statement has no diagnostic.",
       "status": "mapped",
@@ -498,6 +498,12 @@
       "evidence": "Parameter property outside a constructor implementation -> TS2369 via tsc --noEmit on \"var v = (public x: string) => { };\".",
       "status": "mapped",
       "tsCode": 2369
+    },
+    {
+      "bamtsCode": "BAMTS-C081",
+      "evidence": "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value (empty or fall-through body) -> TS2355 via tsc --noEmit on the upstream ParameterList5 reference case (row 1,15).",
+      "status": "mapped",
+      "tsCode": 2355
     }
   ]
 }
