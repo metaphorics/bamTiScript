@@ -15,7 +15,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt::Write as _,
     fs,
     path::Path,
     sync::Arc,
@@ -1548,7 +1547,7 @@ pub(crate) fn observe_javascript(
                     artifact: None,
                 };
             };
-            let emitted = match emit_javascript_baseline(&case) {
+            let emitted = match emit_javascript_baseline(&case, &index_entry.logical_path) {
                 Ok(emitted) => emitted,
                 Err(detail) => {
                     return CompilerCheckObservation {
@@ -1590,9 +1589,31 @@ pub(crate) fn observe_javascript(
     }
 }
 
-fn emit_javascript_baseline(case: &CheckedCase) -> std::result::Result<String, String> {
-    let mut out = String::new();
-    for (unit, output) in case.reached_units() {
+pub fn emit_javascript_baseline(
+    case: &CheckedCase,
+    logical_path: &str,
+) -> std::result::Result<String, String> {
+    // Upstream `doJsEmitBaseline` framing: a `//// [<case>] ////` document
+    // header, one `//// [<basename>]` echo per compiled unit (content kept
+    // verbatim, one `\n` between units), a blank-line block separator, then
+    // one `//// [<stem>.js]` section per emitted output. Comparing the whole
+    // document keeps the echo honest alongside the emit.
+    let mut out = format!("//// [{logical_path}] ////\n\n");
+    let units: Vec<_> = case.reached_units().collect();
+    for (index, (unit, _)) in units.iter().enumerate() {
+        out.push_str(&format!("//// [{}]\n", unit_basename(&unit.virtual_path)));
+        // Upstream's splitter drops the file-final newline, so the last
+        // unit's echo ends without one; mid-file units keep theirs.
+        if index + 1 < units.len() {
+            out.push_str(&unit.text);
+            out.push('\n');
+        } else {
+            out.push_str(unit.text.strip_suffix('\n').unwrap_or(&unit.text));
+        }
+    }
+    out.push_str("\n\n");
+    let mut outputs = 0usize;
+    for (unit, output) in &units {
         let Some(emit) = output.emit() else {
             return Err(format!(
                 "unit `{}` produced no javascript emit",
@@ -1610,12 +1631,13 @@ fn emit_javascript_baseline(case: &CheckedCase) -> std::result::Result<String, S
             Some((stem, _)) => format!("{stem}.js"),
             None => format!("{section}.js"),
         };
-        let _ = write!(out, "//// [{js_name}] ////\n{}", javascript.code);
+        out.push_str(&format!("//// [{js_name}]\n{}", javascript.code));
         if !javascript.code.ends_with('\n') {
             out.push('\n');
         }
+        outputs += 1;
     }
-    if out.is_empty() {
+    if outputs == 0 {
         return Err("javascript emit reached no case units".to_owned());
     }
     Ok(out)
@@ -3394,6 +3416,36 @@ class Board {\n\
             compare_js_emit(&extract_dts_sections(&semantic), &emitted),
             FacetVerdict::Fail { .. }
         ));
+    }
+    /// The javascript doc assembly reproduces the upstream doJsEmitBaseline
+    /// framing on a real pinned baseline: document header with trailing ////,
+    /// a `//// [<basename>]` echo without trailing slashes, one blank-line
+    /// block separator, then the `//// [<stem>.js]` output section.
+    #[test]
+    fn javascript_baseline_frames_the_full_upstream_document() {
+        let logical = "tests/cases/compiler/jsPin.ts";
+        let case_text = "var x = 1;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case_frontend(
+            &units,
+            &entry,
+            &CasePragmas::default(),
+            FrontendMode::JavaScript,
+        )
+        .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        assert!(
+            emitted.starts_with(
+                "//// [tests/cases/compiler/jsPin.ts] ////\n\
+                 \n\
+                 //// [jsPin.ts]\nvar x = 1;\n\
+                 \n\
+                 //// [jsPin.js]\n"
+            ),
+            "{emitted}"
+        );
+        assert_eq!(compare_js_emit(&emitted, &emitted), FacetVerdict::Pass);
     }
 
     #[test]

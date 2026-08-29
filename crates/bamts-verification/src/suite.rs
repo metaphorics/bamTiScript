@@ -4078,6 +4078,85 @@ var s: string = \"hi\";\n\
         ));
     }
 
+    /// Framing pin against the byte-exact upstream ClassDeclaration10.js
+    /// baseline: document header with trailing ////, verbatim unit echo, one
+    /// blank-line separator, then the `//// [ClassDeclaration10.js]` output.
+    const CLASS_DECLARATION_10_SOURCE: &str = "class C {\n   constructor();\n   foo();\n}\n";
+    const CLASS_DECLARATION_10_BASELINE: &str = "//// [tests/cases/compiler/ClassDeclaration10.ts] ////\n\
+        \n\
+        //// [ClassDeclaration10.ts]\nclass C {\n\
+        \x20  constructor();\n\
+        \x20  foo();\n\
+        }\n\
+        \n\
+        //// [ClassDeclaration10.js]\n\
+        \"use strict\";\nclass C {\n}\n";
+
+    #[test]
+    fn compiler_observation_javascript_matches_real_blob() {
+        let units = check_cells::split_case_units(
+            "tests/cases/compiler/ClassDeclaration10.ts",
+            CLASS_DECLARATION_10_SOURCE,
+        );
+        let entry =
+            check_cells::entry_virtual_path("tests/cases/compiler/ClassDeclaration10.ts", &units);
+        let case = check_cells::compile_case_frontend(
+            &units,
+            &entry,
+            &check_cells::CasePragmas::default(),
+            bamts_compiler::pipeline::FrontendMode::JavaScript,
+        )
+        .expect("case compiles");
+        let emitted = check_cells::emit_javascript_baseline(
+            &case,
+            "tests/cases/compiler/ClassDeclaration10.ts",
+        )
+        .expect("javascript emit");
+
+        // The framing is pinned byte-exactly against the real upstream blob:
+        // document header, unit echo, and blank-line separator. The emitted
+        // js section is spliced in so the pin does not conflate framing with
+        // the B4.1 emit-parity burn-down.
+        let emitted_js_section = emitted
+            .rsplit_once("//// [ClassDeclaration10.js]\n")
+            .map(|(_, section)| section.to_owned())
+            .expect("emitted doc carries the js section");
+        let (baseline_head, _) = CLASS_DECLARATION_10_BASELINE
+            .rsplit_once("//// [ClassDeclaration10.js]\n")
+            .expect("baseline carries the js section");
+        let framing_pinned_baseline =
+            format!("{baseline_head}//// [ClassDeclaration10.js]\n{emitted_js_section}");
+        assert!(
+            emitted.starts_with(baseline_head),
+            "framing must match the upstream blob byte-exactly:\n{emitted}"
+        );
+        assert_eq!(
+            emitted, framing_pinned_baseline,
+            "assembled doc must equal the framing-pinned baseline"
+        );
+
+        let fixture = compiler_lane_fixture_with_baselines(
+            "js-blob",
+            "ClassDeclaration10.ts",
+            CLASS_DECLARATION_10_SOURCE,
+            &[("js", &framing_pinned_baseline)],
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/ClassDeclaration10.ts",
+            "default#javascript",
+            &["javascript"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::Pass,
+            "{}",
+            observation.detail
+        );
+    }
+
     #[test]
     fn compiler_observation_javascript_reaches_js_baseline_lookup() {
         let fixture = compiler_lane_fixture(
