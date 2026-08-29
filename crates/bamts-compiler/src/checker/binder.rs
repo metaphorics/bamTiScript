@@ -10454,6 +10454,16 @@ impl<'src> Binder<'src> {
                 GET_ACCESSOR_PARAMETERS_MESSAGE,
             );
         }
+        // Only a real block body can be inspected for a missing return.
+        // Bodyless getters — including the parser's tolerated `get foo()`
+        // recovery and missing-body recovery nodes — stay silent, matching
+        // upstream's accessorWithoutBody1 expectation of zero diagnostics.
+        if !matches!(
+            function.body.as_ref(),
+            Some(crate::syntax::FunctionBody::Block(_))
+        ) {
+            return;
+        }
         if !Self::function_body_returns_value(function) {
             self.emit(
                 GET_ACCESSOR_NO_RETURN,
@@ -17870,6 +17880,27 @@ mod tests {
     #[test]
     fn get_accessor_with_return_value_is_allowed() {
         let (_, diagnostics) = bound("const o = { get foo() { return 0; } };");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == GET_ACCESSOR_NO_RETURN),
+            "{diagnostics:?}"
+        );
+    }
+
+    /// Upstream accessorWithoutBody1 expects zero diagnostics: a getter whose
+    /// body the parser silently recovers as absent must not trip the
+    /// missing-return check (object-literal and class sides share the gate).
+    #[test]
+    fn bodyless_getter_stays_silent_on_missing_return() {
+        let (_, diagnostics) = bound("const o = { get foo() };");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == GET_ACCESSOR_NO_RETURN),
+            "{diagnostics:?}"
+        );
+        let (_, diagnostics) = bound("class C { get bar() }");
         assert!(
             !diagnostics
                 .iter()
