@@ -903,6 +903,18 @@ impl<'a> Rewriter<'a> {
                     }),
                 )]
             }
+            Statement::Declare(inner) => {
+                let erased = match inner.data() {
+                    Statement::Enum(_) | Statement::Namespace(_) => true,
+                    Statement::Variable(declaration) => declaration.kind == VariableKind::Var,
+                    _ => false,
+                };
+                if erased {
+                    Vec::new()
+                } else {
+                    vec![statement.clone()]
+                }
+            }
             Statement::Import(_)
             | Statement::ImportEquals(_)
             | Statement::Export(_)
@@ -910,7 +922,6 @@ impl<'a> Rewriter<'a> {
             | Statement::TypeAlias(_)
             | Statement::Enum(_)
             | Statement::Namespace(_)
-            | Statement::Declare(_)
             | Statement::Empty
             | Statement::Break(_)
             | Statement::Continue(_)
