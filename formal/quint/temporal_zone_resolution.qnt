@@ -203,6 +203,12 @@ module temporal_zone_resolution {
       .with("selectedOffset", sharedTransitionOffset(TemporalMax) + 1),
   }
 
+  // Fault: a named host observed but answered with the Utc resolution is the
+  // recorded host-mapping defect.
+  action faultHostMismatchResolution = all {
+    state' = hostResult(NamedHostZone, UtcResolution),
+  }
+
   // Fault injection remains outside this normal transition relation.
   action step = any {
     resolveNamedHost,
@@ -306,6 +312,22 @@ module temporal_zone_resolution {
     .then(requestTemporalMax)
     .then(checkState(state.engine == TzifWalkerEngine and NamedDomainTotal and AllSafety))
 
+  run noSilentUtcFallbackNormalWitness = init
+    .then(resolveUtcHost)
+    .then(checkState(state.resolution == UtcResolution and NoSilentUtcFallback and AllSafety))
+
+  run exactlyOneNamedEngineNormalWitness = init
+    .then(requestJiffInterior)
+    .then(checkState(state.engine == JiffEngine and ExactlyOneNamedEngine and AllSafety))
+
+  run differentialAgreementNormalWitness = init
+    .then(requestJiffMin)
+    .then(checkState(state.engine == JiffEngine and DifferentialAgreement and AllSafety))
+
+  run namedOffsetFromSharedTableNormalWitness = init
+    .then(requestTemporalMax)
+    .then(checkState(state.engine == TzifWalkerEngine and NamedOffsetFromSharedTable and AllSafety))
+
   run faultSilentUtcFallbackRun = init
     .then(faultSilentUtcFallback)
     .then(checkState(not(HostResolutionExact) and not(NoSilentUtcFallback)))
@@ -329,4 +351,8 @@ module temporal_zone_resolution {
   run faultIgnoreTransitionTableRun = init
     .then(faultIgnoreTransitionTable)
     .then(checkState(not(NamedOffsetFromSharedTable) and NamedDomainTotal))
+
+  run faultHostMismatchResolutionRun = init
+    .then(faultHostMismatchResolution)
+    .then(checkState(not(HostResolutionExact) and not(NoSilentUtcFallback)))
 }

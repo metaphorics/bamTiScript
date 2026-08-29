@@ -595,6 +595,94 @@ module atomics_waiters {
         SharedBackingLedgerExact and SharedBackingRefundExactlyOnce
       ))
 
+  run waiterTypeOKNormalWitness = init
+    .then(enqueueSync)
+    .then(checkState(waiter.fifo == List(1) and WaiterTypeOK))
+
+  run noLostWaiterNormalWitness = init
+    .then(enqueueAsyncFinite)
+    .then(checkState(waiter.fifo == List(1) and NoLostWaiter))
+
+  run noDoubleSettlementNormalWitness = init
+    .then(enqueueAsyncFinite)
+    .then(markHeadTimeoutReady)
+    .then(drainMicrotasks)
+    .then(allocateTimeoutResult)
+    .then(prepareTimeoutReactions)
+    .then(reserveTimeoutCapacity)
+    .then(commitTimeoutSettlement)
+    .then(checkState(waiter.settled == List(1) and NoDoubleSettlement))
+
+  run fuelConservationNormalWitness = init
+    .then(enqueueAsyncFinite)
+    .then(markHeadTimeoutReady)
+    .then(drainMicrotasks)
+    .then(allocateTimeoutResult)
+    .then(prepareTimeoutReactions)
+    .then(reserveTimeoutCapacity)
+    .then(commitTimeoutSettlement)
+    .then(checkState(waiter.fuelCharges == 1 and FuelConservation))
+
+  run fifoPreservationNormalWitness = init
+    .then(enqueueSync)
+    .then(enqueueSync)
+    .then(drainMicrotasks)
+    .then(prepareNotifyHead)
+    .then(commitNotifyHead)
+    .then(prepareNotifyHead)
+    .then(commitNotifyHead)
+    .then(checkState(waiter.settled == List(1, 2) and FIFOPreservation))
+
+  run preparedBeforeCommitNormalWitness = init
+    .then(enqueueAsyncFinite)
+    .then(markHeadTimeoutReady)
+    .then(drainMicrotasks)
+    .then(allocateTimeoutResult)
+    .then(prepareTimeoutReactions)
+    .then(reserveTimeoutCapacity)
+    .then(checkState(waiter.reservedTokens == Set(1) and PreparedBeforeCommit))
+
+  run sharedBackingLedgerExactNormalWitness = init
+    .then(allocateSharedBacking)
+    .then(aliasSharedBacking)
+    .then(growSharedBacking)
+    .then(pinSharedBacking)
+    .then(collectWrapperOne)
+    .then(checkState(backing.wrappers == Set(2) and SharedBackingLedgerExact))
+
+  run sharedBackingRefundExactlyOnceNormalWitness = init
+    .then(allocateSharedBacking)
+    .then(growSharedBacking)
+    .then(releaseFinalWrapper)
+    .then(checkState(backing.refundCount == 1 and SharedBackingRefundExactlyOnce))
+
+  action faultWaiterTypeOK = all {
+    waiter' = waiter.with("nextToken", Bound + 2),
+    backing' = backing,
+  }
+
+  action faultDoubleSettlement = all {
+    waiter.settled.length() > 0,
+    waiter' = waiter.with("settled", waiter.settled.append(waiter.settled.head())),
+    backing' = backing,
+  }
+
+  action faultSettleOutOfOrder = all {
+    waiter.fifo == List(1, 2),
+    waiter' = waiter
+      .with("fifo", List())
+      .with("settled", List(2, 1)),
+    backing' = backing,
+  }
+
+  action faultDoubleRefund = all {
+    not(backing.ledgerLive) and backing.refundCount == 1,
+    waiter' = waiter,
+    backing' = backing
+      .with("refundedBytes", backing.refundedBytes + GrownBackingBytes)
+      .with("refundCount", backing.refundCount + 1),
+  }
+
   // Fault: reserving capacity without the allocation/preparation plan is the
   // reserve-at-registration defect; it breaks the preparation discipline while
   // the conservation and FIFO cores hold.
@@ -691,4 +779,32 @@ module atomics_waiters {
         not(SharedBackingLedgerExact) and
         NoLostWaiter and FuelConservation and FIFOPreservation
       ))
+
+  run faultWaiterTypeOKRun = init
+    .then(faultWaiterTypeOK)
+    .then(checkState(not(WaiterTypeOK)))
+
+  run faultDoubleSettlementRun = init
+    .then(enqueueAsyncFinite)
+    .then(markHeadTimeoutReady)
+    .then(drainMicrotasks)
+    .then(allocateTimeoutResult)
+    .then(prepareTimeoutReactions)
+    .then(reserveTimeoutCapacity)
+    .then(commitTimeoutSettlement)
+    .then(faultDoubleSettlement)
+    .then(checkState(not(NoDoubleSettlement)))
+
+  run faultSettleOutOfOrderRun = init
+    .then(enqueueSync)
+    .then(enqueueSync)
+    .then(faultSettleOutOfOrder)
+    .then(checkState(not(FIFOPreservation) and NoLostWaiter and NoDoubleSettlement))
+
+  run faultDoubleRefundRun = init
+    .then(allocateSharedBacking)
+    .then(growSharedBacking)
+    .then(releaseFinalWrapper)
+    .then(faultDoubleRefund)
+    .then(checkState(not(SharedBackingRefundExactlyOnce)))
 }

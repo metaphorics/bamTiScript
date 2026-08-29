@@ -390,7 +390,7 @@ module module_graph {
     retryRoot,
   }
 
-  val TypeOK =
+  val ModuleGraphTypeOK =
     moduleStateKnown(rootState) and moduleStateKnown(dependencyState) and
       requestStateKnown(request1State) and requestStateKnown(request2State) and
       request1Lease >= 0 and request1Lease <= 1 and request2Lease >= 0 and request2Lease <= 1 and
@@ -452,7 +452,7 @@ module module_graph {
       .then(receiveMatchingCompletion).then(consumeBoundCompletion).then(preflightClosure)
       .then(commitClosure).then(scheduleDependencyEvaluation).then(evaluateDependency)
       .then(scheduleRootEvaluation).then(evaluateRoot).then(settleSuccess)
-      .then(checkState(TypeOK and NoPartialClosureObservable and AtomicClosureInstall and
+      .then(checkState(ModuleGraphTypeOK and NoPartialClosureObservable and AtomicClosureInstall and
         CacheKeysPublishLast and IdentityBinding and NoLostRequest and RequestsEventuallySettle))
 
   run payloadSwapRejectedTest =
@@ -486,6 +486,62 @@ module module_graph {
       .then(evaluateDependency).then(scheduleRootEvaluation).then(failRootFatally)
       .then(checkState(JsonAbsorbingFatalRetryable and retryAllowed)).then(retryRoot)
       .then(checkState(rootState == EvaluationScheduled and not(retryAllowed)))
+
+  run moduleGraphTypeOKNormalWitness = init
+    .then(requestRoot)
+    .then(checkState(request1State == RequestLive and ModuleGraphTypeOK))
+
+  run noPartialClosureObservableNormalWitness =
+    init.then(requestRoot).then(coalesceSecondWaiter).then(resolveAndTransferLeases)
+      .then(loadClosure).then(compileClosure).then(linkClosure).then(deferGraph)
+      .then(receiveMatchingCompletion).then(consumeBoundCompletion).then(preflightClosure)
+      .then(commitClosure).then(scheduleDependencyEvaluation).then(evaluateDependency)
+      .then(scheduleRootEvaluation).then(evaluateRoot).then(settleSuccess)
+      .then(checkState(rootInstalled and dependencyInstalled and NoPartialClosureObservable))
+
+  run atomicClosureInstallNormalWitness =
+    init.then(requestRoot).then(resolveAndTransferLeases).then(loadClosure).then(compileClosure)
+      .then(linkClosure).then(deferGraph).then(receiveMatchingCompletion).then(consumeBoundCompletion)
+      .then(preflightClosure).then(commitClosure)
+      .then(checkState(rootInstalled and dependencyInstalled and AtomicClosureInstall))
+
+  run cacheKeysPublishLastNormalWitness =
+    init.then(requestRoot).then(resolveAndTransferLeases).then(loadClosure).then(compileClosure)
+      .then(linkClosure).then(deferGraph).then(receiveMatchingCompletion).then(consumeBoundCompletion)
+      .then(preflightClosure).then(commitClosure)
+      .then(checkState(commitCount == 1 and CacheKeysPublishLast))
+
+  run identityBindingNormalWitness =
+    init.then(requestRoot).then(resolveAndTransferLeases).then(loadClosure).then(compileClosure)
+      .then(linkClosure).then(deferGraph).then(receiveMatchingCompletion).then(consumeBoundCompletion)
+      .then(checkState(completionConsumed and IdentityBinding))
+
+  run noLostRequestNormalWitness = init
+    .then(requestRoot)
+    .then(checkState(request1State == RequestLive and request1Lease == 1 and NoLostRequest))
+
+  run tombstoneRejectsLateCompletionNormalWitness =
+    init.then(requestRoot).then(coalesceSecondWaiter).then(resolveAndTransferLeases)
+      .then(loadClosure).then(compileClosure).then(linkClosure).then(deferGraph)
+      .then(cancelSecondWaiter).then(receiveLateCompletion)
+      .then(checkState(lateCompletionSeen and TombstoneRejectsLateCompletion))
+
+  run jsonAbsorbingFatalRetryableNormalWitness =
+    init.then(requestRoot).then(resolveAndTransferLeases).then(loadClosure).then(compileClosure)
+      .then(linkClosure).then(deferGraph).then(receiveMatchingCompletion).then(consumeBoundCompletion)
+      .then(preflightClosure).then(commitClosure).then(scheduleDependencyEvaluation)
+      .then(failJsonGrammar)
+      .then(checkState(jsonErrorCached and JsonAbsorbingFatalRetryable))
+
+  run limitsBeforeAllocationNormalWitness = init
+    .then(requestRoot).then(resolveAndTransferLeases).then(rejectNodeLimit)
+    .then(checkState(limitFailure and LimitsBeforeAllocation))
+
+  run coalescedLeaseIsolationNormalWitness =
+    init.then(requestRoot).then(coalesceSecondWaiter).then(resolveAndTransferLeases)
+      .then(loadClosure).then(compileClosure).then(linkClosure).then(deferGraph)
+      .then(cancelSecondWaiter)
+      .then(checkState(request2State == RequestTombstoned and CoalescedLeaseIsolation))
 
   action faultConsumeSwappedPayload = all {
     completionPending and completionKey != expectedKey(completionId),
@@ -538,6 +594,21 @@ module module_graph {
     graph' = graph.with("retryAllowed", true),
   }
 
+  // Fault: a lease above one breaks the ModuleRequestId lease type.
+  action faultModuleGraphTypeOK = all {
+    request1State == RequestLive,
+    graph' = graph.with("request1Lease", 2),
+  }
+
+  // Fault: publishing cache keys before the closure is installed violates the
+  // last-step publication order while the atomic install core still holds.
+  action faultPublishCacheBeforeClosure = all {
+    preflightPassed and not(rootInstalled),
+    graph' = graph
+      .with("rootCachePublished", true)
+      .with("dependencyCachePublished", true),
+  }
+
   run faultPayloadSwapRun =
     init.then(requestRoot).then(resolveAndTransferLeases).then(loadClosure).then(compileClosure)
       .then(linkClosure).then(deferGraph).then(receiveSwappedCompletion).then(faultConsumeSwappedPayload)
@@ -579,4 +650,14 @@ module module_graph {
       .then(preflightClosure).then(commitClosure).then(scheduleDependencyEvaluation)
       .then(failJsonGrammar).then(faultRetryJsonFailure)
       .then(checkState(not(JsonAbsorbingFatalRetryable)))
+
+  run faultModuleGraphTypeOKRun =
+    init.then(requestRoot).then(faultModuleGraphTypeOK)
+      .then(checkState(not(ModuleGraphTypeOK)))
+
+  run faultCacheKeysEarlyRun =
+    init.then(requestRoot).then(resolveAndTransferLeases).then(loadClosure).then(compileClosure)
+      .then(linkClosure).then(deferGraph).then(receiveMatchingCompletion).then(consumeBoundCompletion)
+      .then(preflightClosure).then(faultPublishCacheBeforeClosure)
+      .then(checkState(not(CacheKeysPublishLast) and AtomicClosureInstall))
 }

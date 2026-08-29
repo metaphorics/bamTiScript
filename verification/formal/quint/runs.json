@@ -141,6 +141,70 @@
       "step": "step",
       "trace": "verification/formal/quint/cache_0.itf.json",
       "trace_sha256": "03812676844d5a339b65e78aa092b8a1689211105c2084463c61e8c0eae2f0aa"
+    },
+    {
+      "init": "init",
+      "invariants": [
+        "WaiterTypeOK",
+        "NoLostWaiter",
+        "NoDoubleSettlement",
+        "FuelConservation",
+        "FIFOPreservation",
+        "PreparedBeforeCommit",
+        "SharedBackingLedgerExact",
+        "SharedBackingRefundExactlyOnce"
+      ],
+      "main_module": "atomics_waiters",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "atomics_waiters.qnt",
+      "seed": "707",
+      "step": "step",
+      "trace": "verification/formal/quint/atomics_0.itf.json",
+      "trace_sha256": "765d63464f9315dff2b3a95438cc313a34de0ce7c27b08af7e0c89b3ef6937cc"
+    },
+    {
+      "init": "init",
+      "invariants": [
+        "ModuleGraphTypeOK",
+        "NoPartialClosureObservable",
+        "AtomicClosureInstall",
+        "CacheKeysPublishLast",
+        "IdentityBinding",
+        "NoLostRequest",
+        "TombstoneRejectsLateCompletion",
+        "JsonAbsorbingFatalRetryable",
+        "LimitsBeforeAllocation",
+        "CoalescedLeaseIsolation"
+      ],
+      "main_module": "module_graph",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "module_graph.qnt",
+      "seed": "707",
+      "step": "step",
+      "trace": "verification/formal/quint/modules_0.itf.json",
+      "trace_sha256": "41fbbd1bcd313af2ad356b5e0dedcda8403103818e83f836e9bdb4518d383e32"
+    },
+    {
+      "init": "init",
+      "invariants": [
+        "HostResolutionExact",
+        "NoSilentUtcFallback",
+        "CanonicalFixedOffset",
+        "NamedDomainTotal",
+        "ExactlyOneNamedEngine",
+        "DifferentialAgreement",
+        "NamedOffsetFromSharedTable"
+      ],
+      "main_module": "temporal_zone_resolution",
+      "max_samples": 200,
+      "max_steps": 12,
+      "model": "temporal_zone_resolution.qnt",
+      "seed": "707",
+      "step": "step",
+      "trace": "verification/formal/quint/temporal_zone_0.itf.json",
+      "trace_sha256": "32c5d802a0c100e321e3c230c1c3cf170a845b46df2ab20384b7564dc2c1a630"
     }
   ],
   "schema": "bamti.quint-runs/v1",
