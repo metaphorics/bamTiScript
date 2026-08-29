@@ -1,0 +1,24 @@
+{
+  "schema": "bamti.leaf-evidence/v1",
+  "leaf": "F2.2",
+  "aspect": "mutation",
+  "date": "2026-08-29",
+  "file": "crates/bamts-compiler/src/service/mod.rs",
+  "mutation": "Deleted the final cancellation check in commit_new_document, allowing a cancelled request to allocate a source ID and mutate the document map.",
+  "sha256_before": "ea99a8a663e295c14b759dc0c87595efde693395af20ad3924badab290299c26",
+  "sha256_mutated": "81477aa44189ea44f384e0f5ff5ff9262e28cba9e7e938319fd52c18c73f917e",
+  "sha256_after_restore": "ea99a8a663e295c14b759dc0c87595efde693395af20ad3924badab290299c26",
+  "restore": "byte copy from target/tmp/F2.2.pristine.rs",
+  "mutated_command": [
+    "cargo",
+    "test",
+    "-q",
+    "-p",
+    "bamts-compiler",
+    "--lib",
+    "service::tests::cancelled_commit_new_document_leaves_state_untouched"
+  ],
+  "mutated_status": 101,
+  "mutated_output_sha256": "45accce2b99d3b1fe79ee8d2128ea7b6cd641c9a74fa65bf9bbb6cdbe9be9f16",
+  "guard": "service::tests::cancelled_commit_new_document_leaves_state_untouched failed at the expected Err(ServiceError::Cancelled) assertion; after byte-identical restore, the full service suite passed 25/25."
+}
