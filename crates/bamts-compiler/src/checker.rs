@@ -6630,18 +6630,31 @@ function check(options: Options = {}) {
 
     #[test]
     fn annotated_return_fallthrough_is_diagnosed() {
-        for source in [
-            "function value(): number {}",
-            "function value(flag: boolean): number { if (flag) return 1; }",
-            "const value = (): number => {};",
-            "async function value(): Promise<number> {}",
-            "function value(): number { while (true) { break; } }",
-            "function value(x: number): number { switch (x) { case 0: return 1; } }",
+        // A zero-return body that falls off the end reports the non-void
+        // must-return pairing (BAMTS-C081, upstream TS2355); a body with a
+        // return statement still reports the undefined-assignment mismatch
+        // (BAMTS-C004) when it completes normally.
+        for (source, expected) in [
+            ("function value(): number {}", ["BAMTS-C081"]),
+            (
+                "function value(flag: boolean): number { if (flag) return 1; }",
+                ["BAMTS-C004"],
+            ),
+            ("const value = (): number => {};", ["BAMTS-C081"]),
+            ("async function value(): Promise<number> {}", ["BAMTS-C081"]),
+            (
+                "function value(): number { while (true) { break; } }",
+                ["BAMTS-C081"],
+            ),
+            (
+                "function value(x: number): number { switch (x) { case 0: return 1; } }",
+                ["BAMTS-C004"],
+            ),
         ] {
             let result = check_text(source);
             assert_eq!(
                 checker_codes(&result),
-                ["BAMTS-C004"],
+                expected,
                 "{source}: {:?}",
                 checker_codes(&result)
             );
@@ -6657,7 +6670,7 @@ function check(options: Options = {}) {
             let result = check_text(source);
             assert_eq!(
                 checker_codes(&result),
-                ["BAMTS-C004"],
+                ["BAMTS-C081"],
                 "{source}: {:?}",
                 checker_codes(&result)
             );
@@ -6766,23 +6779,40 @@ function check(options: Options = {}) {
             );
         }
 
-        for source in [
-            "function* value(): Generator<number, string, unknown> { yield 1; }",
-            "async function* value(): AsyncGenerator<number, string, unknown> { yield 1; }",
-            "function* value(): Generator<number, string, unknown> { return 1; }",
-            "type Completion<R> = Generator<number, R, unknown>; function* value(): Completion<string> { return 1; }",
-            "type Completion = Generator<number, string, unknown>; function* value(): Completion { yield 1; }",
-            "type Completion<R> = Generator<number, R, unknown> & {}; function* value(): Completion<string> { yield 1; }",
+        for (source, expected) in [
+            (
+                "function* value(): Generator<number, string, unknown> { yield 1; }",
+                ["BAMTS-C081"],
+            ),
+            (
+                "async function* value(): AsyncGenerator<number, string, unknown> { yield 1; }",
+                ["BAMTS-C081"],
+            ),
+            (
+                "function* value(): Generator<number, string, unknown> { return 1; }",
+                ["BAMTS-C004"],
+            ),
+            (
+                "type Completion<R> = Generator<number, R, unknown>; function* value(): Completion<string> { return 1; }",
+                ["BAMTS-C004"],
+            ),
+            (
+                "type Completion = Generator<number, string, unknown>; function* value(): Completion { yield 1; }",
+                ["BAMTS-C081"],
+            ),
+            (
+                "type Completion<R> = Generator<number, R, unknown> & {}; function* value(): Completion<string> { yield 1; }",
+                ["BAMTS-C081"],
+            ),
         ] {
             let result = check_text(source);
             assert_eq!(
                 checker_codes(&result),
-                ["BAMTS-C004"],
+                expected,
                 "{source}: {:?}",
                 checker_codes(&result)
             );
         }
-
         let missing =
             check_text("function* value(): Generator<Missing, string, unknown> { return 'done'; }");
         assert_eq!(checker_codes(&missing), [CANNOT_FIND_TYPE.as_str()]);
