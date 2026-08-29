@@ -470,6 +470,18 @@
       "tsCode": 2339
     },
     {
+      "bamtsCode": "BAMTS-C058",
+      "evidence": "Accessor declaring a 'this' parameter -> TS2784 via tsc --noEmit on \"var v = { get foo(this: number) { return 1; } };\" (upstream message \"'get' and 'set' accessors cannot declare 'this' parameters.\").",
+      "status": "mapped",
+      "tsCode": 2784
+    },
+    {
+      "bamtsCode": "BAMTS-C059",
+      "evidence": "Expression with no construct signatures is constructed -> TS2351 via tsc --noEmit on \"const x = 1; new x();\" (upstream message \"This expression is not constructable.\").",
+      "status": "mapped",
+      "tsCode": 2351
+    },
+    {
       "bamtsCode": "BAMTS-C066",
       "evidence": "Cannot create an instance of an abstract class (direct abstract class, abstract-union constructor selection, and mixed constructor unions) -> TS2511 via tsc --noEmit on the upstream abstractClassUnionInstantiation reference case (new cls1()/new cls2() rows).",
       "status": "mapped",
