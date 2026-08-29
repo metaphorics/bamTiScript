@@ -38,7 +38,7 @@ use crate::oracle_pins::{
     NPM_INTEGRITY, NPM_SPECIFIER, OraclePins, SUITE_COMMIT, SUITE_DIGEST, SUITE_REPOSITORY,
     SUITE_URL, verify_oracle_pins,
 };
-use crate::shard::ExecutionMode;
+use crate::shard::{ExecutionMode, ObligationKey};
 use crate::ts_ledger::{
     Backend, CompilerOracle, Confidence, Entry, EvidenceRecord, Facet, LEDGER_SCHEMA_VERSION,
     NpmOracle, Oracle, Partition, ReasonCode, SUITE_BASELINE_ROOT, SUITE_CASE_ROOT, Snapshot,
@@ -2708,18 +2708,10 @@ pub fn observe_compiler_lane(
             format!("compiler lane does not bind mode `{}`", key.mode().as_str()),
         );
     }
-    let Some(snapshot_input) = compiler_snapshot_input(key.case()) else {
-        return CompilerLaneObservation::blocking(
-            "",
-            "",
-            "",
-            BTreeMap::new(),
-            format!(
-                "case `{}` is not a compiler/ or conformance/ tests/cases path",
-                key.case()
-            ),
-        );
-    };
+    if compiler_snapshot_input(key.case()).is_none() {
+        return project_trace_lane(snapshot, ctx, request, key);
+    }
+    let snapshot_input = compiler_snapshot_input(key.case()).unwrap_or_default();
     let Some((variant, observable)) = split_configuration(key.configuration()) else {
         return CompilerLaneObservation::blocking(
             snapshot_input,
@@ -2865,6 +2857,95 @@ pub fn observe_compiler_lane(
         selected_options,
         declared,
         check,
+    )
+}
+
+/// Route a project-partition obligation (`project/tests/cases/project/<name>.json`)
+/// through the lane. Per the catalog every project cell declares the `trace`
+/// observable, so these rows must reach the trace comparator and evaluate
+/// honestly instead of dying as malformed compiler/conformance paths. The
+/// trace producer (`resolve_module_name_with_trace`) works at the individual
+/// import level, not the program level — `ProgramLoader` resolves edges via
+/// `plan_relative_module`/`canonical_selection`, not `resolve_module_name` —
+/// so project-level trace collection remains a producer-missing gap. Any other
+/// observable or a non-project path stays a closed blocking fail.
+fn project_trace_lane(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    _ctx: &CheckContext,
+    request: &LaneRequest,
+    key: &ObligationKey,
+) -> CompilerLaneObservation {
+    let case = key.case();
+    let Some(input) = case.strip_prefix("project/") else {
+        return CompilerLaneObservation::blocking(
+            "",
+            "",
+            "",
+            BTreeMap::new(),
+            format!("case `{case}` is not a compiler/, conformance/, or project/ tests/cases path"),
+        );
+    };
+    if !input.starts_with("tests/cases/project/") || !is_safe_logical_path(input) {
+        return CompilerLaneObservation::blocking(
+            "",
+            "",
+            "",
+            BTreeMap::new(),
+            format!("case `{case}` is not a compiler/, conformance/, or project/ tests/cases path"),
+        );
+    }
+    let Some((variant, observable)) = split_configuration(key.configuration()) else {
+        return CompilerLaneObservation::blocking(
+            input,
+            "",
+            "",
+            BTreeMap::new(),
+            format!(
+                "configuration `{}` is not `<variant>#<observable>`",
+                key.configuration()
+            ),
+        );
+    };
+    let declared = request.observables();
+    let expected = BTreeSet::from([observable.to_owned()]);
+    if declared != &expected {
+        return CompilerLaneObservation::blocking(
+            input,
+            variant,
+            observable,
+            BTreeMap::new(),
+            format!(
+                "declared observables {declared:?} do not equal configuration observable `{observable}`"
+            ),
+        );
+    }
+    if observable_kind(observable) != Some(ObservableKind::Trace) {
+        return CompilerLaneObservation::blocking(
+            input,
+            variant,
+            observable,
+            BTreeMap::new(),
+            format!("project case `{input}` does not route observable `{observable}`"),
+        );
+    }
+    let Some(_index_entry) = snapshot.index().entries.get(input) else {
+        return CompilerLaneObservation::blocking(
+            input,
+            variant,
+            observable,
+            BTreeMap::new(),
+            format!("snapshot has no case input `{input}`"),
+        );
+    };
+    // The trace producer works at the individual import level; program-level
+    // collection (wiring `resolve_module_name_with_trace` into `ProgramLoader`)
+    // is not yet available, so project trace rows report the gap honestly.
+    CompilerLaneObservation::blocking(
+        input,
+        variant,
+        observable,
+        BTreeMap::new(),
+        "producer missing: program-level resolution tracer (upstream `traceResolution` log baselined as `.trace.json`; `resolve_module_name_with_trace` works per-import but `ProgramLoader` does not thread a `ResolutionTraceLog` through its `plan_relative_module`/`canonical_selection` path)".to_owned(),
     )
 }
 
@@ -4496,10 +4577,12 @@ var s: string = \"hi\";\n\
         );
     }
 
-    /// The `trace` observable has no bamts-compiler producer (no resolution
-    /// tracer): the gap is recorded precisely, never as a synthesized pass.
+    /// The `trace` observable compiles the case and re-resolves imports
+    /// through `resolve_module_name_with_trace`. A case with no owned
+    /// `.trace.json` baseline is a classification/execution drift, not a
+    /// synthesized pass.
     #[test]
-    fn compiler_observation_trace_records_missing_producer() {
+    fn compiler_observation_trace_without_baseline_is_drift() {
         let fixture = compiler_lane_fixture(
             "trace-gap",
             "traceLane.ts",
@@ -4516,11 +4599,75 @@ var s: string = \"hi\";\n\
         let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
         assert_eq!(observation.class, FailureClass::HarnessError);
         assert!(
+            observation
+                .detail
+                .contains("no owned `.trace.json` baseline"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// Project-partition obligations (`project/tests/cases/project/<name>.json`)
+    /// declare a `trace` observable in the catalog. They must reach the trace
+    /// comparator (recording the honest producer-missing gap today) instead of
+    /// dying in `compiler_snapshot_input` as a malformed compiler/conformance
+    /// path.
+    #[test]
+    fn project_trace_rows_reach_the_trace_comparator() {
+        let extracted = TestDir::new("project-trace-src");
+        let case = extracted.path().join("tests/cases/project/traceFix.json");
+        fs::create_dir_all(case.parent().unwrap()).unwrap();
+        fs::write(
+            &case,
+            r#"{"scenario":"trace","projectRoot":"tests/cases/projects/trace","inputFiles":["main.ts"]}"#,
+        )
+        .unwrap();
+        fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
+        let snap = TestDir::new("project-trace-snap");
+        materialize_from_extracted(snap.path(), extracted.path()).unwrap();
+        let verified = verify_snapshot(snap.path()).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ctx = CheckContext {
+            code_map: crate::facets::load_diagnostic_code_map(&repo).expect("code map"),
+            baseline_groups: crate::check_cells::baseline_groups(&verified.snapshot.index),
+        };
+        let request = compiler_lane_request(
+            &verified.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/traceFix.json",
+            "default#trace",
+            &["trace"],
+        );
+        let observation = observe_compiler_lane(&verified.snapshot, &ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::HarnessError,
+            "{}",
+            observation.detail
+        );
+        assert!(
             observation.detail.starts_with("producer missing:"),
             "{}",
             observation.detail
         );
         assert!(observation.detail.contains("resolution tracer"));
+
+        // A project row routed with a non-trace observable stays a closed
+        // blocking fail (the catalog routes only trace here).
+        let request = compiler_lane_request(
+            &verified.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/traceFix.json",
+            "default#diagnostics",
+            &["diagnostics"],
+        );
+        let observation = observe_compiler_lane(&verified.snapshot, &ctx, &request);
+        closed_non_pass(&observation);
+        assert!(
+            observation.detail.contains("does not route observable"),
+            "{}",
+            observation.detail
+        );
     }
 
     #[test]
