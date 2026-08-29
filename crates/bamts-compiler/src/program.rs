@@ -200,6 +200,12 @@ pub struct ResolvedProgram {
     modules: Arc<[ResolvedModule]>,
     module_indices: HashMap<SourceId, usize>,
     commonjs: bool,
+    no_implicit_any: bool,
+    strict_null_checks: bool,
+    strict_property_initialization: bool,
+    always_strict: bool,
+    es5: bool,
+    check_js: bool,
     jsx: Option<JsxEmit>,
     jsx_factory: Option<Arc<str>>,
     jsx_fragment_factory: Option<Arc<str>>,
@@ -290,13 +296,24 @@ impl ResolvedProgram {
     }
 
     /// Constructs the effective checker environment for this resolved program.
+    ///
+    /// The checker-relevant compiler options travel with the resolved program,
+    /// so every consumer (project build, direct CLI, suite lane, npm API)
+    /// observes the same strict-family configuration without reconstructing
+    /// options from raw tsconfig text.
     #[must_use]
-    pub const fn check_options(&self) -> ProgramCheckOptions {
+    pub fn check_options(&self) -> ProgramCheckOptions {
         if self.commonjs {
             ProgramCheckOptions::commonjs()
         } else {
             ProgramCheckOptions::standard()
         }
+        .with_no_implicit_any(self.no_implicit_any)
+        .with_strict_null_checks(self.strict_null_checks)
+        .with_strict_property_initialization(self.strict_property_initialization)
+        .with_always_strict(self.always_strict)
+        .with_es5(self.es5)
+        .with_check_js(self.check_js)
     }
 
     /// Returns the eager runtime closure in the program's canonical order.
@@ -658,6 +675,14 @@ impl ProgramLoader {
                 .options
                 .module()
                 .is_some_and(|module| module.eq_ignore_ascii_case("commonjs")),
+            no_implicit_any: self.options.no_implicit_any(),
+            strict_null_checks: self.options.strict_null_checks(),
+            strict_property_initialization: self.options.strict_property_initialization(),
+            always_strict: self.options.always_strict(),
+            es5: self.options.target().is_some_and(|target| {
+                target.eq_ignore_ascii_case("es5") || target.eq_ignore_ascii_case("es3")
+            }),
+            check_js: self.options.check_js(),
             jsx: self.options.jsx(),
             jsx_factory: self.options.jsx_factory().map(Arc::from),
             jsx_fragment_factory: self.options.jsx_fragment_factory().map(Arc::from),
@@ -3382,9 +3407,10 @@ mod tests {
 
     use super::{
         ExecutableProgram, JsxRoutingDecision, ModuleEdgeKind, ModuleTarget, ProgramLoadError,
-        ProgramLoader, ProgramLowerErrorKind, ProgramLowerPhase, ProgramOutputKind, lower_program,
-        lower_program_with_cancel,
+        ProgramLoader, ProgramLowerErrorKind, ProgramLowerPhase, ProgramOutputKind,
+        ResolvedProgram, lower_program, lower_program_with_cancel,
     };
+    use crate::checker::ProgramCheckOptions;
     use crate::{
         lower::LowerOptions,
         pipeline::{FrontendMode, compile_program_frontend},
@@ -5670,5 +5696,100 @@ mod tests {
         assert_eq!(session.code(), Some(super::SESSION_TOO_LARGE));
         assert!(session.to_string().contains("next.ts"));
         assert!(std::error::Error::source(&session).is_none());
+    }
+
+    /// Loads one file and returns its checker-facing effective configuration.
+    fn resolved(main: &str, compiler_options: &str) -> ResolvedProgram {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", main);
+        let config = format!(r#"{{"compilerOptions":{compiler_options}}}"#);
+        fixture
+            .loader_with_config(&config)
+            .load("main.ts")
+            .expect("resolved program")
+    }
+
+    #[test]
+    fn strict_family_options_reach_the_checker_environment() {
+        // The suite default (see check_cells.rs build_tsconfig) is strict:true
+        // unless a case pragma says otherwise, so strict-on is the wired shape.
+        let options = resolved("export const value = 1;", r#"{"strict":true}"#).check_options();
+        assert!(options.no_implicit_any());
+        assert!(options.strict_null_checks());
+        assert!(options.strict_property_initialization());
+        assert!(options.always_strict());
+        assert!(!options.is_commonjs());
+        let off = resolved("export const value = 1;", r#"{"strict":false}"#).check_options();
+        assert!(!off.no_implicit_any());
+        assert!(!off.strict_null_checks());
+        assert!(!off.strict_property_initialization());
+        assert!(!off.always_strict());
+    }
+
+    #[test]
+    fn individual_strict_members_override_the_master_switch() {
+        // Upstream optionsStrictPropertyInitializationStrict.ts (sha256
+        // 4c5f28823ac849778d69aed835f56cfff163dfb871c3d31496a0d0b46531c749)
+        // pairs `strict` with explicit strictPropertyInitialization; the
+        // showConfig baselines pin the member names as overridable:
+        // noImplicitAny 35227919..., strictNullChecks 385f6fd5...,
+        // strictPropertyInitialization b3dadd75...
+        let mixed = resolved(
+            "export const value = 1;",
+            r#"{"strict":true,"noImplicitAny":false,"strictNullChecks":false,
+                "strictPropertyInitialization":false,"alwaysStrict":false}"#,
+        )
+        .check_options();
+        assert!(!mixed.no_implicit_any());
+        assert!(!mixed.strict_null_checks());
+        assert!(!mixed.strict_property_initialization());
+        assert!(!mixed.always_strict());
+    }
+
+    #[test]
+    fn module_and_target_still_select_environment_and_es5() {
+        let es5 = resolved(
+            "export const value = 1;",
+            r#"{"module":"commonjs","target":"es5","alwaysStrict":true}"#,
+        )
+        .check_options();
+        assert!(es5.is_commonjs());
+        assert!(es5.es5());
+        assert!(es5.always_strict());
+    }
+
+    #[test]
+    fn check_options_drives_end_to_end_diagnostics() {
+        // Upstream abstractClassUnionInstantiation.ts (sha256
+        // 012bd00d5213a672086b74643b36cf3f252b4a7e96b5950d2f8121ae725581c5)
+        // baseline errors.txt (sha256 20f79cd3...) expects TS2564 rows for
+        // abstract properties; with strict-on plumbing they must surface.
+        let program = resolved(
+            "abstract class A { a: string; }\nnew A();\n",
+            r#"{"strict":true}"#,
+        );
+        let frontend = compile_program_frontend(&program, FrontendMode::Check);
+        let strict_on: Vec<_> = frontend
+            .modules()
+            .iter()
+            .flat_map(|module| module.diagnostics().iter())
+            .filter(|diagnostic| diagnostic.code().as_str() == "BAMTS-C028")
+            .collect();
+        assert_eq!(strict_on.len(), 1, "{strict_on:?}");
+
+        let permissive = resolved(
+            "abstract class A { a: string; }\nnew A();\n",
+            r#"{"strict":false}"#,
+        );
+        let frontend = compile_program_frontend(&permissive, FrontendMode::Check);
+        let permissive_strict_on: Vec<_> = frontend
+            .modules()
+            .iter()
+            .flat_map(|module| module.diagnostics().iter())
+            .filter(|diagnostic| diagnostic.code().as_str() == "BAMTS-C028")
+            .collect();
+        assert!(permissive_strict_on.is_empty(), "{permissive_strict_on:?}");
+        // The same program must report the flag through its checker view.
+        assert!(permissive.check_options() == ProgramCheckOptions::standard());
     }
 }

@@ -329,6 +329,7 @@ const DIRECT_CONSUMED: &[&str] = &[
     "jsx",
     "noEmit",
     "noEmitOnError",
+    "noImplicitAny",
     "out",
     "outDir",
     "outFile",
@@ -337,6 +338,8 @@ const DIRECT_CONSUMED: &[&str] = &[
     "showConfig",
     "sourceMap",
     "strict",
+    "strictNullChecks",
+    "strictPropertyInitialization",
     "version",
 ];
 
@@ -361,6 +364,7 @@ const PROJECT_CONSUMED: &[&str] = &[
     "listFilesOnly",
     "noEmit",
     "noEmitOnError",
+    "noImplicitAny",
     "out",
     "outDir",
     "outFile",
@@ -369,6 +373,8 @@ const PROJECT_CONSUMED: &[&str] = &[
     "rootDir",
     "showConfig",
     "strict",
+    "strictNullChecks",
+    "strictPropertyInitialization",
     "tsBuildInfoFile",
     "version",
 ];

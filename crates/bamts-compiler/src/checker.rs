@@ -535,6 +535,7 @@ pub struct ProgramCheckOptions {
     commonjs: bool,
     strict_null_checks: bool,
     no_implicit_any: bool,
+    strict_property_initialization: bool,
     /// Whether `alwaysStrict` is enabled: every source file is treated as if
     /// it begins with the "use strict" directive.
     always_strict: bool,
@@ -551,6 +552,7 @@ impl ProgramCheckOptions {
             commonjs: false,
             strict_null_checks: false,
             no_implicit_any: false,
+            strict_property_initialization: false,
             always_strict: false,
             es5: false,
             check_js: false,
@@ -563,10 +565,23 @@ impl ProgramCheckOptions {
             commonjs: true,
             strict_null_checks: false,
             no_implicit_any: false,
+            strict_property_initialization: false,
             always_strict: false,
             es5: false,
             check_js: false,
         }
+    }
+
+    /// Applies the `strict` master switch to every modeled member option.
+    /// Call this before any explicit `with_*` member override, matching
+    /// tsconfig resolution where an explicit member value wins over `strict`.
+    #[must_use]
+    pub const fn with_strict(mut self, value: bool) -> Self {
+        self.strict_null_checks = value;
+        self.no_implicit_any = value;
+        self.strict_property_initialization = value;
+        self.always_strict = value;
+        self
     }
 
     #[must_use]
@@ -582,8 +597,20 @@ impl ProgramCheckOptions {
     }
 
     #[must_use]
+    pub const fn with_strict_property_initialization(mut self, value: bool) -> Self {
+        self.strict_property_initialization = value;
+        self
+    }
+
+    #[must_use]
     pub const fn with_always_strict(mut self, value: bool) -> Self {
         self.always_strict = value;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_es5(mut self, value: bool) -> Self {
+        self.es5 = value;
         self
     }
 
@@ -615,13 +642,28 @@ impl ProgramCheckOptions {
     }
 
     #[must_use]
+    pub const fn strict_property_initialization(&self) -> bool {
+        self.strict_property_initialization
+    }
+
+    #[must_use]
     pub const fn always_strict(&self) -> bool {
         self.always_strict
     }
 
     #[must_use]
+    pub const fn is_commonjs(&self) -> bool {
+        self.commonjs
+    }
+
+    #[must_use]
     pub const fn es5(&self) -> bool {
         self.es5
+    }
+
+    #[must_use]
+    pub const fn check_js(&self) -> bool {
+        self.check_js
     }
 
     const fn environment(self) -> GlobalEnvironment {
@@ -2036,13 +2078,13 @@ mod tests {
         ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE,
         CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
         DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
-        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, MIXED_EXPORT_ASSIGNMENT,
-        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
-        PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
-        ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-        SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
-        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
-        WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
+        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, MISSING_METHOD_RETURN_TYPE,
+        MIXED_EXPORT_ASSIGNMENT, PARAMETER_DECORATOR_NOT_SUPPORTED,
+        PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
+        ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
+        SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
+        TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
+        TypeTable, WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -2343,6 +2385,34 @@ mod tests {
             &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
             ProgramCheckOptions::standard().with_strict_null_checks(true),
         )
+    }
+
+    fn check_text_with(
+        text: &str,
+        options: ProgramCheckOptions,
+    ) -> Recovered<super::ProgramSemanticModel> {
+        let parsed = [parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source(text),
+        ))];
+        check_program_with_options(
+            ProgramCheckInput {
+                files: &parsed,
+                edges: &[],
+            },
+            &crate::lint::LintTable::new(crate::lint::LintProfile::Default),
+            options,
+        )
+    }
+
+    fn checker_codes_of(checked: &Recovered<super::ProgramSemanticModel>) -> Vec<String> {
+        checked
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code().as_str().starts_with("BAMTS-C"))
+            .map(|diagnostic| diagnostic.code().as_str().to_owned())
+            .collect()
     }
 
     fn parsed(source_id: u32, text: &str) -> Recovered<SourceFile> {
@@ -11246,10 +11316,16 @@ function check(options: Options = {}) {
     #[test]
     fn f4_function_declaration3_matches_the_upstream_baseline() {
         // Upstream baseline FunctionDeclaration3.errors.txt (sha256
-        // 22ca7ff4...): TS2391 at (1,10) plus TS7010 at (1,10) — the
-        // implicit-any return pairing reports at the same name range in
-        // upstream row order.
-        let result = check_text("function foo();\n1+1;\nfunction foo():string { return \"a\" }");
+        // 22ca7ff40e6fd00df5cfc6b210afe5303aac5ceb18340bb3512f789de42638aa):
+        // TS2391 at (1,10) plus TS7010 at (1,10) — the implicit-any return
+        // pairing reports at the same name range in upstream row order.
+        // TS7010 is a noImplicitAny diagnostic: the suite lane runs this case
+        // strict-default-on (check_cells build_tsconfig supplies strict:true
+        // when no pragma is present), so the pin checks with the option on.
+        let result = check_text_with(
+            "function foo();\n1+1;\nfunction foo():string { return \"a\" }",
+            ProgramCheckOptions::standard().with_no_implicit_any(true),
+        );
         let diagnostics = result
             .diagnostics()
             .iter()
@@ -11342,6 +11418,126 @@ function check(options: Options = {}) {
             ["BAMTS-C066", "BAMTS-C066"],
             "{:?}",
             result.diagnostics()
+        );
+    }
+    // ---- strict-family option tests -------------------------------------------
+
+    #[test]
+    fn strict_master_switch_lifts_unset_members_only() {
+        // `with_strict` mirrors upstream tsconfig merge semantics: apply the
+        // master switch FIRST, then an explicit member value wins. (Resolution
+        // from raw tsconfig happens at parse time via `unwrap_or(strict)`, so
+        // config-driven users never depend on builder order.)
+        // optionsStrictPropertyInitializationStrict.ts (sha256
+        // 4c5f28823ac849778d69aed835f56cfff163dfb871c3d31496a0d0b46531c749)
+        // pairs strict with an explicit strictPropertyInitialization member.
+        let all = ProgramCheckOptions::standard().with_strict(true);
+        assert!(all.no_implicit_any());
+        assert!(all.strict_null_checks());
+        assert!(all.strict_property_initialization());
+        assert!(all.always_strict());
+
+        let off = ProgramCheckOptions::standard().with_strict(false);
+        assert!(!off.no_implicit_any());
+        assert!(!off.strict_null_checks());
+        assert!(!off.strict_property_initialization());
+        assert!(!off.always_strict());
+
+        let explicit_wins = ProgramCheckOptions::standard()
+            .with_strict(true)
+            .with_no_implicit_any(false);
+        assert!(!explicit_wins.no_implicit_any());
+        assert!(explicit_wins.strict_null_checks());
+        assert!(explicit_wins.strict_property_initialization());
+    }
+
+    #[test]
+    fn no_implicit_any_gates_implicit_any_return_diagnostics() {
+        // Upstream noImplicitAnyFunctions.ts baseline (sha256
+        // 3823b182606ca6ef66147393d37e9323a9a44f08ef6256fe02c1b04285e9e4aa)
+        // reports TS7010 on `declare function f1();` only under noImplicitAny.
+        let on = check_text_with(
+            "type Shape = { m(); }",
+            ProgramCheckOptions::standard().with_no_implicit_any(true),
+        );
+        assert!(
+            checker_codes_of(&on)
+                .iter()
+                .any(|code| code == MISSING_METHOD_RETURN_TYPE.as_str()),
+            "{:?}",
+            on.diagnostics()
+        );
+
+        let off = check_text_with("type Shape = { m(); }", ProgramCheckOptions::standard());
+        assert!(
+            !checker_codes_of(&off)
+                .iter()
+                .any(|code| code == MISSING_METHOD_RETURN_TYPE.as_str()),
+            "{:?}",
+            checker_codes_of(&off)
+        );
+    }
+
+    #[test]
+    fn strict_null_checks_gates_nullability_diagnostics() {
+        // Upstream chainedAssignment2.ts baseline (sha256
+        // 54d902661c1551495c19f5265b39d1d9464217b4611e5988a683b4e46aaa21d8)
+        // reports TS2322 for `var a: string; a = null;` under strictNullChecks.
+        let on = check_text_with(
+            "declare const value: string | null;\nconst text: string = value;",
+            ProgramCheckOptions::standard().with_strict_null_checks(true),
+        );
+        assert!(!checker_codes_of(&on).is_empty(), "{:?}", on.diagnostics());
+
+        let off = check_text_with(
+            "declare const value: string | null;\nconst text: string = value;",
+            ProgramCheckOptions::standard(),
+        );
+        assert!(checker_codes_of(&off).is_empty(), "{:?}", off.diagnostics());
+    }
+
+    #[test]
+    fn always_strict_classifies_javascript_sources_as_strict() {
+        // ambientWithStatements(alwaysstrict=true).errors.txt (sha256
+        // d74b39e71a929ba1320370582a8eaf858e4c42fa409f0a292660fa4d7e58d922)
+        // reports TS1101 for `with` in strict mode; the sloppy variant
+        // (sha256 8f88114e...) has no TS1101. `alwaysStrict` must therefore
+        // force the strict classification of a classic script.
+        let parsed_js = |text: &'static str| {
+            crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::JavaScript,
+                source(text),
+            ))
+        };
+        let strict = super::binder::bind_source_with_environment(
+            parsed_js("with ({}) {}").product(),
+            super::intrinsic_environment::GlobalEnvironment::standard(),
+            false,
+            ProgramCheckOptions::standard().with_always_strict(true),
+        );
+        assert!(
+            strict
+                .1
+                .iter()
+                .any(|diagnostic| diagnostic.code() == WITH_STATEMENT_NOT_ALLOWED),
+            "{:?}",
+            strict.1
+        );
+
+        let sloppy = super::binder::bind_source_with_environment(
+            parsed_js("with ({}) {}").product(),
+            super::intrinsic_environment::GlobalEnvironment::standard(),
+            false,
+            ProgramCheckOptions::standard(),
+        );
+        assert!(
+            !sloppy
+                .1
+                .iter()
+                .any(|diagnostic| diagnostic.code() == WITH_STATEMENT_NOT_ALLOWED),
+            "{:?}",
+            sloppy.1
         );
     }
 }

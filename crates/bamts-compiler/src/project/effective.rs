@@ -40,6 +40,9 @@ pub struct ProjectOptionOverrides {
     pub out_file: Option<PathBuf>,
     pub ts_build_info_file: Option<PathBuf>,
     pub strict: Option<bool>,
+    pub no_implicit_any: Option<bool>,
+    pub strict_null_checks: Option<bool>,
+    pub strict_property_initialization: Option<bool>,
     pub always_strict: Option<bool>,
     pub allow_js: Option<bool>,
     pub check_js: Option<bool>,
@@ -1249,6 +1252,12 @@ fn apply_overrides(
         ("inlineSourceMap", overrides.inline_source_map),
         ("inlineSources", overrides.inline_sources),
         ("strict", overrides.strict),
+        ("noImplicitAny", overrides.no_implicit_any),
+        ("strictNullChecks", overrides.strict_null_checks),
+        (
+            "strictPropertyInitialization",
+            overrides.strict_property_initialization,
+        ),
         ("allowJs", overrides.allow_js),
         ("checkJs", overrides.check_js),
         ("alwaysStrict", overrides.always_strict),
@@ -1833,6 +1842,36 @@ mod tests {
         overridden.overrides.strict = Some(false);
         let overridden = EffectiveProject::load(&overridden, &fs).unwrap();
         assert!(!overridden.options().strict());
+    }
+
+    #[test]
+    fn strict_family_cli_overrides_reach_effective_options() {
+        // The native tsc command line pins the member names (TS showConfig
+        // baselines: noImplicitAny 35227919..., strictNullChecks 385f6fd5...,
+        // strictPropertyInitialization b3dadd75...): a `--strict` request with
+        // explicit member opt-outs must keep those members off.
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts", "export const a = 1;\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["src/a.ts"],"compilerOptions":{}}"#,
+        );
+        let fs = fixture.filesystem();
+        let mut request = fixture.request("tsconfig.json");
+        request.overrides.strict = Some(true);
+        request.overrides.no_implicit_any = Some(false);
+        request.overrides.strict_null_checks = Some(false);
+        request.overrides.strict_property_initialization = Some(false);
+
+        let project = EffectiveProject::load(&request, &fs).unwrap();
+        assert!(project.options().strict());
+        assert!(!project.options().no_implicit_any());
+        assert!(!project.options().strict_null_checks());
+        assert!(!project.options().strict_property_initialization());
+        assert!(
+            project.options().always_strict(),
+            "alwaysStrict inherits strict"
+        );
     }
 
     #[test]

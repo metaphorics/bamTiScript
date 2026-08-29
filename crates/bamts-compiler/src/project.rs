@@ -928,6 +928,9 @@ pub struct CompilerOptions {
     jsx_fragment_factory: Option<Arc<str>>,
     jsx_import_source: Option<Arc<str>>,
     strict: bool,
+    no_implicit_any: bool,
+    strict_null_checks: bool,
+    strict_property_initialization: bool,
     always_strict: bool,
     allow_js: bool,
     check_js: bool,
@@ -993,6 +996,21 @@ impl CompilerOptions {
     #[must_use]
     pub const fn strict(&self) -> bool {
         self.strict
+    }
+
+    #[must_use]
+    pub const fn no_implicit_any(&self) -> bool {
+        self.no_implicit_any
+    }
+
+    #[must_use]
+    pub const fn strict_null_checks(&self) -> bool {
+        self.strict_null_checks
+    }
+
+    #[must_use]
+    pub const fn strict_property_initialization(&self) -> bool {
+        self.strict_property_initialization
     }
 
     #[must_use]
@@ -1180,6 +1198,13 @@ impl ProjectConfig {
             jsx_fragment_factory: optional_nested_string(compiler, "jsxFragmentFactory")?,
             jsx_import_source: optional_nested_string(compiler, "jsxImportSource")?,
             strict,
+            no_implicit_any: optional_bool(compiler, "noImplicitAny")?.unwrap_or(strict),
+            strict_null_checks: optional_bool(compiler, "strictNullChecks")?.unwrap_or(strict),
+            strict_property_initialization: optional_bool(
+                compiler,
+                "strictPropertyInitialization",
+            )?
+            .unwrap_or(strict),
             always_strict: optional_bool(compiler, "alwaysStrict")?.unwrap_or(strict),
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
@@ -2359,6 +2384,13 @@ mod tests {
         .expect("corpus-shaped config");
         assert_eq!(config.options().module(), Some("NodeNext"));
         assert!(config.options().strict());
+        // Upstream optionsStrictPropertyInitializationStrict.ts (sha256
+        // 4c5f28823ac849778d69aed835f56cfff163dfb871c3d31496a0d0b46531c749)
+        // combines the strict master switch with its property-initialization member.
+        assert!(config.options().no_implicit_any());
+        assert!(config.options().strict_null_checks());
+        assert!(config.options().strict_property_initialization());
+        assert!(config.options().always_strict());
         assert!(config.options().resolve_json_module());
         assert_eq!(config.options().jsx(), Some(JsxEmit::ReactJsx));
         assert_eq!(config.options().jsx_factory(), Some("h"));
@@ -2373,6 +2405,27 @@ mod tests {
             PathBuf::from("/workspace/corpus/projects/hookable/src/*")
         );
         assert_eq!(config.include()[1].as_ref(), "test");
+    }
+
+    #[test]
+    fn individual_strict_options_override_the_master_switch() {
+        // TypeScript 7.0.2 showConfig baselines pin these canonical option names:
+        // noImplicitAny (sha256 35227919724febab0410cf17ed4ad430a8638100981ddf20643746fff0a8e32a),
+        // strictNullChecks (sha256 385f6fd5f0d8f183a0f56b4ae3f14399d4c982109ca1557152398d8650e43c64),
+        // and strictPropertyInitialization (sha256
+        // b3dadd75912e490756bd1c0165909cbdbb175e7ee223a57351c9061e2f242e9a).
+        let config = ProjectConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{"compilerOptions":{"strict":true,"noImplicitAny":false,"strictNullChecks":false,"strictPropertyInitialization":false,"alwaysStrict":false}}"#,
+        )
+        .expect("individual strict options");
+
+        assert!(config.options().strict());
+        assert!(!config.options().no_implicit_any());
+        assert!(!config.options().strict_null_checks());
+        assert!(!config.options().strict_property_initialization());
+        assert!(!config.options().always_strict());
     }
 
     #[test]

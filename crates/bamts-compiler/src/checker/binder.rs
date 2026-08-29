@@ -4744,6 +4744,10 @@ pub(crate) struct Binder<'src> {
     /// `noImplicitAny` compiler option: missing return types in method signatures
     /// are reported as implicit `any`.
     no_implicit_any: bool,
+    /// `strictPropertyInitialization` compiler option: class properties without
+    /// an initializer that are not definitely assigned in the constructor are
+    /// reported (TS2564).
+    strict_property_initialization: bool,
     /// Whether the compilation target is ES5 or earlier.
     es5: bool,
     /// Variable symbols declared without an initializer and not yet assigned.
@@ -4869,6 +4873,7 @@ impl<'src> Binder<'src> {
             ambient_stack: Vec::new(),
             strict_null_checks: options.strict_null_checks(),
             no_implicit_any: options.no_implicit_any(),
+            strict_property_initialization: options.strict_property_initialization(),
             es5: options.es5(),
             uninitialized_variables: HashSet::new(),
             declarator_symbols: HashMap::new(),
@@ -8111,7 +8116,10 @@ impl<'src> Binder<'src> {
                 );
                 // TS7010 pairs with TS2391 whenever the unimplemented
                 // overload signature also omits its return annotation.
-                if let Statement::Function(function) = statements[index].data()
+                // TS7010 is a noImplicitAny diagnostic, so the pair only
+                // reports when the option is enabled.
+                if this.no_implicit_any
+                    && let Statement::Function(function) = statements[index].data()
                     && function.function.return_type.is_none()
                 {
                     this.emit(
@@ -9431,12 +9439,13 @@ impl<'src> Binder<'src> {
                 .unwrap(),
         }
     }
-
     /// Pairs TS7010 with TS2391: when a class overload group lacks its
     /// implementation and the leading signature also omits a return type,
     /// upstream reports the missing return at the same member-name range.
+    /// Gated on `noImplicitAny` like every TS7010 producer.
     fn emit_missing_overload_return_pair(&mut self, member: &'src ClassMember, range: TextRange) {
         if let ClassMember::Method(method) = member
+            && self.no_implicit_any
             && method.modifier == PropertyModifier::None
             && method.function.return_type.is_none()
         {
@@ -9741,11 +9750,18 @@ impl<'src> Binder<'src> {
         }
         static_type
     }
+    /// TS2564 (`strictPropertyInitialization`): an uninitialized, non-optional
+    /// instance property whose type excludes `undefined` and that no
+    /// constructor assignment definitely assigns. The whole check is gated on
+    /// the compiler option.
     fn check_class_property_initialization(
         &mut self,
         members: &'src [crate::syntax::ClassMemberNode],
         _scope: ScopeId,
     ) {
+        if !self.strict_property_initialization {
+            return;
+        }
         let assigned = self.constructor_property_assignments(members);
         for member in members {
             let ClassMember::Property(property) = member.data() else {
@@ -17580,6 +17596,32 @@ mod tests {
         assert_eq!(count, 2, "{diagnostics:?}");
     }
 
+    fn bound_strict(text: &str) -> (super::SemanticModel, Vec<Diagnostic>) {
+        bound_with_options(
+            text,
+            super::ProgramCheckOptions::standard()
+                .with_strict_null_checks(true)
+                .with_strict_property_initialization(true),
+        )
+    }
+
+    fn bound_with_options(
+        text: &str,
+        options: super::ProgramCheckOptions,
+    ) -> (super::SemanticModel, Vec<Diagnostic>) {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source(text),
+        ));
+        super::bind_source_with_environment(
+            parsed.product(),
+            super::super::intrinsic_environment::GlobalEnvironment::standard(),
+            super::source_is_module(parsed.product()),
+            options,
+        )
+    }
+
     #[test]
     fn non_callable_expression_emits_not_callable() {
         let (_, diagnostics) = bound("const x = 1; x();");
@@ -17591,20 +17633,6 @@ mod tests {
             1,
             "{diagnostics:?}"
         );
-    }
-
-    fn bound_strict(text: &str) -> (super::SemanticModel, Vec<Diagnostic>) {
-        let parsed = crate::parser::parse(crate::scanner::scan(
-            SourceId::new(0),
-            ScriptKind::TypeScript,
-            source(text),
-        ));
-        super::bind_source_with_environment(
-            parsed.product(),
-            super::super::intrinsic_environment::GlobalEnvironment::standard(),
-            super::source_is_module(parsed.product()),
-            super::ProgramCheckOptions::standard().with_strict_null_checks(true),
-        )
     }
 
     #[test]
@@ -17679,6 +17707,85 @@ mod tests {
             .filter(|diagnostic| diagnostic.code() == PROPERTY_NOT_INITIALIZED)
             .count();
         assert_eq!(c028, 2, "expected C028 for D.y and F.w, not for C.x");
+    }
+
+    #[test]
+    fn property_initialization_requires_the_strict_option() {
+        // Upstream abstractClassUnionInstantiation.errors.txt (sha256
+        // 20f79cd35dd8e7298a3cdfe4ba051d9cc4227c910b9a5fd5ca351a5dc6be9f02)
+        // reports TS2564 for `a: string` on an abstract class under the
+        // suite's strict-default-on run. As upstream documents,
+        // strictPropertyInitialization only takes effect together with
+        // strictNullChecks: the undefined-membership probe is a strict-null
+        // relation. Off either flag, the source is clean.
+        let on = bound_with_options(
+            "abstract class A { a: string; }\n",
+            super::ProgramCheckOptions::standard()
+                .with_strict_null_checks(true)
+                .with_strict_property_initialization(true),
+        );
+        assert!(
+            on.1.iter()
+                .any(|diagnostic| diagnostic.code() == PROPERTY_NOT_INITIALIZED),
+            "{:?}",
+            on.1
+        );
+
+        let spi_only = bound_with_options(
+            "abstract class A { a: string; }\n",
+            super::ProgramCheckOptions::standard().with_strict_property_initialization(true),
+        );
+        assert!(
+            !spi_only
+                .1
+                .iter()
+                .any(|diagnostic| diagnostic.code() == PROPERTY_NOT_INITIALIZED),
+            "TS2564 is inert without strictNullChecks: {:?}",
+            spi_only.1
+        );
+
+        let off = bound_with_options(
+            "abstract class A { a: string; }\n",
+            super::ProgramCheckOptions::standard(),
+        );
+        assert!(
+            !off.1
+                .iter()
+                .any(|diagnostic| diagnostic.code() == PROPERTY_NOT_INITIALIZED),
+            "{:?}",
+            off.1
+        );
+    }
+
+    #[test]
+    fn implicit_any_return_pair_requires_no_implicit_any() {
+        // 3823b182606ca6ef66147393d37e9323a9a44f08ef6256fe02c1b04285e9e4aa)
+        // reports TS7010 for an unimplemented overload signature without a
+        // return annotation; the loose run only reports the missing
+        // implementation (TS2391/C039). `declare` contexts have no TS7010
+        // producer in this checker, so the test uses the non-ambient shape.
+        let on = bound_with_options(
+            "function f1();\n1+1;\n",
+            super::ProgramCheckOptions::standard().with_no_implicit_any(true),
+        );
+        assert!(
+            on.1.iter()
+                .any(|diagnostic| diagnostic.code() == MISSING_METHOD_RETURN_TYPE),
+            "{:?}",
+            on.1
+        );
+
+        let off = bound_with_options(
+            "function f1();\n1+1;\n",
+            super::ProgramCheckOptions::standard(),
+        );
+        assert!(
+            !off.1
+                .iter()
+                .any(|diagnostic| diagnostic.code() == MISSING_METHOD_RETURN_TYPE),
+            "{:?}",
+            off.1
+        );
     }
 
     #[test]
