@@ -4564,11 +4564,18 @@ pub(crate) struct Binder<'src> {
     local_enum_member_targets: HashMap<NodeId, SymbolId>,
     imported_enum_member_targets: HashSet<NodeId>,
     pub(crate) namespace_declarations: Vec<NamespaceDeclarationBinding<'src>>,
-    namespace_export_scopes: HashMap<SymbolId, ScopeId>,
+    pub(crate) namespace_export_scopes: HashMap<SymbolId, ScopeId>,
     pub(crate) namespace_local_scopes: HashMap<NodeId, ScopeId>,
-    active_namespace_declarations: Vec<NodeId>,
-    namespace_reference_blocks: HashMap<NodeId, NodeId>,
-    namespace_qualified_type_paths: HashMap<NodeId, Box<[SymbolId]>>,
+    pub(crate) active_namespace_declarations: Vec<NodeId>,
+    pub(crate) namespace_reference_blocks: HashMap<NodeId, NodeId>,
+    pub(crate) namespace_qualified_type_paths: HashMap<NodeId, Box<[SymbolId]>>,
+    /// Class member scopes keyed by their owning class symbol.
+    class_member_scopes: HashMap<SymbolId, ScopeId>,
+    /// Interface member scopes keyed by their owning interface symbol.
+    interface_member_scopes: HashMap<SymbolId, ScopeId>,
+    /// Member accesses whose `.symbols` reference rows are already recorded,
+    /// so the typing-phase recorder never duplicates resolve-phase rows.
+    member_reference_recorded: HashSet<NodeId>,
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
@@ -4740,11 +4747,14 @@ impl<'src> Binder<'src> {
             active_namespace_declarations: Vec::new(),
             namespace_reference_blocks: HashMap::new(),
             namespace_qualified_type_paths: HashMap::new(),
+            class_member_scopes: HashMap::new(),
+            interface_member_scopes: HashMap::new(),
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
+            member_reference_recorded: HashSet::new(),
             hoisted_declaration_symbols: HashMap::new(),
             class_instance_types: HashMap::new(),
             reg_exp_instance_type: None,
@@ -7066,11 +7076,136 @@ impl<'src> Binder<'src> {
             None | Some(_) => {}
         }
         self.set_scope_this_owner(type_scope, id);
+        let member_scope = match self.interface_member_scopes.get(&id) {
+            Some(existing) => *existing,
+            None => {
+                let member_scope = self.new_scope(ScopeKind::Class, Some(scope));
+                self.interface_member_scopes.insert(id, member_scope);
+                member_scope
+            }
+        };
+        self.set_scope_owner(member_scope, id);
+        for member in &interface.members {
+            self.bind_interface_member(member, member_scope);
+        }
         self.interface_merges.entry(id).or_default().push(interface);
         self.type_defs.entry(id).or_insert(TypeDef::Interface {
             scope: type_scope,
             type_parameters: interface.type_parameters.as_ref(),
         });
+    }
+
+    /// Declares a container member unless the same name is already bound in the
+    /// member scope, in which case the existing symbol is reused. Duplicate
+    /// member names therefore contribute one symbol, matching upstream's
+    /// multi-declaration symbols, and this path never mints a new duplicate
+    /// diagnostic.
+    fn declare_member_unique(
+        &mut self,
+        name: &str,
+        kind: SymbolKind,
+        scope: ScopeId,
+        declaration: NodeId,
+        range: TextRange,
+    ) -> SymbolId {
+        if let Some(existing) = self.scopes[scope.0 as usize].values.get(name).copied() {
+            return existing;
+        }
+        self.declare(name, kind, scope, declaration, range)
+    }
+
+    fn bind_interface_member(
+        &mut self,
+        member: &'src crate::syntax::TypeMemberNode,
+        scope: ScopeId,
+    ) {
+        let range = |name: &crate::syntax::PropertyName| Self::property_name_range(name);
+        match member.data() {
+            TypeMember::Property(property) => {
+                if let Some(name) = self.property_key(&property.name) {
+                    self.declare_member_unique(
+                        &name,
+                        SymbolKind::Variable(VariableKind::Let),
+                        scope,
+                        member.id(),
+                        range(&property.name),
+                    );
+                }
+            }
+            TypeMember::Method(method) => {
+                if let Some(name) = self.property_key(&method.name) {
+                    self.declare_member_unique(
+                        &name,
+                        SymbolKind::Function,
+                        scope,
+                        member.id(),
+                        range(&method.name),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a constructor parameter declares a parameter property: a plain
+    /// identifier binding carrying an accessibility modifier or `readonly`.
+    fn is_parameter_property(&self, parameter: &'src crate::syntax::ParameterNode) -> bool {
+        let data = parameter.data();
+        matches!(data.binding.data(), BindingPattern::Identifier(_))
+            && (data.modifiers.accessibility.is_some() || data.modifiers.is_readonly)
+    }
+
+    /// Binds a constructor parameter property as a class member symbol so its
+    /// qualified name and declaration anchor match upstream (`C.x`). The same
+    /// symbol backs the `name` binding inside the constructor body, so a bare
+    /// use of the property resolves through the member symbol. Plain
+    /// parameters keep their unqualified function-scope binding.
+    fn resolve_parameter_property(
+        &mut self,
+        parameter: &'src crate::syntax::ParameterNode,
+        ctor_scope: ScopeId,
+        class_scope: ScopeId,
+    ) {
+        let data = parameter.data();
+        self.resolve_unsupported_legacy_decorators(
+            &data.decorators,
+            PARAMETER_DECORATOR_NOT_SUPPORTED,
+            PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE,
+            ctor_scope,
+        );
+        let Some(owner) = self.scopes[class_scope.0 as usize].owner else {
+            self.resolve_parameter(parameter, ctor_scope);
+            return;
+        };
+        let member_scope = match self.class_member_scopes.get(&owner) {
+            Some(member_scope) => *member_scope,
+            None => {
+                self.resolve_parameter(parameter, ctor_scope);
+                return;
+            }
+        };
+        let BindingPattern::Identifier(identifier) = data.binding.data() else {
+            self.resolve_parameter(parameter, ctor_scope);
+            return;
+        };
+        let name = self.identifier_text(identifier).into_owned();
+        let symbol = self.declare_member_unique(
+            &name,
+            SymbolKind::Variable(VariableKind::Let),
+            member_scope,
+            parameter.id(),
+            identifier.range(),
+        );
+        self.scopes[ctor_scope.0 as usize]
+            .values
+            .entry(name)
+            .or_insert(symbol);
+        if let Some(annotation) = &data.type_annotation {
+            self.resolve_type(&annotation.data().type_node, ctor_scope);
+        }
+        if let Some(initializer) = &data.initializer {
+            self.resolve_expr(initializer, ctor_scope);
+        }
     }
 
     fn merge_interface_type_parameter_defaults(
@@ -9318,6 +9453,9 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
         owner: Option<SymbolId>,
     ) {
+        if let Some(owner) = owner {
+            self.class_member_scopes.insert(owner, scope);
+        }
         if let Some(heritage) = &class.extends {
             self.resolve_expr(&heritage.expression, scope);
             if let Some(owner) = owner
@@ -10589,7 +10727,11 @@ impl<'src> Binder<'src> {
                 self.super_call_contexts
                     .push(SuperCallContext::ConstructorParameters { derived });
                 for parameter in &constructor.parameters {
-                    self.resolve_parameter(parameter, child);
+                    if self.is_parameter_property(parameter) {
+                        self.resolve_parameter_property(parameter, child, scope);
+                    } else {
+                        self.resolve_parameter(parameter, child);
+                    }
                 }
                 let popped_parameters = self.super_call_contexts.pop();
                 debug_assert_eq!(
@@ -10701,6 +10843,19 @@ impl<'src> Binder<'src> {
         match expression.data() {
             Expression::Identifier(identifier) => {
                 self.resolve_value(identifier, expression.id(), scope);
+            }
+            Expression::This => {
+                let owner =
+                    self.this_context
+                        .last()
+                        .and_then(|type_id| match self.types.get(*type_id) {
+                            Type::This { owner, .. } => Some(*owner),
+                            _ => None,
+                        });
+                if let Some(owner) = owner {
+                    self.references.insert(expression.id(), owner);
+                    self.symbol_references.push((expression.range(), owner));
+                }
             }
             Expression::Array(array) => {
                 for element in &array.elements {
@@ -10851,6 +11006,25 @@ impl<'src> Binder<'src> {
                     self.references.insert(expression.id(), member_symbol);
                     self.enum_member_identifier_uses.insert(expression.id());
                     return;
+                }
+                // Symbol-direct path only: computing member types here would
+                // drag the typing pass ahead of function-body resolution and
+                // poison arrow return inference. Instance-typed objects are
+                // recorded from the typing phase instead (see
+                // `record_member_reference_rows`).
+                if let Some(object_symbol) = object_symbol
+                    && matches!(
+                        self.symbols[object_symbol.get() as usize].kind,
+                        SymbolKind::Class | SymbolKind::Interface
+                    )
+                    && !self.member_reference_recorded.contains(&expression.id())
+                {
+                    self.record_symbol_member_reference_rows(
+                        object_symbol,
+                        &name,
+                        &member.property,
+                        expression.range(),
+                    );
                 }
                 let base = object_symbol
                     .filter(|symbol| self.symbols[symbol.get() as usize].kind == SymbolKind::Import)
@@ -15557,6 +15731,85 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Records the `.symbols` reference rows for a member access whose base
+    /// resolves directly to a class or interface symbol (`this.n`, `C.s`).
+    /// Rows land at the property identifier and the whole access path; both
+    /// render the qualified member symbol.
+    fn record_symbol_member_reference_rows(
+        &mut self,
+        owner: SymbolId,
+        name: &EcmaString,
+        property: &'src MemberProperty,
+        path_range: TextRange,
+    ) {
+        let MemberProperty::Named(identifier) = property else {
+            return;
+        };
+        let Some(member_scope) = self.container_member_scope_by_kind(owner) else {
+            return;
+        };
+        let Some(member_symbol) = self.scopes[member_scope.0 as usize].value(&name.to_utf8_lossy())
+        else {
+            return;
+        };
+        self.symbol_references
+            .push((identifier.range(), member_symbol));
+        self.symbol_references.push((path_range, member_symbol));
+    }
+
+    /// Typing-phase counterpart: records rows when the base is typed as an
+    /// applied class instance, an interface, or a `this` type, covering
+    /// `instance.prop` accesses whose base carries no direct symbol. Nodes the
+    /// resolve phase already recorded are skipped.
+    fn record_member_reference_rows(
+        &mut self,
+        member: &'src crate::syntax::MemberExpression,
+        object_type: TypeId,
+        path_range: TextRange,
+        expression_id: NodeId,
+    ) {
+        if member.optional || self.member_reference_recorded.contains(&expression_id) {
+            return;
+        }
+        let MemberProperty::Named(_) = &member.property else {
+            return;
+        };
+        let Some(name) = enum_plan::cook_member_property_name(self.source, &member.property) else {
+            return;
+        };
+        let owner = match self.resolved_expression_reference(&member.object) {
+            Some(symbol)
+                if matches!(
+                    self.symbols[symbol.get() as usize].kind,
+                    SymbolKind::Class | SymbolKind::Interface
+                ) =>
+            {
+                Some(symbol)
+            }
+            _ => match self.types.get(object_type) {
+                Type::AppliedClass { symbol, .. } => Some(*symbol),
+                Type::Named(symbol)
+                    if self.symbols[symbol.get() as usize].kind == SymbolKind::Interface =>
+                {
+                    Some(*symbol)
+                }
+                Type::This { owner, .. } => Some(*owner),
+                _ => None,
+            },
+        };
+        let Some(owner) = owner else {
+            return;
+        };
+        self.record_symbol_member_reference_rows(owner, &name, &member.property, path_range);
+    }
+
+    fn container_member_scope_by_kind(&self, owner: SymbolId) -> Option<ScopeId> {
+        match self.symbols[owner.get() as usize].kind {
+            SymbolKind::Class => self.class_member_scopes.get(&owner).copied(),
+            SymbolKind::Interface => self.interface_member_scopes.get(&owner).copied(),
+            _ => None,
+        }
+    }
     fn compute_type_of_expr(&mut self, expression: &'src Expr, scope: ScopeId) -> TypeId {
         match expression.data() {
             Expression::Identifier(identifier) => {
@@ -15727,13 +15980,24 @@ impl<'src> Binder<'src> {
             Expression::Function(function) => self.type_of_function_like(&function.function, scope),
             Expression::Class(class) => self.resolve_class_expression(&class.class, scope),
             Expression::Arrow(arrow) => self.type_of_arrow(arrow, scope),
-            Expression::Member(member) => self.type_of_member(
-                &member.object,
-                &member.property,
-                member.optional,
-                true,
-                scope,
-            ),
+            Expression::Member(member) => {
+                let object_type = self.type_of_expr(&member.object, scope);
+                let type_id = self.type_of_member(
+                    &member.object,
+                    &member.property,
+                    member.optional,
+                    true,
+                    scope,
+                );
+                self.record_member_reference_rows(
+                    member,
+                    object_type,
+                    expression.range(),
+                    expression.id(),
+                );
+                type_id
+            }
+
             Expression::New(new) => {
                 let callee_type = self.type_of_expr(&new.callee, scope);
                 self.new_return_type(new, callee_type, scope)
@@ -17002,17 +17266,18 @@ mod tests {
     }
 
     #[test]
-    fn interface_type_parameters_and_members_render_bare() {
-        let (model, diagnostics) = bound("interface I<T> {}\n");
+    fn interface_type_parameters_render_bare_and_members_qualified() {
+        let (model, diagnostics) = bound("interface I<T> { item: T; }\n");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let interface_id = type_symbol(&model, "I");
         let t = type_symbol(&model, "T");
         assert_eq!(model.symbol(t).parent(), None);
         assert_eq!(model.qualified_name(t), "T");
-        assert!(
-            owning_scope(&model, interface_id).is_none(),
-            "interface type-parameter scope has no owner"
-        );
+        // The type-parameter scope itself has no owner; members bind into a
+        // separate member scope owned by the interface (upstream `Symbol(I.item)`).
+        let item = symbol_named(&model, "item");
+        assert_eq!(model.symbol(item).parent(), Some(interface_id));
+        assert_eq!(model.qualified_name(item), "I.item");
     }
 
     #[test]
@@ -18134,5 +18399,158 @@ mod tests {
             .filter(|diagnostic| diagnostic.code() == ARGUMENT_COUNT_MISMATCH)
             .count();
         assert_eq!(count, 7, "{diagnostics:?}");
+    }
+
+    fn symbol_named(model: &super::SemanticModel, name: &str) -> SymbolId {
+        let index = model
+            .symbols()
+            .iter()
+            .position(|symbol| symbol.name() == name)
+            .unwrap_or_else(|| panic!("symbol `{name}` not bound"));
+        SymbolId::new(index as u32)
+    }
+
+    /// F3 exemplar ClassDeclaration11: a class member binds as a qualified
+    /// `C.foo` symbol whose declaration anchor is the member name token.
+    #[test]
+    fn class_member_symbol_carries_qualified_identity_and_member_anchor() {
+        let (model, diagnostics) = bound("class C {\n   constructor();\n   foo() { }\n}");
+        // The bare `constructor();` signature before `foo` trips the
+        // pre-existing overload-order check (C049); the F3 contract under test
+        // here is the member symbol itself, so only duplicates are forbidden.
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == DUPLICATE_DECLARATION),
+            "{diagnostics:?}"
+        );
+        let class_id = value_symbol(&model, "C");
+        let foo = symbol_named(&model, "foo");
+        assert_eq!(model.symbol(foo).parent(), Some(class_id));
+        assert_eq!(model.qualified_name(foo), "C.foo");
+        // Anchor: the `foo` identifier starts at line 2, column 3; its UTF-16
+        // offset lands at 31 in the 3-line source.
+        assert_eq!(
+            model.symbol(foo).range().start().get(),
+            31,
+            "anchor at `foo` identifier"
+        );
+    }
+
+    #[test]
+    fn interface_member_symbols_qualify_against_the_interface() {
+        let (model, diagnostics) = bound("interface I {\n    item: number;\n    go(): void;\n}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let interface_id = type_symbol(&model, "I");
+        let item = symbol_named(&model, "item");
+        let go = symbol_named(&model, "go");
+        assert_eq!(model.symbol(item).parent(), Some(interface_id));
+        assert_eq!(model.qualified_name(item), "I.item");
+        assert_eq!(model.qualified_name(go), "I.go");
+    }
+
+    #[test]
+    fn duplicate_interface_members_share_one_symbol() {
+        let (model, diagnostics) = bound("interface I {\n    item: number;\n    item: number;\n}");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == DUPLICATE_DECLARATION),
+            "{diagnostics:?}"
+        );
+        assert_eq!(
+            model
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.name() == "item")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn constructor_parameter_property_binds_as_qualified_class_member() {
+        let (model, diagnostics) =
+            bound("class C {\n    constructor(public x: number) { }\n}\nvar c = new C(1);\nc.x;");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let class_id = value_symbol(&model, "C");
+        let x = symbol_named(&model, "x");
+        assert_eq!(model.symbol(x).parent(), Some(class_id));
+        assert_eq!(model.qualified_name(x), "C.x");
+        // The reference row for `c.x` resolves to the parameter property.
+        let member_refs: Vec<_> = model
+            .symbol_references()
+            .iter()
+            .filter(|(_, symbol)| *symbol == x)
+            .collect();
+        assert!(!member_refs.is_empty(), "`c.x` records a reference row");
+    }
+
+    #[test]
+    fn this_expression_records_class_owner_reference() {
+        let (model, diagnostics) =
+            bound("class C { m() { return this; } }\nvar c = new C();\nc.m();");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let class_id = value_symbol(&model, "C");
+        assert!(
+            model
+                .symbol_references()
+                .iter()
+                .any(|(_, symbol)| *symbol == class_id),
+            "`this` records a reference to the class symbol"
+        );
+    }
+
+    #[test]
+    fn member_access_records_qualified_reference_rows() {
+        let (model, diagnostics) =
+            bound("class C { m() { return this.n; } n: number = 0; }\nvar c = new C();\nc.m().n;");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let n = symbol_named(&model, "n");
+        let rows: Vec<_> = model
+            .symbol_references()
+            .iter()
+            .filter(|(_, symbol)| *symbol == n)
+            .map(|(range, _)| range)
+            .collect();
+        assert!(
+            rows.len() >= 2,
+            "identifier and path rows recorded: {rows:?}"
+        );
+    }
+    /// F3 exemplars aliasUsedAsNameValue / aliasUsageInArray: `import x =
+    /// require(...)` aliases bind as Import symbols anchored at their alias
+    /// name, and their use sites record reference rows against the alias.
+    #[test]
+    fn import_alias_binds_with_anchor_and_reference_rows() {
+        let (model, diagnostics) =
+            bound("import mod = require(\"./mod\");\nimport b = require(\"./b\");\nb(mod);");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == DUPLICATE_DECLARATION),
+            "{diagnostics:?}"
+        );
+        let mod_alias = value_symbol(&model, "mod");
+        let b_alias = value_symbol(&model, "b");
+        assert_eq!(model.symbol(mod_alias).kind(), SymbolKind::Import);
+        // ImportEquals aliases anchor at their statement full start (the
+        // `import` keyword); upstream's Decl marker derives from that start.
+        assert_eq!(model.symbol(mod_alias).range().start().get(), 0);
+        assert_eq!(model.symbol(b_alias).range().start().get(), 31);
+        assert!(
+            model
+                .symbol_references()
+                .iter()
+                .any(|(_, symbol)| *symbol == b_alias),
+            "`b(mod)` records a reference row for `b`"
+        );
+        assert!(
+            model
+                .symbol_references()
+                .iter()
+                .any(|(_, symbol)| *symbol == mod_alias),
+            "`b(mod)` records a reference row for `mod`"
+        );
     }
 }
