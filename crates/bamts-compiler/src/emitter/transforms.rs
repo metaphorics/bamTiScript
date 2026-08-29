@@ -222,7 +222,7 @@ pub fn emit_transformed(
         .map(|plan| bind_and_render_jsx_runtime(file, plan))
         .unwrap_or_default();
 
-    let mut rewriter = Rewriter::new(file, options);
+    let mut rewriter = Rewriter::new(file, options, Some(model));
     if jsx_plan
         .as_ref()
         .is_some_and(|plan| plan.demand.needs_assign)
@@ -263,9 +263,14 @@ pub fn emit_transformed(
         file.diagnostics().to_vec(),
     );
     let helper_emit = helpers::emit_helpers(&used_helpers, &options.helpers, Some(&rewritten));
+    let cjs_marker = rewriter.cjs_marker_prelude(!runtime_prelude.is_empty());
+    let cjs_requires = rewriter.cjs_require_prelude();
     let prelude = join_preludes(
         &strict_prelude(file, options),
-        &join_preludes(&runtime_prelude, &helper_emit.prelude),
+        &join_preludes(
+            &helper_emit.prelude,
+            &join_preludes(&cjs_marker, &join_preludes(&runtime_prelude, &cjs_requires)),
+        ),
     );
     let mut output = print_with_jsx_plan(
         PrintSource {
@@ -535,6 +540,7 @@ enum ExportWrapper {
 
 struct Rewriter<'a> {
     options: &'a TransformOptions,
+    model: Option<&'a SemanticModel>,
     source_id: SourceId,
     source_text: String,
     bank: NameBank,
@@ -544,12 +550,73 @@ struct Rewriter<'a> {
     replace_await: bool,
     used_helpers: BTreeSet<HelperKind>,
     key_prelude: Vec<Stmt>,
+    cjs: Option<CjsPlan>,
+}
+
+/// Per-file CommonJS lowering plan built before the rewrite walk.
+#[derive(Default)]
+struct CjsPlan {
+    /// The file has module syntax, so it receives the `__esModule` marker.
+    is_module: bool,
+    /// Exported names needing `exports.<name> = void 0;` in the prelude.
+    void_0: Vec<String>,
+    /// `require` prelude lines in import-statement order.
+    requires: Vec<String>,
+    /// Import binding replacement by resolved module-scope symbol.
+    imports: BTreeMap<crate::checker::SymbolId, CjsImportRef>,
+    /// Require-local names whose member calls become `(0, m.p)()`.
+    require_roots: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct CjsImportRef {
+    /// The `require` binding local (`_10_lib_1`).
+    root: String,
+    /// Property read off the module object; `None` keeps the root bare.
+    property: Option<String>,
+}
+
+/// Allocates `_module_N` require locals that avoid source identifiers.
+struct RequireNames {
+    occupied: BTreeSet<String>,
+    counters: BTreeMap<String, u32>,
+}
+
+impl RequireNames {
+    fn new(occupied: BTreeSet<String>) -> Self {
+        Self {
+            occupied,
+            counters: BTreeMap::new(),
+        }
+    }
+
+    fn allocate(&mut self, module: &str) -> String {
+        let base = module.rsplit('/').next().unwrap_or(module);
+        let counter = self.counters.entry(base.to_owned()).or_insert(0);
+        loop {
+            *counter += 1;
+            let candidate = format!("_{base}_{}", *counter);
+            if self.occupied.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
 }
 
 impl<'a> Rewriter<'a> {
-    fn new(file: &'a SourceFile, options: &'a TransformOptions) -> Self {
+    fn new(
+        file: &'a SourceFile,
+        options: &'a TransformOptions,
+        model: Option<&'a SemanticModel>,
+    ) -> Self {
+        let cjs = if options.module_kind == Some(ModuleKind::CommonJs) {
+            model.and_then(|model| Self::build_cjs_plan(file, options, model))
+        } else {
+            None
+        };
         Self {
             options,
+            model,
             source_id: file.source_id(),
             source_text: file.source_text().as_str().to_owned(),
             bank: NameBank::new(file.source_text()),
@@ -559,7 +626,469 @@ impl<'a> Rewriter<'a> {
             replace_await: false,
             used_helpers: BTreeSet::new(),
             key_prelude: Vec::new(),
+            cjs,
         }
+    }
+
+    /// Scans top-level module syntax into a CommonJS lowering plan.
+    fn build_cjs_plan(
+        file: &SourceFile,
+        options: &TransformOptions,
+        model: &SemanticModel,
+    ) -> Option<CjsPlan> {
+        let occupied: BTreeSet<String> = file
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::Identifier)
+            .filter_map(|token| {
+                let start = file
+                    .source_text()
+                    .utf16_to_byte(token.range().start())
+                    .ok()?;
+                let end = file.source_text().utf16_to_byte(token.range().end()).ok()?;
+                file.source_text()
+                    .as_str()
+                    .get(start..end)
+                    .map(str::to_owned)
+            })
+            .collect();
+        let mut names = RequireNames::new(occupied);
+        let mut plan = CjsPlan::default();
+        let module_scope = model.module_scope();
+        let symbol_of = |name: &str| model.scope(module_scope).value(name);
+        for statement in file.statements() {
+            match statement.data() {
+                Statement::Import(import) => {
+                    if import.type_only {
+                        continue;
+                    }
+                    plan.is_module = true;
+                    let Some(clause) = &import.clause else {
+                        continue;
+                    };
+                    let raw = raw_token_text(file, import.source.data().token());
+                    let module = raw.trim_matches(['"', '\'']);
+                    let local = names.allocate(module);
+                    // Upstream re-quotes module specifiers with double
+                    // quotes in every require form.
+                    let quoted = quote_module_specifier(module);
+                    let line = format!(
+                        "{} {local} = require({quoted});",
+                        if options.target <= ScriptTarget::Es5 {
+                            "var"
+                        } else {
+                            "const"
+                        }
+                    );
+                    plan.requires.push(line);
+                    plan.require_roots.insert(local.clone());
+                    if let Some(default) = &clause.default {
+                        let text = identifier_text(file, default);
+                        if let Some(symbol) = symbol_of(&text) {
+                            plan.imports.insert(
+                                symbol,
+                                CjsImportRef {
+                                    root: local.clone(),
+                                    property: Some(String::from("default")),
+                                },
+                            );
+                        }
+                    }
+                    match &clause.binding {
+                        Some(ImportBinding::Namespace(name)) => {
+                            let text = identifier_text(file, name);
+                            if let Some(symbol) = symbol_of(&text) {
+                                plan.imports.insert(
+                                    symbol,
+                                    CjsImportRef {
+                                        root: local.clone(),
+                                        property: None,
+                                    },
+                                );
+                            }
+                        }
+                        Some(ImportBinding::Named(specifiers)) => {
+                            for specifier in specifiers {
+                                let specifier = specifier.data();
+                                if !matches!(specifier.mode, ImportSpecifierMode::Value) {
+                                    continue;
+                                }
+                                let imported = match &specifier.imported {
+                                    ModuleExportName::Identifier(ident) => {
+                                        Some(identifier_text(file, ident))
+                                    }
+                                    _ => None,
+                                };
+                                let Some(property) = imported else {
+                                    continue;
+                                };
+                                let text = identifier_text(file, &specifier.local);
+                                if let Some(symbol) = symbol_of(&text) {
+                                    plan.imports.insert(
+                                        symbol,
+                                        CjsImportRef {
+                                            root: local.clone(),
+                                            property: Some(property),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                Statement::ImportEquals(import) => {
+                    plan.is_module |= !import.is_type_only;
+                }
+                Statement::Export(export) => {
+                    plan.is_module = true;
+                    match export {
+                        ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
+                            match inner.data() {
+                                Statement::Class(class) => {
+                                    if let Some(name) = &class.name {
+                                        plan.void_0.push(identifier_text(file, name));
+                                    }
+                                }
+                                Statement::Function(_)
+                                | Statement::Interface(_)
+                                | Statement::TypeAlias(_) => {}
+                                _ => {
+                                    for name in declared_binding_names(file, inner) {
+                                        plan.void_0.push(name);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Script files keep the plan too: the marker stays off until a
+        // require prelude (for example the JSX runtime) forces module form.
+        plan.void_0.sort();
+        plan.void_0.dedup();
+        Some(plan)
+    }
+
+    /// `exports.<exported> = <local>;`
+    fn cjs_export_assignment(&mut self, exported: &str, local: &str, range: TextRange) -> Stmt {
+        let left = self.cjs_export_target(exported, range);
+        let right = self.ident_expr(local);
+        let assignment = self.node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(right),
+            }),
+        );
+        self.node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(assignment),
+            }),
+        )
+    }
+
+    /// `exports.default = <value>;`
+    fn cjs_export_default_assignment(&mut self, range: TextRange, value: Expr) -> Stmt {
+        let left = self.cjs_export_target("default", range);
+        let assignment = self.node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        );
+        self.node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(assignment),
+            }),
+        )
+    }
+
+    fn cjs_export_target(&mut self, exported: &str, range: TextRange) -> AssignmentTargetNode {
+        let exports_ident = self.ident("exports");
+        let object = self.node(range, Expression::Identifier(exports_ident));
+        let property = MemberProperty::Named(self.ident(exported));
+        self.node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(object),
+                property,
+            }),
+        )
+    }
+
+    /// `require("./m");` for a side-effect import, with the specifier
+    /// re-quoted the way upstream prints module text.
+    fn cjs_require_statement(&mut self, source: &StringLiteralNode) -> Stmt {
+        let range = source.range();
+        let raw = self.token_text(source.data().token()).to_owned();
+        let module = raw.trim_matches(['"', '\'']);
+        let require = self.ident("require");
+        let callee = self.node(range, Expression::Identifier(require));
+        let literal = self.string_literal(module);
+        let module = self.node(range, Expression::Literal(Literal::String(literal)));
+        let call = self.node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(callee),
+                optional: false,
+                type_arguments: None,
+                arguments: vec![CallArgument::Expression(Box::new(module))],
+            }),
+        );
+        self.node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(call),
+            }),
+        )
+    }
+
+    /// Replaces `export <declaration>` with assignments around the
+    /// declaration. Functions hoist, so the export assignment precedes them;
+    /// classes and variables receive the `void 0` preamble instead.
+    fn cjs_export_declaration(&mut self, range: TextRange, inner: &Stmt) -> Vec<Stmt> {
+        match inner.data() {
+            Statement::Function(function) => {
+                let Some(name) = function
+                    .function
+                    .name
+                    .as_ref()
+                    .map(|ident| self.token_text(ident.data().token()).to_owned())
+                else {
+                    return self.rewrite_statement(inner);
+                };
+                let mut out = vec![self.cjs_export_assignment(&name, &name, range)];
+                out.extend(self.rewrite_statement(inner));
+                out
+            }
+            Statement::Class(class) => {
+                let Some(name) = class
+                    .name
+                    .as_ref()
+                    .map(|ident| self.token_text(ident.data().token()).to_owned())
+                else {
+                    return self.rewrite_statement(inner);
+                };
+                let mut out = self.rewrite_statement(inner);
+                out.push(self.cjs_export_assignment(&name, &name, range));
+                out
+            }
+            _ => {
+                let names = self.cjs_declared_names(inner);
+                let mut out = self.rewrite_statement(inner);
+                for name in &names {
+                    out.push(self.cjs_export_assignment(name, name, range));
+                }
+                out
+            }
+        }
+    }
+
+    /// `export default class C {}` / anonymous `default_1` renaming.
+    fn cjs_default_class(&mut self, range: TextRange, class: &ClassDeclaration) -> Vec<Stmt> {
+        let (class, name) = match &class.name {
+            Some(ident) => (
+                class.clone(),
+                self.token_text(ident.data().token()).to_owned(),
+            ),
+            None => {
+                let ident = self.ident("default_1");
+                let mut renamed = class.clone();
+                renamed.name = Some(ident);
+                (renamed, String::from("default_1"))
+            }
+        };
+        let statement = self.node(range, Statement::Class(class));
+        let mut out = self.rewrite_statement(&statement);
+        let default_value = self.ident_expr(&name);
+        out.push(self.cjs_export_default_assignment(range, default_value));
+        out
+    }
+
+    /// `export { a, b as c };` becomes one assignment per specifier.
+    fn cjs_export_specifiers(&mut self, specifiers: &[ExportSpecifierNode]) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for specifier in specifiers {
+            let specifier = specifier.data();
+            if matches!(specifier.mode, ExportSpecifierMode::TypeOnly) {
+                continue;
+            }
+            let local_range = match &specifier.local {
+                ModuleExportName::Identifier(local) => local.range(),
+                _ => continue,
+            };
+            let (local, exported) = match (&specifier.local, &specifier.exported) {
+                (ModuleExportName::Identifier(local), ModuleExportName::Identifier(exported)) => (
+                    self.token_text(local.data().token()).to_owned(),
+                    self.token_text(exported.data().token()).to_owned(),
+                ),
+                _ => continue,
+            };
+            out.push(self.cjs_export_assignment(&exported, &local, local_range));
+        }
+        out
+    }
+
+    /// Declared value names of a statement, via the rewrite text.
+    fn cjs_declared_names(&self, statement: &Stmt) -> Vec<String> {
+        match statement.data() {
+            Statement::Variable(declaration) => declaration
+                .declarations
+                .iter()
+                .filter_map(|declarator| match declarator.data().binding.data() {
+                    BindingPattern::Identifier(ident) => {
+                        Some(self.token_text(ident.data().token()).to_owned())
+                    }
+                    _ => None,
+                })
+                .collect(),
+            Statement::Enum(declaration) => {
+                vec![self.token_text(declaration.name.data().token()).to_owned()]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn rewrite_export_named_declaration(&mut self, statement: &Stmt, inner: &Stmt) -> Vec<Stmt> {
+        if self.cjs.is_some() {
+            return self.cjs_export_declaration(statement.range(), inner);
+        }
+        match inner.data() {
+            Statement::Class(class) => self.rewrite_named_export_class(statement, inner, class),
+            _ => self
+                .rewrite_statement(inner)
+                .into_iter()
+                .map(|inner| {
+                    self.node(
+                        statement.range(),
+                        Statement::Export(ExportDeclaration::Named(
+                            ExportNamedDeclaration::Declaration(Box::new(inner)),
+                        )),
+                    )
+                })
+                .collect(),
+        }
+    }
+    /// `export default function f() {}` / anonymous `default_1` renaming.
+    fn cjs_default_function(&mut self, range: TextRange, function: &FunctionLike) -> Vec<Stmt> {
+        let (mut function, name) = match &function.name {
+            Some(ident) => (
+                function.clone(),
+                self.token_text(ident.data().token()).to_owned(),
+            ),
+            None => {
+                let ident = self.ident("default_1");
+                let mut renamed = function.clone();
+                renamed.name = Some(ident);
+                (renamed, String::from("default_1"))
+            }
+        };
+        let function = self.rewrite_function_like(&mut function, range);
+        let statement = self.node(range, Statement::Function(FunctionDeclaration { function }));
+        let mut out = vec![statement];
+        let default_value = self.ident_expr(&name);
+        out.push(self.cjs_export_default_assignment(range, default_value));
+        out
+    }
+
+    /// Rewrites a resolved import reference to its CommonJS member form.
+    fn cjs_identifier_replacement(&mut self, expression: &Expr) -> Option<Expr> {
+        let (root, property) = {
+            let plan = self.cjs.as_ref()?;
+            let symbol = self.model?.reference(expression.id())?;
+            let reference = plan.imports.get(&symbol)?;
+            (reference.root.clone(), reference.property.clone())
+        };
+        let range = expression.range();
+        let root_ident = self.ident(&root);
+        let object = self.node(range, Expression::Identifier(root_ident));
+        let Some(property) = property else {
+            return Some(object);
+        };
+        let property = self.ident(&property);
+        Some(self.node(
+            range,
+            Expression::Member(MemberExpression {
+                object: Box::new(object),
+                property: MemberProperty::Named(property),
+                optional: false,
+            }),
+        ))
+    }
+
+    /// Whether a call's original callee identifier maps to an imported
+    /// binding, so the rewritten member call becomes `(0, m.p)(...)`.
+    fn cjs_call_needs_safe_wrap(&self, original_callee: &Expr) -> bool {
+        let Some(plan) = &self.cjs else {
+            return false;
+        };
+        let Expression::Identifier(ident) = original_callee.data() else {
+            return false;
+        };
+        let Some(symbol) = self.model.and_then(|model| model.reference(ident.id())) else {
+            return false;
+        };
+        plan.imports
+            .get(&symbol)
+            .is_some_and(|reference| reference.property.is_some())
+    }
+
+    fn cjs_wrap_callee(&mut self, callee: Expr) -> Expr {
+        let range = callee.range();
+        let zero = self.number_expr("0");
+        self.node(
+            range,
+            Expression::Sequence(SequenceExpression {
+                expressions: vec![zero, callee],
+            }),
+        )
+    }
+
+    /// The `__esModule` marker plus the `void 0` export preamble.
+    fn cjs_marker_prelude(&self, force_module: bool) -> String {
+        let Some(plan) = &self.cjs else {
+            return String::new();
+        };
+        if !(plan.is_module || force_module) {
+            return String::new();
+        }
+        let mut prelude =
+            String::from("Object.defineProperty(exports, \"__esModule\", { value: true });\n");
+        let mut names = plan.void_0.clone();
+        names.sort();
+        names.dedup();
+        if !names.is_empty() {
+            prelude.push_str("exports.");
+            for (index, name) in names.iter().enumerate() {
+                if index > 0 {
+                    prelude.push_str(" = exports.");
+                }
+                prelude.push_str(name);
+            }
+            prelude.push_str(" = void 0;\n");
+        }
+        prelude
+    }
+
+    fn cjs_require_prelude(&self) -> String {
+        let Some(plan) = &self.cjs else {
+            return String::new();
+        };
+        let mut prelude = String::new();
+        for line in &plan.requires {
+            prelude.push_str(line);
+            prelude.push('\n');
+        }
+        prelude
     }
 
     /// Raw source text of a token, with escapes kept verbatim.
@@ -685,26 +1214,25 @@ impl<'a> Rewriter<'a> {
             }
             Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
                 inner,
-            ))) => match inner.data() {
-                Statement::Class(class) => self.rewrite_named_export_class(statement, inner, class),
-                _ => self
-                    .rewrite_statement(inner)
-                    .into_iter()
-                    .map(|inner| {
-                        self.node(
-                            statement.range(),
-                            Statement::Export(ExportDeclaration::Named(
-                                ExportNamedDeclaration::Declaration(Box::new(inner)),
-                            )),
-                        )
-                    })
-                    .collect(),
-            },
+            ))) => self.rewrite_export_named_declaration(statement, inner),
             Statement::Export(ExportDeclaration::Default(default)) => match &default.value {
                 ExportDefaultValue::Class(class) => {
+                    if self.cjs.is_some() {
+                        return self.cjs_default_class(statement.range(), class);
+                    }
                     self.rewrite_default_export_class(statement, class)
                 }
+                ExportDefaultValue::Function(function) => {
+                    if self.cjs.is_some() {
+                        return self.cjs_default_function(statement.range(), function);
+                    }
+                    vec![statement.clone()]
+                }
                 ExportDefaultValue::Expression(value) => {
+                    if self.cjs.is_some() {
+                        let value = self.rewrite_expr(value);
+                        return vec![self.cjs_export_default_assignment(statement.range(), value)];
+                    }
                     let value = self.rewrite_expr(value);
                     vec![self.node(
                         statement.range(),
@@ -713,10 +1241,36 @@ impl<'a> Rewriter<'a> {
                         })),
                     )]
                 }
-                ExportDefaultValue::Function(_)
-                | ExportDefaultValue::Interface(_)
-                | ExportDefaultValue::Missing(_) => vec![statement.clone()],
+                ExportDefaultValue::Interface(_) | ExportDefaultValue::Missing(_) => {
+                    vec![statement.clone()]
+                }
             },
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+                type_only,
+                specifiers,
+                source,
+                ..
+            })) => {
+                if self.cjs.is_some() && source.is_none() && !*type_only {
+                    return self.cjs_export_specifiers(specifiers);
+                }
+                vec![statement.clone()]
+            }
+            Statement::Import(import) => {
+                if self.cjs.is_none() {
+                    return vec![statement.clone()];
+                }
+                if import.type_only {
+                    // Type-only imports carry no runtime form.
+                    return Vec::new();
+                }
+                match &import.clause {
+                    // A side-effect import stays at its position as a bare
+                    // require; clause imports move into the prelude.
+                    None => vec![self.cjs_require_statement(&import.source)],
+                    Some(_) => Vec::new(),
+                }
+            }
             Statement::Block(block) => {
                 let statements = self.rewrite_statements(&block.data().statements);
                 let block = self.node(block.range(), Block { statements });
@@ -733,6 +1287,19 @@ impl<'a> Rewriter<'a> {
                 )]
             }
             Statement::Expression(expr) => {
+                let mut candidate = &*expr.expression;
+                while let Expression::Parenthesized(value) = candidate.data() {
+                    candidate = value;
+                }
+                if Self::needs(LanguageFeature::Destructuring, self.options)
+                    && let Expression::Assignment(assignment) = candidate.data()
+                    && matches!(
+                        assignment.left.data(),
+                        AssignmentTarget::Object(_) | AssignmentTarget::Array(_)
+                    )
+                {
+                    return self.lower_assignment_destructuring(statement.range(), assignment);
+                }
                 let expression = Box::new(self.rewrite_expr(&expr.expression));
                 vec![self.node(
                     statement.range(),
@@ -932,8 +1499,7 @@ impl<'a> Rewriter<'a> {
                     vec![statement.clone()]
                 }
             }
-            Statement::Import(_)
-            | Statement::ImportEquals(_)
+            Statement::ImportEquals(_)
             | Statement::Export(_)
             | Statement::Interface(_)
             | Statement::TypeAlias(_)
@@ -1231,6 +1797,212 @@ impl<'a> Rewriter<'a> {
                 optional: false,
             }),
         )
+    }
+
+    /// `object.property` / `object[key]` over an arbitrary value expression.
+    fn member_expr(&mut self, object: &Expr, property: MemberProperty, range: TextRange) -> Expr {
+        self.node(
+            range,
+            Expression::Member(MemberExpression {
+                object: Box::new(object.clone()),
+                property,
+                optional: false,
+            }),
+        )
+    }
+
+    /// Lowers one destructuring assignment at targets below ES2015 into a
+    /// statement per assignment target. The right-hand side evaluates once,
+    /// nested pattern values are captured in temps, and computed keys that
+    /// are not bare identifiers evaluate once into a preceding temp.
+    fn lower_assignment_destructuring(
+        &mut self,
+        range: TextRange,
+        assignment: &AssignmentExpression,
+    ) -> Vec<Stmt> {
+        let mut statements = Vec::new();
+        let value = if matches!(assignment.right.data(), Expression::Identifier(_)) {
+            (*assignment.right).clone()
+        } else {
+            let temp = self.temp_ident();
+            let right = self.rewrite_expr(&assignment.right);
+            statements.push(self.make_temp_declaration(temp.clone(), right, range));
+            self.node(temp.range(), Expression::Identifier(temp))
+        };
+        self.lower_assignment_target(&assignment.left, &value, &mut statements, range);
+        statements
+    }
+
+    fn lower_assignment_target(
+        &mut self,
+        target: &AssignmentTargetNode,
+        value: &Expr,
+        statements: &mut Vec<Stmt>,
+        range: TextRange,
+    ) {
+        match target.data() {
+            AssignmentTarget::Identifier(_) | AssignmentTarget::Member(_) => {
+                let assignment = Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left: target.clone(),
+                    right: Box::new(value.clone()),
+                });
+                let expression = self.node(target.range(), assignment);
+                statements.push(self.node(
+                    target.range(),
+                    Statement::Expression(ExpressionStatement {
+                        expression: Box::new(expression),
+                    }),
+                ));
+            }
+            AssignmentTarget::Object(pattern) => {
+                for property in &pattern.properties {
+                    self.lower_assignment_property(property, value, statements, range);
+                }
+            }
+            AssignmentTarget::Array(pattern) => {
+                for (index, element) in pattern.elements.iter().enumerate() {
+                    let AssignmentArrayElement::Target(inner) = element else {
+                        continue;
+                    };
+                    let index_expr = self.number_expr(&index.to_string());
+                    let member = self.member_expr(
+                        value,
+                        MemberProperty::Computed(Box::new(index_expr)),
+                        range,
+                    );
+                    self.assign_or_recurse(inner, member, statements, range);
+                }
+            }
+            AssignmentTarget::Missing(_) => {}
+        }
+    }
+
+    /// Reads `member` once when `target` nests a pattern, otherwise assigns
+    /// it directly.
+    fn assign_or_recurse(
+        &mut self,
+        target: &AssignmentTargetNode,
+        member: Expr,
+        statements: &mut Vec<Stmt>,
+        range: TextRange,
+    ) {
+        if matches!(
+            target.data(),
+            AssignmentTarget::Object(_) | AssignmentTarget::Array(_)
+        ) {
+            let temp = self.temp_ident();
+            statements.push(self.make_temp_declaration(temp.clone(), member, range));
+            let value = self.node(temp.range(), Expression::Identifier(temp));
+            self.lower_assignment_target(target, &value, statements, range);
+        } else {
+            self.lower_assignment_target(target, &member, statements, range);
+        }
+    }
+
+    fn lower_assignment_property(
+        &mut self,
+        property: &AssignmentObjectProperty,
+        value: &Expr,
+        statements: &mut Vec<Stmt>,
+        range: TextRange,
+    ) {
+        let Some(member) = self.assignment_property_member(property, value, statements) else {
+            // A folded spread element has no name or target; report it the
+            // way the diagnostic for nested forms would.
+            self.diag(
+                codes::DESTRUCTURING_ASSIGNMENT_REQUIRES_ES2015,
+                property_name_range(&property.name),
+                "destructuring assignment requires ScriptTarget::Es2015 or later",
+            );
+            return;
+        };
+        if let Some(default) = &property.initializer {
+            let read = self.temp_ident();
+            statements.push(self.make_temp_declaration(read.clone(), member, range));
+            let reference = self.node(read.range(), Expression::Identifier(read.clone()));
+            let void_zero = self.void_zero(range);
+            let test = self.node(
+                range,
+                Expression::Binary(BinaryExpression {
+                    operator: BinaryOperator::StrictEqual,
+                    left: Box::new(reference),
+                    right: Box::new(void_zero),
+                }),
+            );
+            let left = self.node(read.range(), AssignmentTarget::Identifier(read.clone()));
+            let default_value = self.rewrite_expr(default);
+            let assignment = Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(default_value),
+            });
+            let expression = self.node(range, assignment);
+            let consequent = self.node(
+                range,
+                Statement::Expression(ExpressionStatement {
+                    expression: Box::new(expression),
+                }),
+            );
+            statements.push(self.node(
+                range,
+                Statement::If(IfStatement {
+                    test: Box::new(test),
+                    consequent: Box::new(consequent),
+                    alternate: None,
+                }),
+            ));
+            let read_value = self.node(read.range(), Expression::Identifier(read));
+            self.assign_or_recurse(&property.target, read_value, statements, range);
+        } else {
+            self.assign_or_recurse(&property.target, member, statements, range);
+        }
+    }
+
+    /// The `value[key]` read for one assignment-pattern property. String and
+    /// number literal names keep their bracket form; a bare identifier
+    /// computed key is pure and inlines, and any other computed key
+    /// evaluates once into a preceding temp.
+    fn assignment_property_member(
+        &mut self,
+        property: &AssignmentObjectProperty,
+        value: &Expr,
+        statements: &mut Vec<Stmt>,
+    ) -> Option<Expr> {
+        let range = property_name_range(&property.name);
+        match &property.name {
+            PropertyName::Identifier(ident) => {
+                let key = self.token_text(ident.data().token()).to_owned();
+                let property = self.ident(&key);
+                Some(self.member_expr(value, MemberProperty::Named(property), range))
+            }
+            PropertyName::String(literal) => {
+                let key = self.node(
+                    literal.range(),
+                    Expression::Literal(Literal::String(literal.clone())),
+                );
+                Some(self.member_expr(value, MemberProperty::Computed(Box::new(key)), range))
+            }
+            PropertyName::Number(literal) => {
+                let key = self.node(
+                    literal.range(),
+                    Expression::Literal(Literal::Number(literal.clone())),
+                );
+                Some(self.member_expr(value, MemberProperty::Computed(Box::new(key)), range))
+            }
+            PropertyName::Computed(key) => {
+                let key = self.rewrite_expr(key);
+                let key = if matches!(key.data(), Expression::Identifier(_)) {
+                    key
+                } else {
+                    let temp = self.temp_ident();
+                    statements.push(self.make_temp_declaration(temp.clone(), key.clone(), range));
+                    self.node(temp.range(), Expression::Identifier(temp))
+                };
+                Some(self.member_expr(value, MemberProperty::Computed(Box::new(key)), range))
+            }
+            PropertyName::Private(_) | PropertyName::Missing(_) => None,
+        }
     }
 
     fn slice_call(&mut self, object: &IdentifierNode, start: usize, range: TextRange) -> Expr {
@@ -3101,7 +3873,13 @@ impl<'a> Rewriter<'a> {
                 )
             }
             Expression::Call(call) => {
+                let needs_safe_wrap = self.cjs_call_needs_safe_wrap(&call.callee);
                 let callee = self.rewrite_expr(&call.callee);
+                let callee = if needs_safe_wrap {
+                    self.cjs_wrap_callee(callee)
+                } else {
+                    callee
+                };
                 let arguments = self.rewrite_call_arguments(&call.arguments);
                 self.node(
                     expression.range(),
@@ -3284,6 +4062,13 @@ impl<'a> Rewriter<'a> {
                     }),
                 )
             }
+            Expression::Identifier(_) => {
+                if let Some(replacement) = self.cjs_identifier_replacement(expression) {
+                    replacement
+                } else {
+                    expression.clone()
+                }
+            }
             _ => expression.clone(),
         }
     }
@@ -3383,6 +4168,44 @@ fn utf16_to_byte(text: &str, offset: usize) -> Option<usize> {
     None
 }
 
+/// Raw token text taken straight from the source file.
+fn raw_token_text(file: &SourceFile, token: &Token) -> String {
+    let start = file
+        .source_text()
+        .utf16_to_byte(token.range().start())
+        .unwrap_or(0);
+    let end = file
+        .source_text()
+        .utf16_to_byte(token.range().end())
+        .unwrap_or(0);
+    file.source_text()
+        .as_str()
+        .get(start..end)
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// The unescaped identifier spelling for a source identifier node.
+fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
+    raw_token_text(file, ident.data().token())
+}
+
+/// Declared value names of a statement, for export assignment generation.
+fn declared_binding_names(file: &SourceFile, statement: &Stmt) -> Vec<String> {
+    match statement.data() {
+        Statement::Variable(declaration) => declaration
+            .declarations
+            .iter()
+            .filter_map(|declarator| match declarator.data().binding.data() {
+                BindingPattern::Identifier(ident) => Some(identifier_text(file, ident)),
+                _ => None,
+            })
+            .collect(),
+        Statement::Enum(declaration) => vec![raw_token_text(file, declaration.name.data().token())],
+        _ => Vec::new(),
+    }
+}
+
 fn property_key_text(rewriter: &mut Rewriter, property: &ObjectBindingProperty) -> Option<String> {
     match &property.name {
         PropertyName::Identifier(ident) => {
@@ -3393,6 +4216,20 @@ fn property_key_text(rewriter: &mut Rewriter, property: &ObjectBindingProperty) 
             Some(raw.trim_matches(['"', '\'']).to_owned())
         }
         _ => None,
+    }
+}
+
+/// Source range of a property name, taken from its inner node.
+fn property_name_range(name: &PropertyName) -> TextRange {
+    match name {
+        PropertyName::Identifier(ident) => ident.range(),
+        PropertyName::String(literal) => literal.range(),
+        PropertyName::Number(number) => number.range(),
+        PropertyName::Computed(expression) => expression.range(),
+        PropertyName::Private(private) => private.range(),
+        PropertyName::Missing(_) => {
+            TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).expect("zero-width range is ordered")
+        }
     }
 }
 
@@ -4213,6 +5050,198 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         let code = javascript(&output);
         assert!(code.contains("f(null);"), "{code}");
         assert!(!code.contains("<any>"), "{code}");
+    }
+
+    #[test]
+    fn commonjs_named_import_and_function_export_match_upstream_shape() {
+        // Upstream commonjsSafeImport(target=es2015).js
+        // (282283386bc4040f0eba585ac33e142c5c30cfbb67f969b1706c655dc7bee408).
+        let export = emit_with_options(
+            "export function Foo() {}\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let export_code = javascript(&export);
+        assert!(
+            export_code.starts_with(
+                "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.Foo = Foo;\nfunction Foo()"
+            ),
+            "{export_code}"
+        );
+
+        let import = emit_with_options(
+            "import { Foo } from './10_lib';\nFoo();\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let import_code = javascript(&import);
+        assert!(
+            import_code.starts_with(
+                "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst _10_lib_1 = require(\"./10_lib\");\n"
+            ),
+            "{import_code}"
+        );
+        assert!(
+            import_code.contains("(0, _10_lib_1.Foo)();"),
+            "{import_code}"
+        );
+        assert!(!import_code.contains("import "), "{import_code}");
+    }
+
+    #[test]
+    fn es5_lowers_nested_computed_destructuring_assignment() {
+        // Upstream computedPropertiesInDestructuring1.js
+        // (50845e031ebf8203c61d4bfb72d37eea703fea245df4e215c7b5772583a8a898).
+        let output = emit_at(
+            "let foo = 'bar', bar4; [{ [foo]: bar4 }] = [{ bar: 'bar' }];\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(
+            !output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code()
+                    == codes::DESTRUCTURING_ASSIGNMENT_REQUIRES_ES2015),
+            "{:?}",
+            output.diagnostics
+        );
+        assert!(code.contains("bar4 ="), "{code}");
+        assert!(code.contains("[foo]"), "{code}");
+        assert!(!code.contains("[{ [foo]: bar4 }] ="), "{code}");
+    }
+
+    #[test]
+    fn commonjs_class_and_variable_exports_receive_void_0_preamble() {
+        // Upstream importHelpersWithImportStarAs a.js (a2836e68) emits
+        // `exports.A = void 0;` + class + `exports.A = A;`; the variable form
+        // follows es6ImportDefaultBindingWithExport client.js (adfd4388).
+        let output = emit_with_options(
+            "export class A {}\nexport const x = 1;\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.starts_with(
+                "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.A = exports.x = void 0;\n"
+            ),
+            "{code}"
+        );
+        let marker = code
+            .find("exports.A = exports.x = void 0;")
+            .expect("preamble");
+        let class_at = code.find("class A").expect("class kept");
+        let class_export = code.find("exports.A = A;").expect("class export");
+        let variable = code.find("const x = 1;").expect("variable kept");
+        let variable_export = code.find("exports.x = x;").expect("variable export");
+        assert!(
+            marker < class_at
+                && class_at < class_export
+                && class_export < variable
+                && variable < variable_export,
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn commonjs_local_specifier_exports_assign_each_name() {
+        // Same `exports.NAME = LOCAL;` identifier-assignment form as the
+        // identifier default export in es6ImportDefaultBindingWithExport
+        // server.js (adfd4388): `exports.default = a;`.
+        let output = emit_with_options(
+            "const a = 1, b = 2;\nexport { a, b as c };\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("exports.a = a;"), "{code}");
+        assert!(code.contains("exports.c = b;"), "{code}");
+        assert!(!code.contains("export {"), "{code}");
+    }
+
+    #[test]
+    fn commonjs_side_effect_imports_stay_as_require() {
+        let output = emit_with_options(
+            "import './polyfill';\nrun();\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("require(\"./polyfill\");"), "{code}");
+        assert!(!code.contains("import "), "{code}");
+    }
+
+    #[test]
+    fn node_executes_lowered_computed_destructuring_assignment() {
+        // computedPropertiesInDestructuring1 (50845e03) pins the preserved
+        // ES6 forms; this snapshot carries no ES5 blob, so the ES5 lowering
+        // contract is pinned behaviorally: values, and one evaluation per
+        // key/default in source order.
+        let source = r#"
+const log = [];
+let foo = "bar";
+let bar = 0, bar3 = 0, bar4 = 0;
+function key() { log.push("key"); return foo; }
+function rhs() { log.push("rhs"); return { bar: "set" }; }
+({ [key()]: bar } = rhs());
+[{ [key()]: bar4 }] = [{ bar: "nested" }];
+console.log(JSON.stringify([bar, bar4, log]));
+"#;
+        let output = emit_at(source, ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            !output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code()
+                    == codes::DESTRUCTURING_ASSIGNMENT_REQUIRES_ES2015),
+            "{:?}",
+            output.diagnostics
+        );
+        // 3 = function definition `function key()` + 2 call sites (one per destructuring)
+        assert_eq!(code.matches("key()").count(), 3, "{code}");
+        // 2 = function definition `function rhs()` + 1 call site
+        assert_eq!(code.matches("rhs()").count(), 2, "{code}");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bamts-cpd-{nonce}.cjs"));
+        std::fs::write(&path, code).expect("write lowered JavaScript");
+        let result = std::process::Command::new("node")
+            .arg(&path)
+            .output()
+            .expect("execute Node");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(result.stdout)
+                .expect("Node stdout")
+                .trim(),
+            // Per spec, RHS evaluates before computed keys in destructuring assignment:
+            // rhs() → key() → key()
+            r#"["set","nested",["rhs","key","key"]]"#
+        );
     }
 
     #[test]

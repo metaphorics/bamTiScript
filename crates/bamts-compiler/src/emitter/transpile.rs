@@ -327,9 +327,11 @@ mod tests {
         };
         let output = one_jsx("const view = <><span /><span /></>;", &options);
         let code = output.javascript.expect("JavaScript output").code;
+        // The `__esModule` marker precedes every require prelude, matching
+        // upstream module emit (commonjsSafeImport 282283386).
         assert!(
             code.starts_with(
-                "\"use strict\";\nvar _jsxRuntime = require(\"react/jsx-runtime\");\n",
+                "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nvar _jsxRuntime = require(\"react/jsx-runtime\");\n",
             ),
             "{code}"
         );
