@@ -323,6 +323,11 @@ pub const PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR: DiagnosticCode =
     DiagnosticCode::new("BAMTS-C080");
 const PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE: &str =
     "A parameter property is only allowed in a constructor implementation.";
+/// Diagnostic emitted when a function or method whose declared return type is
+/// a value type completes without returning a value.
+pub const NON_VOID_FUNCTION_MUST_RETURN: DiagnosticCode = DiagnosticCode::new("BAMTS-C081");
+const NON_VOID_FUNCTION_MUST_RETURN_MESSAGE: &str =
+    "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.";
 
 /// One cooperative checker invocation was cancelled before completing.
 ///
@@ -11206,6 +11211,94 @@ function check(options: Options = {}) {
         assert_eq!(
             checker_codes(&result),
             [super::INVALID_INDEXED_ACCESS_KEY.as_str()]
+        );
+    }
+    #[test]
+    fn f4_function_declaration3_reports_only_the_missing_implementation() {
+        // Upstream baseline FunctionDeclaration3.errors.txt (sha256
+        // 22ca7ff4...): TS2391 at (1,10) plus TS7010 at (1,10). The TS7010
+        // pairing is emitted by the binder at the same site; this pins the
+        // C039 half and forbids unrelated spurious diagnostics.
+        let result = check_text("function foo();\n1+1;\nfunction foo():string { return \"a\" }");
+        let diagnostics = result
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code().as_str().starts_with("BAMTS-C"))
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code().as_str(), "BAMTS-C039");
+        assert_eq!(diagnostics[0].range().start().get(), 9);
+        assert_eq!(diagnostics[0].range().end().get(), 12);
+    }
+
+    #[test]
+    fn f4_parameter_list5_keeps_the_function_body_and_return_type() {
+        // Upstream baseline ParameterList5.errors.txt (sha256 414b66f7...)
+        // expects exactly four errors (TS2355/TS2369/TS7006/TS2304) with a
+        // live function body. The parser must not turn the annotated
+        // function type into a bodyless declaration, so C039 and the
+        // value-level C002 for `C` must stay absent while the unresolved
+        // return-type reference `C` reports at (1,29) => offset 28.
+        let result = check_text("function A(): (public B) => C {\n}");
+        let diagnostics = result
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code().as_str().starts_with("BAMTS-C"))
+            .collect::<Vec<_>>();
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code().as_str() == "BAMTS-C039"),
+            "the body survives, so no missing-implementation error: {diagnostics:?}"
+        );
+        let unresolved = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code().as_str() == "BAMTS-C003")
+            .expect("the return type name C is unresolved");
+        assert_eq!(unresolved.range().start().get(), 28);
+        assert_eq!(unresolved.range().end().get(), 29);
+    }
+
+    #[test]
+    fn f4_computed_symbol_object_members_accept_without_errors() {
+        // Upstream acceptSymbolAsWeakType expects zero diagnostics; symbol
+        // receivers must not trigger weak-type or member-resolution errors.
+        let result = check_text(
+            "var s: symbol;\nvar x = {\n    [s]: 0,\n    [s]() { },\n    get [s]() {\n        return 0;\n    }\n}",
+        );
+        assert!(
+            checker_codes(&result).is_empty(),
+            "{:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn f4_direct_abstract_union_construction_reports_c066() {
+        // Upstream abstractClassUnionInstantiation reports TS2511 for
+        // `new cls1()` and `new cls2()` and none for `new cls3()`. The three
+        // `.map(cls => new cls())` rows additionally need array-literal
+        // union inference in the binder and are tracked separately.
+        let result = check_text(
+            "class ConcreteA {}\n\
+             class ConcreteB {}\n\
+             abstract class AbstractA { a: string; }\n\
+             abstract class AbstractB { b: string; }\n\
+             type Abstracts = typeof AbstractA | typeof AbstractB;\n\
+             type Concretes = typeof ConcreteA | typeof ConcreteB;\n\
+             type ConcretesOrAbstracts = Concretes | Abstracts;\n\
+             declare const cls1: ConcretesOrAbstracts;\n\
+             declare const cls2: Abstracts;\n\
+             declare const cls3: Concretes;\n\
+             new cls1();\n\
+             new cls2();\n\
+             new cls3();",
+        );
+        assert_eq!(
+            checker_codes(&result),
+            ["BAMTS-C066", "BAMTS-C066"],
+            "{:?}",
+            result.diagnostics()
         );
     }
 }
