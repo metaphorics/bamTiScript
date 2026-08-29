@@ -559,12 +559,52 @@ pub fn compare_symbols(expected: &str, actual: &str) -> FacetVerdict {
     })
 }
 
-/// Structural comparator for `.d.ts` baselines.
+/// Structural comparator for emitted `.d.ts` declaration baselines.
 ///
 /// Both sides are parsed with the exact BAMTS parser and canonicalized from the
 /// AST. A baseline that does not parse without recovery can never pass.
 pub fn compare_dts(expected: &str, actual: &str) -> FacetVerdict {
     compare_structural("d.ts", expected, actual, canonicalize_dts)
+}
+
+/// Structural comparator for JSON source-map baselines.
+///
+/// JSON object-key order and insignificant whitespace do not carry map meaning;
+/// array order and scalar values remain significant.
+pub fn compare_source_map(expected: &str, actual: &str) -> FacetVerdict {
+    compare_structural("source-map", expected, actual, canonicalize_json)
+}
+
+fn canonicalize_json(text: &str) -> Result<Vec<String>, ()> {
+    let mut lines = Vec::new();
+    for line in text.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        let trimmed = line.trim();
+        // Visualization trailers and blank lines carry no map meaning.
+        if trimmed.is_empty() || trimmed.starts_with("//// https://") {
+            continue;
+        }
+        if let Some(name) = trimmed
+            .strip_prefix("//// [")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            lines.push(format!("//// [{name}]"));
+            continue;
+        }
+        if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+            lines.push(trimmed.to_owned());
+            continue;
+        }
+        let mut value: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| ())?;
+        // Upstream's serializer always writes `sourceRoot` (empty when unset);
+        // absent and empty carry the same map meaning, so normalize to absent.
+        if let Some(map) = value.as_object_mut()
+            && map.get("sourceRoot").and_then(serde_json::Value::as_str) == Some("")
+        {
+            map.remove("sourceRoot");
+        }
+        lines.push(serde_json::to_string(&value).map_err(|_| ())?);
+    }
+    Ok(lines)
 }
 
 /// Line-wise comparator for `.js` emit baselines.
@@ -2233,6 +2273,45 @@ mod tests {
         let actual = "[Global]\n  x : Symbol(x)\n[File: a.ts]\n  z : Symbol(z)\n";
         assert!(compare_symbols(expected, actual).is_fail());
         assert!(compare_symbols(expected, expected).is_pass());
+    }
+
+    #[test]
+    fn structural_source_map_normalizes_key_order_and_whitespace() {
+        // Upstream's baseliner writes compact single-line JSON; key order and
+        // in-line whitespace carry no map meaning.
+        let expected = "{\"version\":3,\"file\":\"a.js\",\"sources\":[\"a.ts\"],\"names\":[],\"mappings\":\"AAAA\"}";
+        let actual = "{ \"mappings\" : \"AAAA\", \"names\" : [], \"sources\" : [\"a.ts\"], \"file\" : \"a.js\", \"version\" : 3 }";
+        assert!(compare_source_map(expected, actual).is_pass());
+    }
+
+    #[test]
+    fn structural_source_map_normalizes_empty_sourceroot() {
+        // Upstream always serializes `sourceRoot` (empty when unset); absent
+        // and empty carry the same map meaning.
+        let expected =
+            "{\"version\":3,\"sourceRoot\":\"\",\"sources\":[\"a.ts\"],\"mappings\":\"AAAA\"}";
+        let actual = "{\"mappings\":\"AAAA\",\"sources\":[\"a.ts\"],\"version\":3}";
+        assert!(compare_source_map(expected, actual).is_pass());
+    }
+
+    #[test]
+    fn structural_source_map_preserves_mappings_and_array_order() {
+        let expected = "{\"version\":3,\"sources\":[\"a.ts\",\"b.ts\"],\"mappings\":\"AAAA;ACDE\"}";
+        let reordered_sources =
+            "{\"version\":3,\"sources\":[\"b.ts\",\"a.ts\"],\"mappings\":\"AAAA;ACDE\"}";
+        let changed_mappings =
+            "{\"version\":3,\"sources\":[\"a.ts\",\"b.ts\"],\"mappings\":\"AAAA;ACDF\"}";
+        assert!(compare_source_map(expected, expected).is_pass());
+        assert!(compare_source_map(expected, reordered_sources).is_fail());
+        assert!(compare_source_map(expected, changed_mappings).is_fail());
+    }
+
+    #[test]
+    fn structural_source_map_never_passes_unparseable_json() {
+        let malformed = "{\"version\":3,";
+        let valid = "{\"version\":3}";
+        assert!(compare_source_map(malformed, valid).is_unproven());
+        assert!(compare_source_map(valid, malformed).is_fail());
     }
 
     #[test]

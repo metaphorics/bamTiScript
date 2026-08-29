@@ -18,12 +18,14 @@ use std::{
     fmt::Write as _,
     fs,
     path::Path,
+    sync::Arc,
 };
 
 #[cfg(test)]
 use bamts_compiler::checker::Type;
 use bamts_compiler::checker::{SemanticModel, SymbolId, SymbolKind, render_type};
 use bamts_compiler::diagnostic::DiagnosticSeverity;
+use bamts_compiler::emitter::{EmitFileNames, EmitOptions, emit_checked};
 use bamts_compiler::pipeline::{
     FrontendMode, FrontendOutput, ProgramFrontendOutput, compile_program_frontend,
 };
@@ -36,7 +38,8 @@ use bamts_compiler::syntax::{NodeId, Token, TokenKind};
 use crate::catalog::CaseConfiguration;
 use crate::facets::{
     DiagnosticCategory, DiagnosticCodeMap, FacetDiagnostic, FacetSeverity, FacetVerdict,
-    SourcePosition, compare_diagnostics, compare_js_emit, compare_symbols, compare_types,
+    SourcePosition, compare_diagnostics, compare_js_emit, compare_source_map, compare_symbols,
+    compare_types,
 };
 use crate::suite::{
     CellResult, FailureClass, IndexEntry, PlannedCell, SnapshotAssets, SuiteIndex, TempDir,
@@ -487,7 +490,14 @@ pub fn baseline_groups(index: &SuiteIndex) -> BaselineGroups {
 
 /// Split `<stem>[(suffix)].<ext>`; returns `None` for unrecognized names.
 fn split_baseline_file_name(file_name: &str) -> Option<(&str, &str, &str)> {
-    let extensions = [".errors.txt", ".types", ".symbols", ".jsx", ".js"];
+    let extensions = [
+        ".errors.txt",
+        ".types",
+        ".symbols",
+        ".jsx",
+        ".js.map",
+        ".js",
+    ];
     let extension = extensions
         .iter()
         .find(|extension| file_name.ends_with(*extension))?;
@@ -782,7 +792,7 @@ pub fn compile_case_with_pragmas(
     compile_case_frontend(units, entry_name, pragmas, FrontendMode::Check)
 }
 
-fn compile_case_frontend(
+pub fn compile_case_frontend(
     units: &[CaseUnit],
     entry_name: &str,
     pragmas: &CasePragmas,
@@ -1609,6 +1619,374 @@ fn emit_javascript_baseline(case: &CheckedCase) -> std::result::Result<String, S
         return Err("javascript emit reached no case units".to_owned());
     }
     Ok(out)
+}
+
+/// Swap a unit basename to its declaration-output name (`a.ts` ⇒ `a.d.ts`,
+/// `.mts` ⇒ `.d.mts`, `.cts` ⇒ `.d.cts`), matching upstream's declaration
+/// emit extension rule for per-file output naming.
+#[must_use]
+pub fn declaration_section_name(unit_name: &str) -> String {
+    let lower = unit_name.to_lowercase();
+    let extension = if lower.ends_with(".mts") {
+        ".d.mts"
+    } else if lower.ends_with(".cts") {
+        ".d.cts"
+    } else {
+        ".d.ts"
+    };
+    let stem = unit_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(unit_name);
+    format!("{stem}{extension}")
+}
+
+/// Emit the declaration slice of an upstream `.js` baseline document: one
+/// `//// [<stem>.d.ts]` section per reached unit, framed exactly like
+/// upstream's `doJsEmitBaseline` `fileOutput` sections (header without
+/// trailing slashes, newline-terminated code).
+pub fn emit_declaration_baseline(case: &CheckedCase) -> std::result::Result<String, String> {
+    let mut out = String::new();
+    for (unit, output) in case.reached_units() {
+        let Some(emit) = output.emit() else {
+            return Err(format!(
+                "unit `{}` produced no declaration emit",
+                unit.virtual_path
+            ));
+        };
+        let Some(declaration) = emit.declaration.as_ref() else {
+            return Err(format!(
+                "unit `{}` produced no declaration slot",
+                unit.virtual_path
+            ));
+        };
+        out.push_str(&format!(
+            "//// [{}]\n",
+            declaration_section_name(&unit_basename(&unit.virtual_path))
+        ));
+        out.push_str(&declaration.code);
+        if !declaration.code.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        return Err("declaration emit reached no case units".to_owned());
+    }
+    Ok(out)
+}
+
+/// The `//// [name]` header text of an upstream baseline section, or `None`
+/// for any other line. The document header (`//// [case] ////`) carries
+/// trailing slashes and is never a section header.
+fn section_header_name(line: &str) -> Option<&str> {
+    line.strip_prefix("//// [")
+        .and_then(|rest| rest.strip_suffix(']'))
+}
+
+/// Whether a baseline section name is a declaration output (`a.d.ts`,
+/// `a.d.mts`, `a.d.cts`).
+fn is_declaration_section_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".d.ts") || lower.ends_with(".d.mts") || lower.ends_with(".d.cts")
+}
+
+/// Extract the declaration output sections (header + body) of an upstream
+/// `.js` baseline document. The `declaration` observable speaks only about
+/// this slice; input echoes, `.js` outputs, and `[DtsFileErrors]` markers stay
+/// out of the comparison.
+#[must_use]
+pub fn extract_dts_sections(baseline: &str) -> String {
+    let mut out = String::new();
+    let mut in_section = false;
+    for line in baseline.lines() {
+        match section_header_name(line) {
+            Some(name) => {
+                in_section = is_declaration_section_name(name);
+                if in_section {
+                    out.push_str(line.trim_end());
+                    out.push('\n');
+                }
+            }
+            None if in_section => {
+                out.push_str(line.trim_end());
+                out.push('\n');
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Run the declaration emit comparator against the selected pragma variation.
+///
+/// The upstream `.js` baseline document embeds declaration output as
+/// `//// [<stem>.d.ts]` sections (harness `doJsEmitBaseline`); the comparator
+/// compares only those sections with the javascript facet's line-wise
+/// normalization. Compile failures are `FAIL_BEHAVIOR`/`CRASH`; a missing
+/// owned `.js` baseline is a classification/execution drift `HARNESS_ERROR`.
+pub(crate) fn observe_declaration(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    groups: &BaselineGroups,
+    index_entry: &IndexEntry,
+    text: &str,
+    pragmas: &CasePragmas,
+) -> CompilerCheckObservation {
+    let units = split_case_units(&index_entry.logical_path, text);
+    let entry = entry_virtual_path(&index_entry.logical_path, &units);
+    let compile_options = compile_option_pairs(pragmas);
+    let baseline_path =
+        match resolve_stem_baseline(groups, &index_entry.logical_path, "js", &compile_options) {
+            Ok(path) => path,
+            Err(error) => {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: error.to_string(),
+                    artifact: None,
+                };
+            }
+        };
+    match compile_case_frontend(&units, &entry, pragmas, FrontendMode::Declaration) {
+        Err(error) => compile_failure_observation(error),
+        Ok(case) => {
+            let Some(baseline_path) = baseline_path else {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail:
+                        "classification/execution drift: no owned `.js` baseline document for the declaration facet"
+                            .to_owned(),
+                    artifact: None,
+                };
+            };
+            let emitted = match emit_declaration_baseline(&case) {
+                Ok(emitted) => emitted,
+                Err(detail) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::FailBehavior,
+                        detail,
+                        artifact: None,
+                    };
+                }
+            };
+            let bytes = match read_verified_snapshot_asset(snapshot, &baseline_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::HarnessError,
+                        detail: error.to_string(),
+                        artifact: None,
+                    };
+                }
+            };
+            let expected = extract_dts_sections(&String::from_utf8_lossy(&bytes));
+            match compare_js_emit(&expected, &emitted) {
+                FacetVerdict::Pass => CompilerCheckObservation {
+                    class: FailureClass::Pass,
+                    detail: "declaration parity".to_owned(),
+                    artifact: Some(emitted.into_bytes()),
+                },
+                FacetVerdict::Fail { reason } => CompilerCheckObservation {
+                    class: FailureClass::FailBehavior,
+                    detail: reason,
+                    artifact: None,
+                },
+                FacetVerdict::Unproven { reason } => CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: format!("declaration oracle could not prove parity: {reason}"),
+                    artifact: None,
+                },
+            }
+        }
+    }
+}
+
+/// Whether the selected compile options ask for an inline source map, which
+/// upstream baselines only through the `.sourcemap.txt` record.
+fn is_inline_source_map(compile_options: &[(String, String)]) -> bool {
+    compile_options
+        .iter()
+        .any(|(name, value)| name == "inlinesourcemap" && value.eq_ignore_ascii_case("true"))
+}
+
+/// The precise gap an inline-source-map `source-map` obligation records: the
+/// `.js.map` JSON facet does not exist for inline maps, and the comparable
+/// artifact — the `.sourcemap.txt` sourcemap record — has no producer yet.
+fn inline_source_map_producer_gap() -> String {
+    "producer missing: `.sourcemap.txt` sourcemap-record producer (inline source maps are never baselined as `.js.map` upstream)".to_owned()
+}
+
+/// Emit the source-map slice of an upstream `.js.map` baseline document: one
+/// `//// [<stem>.js.map]` section per reached unit carrying the real printer
+/// map as Source Map v3 JSON. Maps are produced through the public emitter
+/// surface with external-map naming (`file`, `sources`, and the
+/// `sourceMappingURL` mirror upstream's per-file baseline shape).
+pub fn emit_source_map_baseline(
+    case: &CheckedCase,
+    inline_sources: bool,
+) -> std::result::Result<String, String> {
+    let mut out = String::new();
+    for (unit, output) in case.reached_units() {
+        if output.emit().is_none() {
+            return Err(format!(
+                "unit `{}` produced no javascript emit",
+                unit.virtual_path
+            ));
+        }
+        let source_name = unit_basename(&unit.virtual_path);
+        let js_name = match source_name.rsplit_once('.') {
+            Some((stem, _)) => format!("{stem}.js"),
+            None => format!("{source_name}.js"),
+        };
+        let options = EmitOptions {
+            source_map: true,
+            inline_sources,
+            ..EmitOptions::default()
+        };
+        let names = EmitFileNames {
+            source_name: Arc::from(source_name.as_str()),
+            js_file_name: Some(Arc::from(js_name.as_str())),
+            js_source_name: Some(Arc::from(source_name.as_str())),
+            js_source_map_url: Some(Arc::from(format!("{js_name}.map").as_str())),
+            ..EmitFileNames::default()
+        };
+        let emitted = emit_checked(
+            output.source_file(),
+            output.semantic_model(),
+            &options,
+            &names,
+        );
+        let Some(map) = emitted
+            .javascript
+            .as_ref()
+            .and_then(|file| file.source_map.as_ref())
+        else {
+            return Err(format!(
+                "unit `{}` produced no source map",
+                unit.virtual_path
+            ));
+        };
+        out.push_str(&format!("//// [{js_name}.map]\n{}", map.to_json()));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        return Err("source-map emit reached no case units".to_owned());
+    }
+    Ok(out)
+}
+
+/// Run the source-map comparator against the selected pragma variation.
+///
+/// External-map configurations (`sourcemap=true`) compare the emitted maps
+/// against the owned `.js.map` baseline under JSON canonicalization. Inline
+/// configurations have no `.js.map` baseline upstream and are recorded as the
+/// precise producer gap instead. A non-inline configuration with no owned
+/// `.js.map` baseline is a classification/execution drift `HARNESS_ERROR`.
+pub(crate) fn observe_source_map(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    groups: &BaselineGroups,
+    index_entry: &IndexEntry,
+    text: &str,
+    pragmas: &CasePragmas,
+) -> CompilerCheckObservation {
+    let units = split_case_units(&index_entry.logical_path, text);
+    let entry = entry_virtual_path(&index_entry.logical_path, &units);
+    let compile_options = compile_option_pairs(pragmas);
+    if is_inline_source_map(&compile_options) {
+        return CompilerCheckObservation {
+            class: FailureClass::HarnessError,
+            detail: inline_source_map_producer_gap(),
+            artifact: None,
+        };
+    }
+    let baseline_path = match resolve_stem_baseline(
+        groups,
+        &index_entry.logical_path,
+        "js.map",
+        &compile_options,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            return CompilerCheckObservation {
+                class: FailureClass::HarnessError,
+                detail: error.to_string(),
+                artifact: None,
+            };
+        }
+    };
+    match compile_case_frontend(&units, &entry, pragmas, FrontendMode::JavaScript) {
+        Err(error) => compile_failure_observation(error),
+        Ok(case) => {
+            let Some(baseline_path) = baseline_path else {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: "classification/execution drift: no owned `.js.map` baseline"
+                        .to_owned(),
+                    artifact: None,
+                };
+            };
+            let inline_sources = compile_options
+                .iter()
+                .any(|(name, value)| name == "inlinesources" && value.eq_ignore_ascii_case("true"));
+            let emitted = match emit_source_map_baseline(&case, inline_sources) {
+                Ok(emitted) => emitted,
+                Err(detail) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::FailBehavior,
+                        detail,
+                        artifact: None,
+                    };
+                }
+            };
+            let bytes = match read_verified_snapshot_asset(snapshot, &baseline_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::HarnessError,
+                        detail: error.to_string(),
+                        artifact: None,
+                    };
+                }
+            };
+            let expected = String::from_utf8_lossy(&bytes).into_owned();
+            match compare_source_map(&expected, &emitted) {
+                FacetVerdict::Pass => CompilerCheckObservation {
+                    class: FailureClass::Pass,
+                    detail: "source-map parity".to_owned(),
+                    artifact: Some(emitted.into_bytes()),
+                },
+                FacetVerdict::Fail { reason } => CompilerCheckObservation {
+                    class: FailureClass::FailBehavior,
+                    detail: reason,
+                    artifact: None,
+                },
+                FacetVerdict::Unproven { reason } => CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: format!("source-map oracle could not prove parity: {reason}"),
+                    artifact: None,
+                },
+            }
+        }
+    }
+}
+
+/// Record the `trace` observable honestly: upstream baselines
+/// `traceResolution` output as `<stem>.trace.json` (a JSON array of sanitized
+/// resolution log lines), and bamts-compiler has no module-resolution tracer,
+/// so there is no produced artifact to compare. The precise producer gap is a
+/// blocking non-pass — never a synthesized pass.
+pub(crate) fn observe_trace(
+    _snapshot: &(impl SnapshotAssets + ?Sized),
+    _groups: &BaselineGroups,
+    _index_entry: &IndexEntry,
+    _text: &str,
+    _pragmas: &CasePragmas,
+) -> CompilerCheckObservation {
+    CompilerCheckObservation {
+        class: FailureClass::HarnessError,
+        detail: "producer missing: module-resolution trace emitter (upstream `traceResolution` log baselined as `.trace.json`; bamts-compiler has no resolution tracer)".to_owned(),
+        artifact: None,
+    }
 }
 
 /// Emit the `.symbols` baseline for a compiled case in the upstream framing:
@@ -2961,5 +3339,95 @@ class Board {\n\
         let error = resolve_stem_baseline(&groups, "tests/cases/compiler/foo.ts", "types", &[])
             .expect_err("duplicate plains");
         assert_eq!(error.code(), ErrorCode::Duplicate);
+    }
+
+    #[test]
+    fn declaration_section_name_swaps_extensions_per_upstream() {
+        assert_eq!(declaration_section_name("a.ts"), "a.d.ts");
+        assert_eq!(declaration_section_name("b.mts"), "b.d.mts");
+        assert_eq!(declaration_section_name("c.cts"), "c.d.cts");
+        assert_eq!(declaration_section_name("d.tsx"), "d.d.ts");
+    }
+
+    #[test]
+    fn extract_dts_sections_selects_only_declaration_output() {
+        // Real upstream shape (argumentsReferenceInConstructor4_Js.js): a
+        // document header with trailing ////, an input echo, then the `a.d.ts`
+        // output section. Only the declaration section may survive.
+        let doc = "//// [tests/cases/compiler/argumentsReferenceInConstructor4_Js.ts] ////\n\
+            \n\
+            //// [a.js]\nclass A {}\n\
+            \n\
+            //// [a.d.ts]\ndeclare class A {}\n";
+        assert_eq!(
+            extract_dts_sections(doc),
+            "//// [a.d.ts]\ndeclare class A {}\n"
+        );
+    }
+
+    #[test]
+    fn declaration_baseline_frames_and_compares_upstream_sections() {
+        let logical = "tests/cases/compiler/declPin.ts";
+        let case_text = "var x: number = 1;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case_frontend(
+            &units,
+            &entry,
+            &CasePragmas::default(),
+            FrontendMode::Declaration,
+        )
+        .expect("case compiles");
+        let emitted = emit_declaration_baseline(&case).expect("declaration emit");
+        assert_eq!(emitted, "//// [declPin.d.ts]\ndeclare var x: number;\n");
+        let baseline_doc = "//// [tests/cases/compiler/declPin.ts] ////\n\
+            \n\
+            //// [declPin.ts]\nvar x: number = 1;\n\
+            \n\
+            //// [declPin.d.ts]\ndeclare var x: number;\n";
+        assert_eq!(
+            compare_js_emit(&extract_dts_sections(baseline_doc), &emitted),
+            FacetVerdict::Pass
+        );
+        let semantic = baseline_doc.replace("number", "string");
+        assert!(matches!(
+            compare_js_emit(&extract_dts_sections(&semantic), &emitted),
+            FacetVerdict::Fail { .. }
+        ));
+    }
+
+    #[test]
+    fn source_map_baseline_frames_real_printer_maps() {
+        let logical = "tests/cases/compiler/mapPin.ts";
+        let case_text = "var v = 1;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case_frontend(
+            &units,
+            &entry,
+            &CasePragmas::default(),
+            FrontendMode::JavaScript,
+        )
+        .expect("case compiles");
+        let emitted = emit_source_map_baseline(&case, false).expect("map emit");
+        assert!(
+            emitted.starts_with("//// [mapPin.js.map]\n{\"version\":3"),
+            "{emitted}"
+        );
+        assert!(emitted.contains("\"file\":\"mapPin.js\""), "{emitted}");
+        assert!(emitted.contains("\"sources\":[\"mapPin.ts\"]"), "{emitted}");
+        assert_eq!(compare_source_map(&emitted, &emitted), FacetVerdict::Pass);
+    }
+
+    #[test]
+    fn inline_source_maps_record_the_missing_record_producer() {
+        let inline = compile_option_pairs(&parse_case_pragmas(
+            "// @inlinesourcemap: true\nvar v = 1;\n",
+        ));
+        assert!(is_inline_source_map(&inline));
+        assert!(inline_source_map_producer_gap().starts_with("producer missing: "));
+        let external =
+            compile_option_pairs(&parse_case_pragmas("// @sourcemap: true\nvar v = 1;\n"));
+        assert!(!is_inline_source_map(&external));
     }
 }

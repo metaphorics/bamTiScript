@@ -2828,6 +2828,23 @@ pub fn observe_compiler_lane(
             &text,
             &pragmas,
         ),
+        ObservableKind::Declaration => check_cells::observe_declaration(
+            snapshot,
+            &ctx.baseline_groups,
+            index_entry,
+            &text,
+            &pragmas,
+        ),
+        ObservableKind::SourceMap => check_cells::observe_source_map(
+            snapshot,
+            &ctx.baseline_groups,
+            index_entry,
+            &text,
+            &pragmas,
+        ),
+        ObservableKind::Trace => {
+            check_cells::observe_trace(snapshot, &ctx.baseline_groups, index_entry, &text, &pragmas)
+        }
         other => {
             return CompilerLaneObservation::blocking(
                 snapshot_input,
@@ -3780,6 +3797,18 @@ var s: string = \"hi\";\n\
         source: &str,
         types_baseline: &str,
     ) -> CompilerLaneFixture {
+        compiler_lane_fixture_with_baselines(label, file_name, source, &[("types", types_baseline)])
+    }
+
+    /// Materialize a one-case suite snapshot with arbitrary flat reference
+    /// baselines (`(<stem>).<suffix>` files under
+    /// `tests/baselines/reference/`).
+    fn compiler_lane_fixture_with_baselines(
+        label: &str,
+        file_name: &str,
+        source: &str,
+        baselines: &[(&str, &str)],
+    ) -> CompilerLaneFixture {
         let extracted = TestDir::new(&format!("{label}-src"));
         let case = extracted
             .path()
@@ -3791,12 +3820,14 @@ var s: string = \"hi\";\n\
             .rsplit_once('.')
             .map(|(stem, _)| stem)
             .unwrap_or(file_name);
-        let baseline = extracted
-            .path()
-            .join("tests/baselines/reference")
-            .join(format!("{stem}.types"));
-        fs::create_dir_all(baseline.parent().unwrap()).unwrap();
-        fs::write(&baseline, types_baseline).unwrap();
+        for (suffix, content) in baselines {
+            let baseline = extracted
+                .path()
+                .join("tests/baselines/reference")
+                .join(format!("{stem}.{suffix}"));
+            fs::create_dir_all(baseline.parent().unwrap()).unwrap();
+            fs::write(&baseline, content).unwrap();
+        }
         fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
         let snap = TestDir::new(&format!("{label}-snap"));
         materialize_from_extracted(snap.path(), extracted.path()).unwrap();
@@ -4152,6 +4183,265 @@ var s: string = \"hi\";\n\
                 .chars()
                 .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
         );
+    }
+
+    fn declaration_lane_emitted_doc(source: &str) -> String {
+        let logical = "tests/cases/compiler/declLane.ts";
+        let units = check_cells::split_case_units(logical, source);
+        let entry = check_cells::entry_virtual_path(logical, &units);
+        let case = check_cells::compile_case_frontend(
+            &units,
+            &entry,
+            &check_cells::CasePragmas::default(),
+            bamts_compiler::pipeline::FrontendMode::Declaration,
+        )
+        .expect("case compiles");
+        check_cells::emit_declaration_baseline(&case).expect("declaration emit")
+    }
+
+    /// The `declaration` observable evaluates the `//// [<stem>.d.ts]`
+    /// sections of the owned `.js` baseline document against the declaration
+    /// emit — a pass with an artifact, never the no-comparator rejection.
+    #[test]
+    fn compiler_observation_declaration_compares_dts_sections() {
+        let source = "// @declaration: true\nvar x: number = 1;\n";
+        let dts = declaration_lane_emitted_doc(source);
+        assert!(dts.starts_with("//// [declLane.d.ts]\n"), "{dts}");
+        let baseline = format!(
+            "//// [tests/cases/compiler/declLane.ts] ////\n\
+             \n\
+             //// [declLane.ts]\n{source}\n\
+             {dts}"
+        );
+        let fixture = compiler_lane_fixture_with_baselines(
+            "decl-pass",
+            "declLane.ts",
+            source,
+            &[("js", &baseline)],
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/declLane.ts",
+            "declaration=true#declaration",
+            &["declaration"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::Pass,
+            "{}",
+            observation.detail
+        );
+        assert_eq!(observation.observable, "declaration");
+    }
+
+    /// A semantic `.d.ts` divergence is an honest structural mismatch.
+    #[test]
+    fn compiler_observation_declaration_reports_structural_mismatch() {
+        let source = "// @declaration: true\nvar x: number = 1;\n";
+        let dts = declaration_lane_emitted_doc(source).replace("number", "string");
+        let baseline = format!(
+            "//// [tests/cases/compiler/declLane.ts] ////\n\
+             \n\
+             //// [declLane.ts]\n{source}\n\
+             {dts}"
+        );
+        let fixture = compiler_lane_fixture_with_baselines(
+            "decl-fail",
+            "declLane.ts",
+            source,
+            &[("js", &baseline)],
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/declLane.ts",
+            "declaration=true#declaration",
+            &["declaration"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::FailBehavior,
+            "{}",
+            observation.detail
+        );
+        assert!(observation.detail.contains("structural mismatch"));
+    }
+
+    /// A `declaration` obligation with no owned `.js` baseline is a
+    /// classification/execution drift, named precisely.
+    #[test]
+    fn compiler_observation_declaration_names_missing_baseline() {
+        let fixture = compiler_lane_fixture(
+            "decl-missing",
+            "declLane.ts",
+            "// @declaration: true\nvar x: number = 1;\n",
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/declLane.ts",
+            "declaration=true#declaration",
+            &["declaration"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(observation.class, FailureClass::HarnessError);
+        assert!(
+            observation
+                .detail
+                .contains("no owned `.js` baseline document"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// The `source-map` observable compares emitted printer maps against the
+    /// owned `.js.map` baseline under JSON canonicalization; the upstream
+    /// visualization trailer does not disturb the verdict.
+    #[test]
+    fn compiler_observation_source_map_compares_map_json() {
+        let source = "// @sourcemap: true\nvar v = 1;\n";
+        let logical = "tests/cases/compiler/mapLane.ts";
+        let units = check_cells::split_case_units(logical, source);
+        let entry = check_cells::entry_virtual_path(logical, &units);
+        let case = check_cells::compile_case_frontend(
+            &units,
+            &entry,
+            &check_cells::CasePragmas::default(),
+            bamts_compiler::pipeline::FrontendMode::JavaScript,
+        )
+        .expect("case compiles");
+        let emitted = check_cells::emit_source_map_baseline(&case, false).expect("map emit");
+        assert!(emitted.starts_with("//// [mapLane.js.map]\n"), "{emitted}");
+        let baseline =
+            format!("{emitted}//// https://sokra.github.io/source-map-visualization#base64,zm9v\n");
+        let fixture = compiler_lane_fixture_with_baselines(
+            "map-pass",
+            "mapLane.ts",
+            source,
+            &[("js.map", &baseline)],
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/mapLane.ts",
+            "sourcemap=true#source-map",
+            &["source-map"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::Pass,
+            "{}",
+            observation.detail
+        );
+
+        // A changed map is a real mismatch, and an inline configuration has
+        // no `.js.map` facet upstream: it records the producer gap instead.
+        let changed = emitted.replace("\"version\":3", "\"version\":2");
+        let mismatch_fixture = compiler_lane_fixture_with_baselines(
+            "map-fail",
+            "mapLane.ts",
+            source,
+            &[("js.map", &changed)],
+        );
+        let request = compiler_lane_request(
+            &mismatch_fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/mapLane.ts",
+            "sourcemap=true#source-map",
+            &["source-map"],
+        );
+        let observation =
+            observe_compiler_lane(&mismatch_fixture.snapshot, &mismatch_fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::FailBehavior,
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// Inline source maps have no `.js.map` baseline facet upstream and the
+    /// `.sourcemap.txt` record has no producer yet: a precise producer gap.
+    #[test]
+    fn compiler_observation_source_map_records_inline_producer_gap() {
+        let fixture = compiler_lane_fixture(
+            "map-inline",
+            "inlineMapLane.ts",
+            "// @inlinesourcemap: true\nvar v = 1;\n",
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/inlineMapLane.ts",
+            "inlinesourcemap=true#source-map",
+            &["source-map"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(observation.class, FailureClass::HarnessError);
+        assert!(
+            observation.detail.starts_with("producer missing:"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// A non-inline `source-map` obligation with no owned `.js.map` baseline
+    /// is a classification/execution drift, named precisely.
+    #[test]
+    fn compiler_observation_source_map_names_missing_baseline() {
+        let fixture = compiler_lane_fixture(
+            "map-missing",
+            "mapLane.ts",
+            "// @sourcemap: true\nvar v = 1;\n",
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/mapLane.ts",
+            "sourcemap=true#source-map",
+            &["source-map"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(observation.class, FailureClass::HarnessError);
+        assert!(
+            observation.detail.contains("no owned `.js.map` baseline"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// The `trace` observable has no bamts-compiler producer (no resolution
+    /// tracer): the gap is recorded precisely, never as a synthesized pass.
+    #[test]
+    fn compiler_observation_trace_records_missing_producer() {
+        let fixture = compiler_lane_fixture(
+            "trace-gap",
+            "traceLane.ts",
+            "// @traceresolution: true\nvar v = 1;\n",
+            SCALAR_TYPES_BASELINE,
+        );
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "compiler/tests/cases/compiler/traceLane.ts",
+            "traceresolution=true#trace",
+            &["trace"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(observation.class, FailureClass::HarnessError);
+        assert!(
+            observation.detail.starts_with("producer missing:"),
+            "{}",
+            observation.detail
+        );
+        assert!(observation.detail.contains("resolution tracer"));
     }
 
     #[test]
