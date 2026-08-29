@@ -4497,6 +4497,13 @@ impl Parser {
                 Some(FunctionBody::Block(
                     self.with_keyword_context(keyword_context, Self::parse_block),
                 ))
+            } else if self.at_missing_body_boundary() {
+                // Upstream tolerates a missing method or accessor body when
+                // the next token can end the member (its
+                // parseFunctionBlockOrSemicolon accepts a semicolon-like
+                // boundary silently), so `{ get foo() }` recovers without a
+                // diagnostic instead of derailing the object literal.
+                None
             } else {
                 self.error_here(EXPECTED_TOKEN, "expected a method body");
                 None
@@ -4544,6 +4551,20 @@ impl Parser {
                 modifier: PropertyModifier::None,
                 shorthand: true,
             }),
+        )
+    }
+
+    /// Whether the current token can end a member declaration, so a missing
+    /// method or accessor body recovers silently instead of erroring.
+    fn at_missing_body_boundary(&self) -> bool {
+        matches!(
+            self.kind(),
+            TokenKind::Semicolon
+                | TokenKind::Comma
+                | TokenKind::RBrace
+                | TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::EndOfFile
         )
     }
 
@@ -6853,6 +6874,34 @@ mod tests {
         assert_eq!(template.elements.len(), 3);
         assert_eq!(template.expressions.len(), 2);
         assert_clean("tag`x${y}z`;");
+    }
+
+    #[test]
+    fn object_accessor_with_missing_body_recovers_silently() {
+        // Upstream accepts `{ get foo() }` with zero diagnostics (its
+        // parseFunctionBlockOrSemicolon tolerates a member-ending token), so
+        // the parser must recover the accessor with a missing body instead
+        // of minting "expected a method body".
+        let recovered = assert_clean("var v = { get foo() }");
+        let Statement::Variable(decl) = recovered.product().statements()[0].data() else {
+            panic!("expected a variable declaration");
+        };
+        let init = decl.declarations[0]
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        let Expression::Object(object) = init.data() else {
+            panic!("expected an object literal");
+        };
+        let [member] = object.members.as_slice() else {
+            panic!("one object member");
+        };
+        let ObjectMember::Method(method) = member.data() else {
+            panic!("expected a method member");
+        };
+        assert_eq!(method.modifier, PropertyModifier::Get);
+        assert!(method.function.body.is_none());
     }
 
     #[test]
