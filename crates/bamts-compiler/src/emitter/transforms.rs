@@ -3056,7 +3056,7 @@ impl<'a> Rewriter<'a> {
                     Expression::Call(CallExpression {
                         callee: Box::new(callee),
                         optional: call.optional,
-                        type_arguments: call.type_arguments.clone(),
+                        type_arguments: None,
                         arguments,
                     }),
                 )
@@ -3068,7 +3068,7 @@ impl<'a> Rewriter<'a> {
                     expression.range(),
                     Expression::New(NewExpression {
                         callee: Box::new(callee),
-                        type_arguments: new_expr.type_arguments.clone(),
+                        type_arguments: None,
                         arguments,
                     }),
                 )
