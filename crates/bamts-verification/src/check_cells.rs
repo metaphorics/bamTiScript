@@ -28,8 +28,13 @@ use bamts_compiler::emitter::{EmitFileNames, EmitOptions, emit_checked};
 use bamts_compiler::pipeline::{
     FrontendMode, FrontendOutput, ProgramFrontendOutput, compile_program_frontend,
 };
-use bamts_compiler::program::{ProgramLoader, ResolvedProgram};
-use bamts_compiler::project::{ProjectConfig, ProjectRoot};
+use bamts_compiler::program::{ModuleEdgeKind, ProgramLoader, ResolvedProgram};
+use bamts_compiler::project::resolution::{
+    ModuleResolutionKind, ResolutionCache, ResolutionHost, ResolutionMode,
+    resolve_module_name_with_trace,
+};
+use bamts_compiler::project::resolution_trace::ResolutionTraceLog;
+use bamts_compiler::project::{CompilerOptions, ProjectConfig, ProjectRoot};
 use bamts_compiler::source::SourceText;
 use bamts_compiler::source::{TextRange, Utf16Pos};
 use bamts_compiler::syntax::{NodeId, Token, TokenKind};
@@ -177,6 +182,12 @@ pub struct CheckedCase {
     pub entry: String,
     /// Whole-program frontend product (one module per resolved file).
     output: ProgramFrontendOutput,
+    /// The resolved module graph, retained for the trace comparator to
+    /// re-resolve import specifiers with `resolve_module_name_with_trace`.
+    program: ResolvedProgram,
+    /// Compiler options used for this compilation, retained for the trace
+    /// comparator to pass to `resolve_module_name_with_trace`.
+    options: bamts_compiler::project::CompilerOptions,
 }
 
 impl CheckedCase {
@@ -194,6 +205,18 @@ impl CheckedCase {
         self.units
             .iter()
             .filter_map(|(unit, index)| index.map(|index| (unit, &self.output.modules()[index])))
+    }
+
+    /// The resolved module graph, for the trace comparator.
+    #[must_use]
+    pub fn program(&self) -> &ResolvedProgram {
+        &self.program
+    }
+
+    /// Compiler options, for the trace comparator.
+    #[must_use]
+    pub fn options(&self) -> &bamts_compiler::project::CompilerOptions {
+        &self.options
     }
 }
 
@@ -291,13 +314,12 @@ fn directive_body(line: &str) -> Option<&str> {
 /// compiled source, and therefore every emitted `.errors.txt`/`.types`/
 /// `.symbols` position, numbered exactly as the baselines are.
 fn strip_directive_lines(text: &str) -> String {
-    // `Utils.splitContentByNewlines` splits on `\r\n` when the file has any,
-    // else on `\n`; the surviving lines rejoin with `\n`, normalizing endings.
-    let lines: Vec<&str> = if text.contains("\r\n") {
-        text.split("\r\n").collect()
-    } else {
-        text.split('\n').collect()
-    };
+    // Upstream's `lineDelimiter` splits on `\r?\n` per line, so a CRLF line
+    // and a bare `\n` line are distinct lines even within one unit;
+    // normalizing `\r\n` to `\n` before splitting reproduces exactly that
+    // line set (a lone `\r` is not a delimiter on either side).
+    let normalized = text.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
     let mut content: Option<String> = None;
     for line in lines {
         if is_option_directive_line(line) {
@@ -383,10 +405,12 @@ pub fn split_case_units(logical_path: &str, text: &str) -> Vec<CaseUnit> {
         // `.symbols` positions are numbered over directive-free source. Strip
         // the same lines here so emitted positions align with the baselines.
         let content = strip_directive_lines(text);
-        // Later directives that merely restate an earlier unit's name append
-        // to that unit, mirroring upstream's `test.get("units")` naming.
+        // Upstream feeds units into a path-keyed fake FS (`testfs[fileName] =
+        // file.Content`), so a directive restating an earlier unit's name
+        // makes the later chunk the unit's entire content — it replaces, not
+        // appends. Unit order stays at the first-seen position.
         if let Some(existing) = units.iter_mut().find(|u| u.virtual_path == virtual_path) {
-            existing.text.push_str(&content);
+            existing.text = content;
         } else {
             units.push(CaseUnit {
                 virtual_path,
@@ -742,7 +766,8 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "declaration"
             | "alwaysstrict"
             | "exactoptionalpropertytypes"
-            | "nouncheckedindexedaccess" => value.eq_ignore_ascii_case("true").to_string(),
+            | "nouncheckedindexedaccess"
+            | "strictpropertyinitialization" => value.eq_ignore_ascii_case("true").to_string(),
             _ => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
         };
         let key = match name.as_str() {
@@ -756,6 +781,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "alwaysstrict" => "alwaysStrict",
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
+            "strictpropertyinitialization" => "strictPropertyInitialization",
             _ => name.as_str(),
         };
         options.push((key.to_owned(), json));
@@ -838,15 +864,16 @@ pub fn compile_case_frontend(
         let config_source = build_tsconfig(pragmas);
         let config = ProjectConfig::parse(&root, temp.path().join("tsconfig.json"), &config_source)
             .map_err(|error| CaseCompileError::Load(format!("config: {error}")))?;
+        let options = config.options().clone();
         let loader = ProgramLoader::new(&root, config.options())
             .map_err(|error| CaseCompileError::Load(format!("loader: {error}")))?;
         let program = loader
             .load(Path::new(ENTRY))
             .map_err(|error| CaseCompileError::Load(error.to_string()))?;
         let output = compile_program_frontend(&program, mode);
-        Ok::<_, CaseCompileError>((program, output))
+        Ok::<_, CaseCompileError>((program, output, options))
     }));
-    let (program, output) = match compile {
+    let (program, output, options) = match compile {
         Ok(Ok(parts)) => parts,
         Ok(Err(error)) => return Err(error),
         Err(_) => {
@@ -862,6 +889,8 @@ pub fn compile_case_frontend(
         units: pairs,
         entry: entry_name.to_owned(),
         output,
+        program,
+        options,
     })
 }
 
@@ -1992,22 +2021,182 @@ pub(crate) fn observe_source_map(
     }
 }
 
-/// Record the `trace` observable honestly: upstream baselines
-/// `traceResolution` output as `<stem>.trace.json` (a JSON array of sanitized
-/// resolution log lines), and bamts-compiler has no module-resolution tracer,
-/// so there is no produced artifact to compare. The precise producer gap is a
-/// blocking non-pass — never a synthesized pass.
+/// A [`ResolutionHost`] backed by the real filesystem, confined to a project
+/// root. Used by the trace comparator to re-resolve import specifiers with
+/// `resolve_module_name_with_trace` against the same files the loader saw.
+struct FilesystemResolutionHost;
+
+impl ResolutionHost for FilesystemResolutionHost {
+    fn file_exists(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+
+    fn directory_exists(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+
+    fn read_file(&self, path: &Path) -> Option<Arc<str>> {
+        fs::read_to_string(path).ok().map(Arc::from)
+    }
+}
+
+/// Determine the `ModuleResolutionKind` from compiler options. Upstream test
+/// cases default to `bundler` when `moduleResolution` is not set; `node16` and
+/// `nodenext` are parsed when present.
+fn resolution_kind(options: &CompilerOptions) -> ModuleResolutionKind {
+    match options.module_resolution() {
+        Some(value) => ModuleResolutionKind::parse(value).unwrap_or(ModuleResolutionKind::Bundler),
+        None => ModuleResolutionKind::Bundler,
+    }
+}
+
+/// Record the `trace` observable: compile the case, re-resolve each import
+/// specifier through `resolve_module_name_with_trace` to produce upstream
+/// `traceResolution` log lines, and compare the collected lines against the
+/// `<stem>.trace.json` baseline. Resolution kinds the tracer does not cover
+/// (`DirectoryPackage`, `PackageImport`, `PackageName`, `PathsMapping`) are
+/// reported honestly as producer-missing detail rather than fabricated.
 pub(crate) fn observe_trace(
-    _snapshot: &(impl SnapshotAssets + ?Sized),
-    _groups: &BaselineGroups,
-    _index_entry: &IndexEntry,
-    _text: &str,
-    _pragmas: &CasePragmas,
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    groups: &BaselineGroups,
+    index_entry: &IndexEntry,
+    text: &str,
+    pragmas: &CasePragmas,
 ) -> CompilerCheckObservation {
-    CompilerCheckObservation {
-        class: FailureClass::HarnessError,
-        detail: "producer missing: module-resolution trace emitter (upstream `traceResolution` log baselined as `.trace.json`; bamts-compiler has no resolution tracer)".to_owned(),
-        artifact: None,
+    let units = split_case_units(&index_entry.logical_path, text);
+    let entry = entry_virtual_path(&index_entry.logical_path, &units);
+    let compile_options = compile_option_pairs(pragmas);
+    let baseline_path = match resolve_stem_baseline(
+        groups,
+        &index_entry.logical_path,
+        "trace.json",
+        &compile_options,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            return CompilerCheckObservation {
+                class: FailureClass::HarnessError,
+                detail: error.to_string(),
+                artifact: None,
+            };
+        }
+    };
+    let case = match compile_case_with_pragmas(&units, &entry, pragmas) {
+        Err(error) => return compile_failure_observation(error),
+        Ok(case) => case,
+    };
+    let Some(baseline_path) = baseline_path else {
+        return CompilerCheckObservation {
+            class: FailureClass::HarnessError,
+            detail: "classification/execution drift: no owned `.trace.json` baseline".to_owned(),
+            artifact: None,
+        };
+    };
+    let program = case.program();
+    let options = case.options();
+    let root = program.root();
+    let kind = resolution_kind(options);
+    let host = FilesystemResolutionHost;
+    let mut cache = ResolutionCache::new();
+    let mut log = ResolutionTraceLog::default();
+    // Re-resolve each module's static-runtime and type-only import specifiers
+    // through the trace producer. Dynamic imports are skipped: upstream
+    // `traceResolution` does not trace `import()` calls.
+    for module in program.modules() {
+        let importer = module.path();
+        for edge in module.dependencies() {
+            if edge.kind() == ModuleEdgeKind::DynamicRuntime {
+                continue;
+            }
+            let mode = if program.is_commonjs() {
+                ResolutionMode::Require
+            } else {
+                ResolutionMode::Import
+            };
+            let _ = resolve_module_name_with_trace(
+                root,
+                options,
+                importer,
+                edge.specifier(),
+                (kind, mode),
+                &host,
+                &mut cache,
+                &mut log,
+            );
+        }
+    }
+    let unsupported: Vec<&str> = log
+        .unsupported()
+        .iter()
+        .map(|kind| match kind {
+            bamts_compiler::project::resolution_trace::UnsupportedTraceKind::DirectoryPackage => {
+                "DirectoryPackage"
+            }
+            bamts_compiler::project::resolution_trace::UnsupportedTraceKind::PackageImport => {
+                "PackageImport"
+            }
+            bamts_compiler::project::resolution_trace::UnsupportedTraceKind::PackageName => {
+                "PackageName"
+            }
+            bamts_compiler::project::resolution_trace::UnsupportedTraceKind::PathsMapping => {
+                "PathsMapping"
+            }
+        })
+        .collect();
+    let produced_lines = log.lines();
+    let bytes = match read_verified_snapshot_asset(snapshot, &baseline_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return CompilerCheckObservation {
+                class: FailureClass::HarnessError,
+                detail: error.to_string(),
+                artifact: None,
+            };
+        }
+    };
+    let expected_text = String::from_utf8_lossy(&bytes).into_owned();
+    let expected_lines: Vec<String> = match serde_json::from_str::<Vec<String>>(&expected_text) {
+        Ok(lines) => lines,
+        Err(error) => {
+            return CompilerCheckObservation {
+                class: FailureClass::HarnessError,
+                detail: format!(
+                    "trace baseline `{baseline_path}` is not a JSON string array: {error}"
+                ),
+                artifact: None,
+            };
+        }
+    };
+    let produced_json = serde_json::to_string_pretty(produced_lines)
+        .unwrap_or_default()
+        .into_bytes();
+    if produced_lines == expected_lines.as_slice() {
+        CompilerCheckObservation {
+            class: FailureClass::Pass,
+            detail: String::new(),
+            artifact: Some(produced_json),
+        }
+    } else if !unsupported.is_empty() {
+        CompilerCheckObservation {
+            class: FailureClass::HarnessError,
+            detail: format!(
+                "producer missing: resolution tracer does not cover {{{}}}; produced {} of {} expected trace lines",
+                unsupported.join(", "),
+                produced_lines.len(),
+                expected_lines.len()
+            ),
+            artifact: Some(produced_json),
+        }
+    } else {
+        CompilerCheckObservation {
+            class: FailureClass::FailBehavior,
+            detail: format!(
+                "trace mismatch: produced {} lines, expected {} lines",
+                produced_lines.len(),
+                expected_lines.len()
+            ),
+            artifact: Some(produced_json),
+        }
     }
 }
 
@@ -2023,27 +2212,64 @@ pub(crate) fn observe_trace(
 /// member binding lands (the scope-owner substrate is in place). Namespace
 /// exports render bare at declarations per upstream, with access-path
 /// qualification (`A.x`) pending member-access reference resolution. Class
-/// members not yet bound as symbols, references to intrinsic/library symbols
-/// (whose declaration lives outside the unit), and multi-`Decl` merged records
-/// remain known gaps — the S2 burn-down surface, exactly like the `.types`
-/// emitter.
+/// members not yet bound as symbols and references to intrinsic/library symbols
+/// (whose declaration lives outside the unit) remain known gaps — the S2
+/// burn-down surface, exactly like the `.types` emitter.
 #[must_use]
 pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
-    for (unit, output) in case.reached_units() {
-        let section = unit
-            .virtual_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&unit.virtual_path);
+    let units: Vec<_> = case.reached_units().collect();
+    let mut declaration_anchors: HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>> =
+        HashMap::new();
+    for (unit, output) in &units {
+        let section = unit_basename(&unit.virtual_path);
+        let source_file = output.source_file();
+        for (symbol_index, symbol) in output.semantic_model().symbols().iter().enumerate() {
+            let Some((line, character)) =
+                symbol_decl_position(source_file.tokens(), source_file.source_text(), symbol)
+            else {
+                continue;
+            };
+            let anchor = SymbolDeclAnchor {
+                section: section.clone(),
+                line,
+                character,
+            };
+            let model = output.semantic_model();
+            for name in [
+                symbol.name().to_owned(),
+                model.qualified_name(SymbolId::new(symbol_index as u32)),
+            ] {
+                let anchors = declaration_anchors
+                    .entry((name, symbol.kind()))
+                    .or_default();
+                if !anchors.contains(&anchor) {
+                    anchors.push(anchor.clone());
+                }
+            }
+        }
+    }
+    for anchors in declaration_anchors.values_mut() {
+        anchors.sort();
+    }
+    for (unit, output) in units {
+        let section = unit_basename(&unit.virtual_path);
         emit_unit_symbols(
             output.semantic_model(),
             output.source_file(),
-            section,
+            &section,
+            &declaration_anchors,
             &mut out,
         );
     }
     out
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SymbolDeclAnchor {
+    section: String,
+    line: usize,
+    character: usize,
 }
 
 /// One `>name : Symbol(...)` record anchored to a source line.
@@ -2059,25 +2285,48 @@ fn emit_unit_symbols(
     model: &SemanticModel,
     source_file: &bamts_compiler::syntax::SourceFile,
     section: &str,
+    declaration_anchors: &HashMap<(String, SymbolKind), Vec<SymbolDeclAnchor>>,
     out: &mut String,
 ) {
     let source = source_file.source_text();
     let tokens = source_file.tokens();
-    // The declaration position each symbol renders as `Decl(section, l, c)`.
-    // `None` marks intrinsics and library symbols whose declaration is not in
-    // this unit; occurrences resolving to them are dropped.
-    let decl_positions: Vec<Option<(usize, usize)>> = model
+    let local_decl_positions: Vec<Option<(usize, usize)>> = model
         .symbols()
         .iter()
         .map(|symbol| symbol_decl_position(tokens, source, symbol))
         .collect();
     let render = |symbol_id: SymbolId| -> Option<String> {
         let index = symbol_id.get() as usize;
-        let (line, character) = (*decl_positions.get(index)?)?;
+        let symbol = model.symbols().get(index)?;
         let name = model.qualified_name(symbol_id);
-        Some(format!(
-            "Symbol({name}, Decl({section}, {line}, {character}))"
-        ))
+        let anchors = declaration_anchors
+            .get(&(name.clone(), symbol.kind()))
+            .or_else(|| declaration_anchors.get(&(symbol.name().to_owned(), symbol.kind())))
+            .cloned()
+            .or_else(|| {
+                local_decl_positions
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .map(|(line, character)| {
+                        vec![SymbolDeclAnchor {
+                            section: section.to_owned(),
+                            line,
+                            character,
+                        }]
+                    })
+            })?;
+        let declarations = anchors
+            .iter()
+            .map(|anchor| {
+                format!(
+                    "Decl({}, {}, {})",
+                    anchor.section, anchor.line, anchor.character
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("Symbol({name}, {declarations})"))
     };
 
     let mut records: Vec<SymbolRecord> = Vec::new();
@@ -2638,6 +2887,42 @@ error TS5107: Option 'moduleResolution=classic' is deprecated and will stop func
     }
 
     #[test]
+    fn parse_case_pragmas_maps_strict_property_initialization() {
+        let pragmas = parse_case_pragmas("// @strictPropertyInitialization: false\n");
+        let tsconfig = build_tsconfig(&pragmas);
+        assert!(
+            tsconfig.contains("\"strictPropertyInitialization\": false"),
+            "{tsconfig}"
+        );
+    }
+
+    /// Upstream splits unit lines on `\r?\n`, so a CRLF directive followed by
+    /// a bare-`\n` code line keeps the code line; a `\r\n`-only split would
+    /// swallow it into the directive "line" and shift every later position.
+    /// Exemplar: `commentsVarDecl.ts` F5 position rows.
+    #[test]
+    fn strip_directive_lines_mixed_line_endings_keep_code_lines() {
+        let stripped = strip_directive_lines(
+            "// @strict: true\r\nlet a = 1;\r\n// @noImplicitAny: true\nlet b = 2;\n",
+        );
+        assert_eq!(stripped, "let a = 1;\nlet b = 2;\n");
+    }
+
+    /// Upstream materializes units into a path-keyed fake FS, so a restated
+    /// `@filename:` directive makes the later chunk the unit's whole content;
+    /// an append would keep the earlier chunk and shift all line numbers.
+    #[test]
+    fn repeated_filename_directive_replaces_unit_content() {
+        let units = split_case_units(
+            "tests/cases/compiler/twice.ts",
+            "// @filename: a.ts\nconst a = 1;\n\n// @filename: a.ts\nconst b: string = a;\n",
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].virtual_path, "tests/cases/compiler/a.ts");
+        assert_eq!(units[0].text, "const b: string = a;\n");
+    }
+
+    #[test]
     fn split_case_units_single_unit_case() {
         let units = split_case_units(
             "tests/cases/conformance/types/any/anyAsConstructor.ts",
@@ -2771,7 +3056,7 @@ r.toFixed();
     }
 
     #[test]
-    fn split_case_units_repeated_name_appends() {
+    fn split_case_units_repeated_name_replaces() {
         let case = "\
 // @filename: a.ts
 export const a = 1;
@@ -2782,7 +3067,9 @@ export const a2 = 3;
 ";
         let units = split_case_units("tests/cases/compiler/append.ts", case);
         assert_eq!(units.len(), 2);
-        assert!(units[0].text.contains("a = 1"));
+        // Upstream feeds units into a path-keyed fake FS, so a restated
+        // @filename directive replaces the unit's content, not appends.
+        assert!(!units[0].text.contains("a = 1"));
         assert!(units[0].text.contains("a2 = 3"));
     }
 
@@ -3340,6 +3627,49 @@ class Board {\n\
         let symbols = emit_symbols_baseline(&case, logical);
         assert!(symbols.contains("=== index.ts ==="), "{symbols}");
         assert!(symbols.contains("Symbol(zzz, Decl(index.ts"), "{symbols}");
+    }
+
+    /// The declaration-anchor map built across all reached units lets a
+    /// symbol declared in one unit (e.g. `Model` in `aliasUsageInArray_backbone.ts`)
+    /// render with its true `Decl(<other unit>, line, char)` anchor instead of
+    /// being dropped for lacking an in-unit declaration. Cross-unit *reference*
+    /// rows (`>Backbone.Model : Symbol(Backbone.Model, ...)`) depend on
+    /// member-access reference resolution the binder does not yet produce;
+    /// those remain the S2 burn-down surface. Upstream shape pinned by
+    /// `tests/baselines/reference/aliasUsageInArray.symbols`
+    /// (sha256 2ce5d5eb3f810bac79a552a47f2aef0c955b32e9d5fc1ac1bf7f16a07efdbdf0).
+    #[test]
+    fn imported_symbol_occurrences_render_cross_unit_anchors() {
+        let logical = "tests/cases/compiler/aliasUsageInArray.ts";
+        let case_text = "\
+// @module: commonjs
+// @Filename: aliasUsageInArray_main.ts
+import Backbone = require(\"./aliasUsageInArray_backbone\");
+interface IHasVisualizationModel {
+    VisualizationModel: typeof Backbone.Model;
+}
+
+// @Filename: aliasUsageInArray_backbone.ts
+export class Model {
+    public someData: string;
+}
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+
+        let symbols = emit_symbols_baseline(&case, logical);
+        assert!(
+            symbols.contains("=== aliasUsageInArray_backbone.ts ==="),
+            "{symbols}"
+        );
+        // The `Model` class declared in the backbone unit renders with its
+        // true cross-unit declaration anchor, not a dropped or local-only row.
+        assert!(
+            symbols.contains("Symbol(Model, Decl(aliasUsageInArray_backbone.ts, 0, 0))"),
+            "{symbols}"
+        );
     }
 
     #[test]
