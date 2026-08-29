@@ -5984,6 +5984,24 @@ impl Parser {
             }
             let before = self.cursor;
             let rest = self.eat(TokenKind::DotDotDot).is_some();
+            // TypeScript reports parameter-property modifiers inside a
+            // function type's parameter list semantically (TS2369, TS7006),
+            // not syntactically, so skip modifier keywords and bind the
+            // parameter name to the keyword that follows. This keeps
+            // `function f(): (public B) => C {}` a function-type return
+            // with an intact body instead of derailing into statement
+            // recovery.
+            while matches!(
+                self.kind(),
+                TokenKind::KwPublic
+                    | TokenKind::KwPrivate
+                    | TokenKind::KwProtected
+                    | TokenKind::KwReadonly
+                    | TokenKind::KwOverride
+            ) && self.next_significant_starts_parameter_name()
+            {
+                self.bump();
+            }
             let name = if is_identifier_like(self.kind()) || self.at(TokenKind::KwThis) {
                 let token = self.bump();
                 self.ident_from(token)
@@ -6020,6 +6038,23 @@ impl Parser {
         }
         self.expect(TokenKind::RParen, "expected `)`");
         parameters
+    }
+
+    /// Whether the next significant token after the cursor can begin a
+    /// function-type parameter name (an identifier, `this`, or a destructuring
+    /// pattern). Used to skip parameter-property modifier keywords without
+    /// consuming a modifier that is itself the parameter name.
+    fn next_significant_starts_parameter_name(&self) -> bool {
+        let next = self.next_significant(self.cursor + 1);
+        match self.tokens.get(next) {
+            Some(token) => {
+                matches!(
+                    token.kind(),
+                    TokenKind::KwThis | TokenKind::LBrace | TokenKind::LBracket
+                ) || is_identifier_like(token.kind())
+            }
+            None => false,
+        }
     }
 
     fn skip_balanced_pattern(&mut self) {
@@ -6753,6 +6788,52 @@ mod tests {
             .as_ref()
             .expect("initializer");
         assert!(matches!(init.data(), Expression::Conditional(_)));
+    }
+
+    #[test]
+    fn function_type_parameter_modifiers_keep_the_declaration_intact() {
+        // Upstream reports parameter-property modifiers inside function-type
+        // parameter lists semantically (TS2369, TS7006), never syntactically,
+        // so `function A(): (public B) => C {}` must keep its body and bind
+        // `B` as the parameter name instead of derailing into statement
+        // recovery. A modifier followed by `:` or `,` stays a parameter name.
+        let recovered = assert_clean(
+            "function A(): (public B) => C {\n}\
+             \nfunction D(): (readonly x: number) => void {\n}\
+             \nfunction E(): (public: string) => void {\n}",
+        );
+        let mut parameter_names = Vec::new();
+        for statement in recovered.product().statements() {
+            let Statement::Function(function) = statement.data() else {
+                panic!("every statement is a function declaration");
+            };
+            assert!(
+                function.function.body.is_some(),
+                "the declaration body must survive recovery"
+            );
+            let TypeNode::Function(function_type) = function
+                .function
+                .return_type
+                .as_ref()
+                .expect("annotated return type")
+                .data()
+                .type_node
+                .data()
+            else {
+                panic!("the return annotation is a function type");
+            };
+            let [parameter] = function_type.parameters.as_slice() else {
+                panic!("one type parameter per signature");
+            };
+            parameter_names.push(
+                recovered
+                    .product()
+                    .identifier_text(parameter.name.data().token())
+                    .map(|name| name.into_owned())
+                    .unwrap_or_default(),
+            );
+        }
+        assert_eq!(parameter_names, ["B", "x", "public"]);
     }
 
     #[test]
