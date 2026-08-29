@@ -328,7 +328,9 @@ mod tests {
         let output = one_jsx("const view = <><span /><span /></>;", &options);
         let code = output.javascript.expect("JavaScript output").code;
         assert!(
-            code.starts_with("var _jsxRuntime = require(\"react/jsx-runtime\");\n"),
+            code.starts_with(
+                "\"use strict\";\nvar _jsxRuntime = require(\"react/jsx-runtime\");\n",
+            ),
             "{code}"
         );
         assert!(code.contains("var _jsxs = _jsxRuntime.jsxs;"), "{code}");

@@ -106,6 +106,8 @@ impl Newline {
 pub struct EmitOptions {
     pub target: ScriptTarget,
     pub module: Option<ModuleKind>,
+    /// Whether every source file receives a strict-mode prologue.
+    pub always_strict: bool,
     pub import_helpers: bool,
     pub use_define_for_class_fields: Option<bool>,
     pub declaration: bool,
@@ -134,6 +136,7 @@ impl Default for EmitOptions {
         Self {
             target: ScriptTarget::EsNext,
             module: None,
+            always_strict: false,
             import_helpers: false,
             use_define_for_class_fields: None,
             declaration: false,
@@ -201,6 +204,12 @@ impl EmitOptions {
                     return Some(invalid());
                 };
                 self.target = target;
+            }
+            "alwaysstrict" => {
+                let Some(always_strict) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.always_strict = always_strict;
             }
             "module" => {
                 let Some(module) = parse_module(value) else {
@@ -315,6 +324,7 @@ impl EmitOptions {
         };
         TransformOptions {
             target: self.target,
+            always_strict: self.always_strict,
             use_define_for_class_fields: self
                 .use_define_for_class_fields
                 .unwrap_or_else(|| self.target.supports(LanguageFeature::ClassFields)),
@@ -323,6 +333,7 @@ impl EmitOptions {
                 style,
                 module_specifier: String::from("tslib"),
             },
+            module_kind: self.module,
             newline: self.newline,
             indent_width: self.indent_width,
             jsx: self.jsx,

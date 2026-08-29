@@ -31,7 +31,8 @@ use crate::syntax::*;
 
 use super::helpers::{self, HelperKind, HelperOptions};
 use super::{
-    EmitFileNames, EmitOutput, Newline, PrintOptions, PrintSource, Surface, print_with_jsx_plan,
+    EmitFileNames, EmitOutput, ModuleKind, Newline, PrintOptions, PrintSource, Surface,
+    print_with_jsx_plan,
 };
 
 /// Stable diagnostic identifiers produced by target transforms.
@@ -124,11 +125,15 @@ impl ScriptTarget {
 pub struct TransformOptions {
     /// Language target that drives downlevel decisions.
     pub target: ScriptTarget,
+    /// Whether the emitted file begins with a `"use strict"` prologue.
+    pub always_strict: bool,
     /// When true, class fields that survive downlevel use `define` semantics.
     /// Defaults to true for targets that natively include class fields.
     pub use_define_for_class_fields: bool,
     /// Helper import policy applied after rewrite.
     pub helpers: HelperOptions,
+    /// Module kind used to decide strict prologue and JSX import style.
+    pub module_kind: Option<ModuleKind>,
     /// Printer newline.
     pub newline: Newline,
     /// Printer indent width.
@@ -258,7 +263,10 @@ pub fn emit_transformed(
         file.diagnostics().to_vec(),
     );
     let helper_emit = helpers::emit_helpers(&used_helpers, &options.helpers, Some(&rewritten));
-    let prelude = join_preludes(&runtime_prelude, &helper_emit.prelude);
+    let prelude = join_preludes(
+        &strict_prelude(file, options),
+        &join_preludes(&runtime_prelude, &helper_emit.prelude),
+    );
     let mut output = print_with_jsx_plan(
         PrintSource {
             file: &rewritten,
@@ -398,6 +406,41 @@ fn collision_free_name(preferred: &str, occupied: &mut BTreeSet<String>) -> Stri
 
 fn quote_module_specifier(module: &str) -> String {
     format!("\"{}\"", module.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Builds the `"use strict";` prologue for one file.
+///
+/// `alwaysStrict` requests the prologue for every file, and the CommonJS-style
+/// module kinds imply it for transpiled modules the way upstream
+/// `transpileModule` derives `module: CommonJS -> alwaysStrict`. A source-level
+/// directive at the head suppresses the synthetic one.
+#[must_use]
+fn strict_prelude(file: &SourceFile, options: &TransformOptions) -> String {
+    let module_kind_implies_strict = matches!(
+        options.module_kind,
+        Some(ModuleKind::CommonJs)
+            | Some(ModuleKind::Amd)
+            | Some(ModuleKind::Umd)
+            | Some(ModuleKind::System)
+    );
+    if !options.always_strict && !module_kind_implies_strict {
+        return String::new();
+    }
+    let starts_with_strict = file.statements().first().is_some_and(|statement| {
+        let Statement::Expression(statement) = statement.data() else {
+            return false;
+        };
+        let Expression::Literal(Literal::String(literal)) = statement.expression.data() else {
+            return false;
+        };
+        file.token_text(literal.data().token())
+            .is_some_and(|text| text.trim_matches(['\'', '"']) == "use strict")
+    });
+    if starts_with_strict {
+        String::new()
+    } else {
+        String::from("\"use strict\";\n")
+    }
 }
 
 fn join_preludes(runtime: &str, helpers: &str) -> String {
