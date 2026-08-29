@@ -645,6 +645,9 @@ struct SuiteExecutor {
 
 impl LaneExecutor for SuiteExecutor {
     fn run(&mut self, request: &LaneRequest) -> Result<LaneProcessResult> {
+        if let Some(outcome) = fourslash_lane_outcome(request.key()) {
+            return lane_result(request, outcome, Instant::now());
+        }
         if let Some(ClassificationState::NonPass(state)) = self.classifications.get(request.key()) {
             return lane_result(
                 request,
@@ -659,6 +662,24 @@ impl LaneExecutor for SuiteExecutor {
         let outcome = self.adapter.evaluate(request)?;
         lane_result(request, outcome, started)
     }
+}
+
+/// The `typescript-7.0.2` manifest carries `fourslash/…` language-service
+/// authority obligations, and no classification policy exists for that
+/// catalog (`verification/classification/` holds only `test262.toml`), so the
+/// executor routes them itself: the internal fourslash DSL is an exact
+/// completion-contract exclusion and must surface as
+/// `INAPPLICABLE_LANGUAGE_SERVICE`, never as a malformed-path blocking error
+/// from the compiler lane.
+fn fourslash_lane_outcome(key: &ObligationKey) -> Option<LaneOutcome> {
+    key.case().starts_with("fourslash/").then(|| {
+        LaneOutcome::InapplicableLanguageService {
+            detail: format!(
+                "fourslash language-service authority case `{}` routed out of the compiler lane (internal fourslash DSL is an exact exclusion)",
+                key.case()
+            ),
+        }
+    })
 }
 
 fn lane_result(
@@ -2083,5 +2104,40 @@ mod tests {
         }
         assert_eq!(reader.finish().expect("footer").row_count(), rows);
         assert_eq!(rows, 2);
+    }
+
+    /// `fourslash/…` obligations are language-service authority cases: the
+    /// executor routes them to `INAPPLICABLE_LANGUAGE_SERVICE` before any lane
+    /// adapter runs, while compiler/conformance cases stay routable.
+    #[test]
+    fn fourslash_cases_route_to_language_service_inapplicable() {
+        let fourslash = ObligationKey::new(
+            "typescript-7.0.2",
+            "fourslash/tests/cases/fourslash/completionListInTypeAtPosition.ts",
+            "default#parse",
+            ExecutionMode::Aot,
+            "x86_64-unknown-linux-gnu",
+        )
+        .expect("key");
+        let outcome = fourslash_lane_outcome(&fourslash).expect("fourslash routing");
+        assert_eq!(
+            outcome,
+            LaneOutcome::InapplicableLanguageService {
+                detail: format!(
+                    "fourslash language-service authority case `{}` routed out of the compiler lane (internal fourslash DSL is an exact exclusion)",
+                    fourslash.case()
+                ),
+            }
+        );
+
+        let compiler = ObligationKey::new(
+            "typescript-7.0.2",
+            "compiler/tests/cases/compiler/2dArrays.ts",
+            "default#parse",
+            ExecutionMode::Aot,
+            "x86_64-unknown-linux-gnu",
+        )
+        .expect("key");
+        assert!(fourslash_lane_outcome(&compiler).is_none());
     }
 }
