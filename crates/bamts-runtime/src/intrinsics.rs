@@ -1641,7 +1641,6 @@ mod tests {
         let machine = Machine::new(&module, &mut host, Limits::default());
         let names = [
             "eval",
-            "Reflect",
             "Intl",
             "Iterator",
             "AsyncIterator",

@@ -337,7 +337,9 @@ fn set_prototype_of<H: Host>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TestHost, blank_program, ordinary_object};
+    use super::super::test_support::{
+        TestHost, blank_program, constructable_program, ordinary_object,
+    };
     use super::*;
     use crate::intrinsics::{BuiltinDef, native_function};
     use crate::{Limits, NativeCallable, Property, ThrowOrigin};
@@ -413,7 +415,7 @@ mod tests {
 
     #[test]
     fn installs_exact_reflect_surface_and_method_descriptors() {
-        let module = blank_program("<reflect-metadata>");
+        let module = constructable_program("<reflect-metadata>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let reflect = machine
@@ -557,7 +559,7 @@ mod tests {
 
     #[test]
     fn apply_construct_and_receiver_defaults_follow_spec_order() {
-        let module = blank_program("<reflect-call-order>");
+        let module = constructable_program("<reflect-call-order>");
         let mut host = TestHost;
         let mut machine = Machine::new(&module, &mut host, Limits::default());
         let return_this_value = callback(&mut machine, "return this", 0, return_this);
@@ -635,6 +637,7 @@ mod tests {
                 module: ModuleId::new(0),
                 function: FunctionId::new(0),
                 captures: Vec::new(),
+                context: None,
                 properties,
                 prototype: Some(machine.intrinsics.function_prototype),
                 extensible: true,

@@ -225,7 +225,8 @@ fn assign<H: Host>(
             continue;
         }
         for key in machine.internal_own_property_keys(source)? {
-            if !own_descriptor(machine, source, &key)?
+            if !machine
+                .internal_get_own_property(source, &key)?
                 .is_some_and(|descriptor| descriptor.enumerable == Some(true))
             {
                 continue;

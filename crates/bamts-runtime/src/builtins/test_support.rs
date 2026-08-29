@@ -8,7 +8,7 @@ use crate::intrinsics::{BuiltinDef, BuiltinOutcome, native_function};
 use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap};
 
 #[derive(Default)]
-pub(super) struct TestHost;
+pub(crate) struct TestHost;
 
 impl Host for TestHost {}
 
@@ -55,7 +55,7 @@ fn program(name: &str, flags: FunctionFlags) -> Program<Verified> {
     .expect("valid test program")
 }
 
-pub(super) fn ordinary_object<H: Host>(machine: &mut Machine<'_, H>) -> Value {
+pub(crate) fn ordinary_object<H: Host>(machine: &mut Machine<'_, H>) -> Value {
     machine
         .allocate(HeapEntry::Object {
             properties: PropertyMap::default(),

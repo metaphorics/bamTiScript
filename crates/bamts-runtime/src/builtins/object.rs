@@ -386,7 +386,7 @@ fn function_apply<H: Host>(
     })
 }
 
-fn create_list_from_array_like<H: Host>(
+pub(super) fn create_list_from_array_like<H: Host>(
     machine: &mut Machine<'_, H>,
     source: Value,
 ) -> Result<Vec<Value>, EvalFailure> {

@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use bamts_bytecode::EcmaString;
 use bamts_native::{Decoded, Value};
 
-use super::{allocate_array, define_data, heap_index, install_function, type_error};
+use super::{
+    allocate_array, define_data, heap_index, install_constructor_function, install_function,
+    type_error,
+};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
 use crate::{
     CollectionKind, EvalFailure, HeapEntry, Host, Machine, Property, PropertyKey, PropertyMap,
@@ -73,7 +76,7 @@ fn replace_constructor<H: Host>(
     handler: BuiltinHandler<H>,
 ) -> InstalledConstructor {
     let prototype = prototype_of(heap, name, globals);
-    let constructor = install_function(heap, builtins, name, 0, handler);
+    let constructor = install_constructor_function(heap, builtins, name, 0, handler);
     builtins.set_constructor_prototype(heap, constructor, prototype);
     globals.insert(EcmaString::encode(name), constructor);
     InstalledConstructor {

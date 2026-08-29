@@ -17,6 +17,7 @@ mod object_statics;
 mod promise;
 pub(crate) mod property_descriptor;
 pub(crate) mod proxy;
+pub(crate) mod reflect;
 mod regexp;
 pub(crate) use regexp::{canonical_source, initial_regexp_properties};
 mod annex_b;
@@ -35,7 +36,7 @@ mod string_edge;
 mod structured_clone;
 mod symbol;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod timers;
 pub(crate) mod typedarray_all;
 mod uri;
@@ -82,6 +83,7 @@ pub(crate) fn install<H: Host>(
     if let Some(id) = builtins.id_named("Proxy") {
         builtins.set_constructable(id, true);
     }
+    reflect::install(heap, globals, builtins);
     uri::install(heap, globals, builtins);
     disposable_stack::install(heap, globals, builtins);
 }

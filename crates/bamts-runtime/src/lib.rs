@@ -46,6 +46,8 @@ mod gc;
 mod host_objects;
 mod intrinsics;
 mod native;
+#[cfg(test)]
+mod proxy_reflect_integration;
 mod vm;
 pub(crate) use intrinsics::builtins;
 
@@ -7212,7 +7214,9 @@ impl<'a, H: Host> Machine<'a, H> {
                 }
                 Ok(CalleeKind::Proxy) => {
                     let arguments = arguments.as_ref().to_vec();
-                    match crate::builtins::proxy::call(self, callee, this_value, &arguments) {
+                    match self.with_proxy_dispatch(|machine| {
+                        crate::builtins::proxy::call(machine, callee, this_value, &arguments)
+                    }) {
                         Ok(value) => {
                             if let Some(register) = destination {
                                 self.write_register(self.frames.len() - 1, register, value);
@@ -7743,9 +7747,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     .map_err(EvalFailure::Runtime)?;
                 self.internal_construct(bound.target, &bound.arguments, bound.new_target)
             }
-            CalleeKind::Proxy => {
-                crate::builtins::proxy::construct(self, callee, arguments, new_target)
-            }
+            CalleeKind::Proxy => self.with_proxy_dispatch(|machine| {
+                crate::builtins::proxy::construct(machine, callee, arguments, new_target)
+            }),
             CalleeKind::ProxyRevoker | CalleeKind::NotCallable => {
                 Err(EvalFailure::Throw(ThrowOrigin::TypeError {
                     operation: "construct",
@@ -7889,12 +7893,14 @@ impl<'a, H: Host> Machine<'a, H> {
                     arguments = Cow::Owned(bound.arguments);
                 }
                 CalleeKind::Proxy => {
-                    return crate::builtins::proxy::call(
-                        self,
-                        callee,
-                        this_value,
-                        arguments.as_ref(),
-                    );
+                    return self.with_proxy_dispatch(|machine| {
+                        crate::builtins::proxy::call(
+                            machine,
+                            callee,
+                            this_value,
+                            arguments.as_ref(),
+                        )
+                    });
                 }
                 CalleeKind::ProxyRevoker => {
                     return crate::builtins::proxy::call_revoker(self, callee);
@@ -8425,10 +8431,9 @@ impl<'a, H: Host> Machine<'a, H> {
                     .exports
                     .iter()
                     .find_map(|(candidate, export)| candidate.eq_ascii(name).then_some(export))?;
-                let cell = export
-                    .cell
-                    .expect("external namespace exports link before evaluation");
-                Some(Found::Value(self.registry.cells[cell.0].value))
+                Some(Found::Value(export.cell.map_or(export.value, |cell| {
+                    self.registry.cells[cell.0].value
+                })))
             }
             HeapEntry::RegExp {
                 pattern,
@@ -9929,7 +9934,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 }));
             }
         };
-        let keys = self.own_property_keys(source)?;
+        let keys = self.internal_own_property_keys(source)?;
         for key in keys {
             if !self.own_property_is_enumerable(source, &key)? {
                 continue;
@@ -9952,7 +9957,7 @@ impl<'a, H: Host> Machine<'a, H> {
             }));
         }
         let excluded_keys = self.excluded_property_keys(excluded)?;
-        for key in self.own_property_keys(source)? {
+        for key in self.internal_own_property_keys(source)? {
             if excluded_keys.contains(&key) {
                 continue;
             }
@@ -9960,16 +9965,24 @@ impl<'a, H: Host> Machine<'a, H> {
                 continue;
             }
             let value = self.get_property_key(source, &key)?;
-            self.define_descriptor(
+            // CreateDataPropertyOrThrow: [[DefineOwnProperty]] with a full
+            // data descriptor; a proxy target observes the defineProperty
+            // trap and a false is fatal.
+            if !self.internal_define_own_property(
                 target,
                 key,
-                Property::Data {
-                    value,
-                    writable: true,
-                    enumerable: true,
-                    configurable: true,
+                crate::builtins::property_descriptor::PropertyDescriptor {
+                    value: Some(value),
+                    writable: Some(true),
+                    enumerable: Some(true),
+                    configurable: Some(true),
+                    ..Default::default()
                 },
-            )?;
+            )? {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "cannot create property on non-extensible target",
+                }));
+            }
         }
         Ok(())
     }
