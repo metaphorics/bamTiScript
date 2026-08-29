@@ -36,7 +36,7 @@ use super::{
     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
     IMPORT_CONFLICTS_WITH_LOCAL, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
     MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
-    NEW_TARGET_OUTSIDE_FUNCTION, PARAMETER_DECORATOR_NOT_SUPPORTED,
+    NEW_TARGET_OUTSIDE_FUNCTION, NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
     PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
     SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
     STRICT_NULL_MEMBER_ACCESS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
@@ -61,16 +61,17 @@ use super::{
     IMPORT_CONFLICTS_WITH_LOCAL_MESSAGE, INVALID_ASSIGNMENT_TARGET_MESSAGE,
     INVALID_INDEXED_ACCESS_KEY_MESSAGE, MEMBER_NOT_ACCESSIBLE_MESSAGE,
     MISSING_METHOD_RETURN_TYPE_MESSAGE, MIXED_EXPORT_ASSIGNMENT_MESSAGE,
-    NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
-    PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE,
-    PROPERTY_DOES_NOT_EXIST_MESSAGE, PROPERTY_NOT_INITIALIZED_MESSAGE,
-    SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
-    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_REFERENCE_NON_DERIVED_MESSAGE,
-    TYPE_ALIAS_CIRCULAR_MESSAGE, TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
-    UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
-    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
-    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    NEW_TARGET_OUTSIDE_FUNCTION_MESSAGE, NON_VOID_FUNCTION_MUST_RETURN_MESSAGE,
+    NOT_ASSIGNABLE_MESSAGE, PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE,
+    PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE, PROPERTY_DOES_NOT_EXIST_MESSAGE,
+    PROPERTY_NOT_INITIALIZED_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
+    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
+    SUPER_REFERENCE_NON_DERIVED_MESSAGE, TYPE_ALIAS_CIRCULAR_MESSAGE,
+    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
+    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
+    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
+    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -8019,6 +8020,17 @@ impl<'src> Binder<'src> {
                     current.range(),
                     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
                 );
+                // TS7010 pairs with TS2391 whenever the unimplemented
+                // overload signature also omits its return annotation.
+                if let Statement::Function(function) = statements[index].data()
+                    && function.function.return_type.is_none()
+                {
+                    this.emit(
+                        MISSING_METHOD_RETURN_TYPE,
+                        current.range(),
+                        MISSING_METHOD_RETURN_TYPE_MESSAGE,
+                    );
+                }
             };
             let Some(next) = statements.get(index + 1) else {
                 missing(self);
@@ -8951,7 +8963,11 @@ impl<'src> Binder<'src> {
             _ => {}
         });
         if let Some(body) = function.body.as_ref() {
-            self.check_annotated_return_fallthrough(body, expected_return_type);
+            let annotation = function
+                .return_type
+                .as_ref()
+                .map(|node| node.data().type_node.range());
+            self.check_annotated_return_fallthrough(body, expected_return_type, annotation);
         }
         if !is_declaration {
             self.pop_reassigned_scope();
@@ -9327,6 +9343,22 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Pairs TS7010 with TS2391: when a class overload group lacks its
+    /// implementation and the leading signature also omits a return type,
+    /// upstream reports the missing return at the same member-name range.
+    fn emit_missing_overload_return_pair(&mut self, member: &'src ClassMember, range: TextRange) {
+        if let ClassMember::Method(method) = member
+            && method.modifier == PropertyModifier::None
+            && method.function.return_type.is_none()
+        {
+            self.emit(
+                MISSING_METHOD_RETURN_TYPE,
+                range,
+                MISSING_METHOD_RETURN_TYPE_MESSAGE,
+            );
+        }
+    }
+
     fn check_class_method_overload_order(
         &mut self,
         members: &'src [crate::syntax::ClassMemberNode],
@@ -9384,6 +9416,10 @@ impl<'src> Binder<'src> {
                     Self::class_member_overload_range(members[start].data()),
                     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
                 );
+                self.emit_missing_overload_return_pair(
+                    members[start].data(),
+                    Self::class_member_overload_range(members[start].data()),
+                );
                 break;
             }
             let implementation = members[i].data();
@@ -9409,6 +9445,10 @@ impl<'src> Binder<'src> {
                     Self::class_member_overload_range(members[start].data()),
                     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
                 );
+                self.emit_missing_overload_return_pair(
+                    members[start].data(),
+                    Self::class_member_overload_range(members[start].data()),
+                );
             } else if matches!(implementation, ClassMember::Method(method)
                 if method.modifier == PropertyModifier::None && method.function.body.is_some() && !matches_name)
             {
@@ -9425,6 +9465,10 @@ impl<'src> Binder<'src> {
                     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
                     Self::class_member_overload_range(members[start].data()),
                     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
+                );
+                self.emit_missing_overload_return_pair(
+                    members[start].data(),
+                    Self::class_member_overload_range(members[start].data()),
                 );
                 // Do not consume this member; it may be a normal class member.
                 i = start + 1;
@@ -10951,7 +10995,15 @@ impl<'src> Binder<'src> {
                     }
                     FunctionBody::Missing(_) => {}
                 });
-                self.check_annotated_return_fallthrough(&arrow.body, expected_return_type);
+                let annotation = arrow
+                    .return_type
+                    .as_ref()
+                    .map(|node| node.data().type_node.range());
+                self.check_annotated_return_fallthrough(
+                    &arrow.body,
+                    expected_return_type,
+                    annotation,
+                );
                 self.pop_reassigned_scope();
                 if let Some(body_id) = block_body_id {
                     let popped = self.function_body_stack.pop();
@@ -16285,21 +16337,99 @@ impl<'src> Binder<'src> {
             .iter()
             .any(|statement| self.statement_prevents_function_completion(statement.data()))
     }
-
     fn check_annotated_return_fallthrough(
         &mut self,
         body: &'src FunctionBody,
         expected: Option<TypeId>,
+        annotation: Option<TextRange>,
     ) {
         let (FunctionBody::Block(block), Some(expected)) = (body, expected) else {
             return;
         };
-        if self.block_can_complete_normally(block.data())
+        if !(self.block_can_complete_normally(block.data())
             && !self
                 .types
-                .assignable_with_strict_null(self.types.undefined_type(), expected)
+                .assignable_with_strict_null(self.types.undefined_type(), expected))
         {
+            return;
+        }
+        if self.block_contains_return_statement(block.data()) {
+            // At least one return exists; a normal completion therefore falls
+            // off the end with `undefined` against a value type.
             self.emit(TYPE_NOT_ASSIGNABLE, block.range(), NOT_ASSIGNABLE_MESSAGE);
+        } else {
+            // No return statement at all: the function never returns a value,
+            // which upstream reports as its own diagnostic at the annotation.
+            self.emit(
+                NON_VOID_FUNCTION_MUST_RETURN,
+                annotation.unwrap_or_else(|| block.range()),
+                NON_VOID_FUNCTION_MUST_RETURN_MESSAGE,
+            );
+        }
+    }
+
+    /// Whether any return statement is lexically present in the block,
+    /// including inside nested blocks, loops, `try`, and `switch`, but never
+    /// descending into nested function or arrow bodies (their returns belong
+    /// to the nested callable).
+    fn block_contains_return_statement(&self, block: &crate::syntax::Block) -> bool {
+        self.statements_contain_return(&block.statements)
+    }
+
+    fn statements_contain_return(&self, statements: &'src [crate::syntax::Stmt]) -> bool {
+        for statement in statements {
+            if self.statement_contains_return(statement.data()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn statement_contains_return(&self, statement: &crate::syntax::Statement) -> bool {
+        match statement {
+            crate::syntax::Statement::Return(_) => true,
+            crate::syntax::Statement::Block(block) => {
+                self.statements_contain_return(&block.data().statements)
+            }
+            crate::syntax::Statement::If(statement) => {
+                self.statement_contains_return(statement.consequent.data())
+                    || statement
+                        .alternate
+                        .as_ref()
+                        .is_some_and(|alternate| self.statement_contains_return(alternate.data()))
+            }
+            crate::syntax::Statement::While(statement) => {
+                self.statement_contains_return(statement.body.data())
+            }
+            crate::syntax::Statement::DoWhile(statement) => {
+                self.statement_contains_return(statement.body.data())
+            }
+            crate::syntax::Statement::For(statement) => {
+                self.statement_contains_return(statement.body.data())
+            }
+            crate::syntax::Statement::ForIn(statement) => {
+                self.statement_contains_return(statement.body.data())
+            }
+            crate::syntax::Statement::ForOf(statement) => {
+                self.statement_contains_return(statement.body.data())
+            }
+            crate::syntax::Statement::Labeled(statement) => {
+                self.statement_contains_return(statement.body.data())
+            }
+            crate::syntax::Statement::Switch(statement) => statement
+                .cases
+                .iter()
+                .any(|case| self.statements_contain_return(&case.data().consequent)),
+            crate::syntax::Statement::Try(statement) => {
+                self.statements_contain_return(&statement.block.data().statements)
+                    || statement.handler.as_ref().is_some_and(|handler| {
+                        self.statements_contain_return(&handler.data().body.data().statements)
+                    })
+                    || statement.finalizer.as_ref().is_some_and(|finalizer| {
+                        self.statements_contain_return(&finalizer.data().statements)
+                    })
+            }
+            _ => false,
         }
     }
 
@@ -16691,7 +16821,8 @@ mod tests {
         ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION,
         CONSTRUCTOR_TYPE_PARAMETERS, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
         FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
-        GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, PROPERTY_NOT_INITIALIZED, PropertyType,
+        GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, MISSING_METHOD_RETURN_TYPE,
+        NON_VOID_FUNCTION_MUST_RETURN, PROPERTY_NOT_INITIALIZED, PropertyType,
         SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
         SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
         TupleShape, Type, TypeParameterBounds, TypeTable, bind_source,
