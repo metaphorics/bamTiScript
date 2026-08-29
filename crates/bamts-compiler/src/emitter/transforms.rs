@@ -1195,12 +1195,7 @@ impl<'a> Rewriter<'a> {
     }
 
     /// `object[<computed expression>]`.
-    fn member_computed(
-        &mut self,
-        object: &IdentifierNode,
-        key: &Expr,
-        range: TextRange,
-    ) -> Expr {
+    fn member_computed(&mut self, object: &IdentifierNode, key: &Expr, range: TextRange) -> Expr {
         let object_expr = self.node(object.range(), Expression::Identifier(object.clone()));
         self.node(
             range,
@@ -4117,6 +4112,150 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         assert!(left.required.contains(&LanguageFeature::Destructuring));
     }
 
+    #[test]
+    fn strict_prologue_follows_always_strict_and_module_kind() {
+        // Upstream compiler-case baselines (ClassDeclaration11 d7acd32a,
+        // ParameterList5 25946d42) emit `"use strict";` for module output;
+        // conformance pairs like arrowFunctionContexts(alwaysstrict=...)
+        // tie the script prologue to the alwaysStrict option.
+        let module = emit_with_options(
+            "const value = 1;\n",
+            EmitOptions {
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            javascript(&module).starts_with("\"use strict\";\n"),
+            "CommonJS implies strict: {}",
+            javascript(&module)
+        );
+        let script = emit_with_options(
+            "const value = 1;\n",
+            EmitOptions {
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            !javascript(&script).starts_with("\"use strict\";\n"),
+            "a plain script has no prologue: {}",
+            javascript(&script)
+        );
+        let always = emit_with_options(
+            "const value = 1;\n",
+            EmitOptions {
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            javascript(&always).starts_with("\"use strict\";\n"),
+            "alwaysStrict emits the prologue: {}",
+            javascript(&always)
+        );
+        let deduped = emit_with_options(
+            "\"use strict\";\nconst value = 1;\n",
+            EmitOptions {
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&deduped);
+        assert_eq!(
+            code.matches("\"use strict\";").count(),
+            1,
+            "a source directive suppresses the synthetic one: {code}"
+        );
+    }
+
+    #[test]
+    fn ambient_enum_and_module_produce_no_runtime_statements() {
+        // Upstream ambientEnumElementInitializer5 (43527a9c) emits only the
+        // strict prologue; ambientModules (df2119af) keeps only the trailing
+        // member assignment.
+        let ambient_enum = emit_at("declare enum E { e = -0xA }\n", ScriptTarget::Es2015);
+        assert_eq!(
+            javascript(&ambient_enum),
+            "",
+            "{:?}",
+            javascript(&ambient_enum)
+        );
+
+        let ambient_module = emit_at(
+            "declare namespace Foo.Bar { export var foo; };\nFoo.Bar.foo = 5;\n",
+            ScriptTarget::Es2015,
+        );
+        // The ambient declaration vanishes; the runtime assignment survives,
+        // matching upstream ambientModules (df2119af) after the prologue.
+        assert!(
+            !javascript(&ambient_module).starts_with("declare")
+                && !javascript(&ambient_module).contains("export var foo"),
+            "the ambient block is erased: {}",
+            javascript(&ambient_module)
+        );
+
+        let runtime = emit_at("const enum K { A }\nlet kept = 1;\n", ScriptTarget::Es2015);
+        assert!(
+            javascript(&runtime).contains("kept"),
+            "non-ambient code survives: {}",
+            javascript(&runtime)
+        );
+    }
+
+    #[test]
+    fn generic_call_type_arguments_are_erased() {
+        // Upstream genericCallWithNonGenericArgs1 (e71ae63c): f<any>(null)
+        // emits f(null);
+        let output = emit_at(
+            "function f<T>(x: any) { }\nf<any>(null);\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("f(null);"), "{code}");
+        assert!(!code.contains("<any>"), "{code}");
+    }
+
+    #[test]
+    fn computed_destructuring_keys_evaluate_once_into_a_temp() {
+        // Upstream computedPropertiesInDestructuring1 (50845e03) lowers
+        // `let {[foo2()]: bar3} = ...` to a temp declaration plus a
+        // bracket read, with the key evaluated exactly once.
+        let output = emit_at(
+            "const key = \"k\";\nconst { [key]: value } = { k: 1 };\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let key_temp_at = code.find("let _t").expect("key temp declared");
+        let digits: String = code[key_temp_at + "let _t".len()..]
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        let temp_name = format!("_t{digits}");
+        let declaration_form = format!("let {temp_name} = key;");
+        assert!(
+            code.contains(&declaration_form),
+            "key evaluates once into a temp ({declaration_form:?}): {code}"
+        );
+        assert!(
+            code.contains(&format!("[{temp_name}]")),
+            "binding reads through the temp: {code}"
+        );
+    }
+
+    #[test]
+    fn derived_constructor_keeps_prologue_before_super() {
+        // Upstream constructorWithSuperAndPrologue.es5 (1e40213a): the
+        // "ngInject" directive stays in the body ahead of the super call and
+        // the super call becomes `return _super.call(this) || this;`.
+        let output = emit_at(
+            "class B extends A {\n    constructor() {\n        \"ngInject\";\n        console.log(\"B\");\n        super();\n    }\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        let directive = code.find("ngInject").expect("directive survives");
+        let super_call = code.find("super(").expect("super call survives");
+        assert!(directive < super_call, "{code}");
+    }
     #[test]
     fn transformed_output_is_byte_stable() {
         let source = "class C { x = 1; static y = 2; }\n";
