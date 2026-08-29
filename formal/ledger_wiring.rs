@@ -31,11 +31,11 @@ use crate::{
 };
 
 /// Locked P0.7 inventory for the current TypeScript 7.0.2 completion wave.
-pub const EXPECTED_P07_ROWS: usize = 239;
+pub const EXPECTED_P07_ROWS: usize = 264;
 /// Locked `formal-lean` identifier count.
 pub const FORMAL_LEAN_ROWS: usize = 80;
 /// Locked `formal-quint` identifier count.
-pub const FORMAL_QUINT_ROWS: usize = 49;
+pub const FORMAL_QUINT_ROWS: usize = 74;
 /// Locked `formal-redex` identifier count.
 pub const FORMAL_REDEX_ROWS: usize = 110;
 
@@ -291,7 +291,7 @@ pub fn p07_universe(manifest: &VerificationManifest) -> Result<Vec<FormalObligat
     Ok(universe)
 }
 
-/// Rejects a universe that is not the locked 80/49/110 P0.7 inventory.
+/// Rejects a universe that is not the locked 80/74/110 P0.7 inventory.
 pub fn assert_locked_p07_inventory(universe: &[FormalObligation]) -> Result<()> {
     let mut lean = 0usize;
     let mut quint = 0usize;

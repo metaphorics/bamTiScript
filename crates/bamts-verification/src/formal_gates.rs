@@ -1220,10 +1220,10 @@ fn validate_quint_runs(
             "runs.json does not describe the pinned Quint 0.32.0 runner",
         ));
     }
-    if manifest.runs.len() != 6 {
+    if manifest.runs.len() != 9 {
         return Err(schema_error(
             &path,
-            "runs.json must contain exactly six bounded safety simulations",
+            "runs.json must contain exactly nine bounded safety simulations",
         ));
     }
     let mut seen_models = BTreeSet::new();

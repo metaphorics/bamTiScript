@@ -103,8 +103,8 @@ catalog row. An identifier whose only witness is a skipped test is not admitted.
 ## 5. Ledger PASS
 
 F1.1 projection (`project_formal_ledger`) is the only function that may flip a
-P0.7 formal row to `PASS`. The locked inventory is 80 Lean + 49 Quint + 110 Redex
-= 239 rows, owner `P0.7`, reason
+P0.7 formal row to `PASS`. The locked inventory is 80 Lean + 74 Quint + 110 Redex
+= 264 rows, owner `P0.7`, reason
 `{case} has not passed its proof or property gate.` until PASS.
 
 PASS requires all of:
