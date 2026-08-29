@@ -6,6 +6,7 @@
 //! resolution-mode conditions, deterministic trace, and cycle-safe package lookup.
 //! It does not introduce a second path, options, or diagnostics model.
 
+use super::resolution_trace::ResolutionTraceLog;
 use crate::project::{
     CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode, PackageTarget,
     PathError, PathMapping, ProjectRoot, ResolutionConditions, ResolutionFlavor,
@@ -63,6 +64,15 @@ impl ModuleResolutionKind {
     #[must_use]
     pub const fn allows_extensionless_relative(self) -> bool {
         matches!(self, Self::Bundler)
+    }
+    /// Upstream trace spelling used by `traceResolution` output.
+    #[must_use]
+    pub const fn trace_name(self) -> &'static str {
+        match self {
+            Self::Node16 => "Node16",
+            Self::NodeNext => "NodeNext",
+            Self::Bundler => "Bundler",
+        }
     }
 }
 
@@ -392,6 +402,29 @@ pub fn resolve_module_name(
         specifier,
         (strategy.0, strategy.1, false),
         (host, cache, &mut BTreeSet::new()),
+        None,
+    )
+}
+
+/// Like [`resolve_module_name`] while appending sanitized upstream
+/// `traceResolution` lines to `log`.
+pub fn resolve_module_name_with_trace(
+    root: &ProjectRoot,
+    options: &CompilerOptions,
+    importer: impl AsRef<Path>,
+    specifier: &str,
+    strategy: (ModuleResolutionKind, ResolutionMode),
+    host: &dyn ResolutionHost,
+    cache: &mut ResolutionCache,
+    log: &mut ResolutionTraceLog,
+) -> Result<ResolvedModule, ResolutionError> {
+    resolve_module_name_inner(
+        (root, options),
+        importer.as_ref(),
+        specifier,
+        (strategy.0, strategy.1, false),
+        (host, cache, &mut BTreeSet::new()),
+        Some(log),
     )
 }
 
@@ -412,6 +445,7 @@ pub fn resolve_type_reference(
         specifier,
         (strategy.0, strategy.1, true),
         (host, cache, &mut BTreeSet::new()),
+        None,
     )
 }
 
@@ -421,6 +455,7 @@ fn resolve_module_name_inner(
     specifier: &str,
     strategy: (ModuleResolutionKind, ResolutionMode, bool),
     services: ResolverServices<'_, '_, '_>,
+    log: Option<&mut ResolutionTraceLog>,
 ) -> Result<ResolvedModule, ResolutionError> {
     let (root, options) = context;
     let (kind, mode, types) = strategy;
@@ -445,7 +480,11 @@ fn resolve_module_name_inner(
         types,
     };
     if let Some(cached) = cache.hits.get(&key) {
-        return cached.clone();
+        let result = cached.clone();
+        if let Some(log) = log {
+            log.record_module(root, &importer, specifier, (kind, mode), true, &result);
+        }
+        return result;
     }
 
     let mut trace = ResolutionTrace::default();
@@ -503,6 +542,9 @@ fn resolve_module_name_inner(
         Err(other) => Err(other),
     };
 
+    if let Some(log) = log {
+        log.record_module(root, &importer, specifier, (kind, mode), false, &stored);
+    }
     cache.hits.insert(key, stored.clone());
     stored
 }
@@ -1049,6 +1091,7 @@ fn resolve_hash_import(
                 external.as_ref(),
                 (kind, mode, types),
                 (host, &mut *cache, &mut *package_stack),
+                None,
             )
         }
         Err(error) => Err(error.into()),
@@ -1699,5 +1742,80 @@ mod tests {
         let _mappings: &[PathMapping] = options.paths();
         let _object_ty: Option<&JsonObject> = None;
         let _value_ty: Option<&JsonValue> = None;
+    }
+    #[test]
+    fn trace_log_matches_upstream_bundler_relative_blob() {
+        // Lines pinned byte-for-byte to the upstream baseline blob
+        // sha256 1170256ebc7a95579edb54bfe7ce1b8c6ffd8ffcf8a219318822605ad58fdda3
+        // (tests/baselines/reference/bundlerRelative1(module=bundler).trace.json,
+        // indices 12..=31) plus its cache-hit re-resolution template.
+        let expected: &[&str] = &[
+            "======== Resolving module './dir/index' from '/main.ts'. ========",
+            "Explicitly specified module resolution kind: 'Bundler'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "Loading module as file / folder, candidate module location '/dir/index', target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "File '/dir/index.ts' exists - use it as a name resolution result.",
+            "======== Module name './dir/index' was successfully resolved to '/dir/index.ts'. ========",
+            "======== Resolving module './dir/index.js' from '/main.ts'. ========",
+            "Explicitly specified module resolution kind: 'Bundler'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "Loading module as file / folder, candidate module location '/dir/index.js', target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "File name '/dir/index.js' has a '.js' extension - stripping it.",
+            "File '/dir/index.ts' exists - use it as a name resolution result.",
+            "======== Module name './dir/index.js' was successfully resolved to '/dir/index.ts'. ========",
+            "======== Resolving module './dir/index.ts' from '/main.ts'. ========",
+            "Explicitly specified module resolution kind: 'Bundler'.",
+            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "Loading module as file / folder, candidate module location '/dir/index.ts', target file types: TypeScript, JavaScript, Declaration, JSON.",
+            "File name '/dir/index.ts' has a '.ts' extension - stripping it.",
+            "File '/dir/index.ts' exists - use it as a name resolution result.",
+            "======== Module name './dir/index.ts' was successfully resolved to '/dir/index.ts'. ========",
+            "======== Resolving module './dir/index' from '/main.ts'. ========",
+            "Resolution for module './dir/index' was found in cache from location '/'.",
+            "======== Module name './dir/index' was successfully resolved to '/dir/index.ts'. ========",
+        ];
+
+        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let config = ProjectConfig::parse(
+            &fs_root,
+            "/tsconfig.json",
+            r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut host = MemoryHost::default();
+        host.file("/main.ts", "import {} from './dir/index.js';\n");
+        host.file("/dir/index.ts", "export {};\n");
+        let mut cache = ResolutionCache::new();
+        let mut log = ResolutionTraceLog::default();
+
+        for specifier in ["./dir/index", "./dir/index.js", "./dir/index.ts"] {
+            resolve_module_name_with_trace(
+                &fs_root,
+                &options,
+                "/main.ts",
+                specifier,
+                (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+                &host,
+                &mut cache,
+                &mut log,
+            )
+            .unwrap_or_else(|error| panic!("resolve {specifier}: {error}"));
+        }
+        resolve_module_name_with_trace(
+            &fs_root,
+            &options,
+            "/main.ts",
+            "./dir/index",
+            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+            &host,
+            &mut cache,
+            &mut log,
+        )
+        .expect("cache hit");
+
+        let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
+        assert_eq!(produced, expected);
+        assert!(log.unsupported().is_empty());
     }
 }

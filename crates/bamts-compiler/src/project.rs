@@ -3,6 +3,7 @@ pub mod effective;
 pub mod output;
 pub mod references;
 pub mod resolution;
+pub mod resolution_trace;
 pub mod tsconfig;
 
 use crate::{
