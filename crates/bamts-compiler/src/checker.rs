@@ -11214,21 +11214,30 @@ function check(options: Options = {}) {
         );
     }
     #[test]
-    fn f4_function_declaration3_reports_only_the_missing_implementation() {
+    fn f4_function_declaration3_matches_the_upstream_baseline() {
         // Upstream baseline FunctionDeclaration3.errors.txt (sha256
-        // 22ca7ff4...): TS2391 at (1,10) plus TS7010 at (1,10). The TS7010
-        // pairing is emitted by the binder at the same site; this pins the
-        // C039 half and forbids unrelated spurious diagnostics.
+        // 22ca7ff4...): TS2391 at (1,10) plus TS7010 at (1,10) — the
+        // implicit-any return pairing reports at the same name range in
+        // upstream row order.
         let result = check_text("function foo();\n1+1;\nfunction foo():string { return \"a\" }");
         let diagnostics = result
             .diagnostics()
             .iter()
             .filter(|diagnostic| diagnostic.code().as_str().starts_with("BAMTS-C"))
             .collect::<Vec<_>>();
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].code().as_str(), "BAMTS-C039");
-        assert_eq!(diagnostics[0].range().start().get(), 9);
-        assert_eq!(diagnostics[0].range().end().get(), 12);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        // The suite comparator sorts rows by position plus canonical code,
+        // so only the pairing and the shared name range are contractual.
+        let mut codes = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        assert_eq!(codes, ["BAMTS-C037", "BAMTS-C039"]);
+        for diagnostic in &diagnostics {
+            assert_eq!(diagnostic.range().start().get(), 9);
+            assert_eq!(diagnostic.range().end().get(), 12);
+        }
     }
 
     #[test]
@@ -11237,8 +11246,11 @@ function check(options: Options = {}) {
         // expects exactly four errors (TS2355/TS2369/TS7006/TS2304) with a
         // live function body. The parser must not turn the annotated
         // function type into a bodyless declaration, so C039 and the
-        // value-level C002 for `C` must stay absent while the unresolved
-        // return-type reference `C` reports at (1,29) => offset 28.
+        // value-level C002 for `C` stay absent. The zero-return fall-through
+        // pairs TS2355 (BAMTS-C081) with the unresolved return-type name C
+        // (C003, TS2304) at (1,29) => offset 28. TS2369/TS7006 in the type
+        // position additionally need modifier modeling on function-type
+        // parameters and are tracked as a syntax.rs change-window item.
         let result = check_text("function A(): (public B) => C {\n}");
         let diagnostics = result
             .diagnostics()
@@ -11251,14 +11263,15 @@ function check(options: Options = {}) {
                 .any(|diagnostic| diagnostic.code().as_str() == "BAMTS-C039"),
             "the body survives, so no missing-implementation error: {diagnostics:?}"
         );
-        let unresolved = diagnostics
+        let codes = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code().as_str() == "BAMTS-C003")
-            .expect("the return type name C is unresolved");
+            .map(|diagnostic| diagnostic.code().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(codes, ["BAMTS-C081", "BAMTS-C003"], "{diagnostics:?}");
+        let unresolved = &diagnostics[1];
         assert_eq!(unresolved.range().start().get(), 28);
         assert_eq!(unresolved.range().end().get(), 29);
     }
-
     #[test]
     fn f4_computed_symbol_object_members_accept_without_errors() {
         // Upstream acceptSymbolAsWeakType expects zero diagnostics; symbol
