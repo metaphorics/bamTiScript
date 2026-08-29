@@ -927,6 +927,7 @@ pub struct CompilerOptions {
     jsx_fragment_factory: Option<Arc<str>>,
     jsx_import_source: Option<Arc<str>>,
     strict: bool,
+    always_strict: bool,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
@@ -991,6 +992,11 @@ impl CompilerOptions {
     #[must_use]
     pub const fn strict(&self) -> bool {
         self.strict
+    }
+
+    #[must_use]
+    pub const fn always_strict(&self) -> bool {
+        self.always_strict
     }
 
     #[must_use]
@@ -1163,6 +1169,7 @@ impl ProjectConfig {
         let base_url = optional_path(root, directory, compiler, "baseUrl")?
             .unwrap_or_else(|| directory.to_path_buf());
         let paths = parse_path_mappings(root, &base_url, compiler)?;
+        let strict = optional_bool(compiler, "strict")?.unwrap_or(false);
         let options = CompilerOptions {
             target: optional_nested_string(compiler, "target")?,
             module: optional_nested_string(compiler, "module")?,
@@ -1171,7 +1178,8 @@ impl ProjectConfig {
             jsx_factory: optional_nested_string(compiler, "jsxFactory")?,
             jsx_fragment_factory: optional_nested_string(compiler, "jsxFragmentFactory")?,
             jsx_import_source: optional_nested_string(compiler, "jsxImportSource")?,
-            strict: optional_bool(compiler, "strict")?.unwrap_or(false),
+            strict,
+            always_strict: optional_bool(compiler, "alwaysStrict")?.unwrap_or(strict),
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
             resolve_json_module: optional_bool(compiler, "resolveJsonModule")?.unwrap_or(false),

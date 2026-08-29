@@ -320,6 +320,7 @@ pub enum ModeOptionClassification {
 /// dispatch routes it after ordinary argument validation.
 const DIRECT_CONSUMED: &[&str] = &[
     "allowJs",
+    "alwaysStrict",
     "checkJs",
     "declaration",
     "help",
@@ -348,6 +349,7 @@ const DIRECT_CONSUMED: &[&str] = &[
 /// after `EffectiveProject::load`.
 const PROJECT_CONSUMED: &[&str] = &[
     "allowJs",
+    "alwaysStrict",
     "checkJs",
     "declaration",
     "declarationMap",

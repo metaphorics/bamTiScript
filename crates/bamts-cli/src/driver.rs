@@ -882,6 +882,7 @@ fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOverrides {
             .option_str("outFile")
             .or_else(|| command.option_str("out"))
             .map(PathBuf::from),
+        always_strict: boolean("alwaysStrict"),
         ts_build_info_file: command.option_str("tsBuildInfoFile").map(PathBuf::from),
         strict: boolean("strict"),
         allow_js: boolean("allowJs"),

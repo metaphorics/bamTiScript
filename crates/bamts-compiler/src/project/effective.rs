@@ -40,6 +40,7 @@ pub struct ProjectOptionOverrides {
     pub out_file: Option<PathBuf>,
     pub ts_build_info_file: Option<PathBuf>,
     pub strict: Option<bool>,
+    pub always_strict: Option<bool>,
     pub allow_js: Option<bool>,
     pub check_js: Option<bool>,
     pub jsx: Option<Arc<str>>,
@@ -671,6 +672,7 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
         ("inlineSourceMap", options.inline_source_map()),
         ("declarationMap", options.declaration_map()),
         ("inlineSources", options.inline_sources()),
+        ("alwaysStrict", options.always_strict()),
     ] {
         if enabled {
             directives.insert(name.to_owned(), String::from("true"));
@@ -1249,6 +1251,7 @@ fn apply_overrides(
         ("strict", overrides.strict),
         ("allowJs", overrides.allow_js),
         ("checkJs", overrides.check_js),
+        ("alwaysStrict", overrides.always_strict),
     ] {
         if let Some(value) = value {
             set_named_entry(&mut compiler, key, JsonValue::Bool(value));
@@ -2212,6 +2215,62 @@ mod tests {
         .unwrap();
         assert!(javascript.contains("./runtime/jsx-runtime"));
         assert!(!javascript.contains("<div"));
+    }
+
+    #[test]
+    fn always_strict_emits_use_strict_prologue() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts", "export const a = 1;\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["src/a.ts"],"compilerOptions":{"alwaysStrict":true,"outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        assert!(project.options().always_strict());
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/a.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert!(
+            javascript.starts_with("\"use strict\";\n"),
+            "alwaysStrict emits the prologue: {javascript}"
+        );
+    }
+
+    #[test]
+    fn strict_implies_always_strict_prologue() {
+        let fixture = Fixture::new();
+        fixture.write("src/a.ts", "export const a = 1;\n");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":["src/a.ts"],"compilerOptions":{"strict":true,"outDir":"dist"}}"#,
+        );
+        let filesystem = fixture.filesystem();
+        let project =
+            EffectiveProject::load(&fixture.request("tsconfig.json"), &filesystem).unwrap();
+        assert!(project.options().always_strict());
+        let report =
+            compile_project(&project, &ProjectCompileOptions::default(), &filesystem).unwrap();
+        let javascript = std::str::from_utf8(
+            report
+                .outputs
+                .files
+                .get(&fixture.0.join("dist/a.js"))
+                .expect("project JavaScript output"),
+        )
+        .unwrap();
+        assert!(
+            javascript.starts_with("\"use strict\";\n"),
+            "strict implies alwaysStrict: {javascript}"
+        );
     }
 
     #[test]
