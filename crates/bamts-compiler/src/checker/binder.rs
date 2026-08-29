@@ -1302,6 +1302,9 @@ pub struct TypeTable {
     collection_symbols: [Option<SymbolId>; 4],
     record_symbol: Option<SymbolId>,
     property_key_symbol: Option<SymbolId>,
+    /// The `ConcatArray<T>` interface head backing the synthesized `concat`
+    /// member on array types.
+    concat_array_symbol: Option<SymbolId>,
     /// Declared constraint per type-parameter symbol. Class and interface names
     /// never enter this map, so nominal named types remain nominal.
     type_parameter_constraints: HashMap<SymbolId, TypeId>,
@@ -1362,6 +1365,7 @@ impl TypeTable {
             collection_symbols: [None; 4],
             record_symbol: None,
             property_key_symbol: None,
+            concat_array_symbol: None,
             type_parameter_constraints: HashMap::new(),
             type_parameter_defaults: HashMap::new(),
             classes: HashMap::new(),
@@ -1637,7 +1641,15 @@ impl TypeTable {
                 let index = name.parse::<usize>().ok()?;
                 self.tuple_index_type(&shape, index)
             }
-            Type::Array(element) => name.parse::<usize>().is_ok().then_some(element),
+            Type::Array(element) => {
+                if name.parse::<usize>().is_ok() {
+                    return Some(element);
+                }
+                if name == "concat" {
+                    return Some(self.array_concat_member_type(element));
+                }
+                None
+            }
             Type::Union(members) => {
                 let mut found = Vec::with_capacity(members.len());
                 for member in members {
@@ -3387,6 +3399,12 @@ impl TypeTable {
     }
 
     /// Interns a union, normalizing absorption, `never` removal, and duplicates.
+    ///
+    /// Identity is order-insensitive: unions with the same members
+    /// canonicalize onto one interned type regardless of construction order.
+    /// The stored member order is first-creation order, which is what
+    /// `render_type` displays — TypeScript renders unions in type-creation
+    /// order, and the `.types` baselines pin that order.
     pub fn union(&mut self, members: &[TypeId]) -> TypeId {
         let mut flat = Vec::new();
         for member in members {
@@ -3394,16 +3412,34 @@ impl TypeTable {
                 Type::Any => return self.any,
                 Type::Unknown => return self.unknown,
                 Type::Never => {}
-                Type::Union(nested) => flat.extend(nested.iter().copied()),
-                _ => flat.push(*member),
+                Type::Union(nested) => {
+                    for nested_member in nested.iter().copied() {
+                        if !flat.contains(&nested_member) {
+                            flat.push(nested_member);
+                        }
+                    }
+                }
+                _ => {
+                    if !flat.contains(member) {
+                        flat.push(*member);
+                    }
+                }
             }
         }
-        flat.sort_by_key(|id| id.get());
-        flat.dedup();
         match flat.len() {
             0 => self.never,
             1 => flat[0],
-            _ => self.intern(Type::Union(flat)),
+            _ => {
+                let mut canonical = flat.clone();
+                canonical.sort_by_key(|id| id.get());
+                if let Some(existing) = self.index.get(&Type::Union(canonical.clone())) {
+                    return *existing;
+                }
+                let id = TypeId(u32::try_from(self.types.len()).expect("type count fits in u32"));
+                self.types.push(Type::Union(flat));
+                self.index.insert(Type::Union(canonical), id);
+                id
+            }
         }
     }
 
@@ -3458,6 +3494,58 @@ impl TypeTable {
         TypeRelations::new(self).assignable(source, target)
     }
 
+    /// Synthesizes the `Array<T>.concat` overload pair the standard library
+    /// declares:
+    /// `(...items: ConcatArray<T>[]): T[]` and
+    /// `(...items: (ConcatArray<T> | T)[]): T[]`.
+    /// The result is the object type carrying both call signatures so `.types`
+    /// rendering matches the library overload set.
+    fn array_concat_member_type(&mut self, element: TypeId) -> TypeId {
+        let Some(concat_array) = self.concat_array_symbol else {
+            return self.any;
+        };
+        let concat_array_element = self.applied_class(concat_array, vec![element]);
+        let array_of_element = self.array(element);
+        let items_of_concat_arrays = self.array(concat_array_element);
+        let element_or_concat_array = self.union(&[concat_array_element, element]);
+        let items_of_elements_or_concat_arrays = self.array(element_or_concat_array);
+        let first = self.function_with_parameters(
+            Vec::new(),
+            vec![FunctionParameter::new(
+                "items".to_owned(),
+                items_of_concat_arrays,
+                false,
+                true,
+            )],
+            array_of_element,
+        );
+        let second = self.function_with_parameters(
+            Vec::new(),
+            vec![FunctionParameter::new(
+                "items".to_owned(),
+                items_of_elements_or_concat_arrays,
+                false,
+                true,
+            )],
+            array_of_element,
+        );
+        let mut call_signatures = Vec::with_capacity(2);
+        for signature in [first, second] {
+            match self.get(signature).clone() {
+                Type::Function(signature) => call_signatures.push(signature),
+                _ => unreachable!("synthesized concat member must be a function"),
+            }
+        }
+        self.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures,
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        })
+    }
     /// Returns whether a value of `source` may be assigned where `target` is
     /// expected with `strictNullChecks` enabled.
     #[must_use]
@@ -4992,6 +5080,7 @@ impl<'src> Binder<'src> {
                 "ReadonlyMap" => self.types.collection_symbols[3] = Some(id),
                 "Record" => self.types.record_symbol = Some(id),
                 "PropertyKey" => self.types.property_key_symbol = Some(id),
+                "ConcatArray" => self.types.concat_array_symbol = Some(id),
                 _ => {}
             }
             if *name == "RegExp" {

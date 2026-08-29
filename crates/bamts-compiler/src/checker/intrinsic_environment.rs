@@ -123,6 +123,7 @@ const STANDARD_TYPES: &[&str] = &[
     "PropertyKey",
     "Array",
     "ReadonlyArray",
+    "ConcatArray",
     "Readonly",
     "Partial",
     "Required",
