@@ -87,6 +87,7 @@ pub enum LanguageFeature {
     Generators,
     Destructuring,
     AsyncFunctions,
+    Exponentiation,
     ObjectRestSpread,
     AsyncIteration,
     OptionalChaining,
@@ -102,7 +103,7 @@ impl LanguageFeature {
     pub const fn since(self) -> ScriptTarget {
         match self {
             Self::Classes | Self::Generators | Self::Destructuring => ScriptTarget::Es2015,
-            Self::AsyncFunctions => ScriptTarget::Es2017,
+            Self::Exponentiation => ScriptTarget::Es2016,
             Self::ObjectRestSpread | Self::AsyncIteration => ScriptTarget::Es2018,
             Self::OptionalChaining | Self::NullishCoalescing => ScriptTarget::Es2020,
             Self::LogicalAssignment => ScriptTarget::Es2021,
@@ -229,7 +230,7 @@ pub fn emit_transformed(
     {
         rewriter.used_helpers.insert(HelperKind::Assign);
     }
-    let statements = rewriter.rewrite_statements(file.statements());
+    let statements = rewriter.rewrite_root_statements(file.statements(), file.range());
     let used_helpers: Vec<_> = rewriter.used_helpers.iter().copied().collect();
     let (source, eof, range) = match rewriter.finish_source() {
         Ok(parts) => parts,
@@ -550,6 +551,7 @@ struct Rewriter<'a> {
     replace_await: bool,
     used_helpers: BTreeSet<HelperKind>,
     key_prelude: Vec<Stmt>,
+    expression_temp_scopes: Vec<Vec<IdentifierNode>>,
     cjs: Option<CjsPlan>,
 }
 
@@ -626,6 +628,7 @@ impl<'a> Rewriter<'a> {
             replace_await: false,
             used_helpers: BTreeSet::new(),
             key_prelude: Vec::new(),
+            expression_temp_scopes: Vec::new(),
             cjs,
         }
     }
@@ -1164,6 +1167,40 @@ impl<'a> Rewriter<'a> {
         let name = format!("_t{}", self.next_temp);
         self.next_temp += 1;
         self.ident(&name)
+    }
+
+    fn expression_temp(&mut self) -> IdentifierNode {
+        let temp = self.temp_ident();
+        if let Some(scope) = self.expression_temp_scopes.last_mut() {
+            scope.push(temp.clone());
+        }
+        temp
+    }
+
+    fn temp_declaration(&mut self, temps: Vec<IdentifierNode>, range: TextRange) -> Option<Stmt> {
+        if temps.is_empty() {
+            return None;
+        }
+        let declarations = temps
+            .into_iter()
+            .map(|temp| self.make_declarator(temp, None, range))
+            .collect();
+        let declaration = VariableDeclaration {
+            range,
+            kind: VariableKind::Var,
+            declarations,
+        };
+        Some(self.node(range, Statement::Variable(declaration)))
+    }
+
+    fn rewrite_root_statements(&mut self, statements: &[Stmt], range: TextRange) -> Vec<Stmt> {
+        self.expression_temp_scopes.push(Vec::new());
+        let mut rewritten = self.rewrite_statements(statements);
+        let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+        if let Some(declaration) = self.temp_declaration(temps, range) {
+            rewritten.insert(0, declaration);
+        }
+        rewritten
     }
 
     fn node<T>(&mut self, range: TextRange, data: T) -> Node<T> {
@@ -3664,7 +3701,12 @@ impl<'a> Rewriter<'a> {
     fn rewrite_body(&mut self, body: &FunctionBody) -> FunctionBody {
         match body {
             FunctionBody::Block(block) => {
-                let statements = self.rewrite_statements(&block.data().statements);
+                self.expression_temp_scopes.push(Vec::new());
+                let mut statements = self.rewrite_statements(&block.data().statements);
+                let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+                if let Some(declaration) = self.temp_declaration(temps, block.range()) {
+                    statements.insert(0, declaration);
+                }
                 FunctionBody::Block(self.node(block.range(), Block { statements }))
             }
             FunctionBody::Expression(expression) => {
@@ -3954,6 +3996,11 @@ impl<'a> Rewriter<'a> {
             Expression::Binary(value) => {
                 let left = self.rewrite_expr(&value.left);
                 let right = self.rewrite_expr(&value.right);
+                if value.operator == BinaryOperator::Exponentiate
+                    && Self::needs(LanguageFeature::Exponentiation, self.options)
+                {
+                    return self.math_pow(left, right, expression.range());
+                }
                 self.node(
                     expression.range(),
                     Expression::Binary(BinaryExpression {
@@ -4053,6 +4100,11 @@ impl<'a> Rewriter<'a> {
                 expression.clone()
             }
             Expression::Assignment(assignment) => {
+                if assignment.operator == AssignmentOperator::ExponentiateAssign
+                    && Self::needs(LanguageFeature::Exponentiation, self.options)
+                {
+                    return self.lower_compound_exponentiation(expression, assignment);
+                }
                 let right = self.rewrite_expr(&assignment.right);
                 self.node(
                     expression.range(),
@@ -4073,25 +4125,142 @@ impl<'a> Rewriter<'a> {
         }
     }
 
+    /// `Math.pow(base, exponent)` — the ES2016 exponentiation downlevel form.
+    fn math_pow(&mut self, base: Expr, exponent: Expr, range: TextRange) -> Expr {
+        let math = self.ident("Math");
+        let callee = self.member_ident(&math, "pow", range);
+        self.node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(callee),
+                optional: false,
+                type_arguments: None,
+                arguments: vec![
+                    CallArgument::Expression(Box::new(base)),
+                    CallArgument::Expression(Box::new(exponent)),
+                ],
+            }),
+        )
+    }
+
+    /// Lowers `lhs **= rhs` below ES2016 to `lhs = Math.pow(lhs, rhs)`.
+    /// Identifier targets read the binding directly; member targets capture
+    /// the base (and computed keys that are not bare identifiers) in temps so
+    /// every side-effectful piece evaluates exactly once, in source order.
+    fn lower_compound_exponentiation(
+        &mut self,
+        expression: &Expr,
+        assignment: &AssignmentExpression,
+    ) -> Expr {
+        let right = self.rewrite_expr(&assignment.right);
+        match assignment.left.data() {
+            AssignmentTarget::Identifier(identifier) => {
+                let read = self.node(
+                    identifier.range(),
+                    Expression::Identifier(identifier.clone()),
+                );
+                let lowered = Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left: assignment.left.clone(),
+                    right: Box::new(self.math_pow(read, right, expression.range())),
+                });
+                self.node(expression.range(), lowered)
+            }
+            AssignmentTarget::Member(member) => {
+                // `super.x` targets flow through the static-super Reflect
+                // lowering, which runs after this pass and cannot see through
+                // synthetic temps, so the source form is left for it.
+                if matches!(member.object.data(), Expression::Super) {
+                    return expression.clone();
+                }
+                let object = self.rewrite_expr(&member.object);
+                let base = self.expression_temp();
+                let base_reference =
+                    self.node(base.range(), Expression::Identifier(base.clone()));
+                let base_target = self.node(base.range(), AssignmentTarget::Identifier(base));
+                let base_assignment = self.node(
+                    object.range(),
+                    Expression::Assignment(AssignmentExpression {
+                        operator: AssignmentOperator::Assign,
+                        left: base_target,
+                        right: Box::new(object),
+                    }),
+                );
+                let (target_property, read_property) = match &member.property {
+                    MemberProperty::Computed(key) => {
+                        let key = self.rewrite_expr(key);
+                        if matches!(key.data(), Expression::Identifier(_)) {
+                            (
+                                MemberProperty::Computed(Box::new(key.clone())),
+                                MemberProperty::Computed(Box::new(key)),
+                            )
+                        } else {
+                            let key_temp = self.expression_temp();
+                            let key_reference = self.node(
+                                key_temp.range(),
+                                Expression::Identifier(key_temp.clone()),
+                            );
+                            let key_target = self.node(
+                                key_temp.range(),
+                                AssignmentTarget::Identifier(key_temp),
+                            );
+                            let key_assignment = self.node(
+                                key.range(),
+                                Expression::Assignment(AssignmentExpression {
+                                    operator: AssignmentOperator::Assign,
+                                    left: key_target,
+                                    right: Box::new(key),
+                                }),
+                            );
+                            (
+                                MemberProperty::Computed(Box::new(key_assignment)),
+                                MemberProperty::Computed(Box::new(key_reference)),
+                            )
+                        }
+                    }
+                    other => (other.clone(), other.clone()),
+                };
+                let read = self.member_expr(&base_reference, read_property, expression.range());
+                let target = self.node(
+                    assignment.left.range(),
+                    AssignmentTarget::Member(AssignmentMemberTarget {
+                        object: Box::new(base_assignment),
+                        property: target_property,
+                    }),
+                );
+                let lowered = Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left: target,
+                    right: Box::new(self.math_pow(read, right, expression.range())),
+                });
+                self.node(expression.range(), lowered)
+            }
+            AssignmentTarget::Object(_)
+            | AssignmentTarget::Array(_)
+            | AssignmentTarget::Missing(_) => expression.clone(),
+        }
+    }
+
     fn rewrite_arrow(&mut self, expression: &Expr, arrow: &ArrowFunction) -> Expr {
         if arrow.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
             let previous = self.replace_await;
             self.replace_await = true;
             let body = match &arrow.body {
                 FunctionBody::Expression(expr) => {
+                    self.expression_temp_scopes.push(Vec::new());
                     let rewritten = self.rewrite_expr(expr);
-                    let return_statement = self.node(
+                    let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+                    let mut statements = Vec::new();
+                    if let Some(declaration) = self.temp_declaration(temps, expression.range()) {
+                        statements.push(declaration);
+                    }
+                    statements.push(self.node(
                         expression.range(),
                         Statement::Return(ReturnStatement {
                             argument: Some(Box::new(rewritten)),
                         }),
-                    );
-                    let block = self.node(
-                        expression.range(),
-                        Block {
-                            statements: vec![return_statement],
-                        },
-                    );
+                    ));
+                    let block = self.node(expression.range(), Block { statements });
                     FunctionBody::Block(block)
                 }
                 other => self.rewrite_body(other),
@@ -4267,11 +4436,79 @@ fn scan_statements(
                 }
                 for declarator in &declaration.declarations {
                     scan_pattern(declarator.data().binding.data(), features);
+                    if let Some(initializer) = declarator.data().initializer.as_deref() {
+                        scan_expression(initializer, features);
+                    }
                 }
+            }
+            Statement::Expression(expr) => scan_expression(&expr.expression, features),
+            Statement::If(value) => {
+                scan_expression(&value.test, features);
+                scan_nested_statements(std::slice::from_ref(value.consequent.as_ref()), features);
+                if let Some(alternate) = value.alternate.as_deref() {
+                    scan_nested_statements(std::slice::from_ref(alternate), features);
+                }
+            }
+            Statement::While(value) => {
+                scan_expression(&value.test, features);
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+            }
+            Statement::DoWhile(value) => {
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+                scan_expression(&value.test, features);
+            }
+            Statement::With(value) => {
+                scan_expression(&value.object, features);
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+            }
+            Statement::Labeled(value) => {
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+            }
+            Statement::Return(ret) => {
+                if let Some(argument) = ret.argument.as_deref() {
+                    scan_expression(argument, features);
+                }
+            }
+            Statement::Throw(value) => scan_expression(&value.argument, features),
+            Statement::For(value) => {
+                if let Some(ForInitializer::Expression(initializer)) = &value.initializer {
+                    scan_expression(initializer, features);
+                }
+                if let Some(test) = value.test.as_deref() {
+                    scan_expression(test, features);
+                }
+                if let Some(update) = value.update.as_deref() {
+                    scan_expression(update, features);
+                }
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+            }
+            Statement::ForIn(for_in) => {
+                scan_expression(&for_in.object, features);
+                scan_nested_statements(std::slice::from_ref(for_in.body.as_ref()), features);
             }
             Statement::ForOf(for_of) => {
                 if for_of.mode == ForOfMode::Async {
                     features.insert(LanguageFeature::AsyncIteration);
+                }
+                scan_expression(&for_of.iterable, features);
+                scan_nested_statements(std::slice::from_ref(for_of.body.as_ref()), features);
+            }
+            Statement::Switch(value) => {
+                scan_expression(&value.discriminant, features);
+                for case in &value.cases {
+                    if let Some(test) = case.data().test.as_deref() {
+                        scan_expression(test, features);
+                    }
+                    scan_nested_statements(&case.data().consequent, features);
+                }
+            }
+            Statement::Try(value) => {
+                scan_nested_statements(&value.block.data().statements, features);
+                if let Some(handler) = &value.handler {
+                    scan_nested_statements(&handler.data().body.data().statements, features);
+                }
+                if let Some(finalizer) = &value.finalizer {
+                    scan_nested_statements(&finalizer.data().statements, features);
                 }
             }
             Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
@@ -4288,6 +4525,8 @@ fn scan_statements(
                 if let ExportDefaultValue::Class(class) = &default.value {
                     features.insert(LanguageFeature::Classes);
                     scan_class(file, class, options, features, diagnostics);
+                } else if let ExportDefaultValue::Expression(value) = &default.value {
+                    scan_expression(value, features);
                 }
             }
             Statement::Block(block) => {
@@ -4312,11 +4551,18 @@ fn scan_class(
     features: &mut BTreeSet<LanguageFeature>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    if let Some(heritage) = &class.extends {
+        scan_expression(&heritage.expression, features);
+    }
     for member in &class.members {
         match member.data() {
             ClassMember::Property(property) => {
                 if !property.modifiers.is_declare && !property.modifiers.is_abstract {
                     features.insert(LanguageFeature::ClassFields);
+                }
+                scan_computed_name(&property.name, features);
+                if let Some(initializer) = property.initializer.as_deref() {
+                    scan_expression(initializer, features);
                 }
                 if matches!(property.name, PropertyName::Private(_))
                     && !options.target.supports(LanguageFeature::ClassFields)
@@ -4339,8 +4585,12 @@ fn scan_class(
                     diagnostics,
                 );
             }
-            ClassMember::AutoAccessor(_) => {
+            ClassMember::AutoAccessor(accessor) => {
                 features.insert(LanguageFeature::ClassFields);
+                scan_computed_name(&accessor.name, features);
+                if let Some(initializer) = accessor.initializer.as_deref() {
+                    scan_expression(initializer, features);
+                }
                 if !options.target.supports(LanguageFeature::ClassFields) {
                     diagnostics.push(Diagnostic::error(
                         codes::AUTO_ACCESSOR_REQUIRES_ES2022,
@@ -4382,16 +4632,21 @@ fn scan_function(
     }
     for parameter in &function.parameters {
         scan_pattern(parameter.data().binding.data(), features);
+        if let Some(initializer) = parameter.data().initializer.as_deref() {
+            scan_expression(initializer, features);
+        }
     }
-    if let Some(FunctionBody::Block(body)) = &function.body {
-        scan_statements(
+    match function.body.as_deref() {
+        Some(FunctionBody::Block(body)) => scan_statements(
             file,
             &body.data().statements,
             options,
             features,
             diagnostics,
             function.is_async,
-        );
+        ),
+        Some(FunctionBody::Expression(expression)) => scan_expression(expression, features),
+        Some(FunctionBody::Missing(_)) | None => {}
     }
 }
 
@@ -4405,6 +4660,327 @@ fn scan_pattern(pattern: &BindingPattern, features: &mut BTreeSet<LanguageFeatur
             features.insert(LanguageFeature::Destructuring);
         }
         _ => {}
+    }
+}
+
+/// Recursively scans one expression for exponentiation syntax. The deep walk
+/// intentionally reports only [`LanguageFeature::Exponentiation`]: every other
+/// feature keeps the statement-level analysis surface this module has always
+/// exposed, and only exponentiation is lowered in every expression position
+/// the rewriter visits.
+fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) {
+    match expression.data() {
+        Expression::Binary(value) => {
+            scan_expression(&value.left, features);
+            if value.operator == BinaryOperator::Exponentiate {
+                features.insert(LanguageFeature::Exponentiation);
+            }
+            scan_expression(&value.right, features);
+        }
+        Expression::Assignment(value) => {
+            scan_target(value.left.data(), features);
+            if value.operator == AssignmentOperator::ExponentiateAssign {
+                features.insert(LanguageFeature::Exponentiation);
+            }
+            scan_expression(&value.right, features);
+        }
+        Expression::Template(value) => {
+            for expression in &value.expressions {
+                scan_expression(expression, features);
+            }
+        }
+        Expression::TaggedTemplate(value) => {
+            scan_expression(&value.tag, features);
+            for expression in &value.template.expressions {
+                scan_expression(expression, features);
+            }
+        }
+        Expression::Array(value) => {
+            for element in &value.elements {
+                if let ArrayElement::Expression(expression) = element.data() {
+                    scan_expression(expression, features);
+                }
+            }
+        }
+        Expression::Object(value) => {
+            for member in &value.members {
+                match member.data() {
+                    ObjectMember::Property(property) => {
+                        scan_computed_name(&property.name, features);
+                        scan_expression(&property.value, features);
+                    }
+                    ObjectMember::Method(method) => {
+                        scan_computed_name(&method.name, features);
+                        scan_parameter_defaults(&method.function.parameters, features);
+                        scan_nested_body(method.function.body.as_deref(), features);
+                    }
+                    ObjectMember::Spread(spread) => scan_expression(&spread.argument, features),
+                    ObjectMember::Missing(_) => {}
+                }
+            }
+        }
+        Expression::Function(value) => {
+            scan_parameter_defaults(&value.function.parameters, features);
+            scan_nested_body(value.function.body.as_deref(), features);
+        }
+        Expression::Class(value) => scan_class_expressions(&value.class, features),
+        Expression::Arrow(value) => {
+            scan_parameter_defaults(&value.parameters, features);
+            scan_nested_body(Some(&value.body), features);
+        }
+        Expression::Call(value) => {
+            scan_expression(&value.callee, features);
+            for argument in &value.arguments {
+                match argument {
+                    CallArgument::Expression(expression) => scan_expression(expression, features),
+                    CallArgument::Spread(spread) => scan_expression(&spread.argument, features),
+                    CallArgument::Missing(_) => {}
+                }
+            }
+        }
+        Expression::Member(value) => {
+            scan_expression(&value.object, features);
+            if let MemberProperty::Computed(key) = &value.property {
+                scan_expression(key, features);
+            }
+        }
+        Expression::New(value) => {
+            scan_expression(&value.callee, features);
+            for argument in &value.arguments {
+                match argument {
+                    CallArgument::Expression(expression) => scan_expression(expression, features),
+                    CallArgument::Spread(spread) => scan_expression(&spread.argument, features),
+                    CallArgument::Missing(_) => {}
+                }
+            }
+        }
+        Expression::Await(value) => scan_expression(&value.argument, features),
+        Expression::Yield(value) => {
+            if let Some(argument) = value.argument.as_deref() {
+                scan_expression(argument, features);
+            }
+        }
+        Expression::Unary(value) => scan_expression(&value.argument, features),
+        Expression::Update(value) => scan_target(value.argument.data(), features),
+        Expression::Logical(value) => {
+            scan_expression(&value.left, features);
+            scan_expression(&value.right, features);
+        }
+        Expression::Conditional(value) => {
+            scan_expression(&value.test, features);
+            scan_expression(&value.consequent, features);
+            scan_expression(&value.alternate, features);
+        }
+        Expression::Sequence(value) => {
+            for expression in &value.expressions {
+                scan_expression(expression, features);
+            }
+        }
+        Expression::Parenthesized(value) => scan_expression(value, features),
+        Expression::As(value) => scan_expression(&value.expression, features),
+        Expression::Satisfies(value) => scan_expression(&value.expression, features),
+        Expression::TypeAssertion(value) => scan_expression(&value.expression, features),
+        Expression::NonNull(value) => scan_expression(&value.expression, features),
+        Expression::Import(value) => {
+            scan_expression(&value.source, features);
+            if let Some(options) = value.options.as_deref() {
+                scan_expression(options, features);
+            }
+        }
+        // JSX trees print through the JSX desugar plan, which owns their
+        // expression containers, so the transform walk never visits them.
+        _ => {}
+    }
+}
+
+/// Recursively scans an assignment target for exponentiation syntax.
+fn scan_target(target: &AssignmentTarget, features: &mut BTreeSet<LanguageFeature>) {
+    match target {
+        AssignmentTarget::Member(member) => {
+            scan_expression(&member.object, features);
+            if let MemberProperty::Computed(key) = &member.property {
+                scan_expression(key, features);
+            }
+        }
+        AssignmentTarget::Object(pattern) => {
+            for property in &pattern.properties {
+                scan_computed_name(&property.name, features);
+                scan_target(property.target.data(), features);
+                if let Some(initializer) = property.initializer.as_deref() {
+                    scan_expression(initializer, features);
+                }
+            }
+        }
+        AssignmentTarget::Array(pattern) => {
+            for element in &pattern.elements {
+                if let AssignmentArrayElement::Target(inner) = element.data() {
+                    scan_target(inner.data(), features);
+                }
+            }
+        }
+        AssignmentTarget::Identifier(_) | AssignmentTarget::Missing(_) => {}
+    }
+}
+
+/// Scans a property name for exponentiation inside a computed key.
+fn scan_computed_name(name: &PropertyName, features: &mut BTreeSet<LanguageFeature>) {
+    if let PropertyName::Computed(key) = name {
+        scan_expression(key, features);
+    }
+}
+
+/// Scans parameter default values for exponentiation syntax.
+fn scan_parameter_defaults(
+    parameters: &[ParameterNode],
+    features: &mut BTreeSet<LanguageFeature>,
+) {
+    for parameter in parameters {
+        if let Some(initializer) = parameter.data().initializer.as_deref() {
+            scan_expression(initializer, features);
+        }
+    }
+}
+
+/// Scans a nested function body for exponentiation syntax.
+fn scan_nested_body(body: Option<&FunctionBody>, features: &mut BTreeSet<LanguageFeature>) {
+    match body {
+        Some(FunctionBody::Block(block)) => {
+            scan_nested_statements(&block.data().statements, features);
+        }
+        Some(FunctionBody::Expression(expression)) => scan_expression(expression, features),
+        Some(FunctionBody::Missing(_)) | None => {}
+    }
+}
+
+/// Exponentiation-only statement walk for bodies the rewriter descends into
+/// from expression position (nested functions, arrows, object methods).
+fn scan_nested_statements(statements: &[Stmt], features: &mut BTreeSet<LanguageFeature>) {
+    for statement in statements {
+        match statement.data() {
+            Statement::Variable(declaration) => {
+                for declarator in &declaration.declarations {
+                    if let Some(initializer) = declarator.data().initializer.as_deref() {
+                        scan_expression(initializer, features);
+                    }
+                }
+            }
+            Statement::Expression(expr) => scan_expression(&expr.expression, features),
+            Statement::Return(ret) => {
+                if let Some(argument) = ret.argument.as_deref() {
+                    scan_expression(argument, features);
+                }
+            }
+            Statement::Throw(value) => scan_expression(&value.argument, features),
+            Statement::If(value) => {
+                scan_expression(&value.test, features);
+                scan_nested_statements(std::slice::from_ref(value.consequent.as_ref()), features);
+                if let Some(alternate) = value.alternate.as_deref() {
+                    scan_nested_statements(std::slice::from_ref(alternate), features);
+                }
+            }
+            Statement::While(value) => {
+                scan_expression(&value.test, features);
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+            }
+            Statement::DoWhile(value) => {
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+                scan_expression(&value.test, features);
+            }
+            Statement::With(value) => {
+                scan_expression(&value.object, features);
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+            }
+            Statement::Labeled(value) => {
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+            }
+            Statement::For(value) => {
+                if let Some(ForInitializer::Expression(initializer)) = &value.initializer {
+                    scan_expression(initializer, features);
+                }
+                if let Some(test) = value.test.as_deref() {
+                    scan_expression(test, features);
+                }
+                if let Some(update) = value.update.as_deref() {
+                    scan_expression(update, features);
+                }
+                scan_nested_statements(std::slice::from_ref(value.body.as_ref()), features);
+            }
+            Statement::ForIn(for_in) => {
+                scan_expression(&for_in.object, features);
+                scan_nested_statements(std::slice::from_ref(for_in.body.as_ref()), features);
+            }
+            Statement::ForOf(for_of) => {
+                scan_expression(&for_of.iterable, features);
+                scan_nested_statements(std::slice::from_ref(for_of.body.as_ref()), features);
+            }
+            Statement::Switch(value) => {
+                scan_expression(&value.discriminant, features);
+                for case in &value.cases {
+                    if let Some(test) = case.data().test.as_deref() {
+                        scan_expression(test, features);
+                    }
+                    scan_nested_statements(&case.data().consequent, features);
+                }
+            }
+            Statement::Try(value) => {
+                scan_nested_statements(&value.block.data().statements, features);
+                if let Some(handler) = &value.handler {
+                    scan_nested_statements(&handler.data().body.data().statements, features);
+                }
+                if let Some(finalizer) = &value.finalizer {
+                    scan_nested_statements(&finalizer.data().statements, features);
+                }
+            }
+            Statement::Function(function) => {
+                scan_parameter_defaults(&function.function.parameters, features);
+                scan_nested_body(function.function.body.as_deref(), features);
+            }
+            Statement::Class(class) => scan_class_expressions(class, features),
+            Statement::Block(block) => {
+                scan_nested_statements(&block.data().statements, features);
+            }
+            Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Declaration(
+                inner,
+            ))) => scan_nested_statements(std::slice::from_ref(inner), features),
+            Statement::Export(ExportDeclaration::Default(default)) => {
+                if let ExportDefaultValue::Expression(value) = &default.value {
+                    scan_expression(value, features);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Exponentiation-only walk over the expression positions of one class.
+fn scan_class_expressions(class: &ClassDeclaration, features: &mut BTreeSet<LanguageFeature>) {
+    if let Some(heritage) = &class.extends {
+        scan_expression(&heritage.expression, features);
+    }
+    for member in &class.members {
+        match member.data() {
+            ClassMember::Property(property) => {
+                scan_computed_name(&property.name, features);
+                if let Some(initializer) = property.initializer.as_deref() {
+                    scan_expression(initializer, features);
+                }
+            }
+            ClassMember::Method(method) => {
+                scan_computed_name(&method.name, features);
+                scan_parameter_defaults(&method.function.parameters, features);
+                scan_nested_body(method.function.body.as_deref(), features);
+            }
+            ClassMember::AutoAccessor(accessor) => {
+                scan_computed_name(&accessor.name, features);
+                if let Some(initializer) = accessor.initializer.as_deref() {
+                    scan_expression(initializer, features);
+                }
+            }
+            ClassMember::StaticBlock(block) => {
+                scan_nested_statements(&block.data().statements, features);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -5296,5 +5872,133 @@ console.log(JSON.stringify([bar, bar4, log]));
             emit_transformed(&file, checked.product(), &options, &names),
             emit_transformed(&file, checked.product(), &options, &names)
         );
+    }
+
+    #[test]
+    fn es5_downlevels_exponentiation_to_math_pow() {
+        // Upstream exponentiationOperatorWithAnyAndNumber: every `**`
+        // becomes `Math.pow(left, right)` below ES2016, and the nested
+        // right-associative form nests the calls.
+        let output = emit_at(
+            "var a: any;\nvar b: number;\nvar r1 = a ** b;\nvar r2 = b ** 2;\nvar r3 = a ** b ** 2;\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("Math.pow(a, b)"), "{code}");
+        assert!(code.contains("Math.pow(b, 2)"), "{code}");
+        assert!(code.contains("Math.pow(a, Math.pow(b, 2))"), "{code}");
+        assert!(!code.contains("**"), "{code}");
+    }
+
+    #[test]
+    fn es5_downlevels_compound_exponentiation_identifiers() {
+        // Upstream compoundExponentiationAssignmentLHSIsReference: identifier
+        // targets become `x = Math.pow(x, value)` without temps.
+        let output = emit_at("var x = 2;\nvar value = 3;\nx **= value;\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(code.contains("x = Math.pow(x, value)"), "{code}");
+        assert!(!code.contains("**"), "{code}");
+    }
+
+    #[test]
+    fn es5_compound_exponentiation_property_lhs_evaluates_base_once() {
+        let output = emit_at(
+            "var obj = { v: 2 };\nfunction pick() { return obj; }\npick().v **= 3;\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("(_t0 = pick()).v = Math.pow(_t0.v, 3)"),
+            "{code}"
+        );
+        assert_eq!(code.matches("pick()").count(), 1, "{code}");
+        // Declaration plus the pick return; the lowering never re-evaluates it.
+        assert_eq!(code.matches("obj").count(), 2, "{code}");
+    }
+
+    #[test]
+    fn es5_compound_exponentiation_captures_computed_keys() {
+        let output = emit_at("var obj = { a: 2 };\nobj[\"a\"] **= 3;\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            code.contains("(_t0 = obj)[_t1 = \"a\"] = Math.pow(_t0[_t1], 3)"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es5_declares_compound_exponentiation_temps_in_the_enclosing_function() {
+        let output = emit_at(
+            "var obj = { v: 2 };\nfunction f() { obj.v **= 3; }\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("var _t0;"), "{code}");
+        assert!(
+            code.contains("(_t0 = obj).v = Math.pow(_t0.v, 3)"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn node_executes_lowered_compound_exponentiation_with_single_evaluations() {
+        let output = emit_at(
+            "var calls = 0;\nvar target = { v: 2 };\nfunction base() { calls += 1; return target; }\nfunction key() { calls += 10; return \"v\"; }\nbase()[key()] **= 3;\nconsole.log(calls + \":\" + target.v);\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("**"), "{code}");
+        let result = run_node_in_owned_dir(code, "bamts-exponentiation", "program.cjs");
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        // The base runs once, the key runs once, and `2 ** 3` is `8`.
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("11:8"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es2016_preserves_exponentiation_operators() {
+        let source = "var r = a ** 2;\na **= 2;\n";
+        let es2016 = javascript(&emit_at(source, ScriptTarget::Es2016));
+        assert!(es2016.contains("**"), "{es2016}");
+        assert!(es2016.contains("**="), "{es2016}");
+        assert!(!es2016.contains("Math.pow"), "{es2016}");
+        let es2015 = javascript(&emit_at(source, ScriptTarget::Es2015));
+        assert!(es2015.contains("Math.pow(a, 2)"), "{es2015}");
+        assert!(!es2015.contains("**"), "{es2015}");
+    }
+
+    #[test]
+    fn es5_lowers_exponentiation_nested_in_expressions() {
+        let output = emit_at(
+            "var r = flag ? call(a ** 2) : obj[b ** 3];\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("Math.pow(a, 2)"), "{code}");
+        assert!(code.contains("Math.pow(b, 3)"), "{code}");
+        assert!(!code.contains("**"), "{code}");
+    }
+
+    #[test]
+    fn analysis_detects_exponentiation_nested_in_expressions() {
+        let file = parse("var r = flag ? call(a ** 2) : b **= 3;\n");
+        let options = options_for(ScriptTarget::Es5).transform_view();
+        let plan = analyze(&file, &options);
+        assert!(
+            plan.features.contains(&LanguageFeature::Exponentiation),
+            "{plan:?}"
+        );
+        assert!(
+            plan.required.contains(&LanguageFeature::Exponentiation),
+            "{plan:?}"
+        );
+        let plain = analyze(&parse("var r = a * b;\n"), &options);
+        assert!(!plain.features.contains(&LanguageFeature::Exponentiation));
     }
 }
