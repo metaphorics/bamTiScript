@@ -14,14 +14,16 @@ use std::{
     time::Duration,
 };
 
-use bamts_compiler::{
-    diagnostic::Diagnostic,
-    parser::parse,
-    scanner::scan,
-    source::{ScriptKind, SourceId, SourceText},
-    syntax::{Token, TokenKind},
-    telemetry::{PhaseTotals, TelemetryCollector},
-};
+use bamts_cli::cli::tsc_report::render_resolution_trace;
+use bamts_compiler::diagnostic::Diagnostic;
+use bamts_compiler::parser::parse;
+use bamts_compiler::program::{ProgramLoadOptions, ProgramLoader};
+use bamts_compiler::project::{ProjectConfig, ProjectRoot};
+use bamts_compiler::scanner::scan;
+use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
+use bamts_compiler::syntax::{Token, TokenKind};
+use bamts_compiler::telemetry::{PhaseTotals, TelemetryCollector};
+use bamts_compiler::CancellationToken;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -2860,15 +2862,10 @@ pub fn observe_compiler_lane(
     )
 }
 
-/// Route a project-partition obligation (`project/tests/cases/project/<name>.json`)
-/// through the lane. Per the catalog every project cell declares the `trace`
-/// observable, so these rows must reach the trace comparator and evaluate
-/// honestly instead of dying as malformed compiler/conformance paths. The
-/// trace producer (`resolve_module_name_with_trace`) works at the individual
-/// import level, not the program level — `ProgramLoader` resolves edges via
-/// `plan_relative_module`/`canonical_selection`, not `resolve_module_name` —
-/// so project-level trace collection remains a producer-missing gap. Any other
-/// observable or a non-project path stays a closed blocking fail.
+/// Execute a project-partition trace obligation against the project fixture's
+/// owned `tests/baselines/reference/project/<case>.trace.json` baseline.
+/// Project sources are materialized into one confined temporary root before the
+/// same `ProgramLoader` load produces both the graph and its resolution trace.
 fn project_trace_lane(
     snapshot: &(impl SnapshotAssets + ?Sized),
     _ctx: &CheckContext,
@@ -2928,7 +2925,7 @@ fn project_trace_lane(
             format!("project case `{input}` does not route observable `{observable}`"),
         );
     }
-    let Some(_index_entry) = snapshot.index().entries.get(input) else {
+    let Some(index_entry) = snapshot.index().entries.get(input) else {
         return CompilerLaneObservation::blocking(
             input,
             variant,
@@ -2937,16 +2934,164 @@ fn project_trace_lane(
             format!("snapshot has no case input `{input}`"),
         );
     };
-    // The trace producer works at the individual import level; program-level
-    // collection (wiring `resolve_module_name_with_trace` into `ProgramLoader`)
-    // is not yet available, so project trace rows report the gap honestly.
-    CompilerLaneObservation::blocking(
+    let check = observe_project_trace(snapshot, index_entry);
+    bind_compiler_observation(
         input,
         variant,
         observable,
         BTreeMap::new(),
-        "producer missing: program-level resolution tracer (upstream `traceResolution` log baselined as `.trace.json`; `resolve_module_name_with_trace` works per-import but `ProgramLoader` does not thread a `ResolutionTraceLog` through its `plan_relative_module`/`canonical_selection` path)".to_owned(),
+        declared,
+        check,
     )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectTraceCase {
+    project_root: String,
+    input_files: Vec<String>,
+}
+
+fn observe_project_trace(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+) -> check_cells::CompilerCheckObservation {
+    match produce_project_trace(snapshot, index_entry) {
+        Ok((produced, expected, _baseline)) if produced == expected => {
+            check_cells::CompilerCheckObservation {
+                class: FailureClass::Pass,
+                detail: String::new(),
+                artifact: Some(produced),
+            }
+        }
+        Ok((produced, expected, baseline_path)) => check_cells::CompilerCheckObservation {
+            class: FailureClass::FailBehavior,
+            detail: format!(
+                "trace mismatch against `{baseline_path}`: produced {} bytes, expected {} bytes",
+                produced.len(),
+                expected.len()
+            ),
+            artifact: Some(produced),
+        },
+        Err(detail) => check_cells::CompilerCheckObservation {
+            class: FailureClass::HarnessError,
+            detail,
+            artifact: None,
+        },
+    }
+}
+
+fn produce_project_trace(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    index_entry: &IndexEntry,
+) -> std::result::Result<(Vec<u8>, Vec<u8>, String), String> {
+    let descriptor = read_verified_snapshot_asset(snapshot, &index_entry.logical_path)
+        .map_err(|error| error.to_string())?;
+    let fixture: ProjectTraceCase = serde_json::from_slice(&descriptor)
+        .map_err(|error| format!("invalid project trace fixture: {error}"))?;
+    if !fixture.project_root.starts_with("tests/cases/projects/")
+        || !is_safe_logical_path(&fixture.project_root)
+    {
+        return Err(format!(
+            "project trace fixture has unsafe projectRoot `{}`",
+            fixture.project_root
+        ));
+    }
+    if fixture.input_files.is_empty()
+        || fixture
+            .input_files
+            .iter()
+            .any(|path| !is_safe_logical_path(path))
+    {
+        return Err("project trace fixture has no safe inputFiles".to_owned());
+    }
+
+    let relative_case = index_entry
+        .logical_path
+        .strip_prefix("tests/cases/project/")
+        .and_then(|path| path.strip_suffix(".json"))
+        .ok_or_else(|| {
+            format!(
+                "project trace fixture path `{}` has no project baseline stem",
+                index_entry.logical_path
+            )
+        })?;
+    let baseline_path =
+        format!("tests/baselines/reference/project/{relative_case}.trace.json");
+    let expected = read_verified_snapshot_asset(snapshot, &baseline_path).map_err(|error| {
+        format!("missing trace evidence `{baseline_path}`: {error}")
+    })?;
+
+    let temp = TempDir::new("bamts-project-trace")
+        .map_err(|error| format!("project trace temp root: {error}"))?;
+    let project_dir = temp.path().join(&fixture.project_root);
+    fs::create_dir_all(&project_dir)
+        .map_err(|error| format!("project trace root `{}`: {error}", project_dir.display()))?;
+    let project_prefix = format!("{}/", fixture.project_root.trim_end_matches('/'));
+    for entry in snapshot.index().entries.values() {
+        let Some(relative) = entry.logical_path.strip_prefix(&project_prefix) else {
+            continue;
+        };
+        if entry.asset_kind != AssetKind::CaseInput || !is_safe_logical_path(relative) {
+            continue;
+        }
+        let bytes = read_verified_snapshot_asset(snapshot, &entry.logical_path)
+            .map_err(|error| error.to_string())?;
+        let destination = project_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("project trace directory `{}`: {error}", parent.display())
+            })?;
+        }
+        fs::write(&destination, bytes).map_err(|error| {
+            format!(
+                "project trace source `{}`: {error}",
+                destination.display()
+            )
+        })?;
+    }
+
+    let root = ProjectRoot::new(&project_dir)
+        .map_err(|error| format!("project trace root: {error}"))?;
+    let config_path = project_dir.join("tsconfig.json");
+    let config_source = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .map_err(|error| format!("project trace config `{}`: {error}", config_path.display()))?
+    } else {
+        "{}".to_owned()
+    };
+    let config = ProjectConfig::parse(&root, &config_path, &config_source)
+        .map_err(|error| format!("project trace config: {error}"))?;
+    let loader = ProgramLoader::new(&root, config.configuration())
+        .map_err(|error| format!("project trace loader: {error}"))?;
+    let roots: Vec<PathBuf> = fixture.input_files.iter().map(PathBuf::from).collect();
+    let cancellation = CancellationToken::new();
+    let loaded = loader
+        .load_roots_with_options(
+            &roots,
+            ProgramLoadOptions {
+                cancellation: &cancellation,
+                trace_resolution: true,
+            },
+        )
+        .map_err(|error| format!("project trace load failed: {error}"))?;
+    let trace = loaded.resolution_trace.ok_or_else(|| {
+        "missing trace evidence: ProgramLoader returned no ResolutionTraceLog".to_owned()
+    })?;
+    let mut rendered = Vec::new();
+    render_resolution_trace(&trace, &mut rendered);
+    let rendered = String::from_utf8(rendered)
+        .map_err(|error| format!("project trace renderer returned non-UTF-8 output: {error}"))?;
+    let physical_root = loaded
+        .program
+        .root()
+        .path()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let produced = rendered
+        .replace(&physical_root, fixture.project_root.trim_end_matches('/'))
+        .into_bytes();
+    Ok((produced, expected, baseline_path))
 }
 
 fn bind_compiler_observation(
@@ -4607,14 +4752,10 @@ var s: string = \"hi\";\n\
         );
     }
 
-    /// Project-partition obligations (`project/tests/cases/project/<name>.json`)
-    /// declare a `trace` observable in the catalog. They must reach the trace
-    /// comparator (recording the honest producer-missing gap today) instead of
-    /// dying in `compiler_snapshot_input` as a malformed compiler/conformance
-    /// path.
-    #[test]
-    fn project_trace_rows_reach_the_trace_comparator() {
-        let extracted = TestDir::new("project-trace-src");
+    /// One project-trace suite fixture: the case JSON, its project sources,
+    /// and an optional owned `.trace.json` baseline.
+    fn project_trace_fixture(label: &str, trace_baseline: Option<&str>) -> CompilerLaneFixture {
+        let extracted = TestDir::new(&format!("{label}-src"));
         let case = extracted.path().join("tests/cases/project/traceFix.json");
         fs::create_dir_all(case.parent().unwrap()).unwrap();
         fs::write(
@@ -4622,8 +4763,19 @@ var s: string = \"hi\";\n\
             r#"{"scenario":"trace","projectRoot":"tests/cases/projects/trace","inputFiles":["main.ts"]}"#,
         )
         .unwrap();
+        let project = extracted.path().join("tests/cases/projects/trace");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("main.ts"), "import './util.js'; void 0;\n").unwrap();
+        fs::write(project.join("util.ts"), "export const util = 1;\n").unwrap();
+        if let Some(baseline) = trace_baseline {
+            let baseline_path = extracted
+                .path()
+                .join("tests/baselines/reference/project/traceFix.trace.json");
+            fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+            fs::write(&baseline_path, baseline).unwrap();
+        }
         fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
-        let snap = TestDir::new("project-trace-snap");
+        let snap = TestDir::new(&format!("{label}-snap"));
         materialize_from_extracted(snap.path(), extracted.path()).unwrap();
         let verified = verify_snapshot(snap.path()).unwrap();
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -4631,14 +4783,73 @@ var s: string = \"hi\";\n\
             code_map: crate::facets::load_diagnostic_code_map(&repo).expect("code map"),
             baseline_groups: crate::check_cells::baseline_groups(&verified.snapshot.index),
         };
+        CompilerLaneFixture {
+            _extracted: extracted,
+            _snap: snap,
+            snapshot: verified.snapshot,
+            ctx,
+        }
+    }
+
+    /// The rendered trace of the one-edge fixture project, written with the
+    /// fixture's logical project root instead of the loader's temporary root.
+    const PROJECT_TRACE_BASELINE: &str = "\
+======== Resolving module './util.js' from 'tests/cases/projects/trace/main.ts'. ========\n\
+Explicitly specified module resolution kind: 'Bundler'.\n\
+Resolving in ESM mode with conditions 'import', 'types'.\n\
+File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution result.\n\
+Resolved to 'tests/cases/projects/trace/util.ts'.\n\
+======== Module name './util.js' was successfully resolved to 'tests/cases/projects/trace/util.ts'. ========\n";
+
+    /// Project-partition trace obligations execute a real traced program load
+    /// over the fixture's project sources and compare the rendered
+    /// `ResolutionTraceLog` against the owned project `.trace.json` baseline.
+    #[test]
+    fn project_trace_lane_executes_traced_load_and_passes() {
+        let fixture = project_trace_fixture("project-trace-pass", Some(PROJECT_TRACE_BASELINE));
         let request = compiler_lane_request(
-            &verified.snapshot,
+            &fixture.snapshot,
             COMPILER_CATALOG,
             "project/tests/cases/project/traceFix.json",
             "default#trace",
             &["trace"],
         );
-        let observation = observe_compiler_lane(&verified.snapshot, &ctx, &request);
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(observation.class, FailureClass::Pass, "{}", observation.detail);
+        assert_eq!(observation.detail, "");
+        assert!(observation.artifacts.contains_key("trace"));
+
+        // A project row routed with a non-trace observable stays a closed
+        // blocking fail (the catalog routes only trace here).
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/traceFix.json",
+            "default#diagnostics",
+            &["diagnostics"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        closed_non_pass(&observation);
+        assert!(
+            observation.detail.contains("does not route observable"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// A project fixture with no owned `.trace.json` baseline is missing
+    /// evidence, not a producer-missing gap: the traced loader ran.
+    #[test]
+    fn project_trace_without_baseline_names_missing_evidence() {
+        let fixture = project_trace_fixture("project-trace-missing", None);
+        let request = compiler_lane_request(
+            &fixture.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/traceFix.json",
+            "default#trace",
+            &["trace"],
+        );
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
         assert_eq!(
             observation.class,
             FailureClass::HarnessError,
@@ -4646,25 +4857,40 @@ var s: string = \"hi\";\n\
             observation.detail
         );
         assert!(
-            observation.detail.starts_with("producer missing:"),
+            observation.detail.starts_with(
+                "missing trace evidence `tests/baselines/reference/project/traceFix.trace.json`"
+            ),
             "{}",
             observation.detail
         );
-        assert!(observation.detail.contains("resolution tracer"));
+    }
 
-        // A project row routed with a non-trace observable stays a closed
-        // blocking fail (the catalog routes only trace here).
+    /// Divergent trace output is a behavioral failure against the owned
+    /// baseline, carrying the produced render as the observation artifact.
+    #[test]
+    fn project_trace_mismatch_reports_behavior_failure() {
+        let fixture = project_trace_fixture(
+            "project-trace-mismatch",
+            Some("======== unexpected ========\n"),
+        );
         let request = compiler_lane_request(
-            &verified.snapshot,
+            &fixture.snapshot,
             COMPILER_CATALOG,
             "project/tests/cases/project/traceFix.json",
-            "default#diagnostics",
-            &["diagnostics"],
+            "default#trace",
+            &["trace"],
         );
-        let observation = observe_compiler_lane(&verified.snapshot, &ctx, &request);
-        closed_non_pass(&observation);
+        let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::FailBehavior,
+            "{}",
+            observation.detail
+        );
         assert!(
-            observation.detail.contains("does not route observable"),
+            observation
+                .detail
+                .starts_with("trace mismatch against `tests/baselines/reference/project/traceFix.trace.json`"),
             "{}",
             observation.detail
         );
