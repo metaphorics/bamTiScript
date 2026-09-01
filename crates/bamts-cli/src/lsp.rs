@@ -2550,13 +2550,25 @@ mod tests {
             .collect();
         assert_eq!(publishes.len(), 2, "{messages:?}");
         let first = &publishes[0]["params"]["diagnostics"];
+        let entries = first.as_array().expect("diagnostics array");
+        let ts2307 = entries
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "2307")
+            .expect("didOpen publish carries code 2307");
+        assert_eq!(ts2307["severity"], 1, "{first:?}");
+        // The Diagnostic model carries static messages only; the catalog
+        // template's {0} placeholder must never leak onto the wire and the
+        // rendered stem stays readable until message arguments exist.
+        assert_eq!(
+            ts2307["message"],
+            "Cannot find module or its corresponding type declarations."
+        );
         assert!(
-            first
-                .as_array()
-                .expect("diagnostics array")
-                .iter()
-                .any(|diagnostic| diagnostic["code"] == "2307" && diagnostic["severity"] == 1),
-            "didOpen publish must carry code 2307 severity Error: {first:?}"
+            !ts2307["message"]
+                .as_str()
+                .expect("message text")
+                .contains('{'),
+            "template placeholder leaked: {ts2307:?}"
         );
         let second = &publishes[1]["params"]["diagnostics"];
         assert!(
