@@ -405,7 +405,16 @@ impl Session {
                     .insert(snapshot.path().to_path_buf(), snapshot);
                 Some(vec![self.publish_diagnostics(&path)])
             }
-            Err(error) => Some(vec![show_message(&error)]),
+            Err(error) => {
+                // Republish the last good set so the editor and the server
+                // stay coherent instead of silently diverging on a failed
+                // recomputation.
+                let mut notifications = vec![show_message(&error)];
+                if self.snapshots.contains_key(&path) {
+                    notifications.push(self.publish_diagnostics(&path));
+                }
+                Some(notifications)
+            }
         }
     }
 
@@ -433,12 +442,29 @@ impl Session {
     }
     fn publish_diagnostics(&mut self, path: &Path) -> Value {
         let uri = path_to_uri(path);
-        let diagnostics = self
-            .state
-            .diagnostics(path)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| self.lsp_diagnostic(&entry))
+        let entries = match self.state.diagnostics(path) {
+            Ok(entries) => entries,
+            Err(_) => self
+                .snapshots
+                .get(path)
+                .map(|snapshot| {
+                    snapshot
+                        .diagnostics()
+                        .iter()
+                        .map(|diagnostic| DiagnosticEntry {
+                            path: snapshot.path().to_path_buf(),
+                            range: diagnostic.range(),
+                            code: diagnostic.code().as_str(),
+                            severity: diagnostic.severity(),
+                            message: diagnostic.message(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        };
+        let diagnostics = entries
+            .iter()
+            .filter_map(|entry| self.lsp_diagnostic(entry))
             .collect::<Vec<_>>();
         json!({
             "jsonrpc": "2.0",
@@ -1129,6 +1155,63 @@ mod tests {
                 .expect("closed")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn failed_recomputation_preserves_last_published_diagnostics() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("stale.ts");
+        std::fs::write(&file, "const value: number = \"wrong\";\n").expect("seed");
+        let uri = path_to_uri(&file);
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "typescript",
+                    "version": 1,
+                    "text": "const value: number = \"wrong\";\n"
+                }
+            }
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": { "uri": uri, "version": 1 },
+                "contentChanges": [{ "text": "const value: number = \"also wrong\";\n" }]
+            }
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let mut output = Vec::new();
+        run(Cursor::new(input), &mut output, root.path()).expect("run");
+        let messages = read_all(&output);
+        let publishes: Vec<&Value> = messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str)
+                    == Some("textDocument/publishDiagnostics")
+            })
+            .collect();
+        assert_eq!(publishes.len(), 2, "{messages:?}");
+        for publish in &publishes {
+            assert!(
+                publish["params"]["diagnostics"]
+                    .as_array()
+                    .expect("diagnostics")
+                    .iter()
+                    .any(|diagnostic| diagnostic["code"] == "BAMTS-C004"),
+                "failed recomputation must preserve the last good set: {publishes:?}"
+            );
+        }
     }
 
     #[test]
