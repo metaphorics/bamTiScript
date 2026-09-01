@@ -618,6 +618,52 @@ impl IteratorProperty {
     }
 }
 
+/// Owner scope a property belongs to. Anonymous object literals keep one
+/// owner per literal expression node, so structurally equal shapes never
+/// merge; named declarations anchor to their container symbol.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum PropertyOwner {
+    /// Declared container member owner (interface, class, or namespace symbol).
+    Member(SymbolId),
+    /// Object literal expression node. Each literal mints its own owner.
+    Site(NodeId),
+}
+
+/// Identifies one interned `(owner, name)` property declaration for rename.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PropertyId(usize);
+
+/// How the property appeared at its bare span. Shorthand anchors expand to
+/// `newName: oldName` rather than renaming the value binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PropertyAnchorKind {
+    Plain,
+    Shorthand,
+}
+
+/// One property occurrence recorded for rename support.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PropertyAnchor {
+    /// Bare name span (Invariant A): quotes excluded, brackets excluded,
+    /// receiver excluded, and the source text at that span is byte-identical
+    /// to the interned property name.
+    pub(crate) range: TextRange,
+    pub(crate) property_id: PropertyId,
+
+    pub(crate) kind: PropertyAnchorKind,
+    /// Whether this anchor was recorded at a declaration site (object
+    /// literal property, class member, interface member) rather than a
+    /// member access.
+    pub(crate) declaration: bool,
+}
+
+/// The interned declaration-facing name an anchor refers to.
+#[derive(Clone, Debug)]
+pub(crate) struct PropertySite {
+    pub(crate) name: Box<str>,
+    pub(crate) owner: PropertyOwner,
+}
+
 /// One index signature retained by an interned object type.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IndexSignature {
@@ -4312,6 +4358,10 @@ pub struct SemanticModel {
     /// This is the range-indexed projection of `references`, which is keyed by
     /// node identity and so cannot itself place records against source lines.
     symbol_references: Vec<(TextRange, SymbolId)>,
+    /// Interned property declarations and their recorded occurrences,
+    /// feeding the language service's property rename path.
+    property_sites: Vec<PropertySite>,
+    property_anchors: Vec<PropertyAnchor>,
     types: TypeTable,
     module_scope: ScopeId,
     facts: AnalysisFacts,
@@ -4416,6 +4466,24 @@ impl SemanticModel {
     #[must_use]
     pub fn symbol_references(&self) -> &[(TextRange, SymbolId)] {
         &self.symbol_references
+    }
+
+    /// Returns every recorded property anchor, in first-seen order.
+    #[must_use]
+    pub(crate) fn property_anchors(&self) -> &[PropertyAnchor] {
+        &self.property_anchors
+    }
+
+    /// Returns the interned property site for a rename identity.
+    #[must_use]
+    pub(crate) fn property_site(&self, id: PropertyId) -> Option<&PropertySite> {
+        self.property_sites.get(id.0)
+    }
+
+    /// Returns every interned property site, indexed by [`PropertyId`].
+    #[must_use]
+    pub(crate) fn property_sites(&self) -> &[PropertySite] {
+        &self.property_sites
     }
 
     /// Returns the immutable semantic evidence consumed by lint rules.
@@ -4665,6 +4733,17 @@ pub(crate) struct Binder<'src> {
     /// Member accesses whose `.symbols` reference rows are already recorded,
     /// so the typing-phase recorder never duplicates resolve-phase rows.
     member_reference_recorded: HashSet<NodeId>,
+    /// Interned property declarations for rename anchoring.
+    property_sites: Vec<PropertySite>,
+    property_site_index: HashMap<(PropertyOwner, Box<str>), PropertyId>,
+    property_anchors: Vec<PropertyAnchor>,
+    property_anchor_index: HashMap<TextRange, usize>,
+    /// Object literal expression node → property owner, seeded before the
+    /// literal is typed so declarations anchor under the annotated owner.
+    literal_anchor: HashMap<NodeId, PropertyOwner>,
+    /// Variable/parameter symbol → property owner, seeded at declaration so
+    /// member accesses resolve to the annotated owner.
+    symbol_anchor: HashMap<SymbolId, PropertyOwner>,
     import_equals_symbols: HashMap<NodeId, SymbolId>,
     qualified_import_paths: HashMap<NodeId, Box<[SymbolId]>>,
     import_equals_targets: HashMap<SymbolId, ImportEqualsTarget>,
@@ -4842,12 +4921,18 @@ impl<'src> Binder<'src> {
             namespace_qualified_type_paths: HashMap::new(),
             class_member_scopes: HashMap::new(),
             interface_member_scopes: HashMap::new(),
+            member_reference_recorded: HashSet::new(),
+            property_sites: Vec::new(),
+            property_site_index: HashMap::new(),
+            property_anchors: Vec::new(),
+            property_anchor_index: HashMap::new(),
+            literal_anchor: HashMap::new(),
+            symbol_anchor: HashMap::new(),
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
-            member_reference_recorded: HashSet::new(),
             hoisted_declaration_symbols: HashMap::new(),
             class_instance_types: HashMap::new(),
             reg_exp_instance_type: None,
@@ -5717,6 +5802,8 @@ impl<'src> Binder<'src> {
             overload_signatures: self.overload_signatures,
             references: self.references,
             reference_aliases: self.reference_aliases,
+            property_sites: self.property_sites,
+            property_anchors: self.property_anchors,
             type_nodes: self.type_nodes,
             node_types: self.node_types,
             typed_expressions: self.typed_expressions,
@@ -7215,6 +7302,11 @@ impl<'src> Binder<'src> {
         scope: ScopeId,
     ) {
         let range = |name: &crate::syntax::PropertyName| Self::property_name_range(name);
+        let owner = self
+            .scopes
+            .get(scope.0 as usize)
+            .and_then(|scope| scope.owner)
+            .map(PropertyOwner::Member);
         match member.data() {
             TypeMember::Property(property) => {
                 if let Some(name) = self.property_key(&property.name) {
@@ -7225,6 +7317,17 @@ impl<'src> Binder<'src> {
                         member.id(),
                         range(&property.name),
                     );
+                    if let (Some(owner), Some(bare)) =
+                        (owner, Self::property_bare_range(&property.name))
+                    {
+                        self.record_property_anchor(
+                            owner,
+                            &name,
+                            bare,
+                            PropertyAnchorKind::Plain,
+                            true,
+                        );
+                    }
                 }
             }
             TypeMember::Method(method) => {
@@ -7236,6 +7339,17 @@ impl<'src> Binder<'src> {
                         member.id(),
                         range(&method.name),
                     );
+                    if let (Some(owner), Some(bare)) =
+                        (owner, Self::property_bare_range(&method.name))
+                    {
+                        self.record_property_anchor(
+                            owner,
+                            &name,
+                            bare,
+                            PropertyAnchorKind::Plain,
+                            true,
+                        );
+                    }
                 }
             }
             _ => {}
@@ -8101,30 +8215,36 @@ impl<'src> Binder<'src> {
             return;
         }
         let kind = self.scopes[scope.0 as usize].kind;
-        if !matches!(kind, ScopeKind::Global | ScopeKind::Module) {
+        let is_namespace_body = kind == ScopeKind::Function
+            && self
+                .active_namespace_declarations
+                .last()
+                .and_then(|declaration| self.namespace_local_scopes.get(declaration))
+                .is_some_and(|namespace_scope| *namespace_scope == scope);
+        if !matches!(
+            kind,
+            ScopeKind::Global | ScopeKind::Module | ScopeKind::Namespace | ScopeKind::Block
+        ) && !is_namespace_body
+        {
             return;
         }
-        for index in 0..statements.len() {
-            let Some(current) = Self::overloaded_function_name(&statements[index]) else {
+        for (index, statement) in statements.iter().enumerate() {
+            let Some(current) = Self::overload_signature(statement) else {
+                continue;
+            };
+            let Some(current_name) = current.name.as_ref() else {
                 continue;
             };
             let missing = |this: &mut Self| {
                 this.emit(
                     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
-                    current.range(),
+                    current_name.range(),
                     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
                 );
-                // TS7010 pairs with TS2391 whenever the unimplemented
-                // overload signature also omits its return annotation.
-                // TS7010 is a noImplicitAny diagnostic, so the pair only
-                // reports when the option is enabled.
-                if this.no_implicit_any
-                    && let Statement::Function(function) = statements[index].data()
-                    && function.function.return_type.is_none()
-                {
+                if this.no_implicit_any && current.return_type.is_none() {
                     this.emit(
                         MISSING_METHOD_RETURN_TYPE,
-                        current.range(),
+                        current_name.range(),
                         MISSING_METHOD_RETURN_TYPE_MESSAGE,
                     );
                 }
@@ -8133,54 +8253,78 @@ impl<'src> Binder<'src> {
                 missing(self);
                 continue;
             };
-            match Self::statement_function_name(next) {
-                Some(next_name)
-                    if self.identifier_text(current) == self.identifier_text(next_name) => {}
-                _ => missing(self),
+            let Some(next_function) = Self::statement_function(next) else {
+                missing(self);
+                continue;
+            };
+            let Some(next_name) = next_function.name.as_ref() else {
+                missing(self);
+                continue;
+            };
+            if self.identifier_text(current_name) == self.identifier_text(next_name) {
+                continue;
             }
+            if next_function.body.is_none() {
+                missing(self);
+                continue;
+            }
+            if self.no_implicit_any && current.return_type.is_none() {
+                self.emit(
+                    MISSING_METHOD_RETURN_TYPE,
+                    current_name.range(),
+                    MISSING_METHOD_RETURN_TYPE_MESSAGE,
+                );
+            }
+            self.emit(
+                FUNCTION_IMPLEMENTATION_WRONG_NAME,
+                next_name.range(),
+                FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE,
+            );
         }
     }
 
-    fn overloaded_function_name(
-        statement: &'src crate::syntax::Stmt,
-    ) -> Option<&'src IdentifierNode> {
-        match statement.data() {
-            Statement::Function(function) => Self::function_overload_name(&function.function),
+    fn overload_signature(statement: &'src crate::syntax::Stmt) -> Option<&'src FunctionLike> {
+        let function = match statement.data() {
+            Statement::Function(function) => &function.function,
             // `declare function` overloads are ambient and do not require an implementation.
             Statement::Export(crate::syntax::ExportDeclaration::Named(
                 crate::syntax::ExportNamedDeclaration::Declaration(inner),
             )) => match inner.data() {
-                Statement::Function(function) => Self::function_overload_name(&function.function),
-                _ => None,
+                Statement::Function(function) => &function.function,
+                _ => return None,
             },
-            _ => None,
-        }
+            Statement::Export(crate::syntax::ExportDeclaration::Default(export)) => {
+                match &export.value {
+                    crate::syntax::ExportDefaultValue::Function(function) => function,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        (function.body.is_none() && function.name.is_some()).then_some(function)
     }
 
-    fn statement_function_name(
-        statement: &'src crate::syntax::Stmt,
-    ) -> Option<&'src IdentifierNode> {
+    fn statement_function(statement: &'src crate::syntax::Stmt) -> Option<&'src FunctionLike> {
         match statement.data() {
-            Statement::Function(function) => function.function.name.as_ref(),
+            Statement::Function(function) => Some(&function.function),
             Statement::Declare(inner) => match inner.data() {
-                Statement::Function(function) => function.function.name.as_ref(),
+                Statement::Function(function) => Some(&function.function),
                 _ => None,
             },
             Statement::Export(crate::syntax::ExportDeclaration::Named(
                 crate::syntax::ExportNamedDeclaration::Declaration(inner),
             )) => match inner.data() {
-                Statement::Function(function) => function.function.name.as_ref(),
+                Statement::Function(function) => Some(&function.function),
                 _ => None,
             },
+            Statement::Export(crate::syntax::ExportDeclaration::Default(export)) => {
+                match &export.value {
+                    crate::syntax::ExportDefaultValue::Function(function) => Some(function),
+                    _ => None,
+                }
+            }
             _ => None,
         }
-    }
-
-    fn function_overload_name(function: &'src FunctionLike) -> Option<&'src IdentifierNode> {
-        if function.body.is_some() {
-            return None;
-        }
-        function.name.as_ref()
     }
 
     fn resolve_statement(&mut self, statement: &'src crate::syntax::Stmt, scope: ScopeId) {
@@ -8799,6 +8943,21 @@ impl<'src> Binder<'src> {
                 .type_annotation
                 .as_ref()
                 .map(|annotation| self.resolve_type(&annotation.data().type_node, scope));
+            // Seed the object-literal anchor before typing so the literal's
+            // declarations anchor under the annotated owner rather than a
+            // fresh site owner.
+            if let Some(initializer) = &declarator.initializer
+                && matches!(initializer.data(), Expression::Object(_))
+            {
+                let owner = declarator
+                    .type_annotation
+                    .as_ref()
+                    .and_then(|annotation| {
+                        self.anchor_of_type_node(&annotation.data().type_node, scope)
+                    })
+                    .unwrap_or_else(|| PropertyOwner::Site(initializer.id()));
+                self.literal_anchor.insert(initializer.id(), owner);
+            }
             let initializer_type =
                 declarator
                     .initializer
@@ -8850,6 +9009,32 @@ impl<'src> Binder<'src> {
             if let BindingPattern::Identifier(name) = declarator.binding.data()
                 && let Some(symbol) = self.lookup_value(scope, &self.identifier_text(name))
             {
+                // Seed the symbol anchor so member accesses on this variable
+                // resolve to the property owner for rename anchoring.
+                let owner = declarator
+                    .initializer
+                    .as_ref()
+                    .and_then(|initializer| {
+                        if matches!(initializer.data(), Expression::Object(_)) {
+                            self.literal_anchor.get(&initializer.id()).copied()
+                        } else if matches!(initializer.data(), Expression::Identifier(_)) {
+                            self.resolved_expression_reference(initializer)
+                                .and_then(|alias| self.symbol_anchor.get(&alias).copied())
+                        } else {
+                            self.node_types
+                                .get(&initializer.id())
+                                .copied()
+                                .and_then(|ty| self.owner_of_named_type(ty))
+                        }
+                    })
+                    .or_else(|| {
+                        declarator.type_annotation.as_ref().and_then(|annotation| {
+                            self.anchor_of_type_node(&annotation.data().type_node, scope)
+                        })
+                    });
+                if let Some(owner) = owner {
+                    self.symbol_anchor.insert(symbol, owner);
+                }
                 match declarator
                     .initializer
                     .as_ref()
@@ -9302,6 +9487,16 @@ impl<'src> Binder<'src> {
                 .get(self.identifier_text(name).as_ref())
                 .copied()
         {
+            // Seed the parameter's symbol anchor from its type annotation
+            // so member accesses resolve to the annotated interface/class.
+            // Name-first via the annotation node: interface references
+            // intern as structural views, so the declaring symbol is only
+            // reachable from the node, not from the resolved TypeId.
+            if let Some(owner) = data.type_annotation.as_ref().and_then(|annotation| {
+                self.anchor_of_type_node(&annotation.data().type_node, scope)
+            }) {
+                self.symbol_anchor.insert(symbol, owner);
+            }
             let type_id = annotation
                 .or_else(|| initializer_type.map(|ty| self.types.widen(ty, false)))
                 .unwrap_or_else(|| self.types.any());
@@ -10497,6 +10692,147 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// Returns the bare name span for a renameable property key. Quotes are
+    /// stripped from string keys; every other form fails closed.
+    fn property_bare_range(name: &PropertyName) -> Option<TextRange> {
+        match name {
+            PropertyName::Identifier(identifier) => Some(identifier.range()),
+            PropertyName::String(literal) => {
+                let range = literal.range();
+                let start = range.start().get().checked_add(1)?;
+                let end = range.end().get().checked_sub(1)?;
+                TextRange::new(
+                    crate::source::Utf16Pos::new(start),
+                    crate::source::Utf16Pos::new(end),
+                )
+                .ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the bare string-literal interior for a bracket access key.
+    fn bracket_bare_range(expression: &Expr) -> Option<TextRange> {
+        let Expression::Literal(Literal::String(literal)) = expression.data() else {
+            return None;
+        };
+        let range = literal.range();
+        let start = range.start().get().checked_add(1)?;
+        let end = range.end().get().checked_sub(1)?;
+        TextRange::new(
+            crate::source::Utf16Pos::new(start),
+            crate::source::Utf16Pos::new(end),
+        )
+        .ok()
+    }
+
+    /// Whether a canonical property name has identifier shape. Numeric and
+    /// otherwise non-identifier keys never participate in rename.
+    fn is_property_identifier(name: &str) -> bool {
+        let mut characters = name.chars();
+        let Some(first) = characters.next() else {
+            return false;
+        };
+        (first.is_alphabetic() || first == '_' || first == '$')
+            && characters.all(|character| {
+                character.is_alphanumeric() || character == '_' || character == '$'
+            })
+    }
+
+    /// Interns `(owner, name)` and returns its stable [`PropertyId`].
+    fn record_property_site(&mut self, owner: PropertyOwner, name: &str) -> PropertyId {
+        let key = (owner, Box::<str>::from(name));
+        if let Some(&id) = self.property_site_index.get(&key) {
+            return id;
+        }
+        let id = PropertyId(self.property_sites.len());
+        self.property_sites.push(PropertySite {
+            name: key.1.clone(),
+            owner: key.0,
+        });
+        self.property_site_index.insert(key, id);
+        id
+    }
+
+    /// Records one property occurrence for rename. Invariant A is enforced
+    /// here: the source text at the bare span must equal the canonical name
+    /// byte-for-byte, otherwise the anchor is silently dropped (fail-closed
+    /// for escaped identifiers, escaped string keys, and numeric keys).
+    fn record_property_anchor(
+        &mut self,
+        owner: PropertyOwner,
+        name: &str,
+        range: TextRange,
+        kind: PropertyAnchorKind,
+        declaration: bool,
+    ) {
+        if !Self::is_property_identifier(name) {
+            return;
+        }
+        let text = self.source.source_text();
+        let Some(start) = text.utf16_to_byte(range.start()).ok() else {
+            return;
+        };
+        let Some(end) = text.utf16_to_byte(range.end()).ok() else {
+            return;
+        };
+        if text.as_str().get(start..end) != Some(name) {
+            return;
+        }
+        let property_id = self.record_property_site(owner, name);
+        if self.property_anchor_index.contains_key(&range) {
+            return;
+        }
+        let index = self.property_anchors.len();
+        self.property_anchor_index.insert(range, index);
+        self.property_anchors.push(PropertyAnchor {
+            range,
+            property_id,
+
+            kind,
+            declaration,
+        });
+    }
+
+    /// Resolves a type annotation node to its named declaration owner.
+    fn anchor_of_type_node(&self, node: &Ty, scope: ScopeId) -> Option<PropertyOwner> {
+        match node.data() {
+            TypeNode::Reference(reference) => {
+                let EntityName::Identifier(identifier) = &reference.name else {
+                    return None;
+                };
+                let name = self.identifier_text(identifier);
+                let symbol = self.lookup_type(scope, name.as_ref())?;
+                let kind = self.symbols[symbol.get() as usize].kind();
+                matches!(
+                    kind,
+                    SymbolKind::Interface | SymbolKind::Class | SymbolKind::Namespace
+                )
+                .then_some(PropertyOwner::Member(symbol))
+            }
+            TypeNode::Parenthesized(inner) => self.anchor_of_type_node(inner, scope),
+            _ => None,
+        }
+    }
+
+    /// Resolves an interned type to its declaration owner for member
+    /// access anchoring.
+    fn owner_of_named_type(&self, type_id: TypeId) -> Option<PropertyOwner> {
+        match self.types.get(type_id) {
+            Type::Named(symbol)
+                if matches!(
+                    self.symbols[symbol.get() as usize].kind(),
+                    SymbolKind::Interface | SymbolKind::Class | SymbolKind::Namespace
+                ) =>
+            {
+                Some(PropertyOwner::Member(*symbol))
+            }
+            Type::AppliedClass { symbol, .. } => Some(PropertyOwner::Member(*symbol)),
+            Type::This { owner, .. } => Some(PropertyOwner::Member(*owner)),
+            _ => None,
+        }
+    }
+
     fn check_set_accessor_parameter_initializer(
         &mut self,
         modifier: PropertyModifier,
@@ -10747,7 +11083,16 @@ impl<'src> Binder<'src> {
         }
     }
     fn bind_class_member(&mut self, member: &'src crate::syntax::ClassMemberNode, scope: ScopeId) {
-        let range = |name: &crate::syntax::PropertyName| Self::property_name_range(name);
+        let owner = self
+            .scopes
+            .get(scope.0 as usize)
+            .and_then(|scope| scope.owner)
+            .map(PropertyOwner::Member);
+        let anchor = |binder: &mut Self, name: &str, property_name: &PropertyName| {
+            if let (Some(owner), Some(bare)) = (owner, Self::property_bare_range(property_name)) {
+                binder.record_property_anchor(owner, name, bare, PropertyAnchorKind::Plain, true);
+            }
+        };
         match member.data() {
             ClassMember::Property(property) => {
                 if let Some(name) = self.property_key(&property.name) {
@@ -10756,8 +11101,9 @@ impl<'src> Binder<'src> {
                         SymbolKind::Variable(VariableKind::Let),
                         scope,
                         member.id(),
-                        range(&property.name),
+                        Self::property_name_range(&property.name),
                     );
+                    anchor(self, &name, &property.name);
                 }
             }
             ClassMember::AutoAccessor(accessor) => {
@@ -10767,8 +11113,9 @@ impl<'src> Binder<'src> {
                         SymbolKind::Variable(VariableKind::Let),
                         scope,
                         member.id(),
-                        range(&accessor.name),
+                        Self::property_name_range(&accessor.name),
                     );
+                    anchor(self, &name, &accessor.name);
                 }
             }
             ClassMember::Method(method) if method.modifier == PropertyModifier::None => {
@@ -10778,8 +11125,9 @@ impl<'src> Binder<'src> {
                         SymbolKind::Function,
                         scope,
                         member.id(),
-                        range(&method.name),
+                        Self::property_name_range(&method.name),
                     );
+                    anchor(self, &name, &method.name);
                 }
             }
             _ => {}
@@ -12719,6 +13067,34 @@ impl<'src> Binder<'src> {
             MemberProperty::Private(identifier) => identifier.range(),
             MemberProperty::Computed(expression) => expression.range(),
         };
+        // Record the property access anchor for rename support. Only Named
+        // properties and bracket string-literal accesses participate.
+        let bare = match property {
+            MemberProperty::Named(identifier) => Some(identifier.range()),
+            MemberProperty::Computed(expression) => Self::bracket_bare_range(expression),
+            _ => None,
+        };
+        if let Some(bare) = bare {
+            let owner = self
+                .resolved_expression_reference(object)
+                .and_then(|symbol| self.symbol_anchor.get(&symbol).copied())
+                .or_else(|| {
+                    if matches!(object.data(), Expression::Object(_)) {
+                        self.literal_anchor.get(&object.id()).copied()
+                    } else {
+                        self.owner_of_named_type(object_type)
+                    }
+                });
+            if let Some(owner) = owner {
+                self.record_property_anchor(
+                    owner,
+                    name_str.as_ref(),
+                    bare,
+                    PropertyAnchorKind::Plain,
+                    false,
+                );
+            }
+        }
         if !optional
             && read
             && let Some(narrowed) = self.flow_narrowed_property_type(object, name_str.as_ref())
@@ -15497,7 +15873,8 @@ impl<'src> Binder<'src> {
                 }
             }
             Expression::Object(object) => {
-                let result = self.type_of_object_literal(object, Some(target), scope);
+                let result =
+                    self.type_of_object_literal(object, expression.id(), Some(target), scope);
                 for range in self.fresh_excess_property_ranges(expression, target, false) {
                     self.emit(EXCESS_PROPERTY, range, EXCESS_PROPERTY_MESSAGE);
                 }
@@ -15634,9 +16011,15 @@ impl<'src> Binder<'src> {
     fn type_of_object_literal(
         &mut self,
         object: &'src ObjectLiteral,
+        literal_node: NodeId,
         contextual_target: Option<TypeId>,
         scope: ScopeId,
     ) -> TypeId {
+        let owner = self
+            .literal_anchor
+            .get(&literal_node)
+            .copied()
+            .unwrap_or(PropertyOwner::Site(literal_node));
         let contextual_target = contextual_target.map(|target| self.types.non_nullable(target));
         let mut properties = Vec::new();
         let mut index_signatures = Vec::new();
@@ -15669,6 +16052,14 @@ impl<'src> Binder<'src> {
                         continue;
                     }
                     if let Some(name) = self.property_key(&property.name) {
+                        if let Some(bare) = Self::property_bare_range(&property.name) {
+                            let kind = if property.shorthand {
+                                PropertyAnchorKind::Shorthand
+                            } else {
+                                PropertyAnchorKind::Plain
+                            };
+                            self.record_property_anchor(owner, &name, bare, kind, true);
+                        }
                         let target = contextual_target
                             .and_then(|target| self.types.read_property_type(target, &name));
                         let value_type = match target {
@@ -16133,7 +16524,9 @@ impl<'src> Binder<'src> {
                 };
                 self.types.array(element)
             }
-            Expression::Object(object) => self.type_of_object_literal(object, None, scope),
+            Expression::Object(object) => {
+                self.type_of_object_literal(object, expression.id(), None, scope)
+            }
             Expression::JsxElement(_)
             | Expression::JsxSelfClosingElement(_)
             | Expression::JsxFragment(_) => self
@@ -16937,10 +17330,10 @@ mod tests {
         CONSTRUCTOR_TYPE_PARAMETERS, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
         FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
         GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, MISSING_METHOD_RETURN_TYPE,
-        NON_VOID_FUNCTION_MUST_RETURN, PROPERTY_NOT_INITIALIZED, PropertyType,
-        SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
-        SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
-        TupleShape, Type, TypeParameterBounds, TypeTable, bind_source,
+        PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
+        STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind,
+        SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeParameterBounds,
+        TypeTable, bind_source,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -17757,35 +18150,130 @@ mod tests {
         );
     }
 
+    fn overload_diagnostics(
+        diagnostics: &[Diagnostic],
+    ) -> Vec<(crate::diagnostic::DiagnosticCode, usize, usize)> {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                [
+                    MISSING_METHOD_RETURN_TYPE,
+                    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
+                    FUNCTION_IMPLEMENTATION_WRONG_NAME,
+                ]
+                .contains(&diagnostic.code())
+            })
+            .map(|diagnostic| {
+                let range = diagnostic.range();
+                (diagnostic.code(), range.start().get(), range.end().get())
+            })
+            .collect()
+    }
+
     #[test]
     fn implicit_any_return_pair_requires_no_implicit_any() {
-        // 3823b182606ca6ef66147393d37e9323a9a44f08ef6256fe02c1b04285e9e4aa)
-        // reports TS7010 for an unimplemented overload signature without a
-        // return annotation; the loose run only reports the missing
-        // implementation (TS2391/C039). `declare` contexts have no TS7010
-        // producer in this checker, so the test uses the non-ambient shape.
-        let on = bound_with_options(
-            "function f1();\n1+1;\n",
+        let source = "function f1();\n1+1;\n";
+        let (_, strict_diagnostics) = bound_with_options(
+            source,
             super::ProgramCheckOptions::standard().with_no_implicit_any(true),
         );
-        assert!(
-            on.1.iter()
-                .any(|diagnostic| diagnostic.code() == MISSING_METHOD_RETURN_TYPE),
-            "{:?}",
-            on.1
+        assert_eq!(
+            overload_diagnostics(&strict_diagnostics),
+            vec![
+                (FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, 9, 11),
+                (MISSING_METHOD_RETURN_TYPE, 9, 11),
+            ],
+            "{strict_diagnostics:?}"
         );
 
-        let off = bound_with_options(
-            "function f1();\n1+1;\n",
+        let (_, loose_diagnostics) =
+            bound_with_options(source, super::ProgramCheckOptions::standard());
+        assert_eq!(
+            overload_diagnostics(&loose_diagnostics),
+            vec![(FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, 9, 11)],
+            "{loose_diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_name_implementation_reports_wrong_name_not_missing() {
+        let (_, diagnostics) = bound_with_options(
+            "function foo();\nfunction bar() {}\n",
+            super::ProgramCheckOptions::standard().with_no_implicit_any(true),
+        );
+        assert_eq!(
+            overload_diagnostics(&diagnostics),
+            vec![
+                (MISSING_METHOD_RETURN_TYPE, 9, 12),
+                (FUNCTION_IMPLEMENTATION_WRONG_NAME, 25, 28),
+            ],
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn block_statement_lists_scan_overload_groups() {
+        let (_, diagnostics) = bound_with_options(
+            "{\n    function foo();\n    function bar() {}\n}\n",
+            super::ProgramCheckOptions::standard().with_no_implicit_any(true),
+        );
+        assert_eq!(
+            overload_diagnostics(&diagnostics),
+            vec![
+                (MISSING_METHOD_RETURN_TYPE, 15, 18),
+                (FUNCTION_IMPLEMENTATION_WRONG_NAME, 35, 38),
+            ],
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_statement_lists_scan_overload_groups() {
+        let (_, diagnostics) = bound_with_options(
+            "namespace M {\n   function foo();\n}\n",
+            super::ProgramCheckOptions::standard().with_no_implicit_any(true),
+        );
+        assert_eq!(
+            overload_diagnostics(&diagnostics),
+            vec![
+                (FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, 26, 29),
+                (MISSING_METHOD_RETURN_TYPE, 26, 29),
+            ],
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_block_signature_skips_return_pair() {
+        let (_, diagnostics) = bound_with_options(
+            "{\n    function foo(): void;\n}\n",
             super::ProgramCheckOptions::standard(),
         );
-        assert!(
-            !off.1
-                .iter()
-                .any(|diagnostic| diagnostic.code() == MISSING_METHOD_RETURN_TYPE),
-            "{:?}",
-            off.1
+        assert_eq!(
+            overload_diagnostics(&diagnostics),
+            vec![(FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, 15, 18)],
+            "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn default_export_function_overloads_share_the_statement_group() {
+        let (_, wrong_name) = bound_with_options(
+            "export default function foo();\nexport default function bar() {}\n",
+            super::ProgramCheckOptions::standard().with_no_implicit_any(true),
+        );
+        assert_eq!(
+            overload_diagnostics(&wrong_name),
+            vec![
+                (MISSING_METHOD_RETURN_TYPE, 24, 27),
+                (FUNCTION_IMPLEMENTATION_WRONG_NAME, 55, 58),
+            ],
+            "{wrong_name:?}"
+        );
+
+        let (_, matched) =
+            bound("export default function f();\nexport default function f(value: string) {}\n");
+        assert!(overload_diagnostics(&matched).is_empty(), "{matched:?}");
     }
 
     #[test]

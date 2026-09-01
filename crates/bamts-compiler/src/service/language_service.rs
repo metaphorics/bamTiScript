@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::checker::binder::{PropertyAnchor, PropertyAnchorKind, PropertyId};
 use crate::{
     checker::{SymbolId, SymbolKind, render_type},
     diagnostic::DiagnosticSeverity,
@@ -188,6 +189,9 @@ impl<F: FileSystem> ServiceState<F> {
             )));
         }
         let document = self.ensure_document(path.as_ref())?;
+        if let Some(property_id) = property_anchor_at(&document, position) {
+            return rename_property(&document, property_id, new_name);
+        }
         let symbol = symbol_at(&document, position)?.ok_or(ServiceError::RenameUnavailable)?;
         let target = document.semantic().symbol(symbol);
         let old_name = target.name();
@@ -360,6 +364,73 @@ fn property_quick_info(document: &DocumentSnapshot, token: &Token) -> Option<Qui
         kind: QuickInfoKind::Property,
         type_display: render_type(model, *type_id),
         range: token.range(),
+    })
+}
+
+/// Finds the property anchor at `position`. The anchor's bare range either
+/// equals the token range (identifier keys) or sits strictly inside it
+/// (string-literal keys whose interior is the bare span).
+fn property_anchor_at(document: &DocumentSnapshot, position: Utf16Pos) -> Option<PropertyId> {
+    let token = token_at(document, position)?;
+    let model = document.semantic();
+    let token_range = token.range();
+    model
+        .property_anchors()
+        .iter()
+        .find(|anchor| {
+            anchor.range == token_range
+                || (token_range.start() < anchor.range.start()
+                    && anchor.range.end() < token_range.end())
+        })
+        .map(|anchor| anchor.property_id)
+}
+
+/// Builds the rename edit set for a property identity. Owner-local collision
+/// checks, completeness guards, and shorthand expansion all resolve here.
+fn rename_property(
+    document: &DocumentSnapshot,
+    property_id: PropertyId,
+    new_name: &str,
+) -> Result<RenameResult, ServiceError> {
+    let model = document.semantic();
+    let site = model
+        .property_site(property_id)
+        .ok_or(ServiceError::RenameUnavailable)?;
+    let old_name = site.name.to_string();
+    if model
+        .property_sites()
+        .iter()
+        .any(|other| other.owner == site.owner && other.name.as_ref() == new_name)
+    {
+        return Err(ServiceError::InvalidRename(format!(
+            "rename would conflict with existing property `{new_name}`"
+        )));
+    }
+    let anchors: Vec<&PropertyAnchor> = model
+        .property_anchors()
+        .iter()
+        .filter(|anchor| anchor.property_id == property_id)
+        .collect();
+    if !anchors.iter().any(|anchor| anchor.declaration) {
+        return Err(ServiceError::RenameUnavailable);
+    }
+    let edits = anchors
+        .iter()
+        .map(|anchor| {
+            let replacement = match anchor.kind {
+                PropertyAnchorKind::Plain => new_name.to_owned(),
+                PropertyAnchorKind::Shorthand => format!("{new_name}: {old_name}"),
+            };
+            DocumentEdit {
+                path: document.path().to_path_buf(),
+                range: anchor.range,
+                replacement,
+            }
+        })
+        .collect();
+    Ok(RenameResult {
+        symbol: old_name,
+        edit: RenameEdit { edits },
     })
 }
 
@@ -640,5 +711,181 @@ mod tests {
             Err(ServiceError::Cancelled)
         ));
         std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    fn cursor(source: &str, needle: &str, offset: usize) -> Utf16Pos {
+        let position = source.find(needle).expect("fixture contains cursor needle") + offset;
+        Utf16Pos::new(position)
+    }
+
+    fn edited_text<'a>(source: &'a str, edit: &DocumentEdit) -> &'a str {
+        let start = edit.range.start().get();
+        let end = edit.range.end().get();
+        source.get(start..end).expect("ASCII fixture edit range")
+    }
+
+    #[test]
+    fn rename_property_covers_anchor_forms_and_preserves_shorthand_binding() {
+        let source =
+            "const value = 1; const a = { \"other\": 2, value }; a.other; a[\"other\"]; a?.other;";
+        let (root, mut state) = state(source);
+        let rename = state
+            .rename("a.ts", cursor(source, "a.other", 2), "result")
+            .expect("static property rename");
+        assert_eq!(rename.edit.edits.len(), 4);
+        assert!(
+            rename
+                .edit
+                .edits
+                .iter()
+                .all(|edit| edited_text(source, edit) == "other")
+        );
+
+        let shorthand = state
+            .rename("a.ts", cursor(source, "value };", 0), "result")
+            .expect("shorthand property rename");
+        assert_eq!(shorthand.edit.edits.len(), 1);
+        assert_eq!(shorthand.edit.edits[0].replacement, "result: value");
+        assert_eq!(edited_text(source, &shorthand.edit.edits[0]), "value");
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_property_keeps_unrelated_structurally_equal_owners_separate() {
+        let source = "const a = { value: 1 }; const b = { value: 2 }; a.value; b.value;";
+        let (root, mut state) = state(source);
+        let rename = state
+            .rename("a.ts", cursor(source, "a.value", 2), "result")
+            .expect("owner-local property rename");
+        assert_eq!(rename.edit.edits.len(), 2);
+        let mut starts: Vec<usize> = rename
+            .edit
+            .edits
+            .iter()
+            .map(|edit| edit.range.start().get())
+            .collect();
+        starts.sort_unstable();
+        assert_eq!(
+            starts,
+            [
+                source.find("value: 1").expect("a declaration"),
+                source.find("a.value").expect("a access") + 2,
+            ]
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_property_includes_bracket_access_on_annotated_receiver() {
+        let source = "interface I { value: string } const a: I = { value: \"x\" }; a[\"value\"];";
+        let (root, mut state) = state(source);
+        let rename = state
+            .rename("a.ts", cursor(source, "a[\"value\"]", 4), "result")
+            .expect("bracket property rename");
+        assert_eq!(rename.edit.edits.len(), 3, "{rename:?}");
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_property_includes_bracket_access_in_function_body() {
+        let source = "interface I { value: string } function f(o: I) { o[\"value\"]; }";
+        let (root, mut state) = state(source);
+        let from_interface = state
+            .rename("a.ts", cursor(source, "{ value", 2), "result")
+            .expect("interface trigger");
+        assert_eq!(from_interface.edit.edits.len(), 2, "{from_interface:?}");
+        let from_bracket = state.rename("a.ts", cursor(source, "o[\"value\"]", 4), "result");
+        assert!(
+            matches!(&from_bracket, Ok(result) if result.edit.edits.len() == 2),
+            "{from_bracket:?}"
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_property_anchors_module_receiver_bracket_inside_function_body() {
+        let source = "interface I { value: string } const a: I = { value: \"x\" }; function g() { a[\"value\"]; }";
+        let (root, mut state) = state(source);
+        let rename = state
+            .rename("a.ts", cursor(source, "a[\"value\"]", 3), "result")
+            .expect("module receiver bracket rename");
+        assert_eq!(rename.edit.edits.len(), 3);
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_property_tracks_named_contextual_parameter_and_alias_owners() {
+        let source = "interface I { value: string } const a: I = { value: \"x\" }; const b = a; function f(o: I) { o[\"value\"]; } b.value;";
+        let (root, mut state) = state(source);
+        let rename = state
+            .rename("a.ts", cursor(source, "b.value", 2), "result")
+            .expect("named contextual property rename");
+        assert_eq!(rename.edit.edits.len(), 4);
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn rename_property_fails_closed_for_dynamic_and_escaped_keys() {
+        let dynamic = "declare const k: string; const a = { value: 1 }; a[k];";
+        let (dynamic_root, mut dynamic_state) = state(dynamic);
+        let rename = dynamic_state
+            .rename("a.ts", cursor(dynamic, "value", 0), "result")
+            .expect("declared static key remains renameable");
+        assert_eq!(rename.edit.edits.len(), 1);
+        fs::remove_dir_all(dynamic_root).expect("remove dynamic root");
+
+        let escaped = r"const a = { 'va\u006cue': 1 };";
+        let (escaped_root, mut escaped_state) = state(escaped);
+        assert!(matches!(
+            escaped_state.rename("a.ts", cursor(escaped, r"va\u006cue", 1), "result"),
+            Err(ServiceError::RenameUnavailable)
+        ));
+        fs::remove_dir_all(escaped_root).expect("remove escaped root");
+    }
+
+    #[test]
+    fn rename_property_rejects_owner_collision_but_not_foreign_owner_name() {
+        let collision = "const a = { value: 1, result: 2 }; a.value;";
+        let (collision_root, mut collision_state) = state(collision);
+        assert!(matches!(
+            collision_state.rename("a.ts", cursor(collision, "a.value", 2), "result"),
+            Err(ServiceError::InvalidRename(_))
+        ));
+        fs::remove_dir_all(collision_root).expect("remove collision root");
+
+        let separate = "const a = { value: 1 }; const b = { result: 2 }; a.value;";
+        let (separate_root, mut separate_state) = state(separate);
+        assert!(
+            separate_state
+                .rename("a.ts", cursor(separate, "a.value", 2), "result")
+                .is_ok()
+        );
+        fs::remove_dir_all(separate_root).expect("remove separate root");
+    }
+
+    #[test]
+    fn rename_filters_composite_symbol_ranges_and_refuses_incomplete_properties() {
+        let class = "class C { n = 1; m() { return this.n; } } const c = new C(); c.n;";
+        let (class_root, mut class_state) = state(class);
+        let rename = class_state
+            .rename("a.ts", cursor(class, "n = 1", 0), "result")
+            .expect("class property rename");
+        assert!(rename.edit.edits.len() >= 3);
+        assert!(
+            rename
+                .edit
+                .edits
+                .iter()
+                .all(|edit| edited_text(class, edit) == "n")
+        );
+        fs::remove_dir_all(class_root).expect("remove class root");
+
+        let spread = "const a = { value: 1 }; const c = { ...a }; c.value;";
+        let (spread_root, mut spread_state) = state(spread);
+        assert!(matches!(
+            spread_state.rename("a.ts", cursor(spread, "c.value", 2), "result"),
+            Err(ServiceError::RenameUnavailable)
+        ));
+        fs::remove_dir_all(spread_root).expect("remove spread root");
     }
 }
