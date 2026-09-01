@@ -50,12 +50,16 @@ pub const LEDGER_PATH: &str = "proof/completeness-ledger.json";
 pub const RECEIPTS_DIR: &str = "verification/receipts";
 /// Exact, non-recursive receipt-set owners. A rebuild consumes exactly one
 /// populated directory; combining roots would mix independent workflow runs.
-const RECEIPT_SET_DIRS: [&str; 5] = [
+/// The release-named directory (`verification/evidence/<release>`) is the
+/// canonical home for committed release evidence, as declared by the
+/// completion program's `owns` list and the A3.1 gate ledger.
+const RECEIPT_SET_DIRS: [&str; 6] = [
     RECEIPTS_DIR,
     "verification/evidence/pr-merged",
     "verification/evidence/nightly-merged",
     "verification/evidence/weekly-merged",
     "verification/evidence/release",
+    "verification/evidence/typescript-7.0.2",
 ];
 /// Schema tag the G0 ledger verifier requires.
 pub const LEDGER_SCHEMA: &str = "bamti.completeness-ledger/v1";
