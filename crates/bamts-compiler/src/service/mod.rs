@@ -19,11 +19,22 @@ use std::{
 
 use crate::{
     checker::{self, SemanticModel},
-    diagnostic::{Diagnostic, Recovered},
+    diagnostic::{Diagnostic, DiagnosticCode, Recovered},
     lint::{LintProfile, LintTable},
-    parser, scanner,
-    source::{ScriptKind, SourceId, SourcePositionError, SourceText},
-    syntax::SourceFile,
+    parser,
+    project::{
+        CompilerOptions, ProjectConfig, ProjectRoot,
+        resolution::{
+            ModuleResolutionKind, ResolutionCache, ResolutionHost, ResolutionMode,
+            resolve_module_name, resolve_type_reference,
+        },
+    },
+    scanner,
+    source::{ScriptKind, SourceId, SourcePositionError, SourceText, TextRange},
+    syntax::{
+        ExportDeclaration, ExportNamedDeclaration, ExportSpecifierMode, ExternalModuleReference,
+        ImportBinding, ImportSpecifierMode, SourceFile, Statement, StringLiteralNode,
+    },
 };
 
 use filesystem::{FileMetadata, FileSystem, FileSystemError};
@@ -169,6 +180,8 @@ pub struct ServiceState<F: FileSystem> {
     pub(crate) filesystem: F,
     pub(crate) documents: BTreeMap<PathBuf, Arc<DocumentSnapshot>>,
     next_source_id: u32,
+    resolution_root: Option<PathBuf>,
+    resolution_config: Option<ResolutionConfig>,
 }
 
 impl<F: FileSystem> ServiceState<F> {
@@ -178,7 +191,17 @@ impl<F: FileSystem> ServiceState<F> {
             filesystem,
             documents: BTreeMap::new(),
             next_source_id: 0,
+            resolution_root: None,
+            resolution_config: None,
         }
+    }
+
+    /// Configures the workspace root used to surface unresolvable relative
+    /// imports as `TS2307` diagnostics. Loads `tsconfig.json` under `root`
+    /// when present; otherwise falls back to `Bundler` / `Import` defaults.
+    pub fn set_resolution_root(&mut self, root: PathBuf) {
+        self.resolution_config = load_resolution_config(&self.filesystem, &root);
+        self.resolution_root = Some(root);
     }
 
     pub fn open(
@@ -212,11 +235,15 @@ impl<F: FileSystem> ServiceState<F> {
         let snapshot = Arc::new(build_snapshot_with_cancel(
             path.clone(),
             source_id,
-            text.into(),
-            version,
-            true,
-            None,
+            SnapshotContent {
+                text: text.into(),
+                version,
+                open: true,
+                disk_metadata: None,
+            },
             cancel,
+            self.resolution_config.as_ref(),
+            &self.filesystem,
         )?);
         self.commit_new_document(path, snapshot, cancel)
     }
@@ -255,11 +282,15 @@ impl<F: FileSystem> ServiceState<F> {
         let snapshot = Arc::new(build_snapshot_with_cancel(
             path.clone(),
             source_id,
-            text.into(),
-            version,
-            true,
-            None,
+            SnapshotContent {
+                text: text.into(),
+                version,
+                open: true,
+                disk_metadata: None,
+            },
             cancel,
+            self.resolution_config.as_ref(),
+            &self.filesystem,
         )?);
         self.commit_replacement_document(path, snapshot, cancel)
     }
@@ -287,11 +318,15 @@ impl<F: FileSystem> ServiceState<F> {
                 let snapshot = build_snapshot_with_cancel(
                     path.clone(),
                     source_id,
-                    Arc::<str>::from(text),
-                    0,
-                    false,
-                    metadata,
+                    SnapshotContent {
+                        text: Arc::<str>::from(text),
+                        version: 0,
+                        open: false,
+                        disk_metadata: metadata,
+                    },
                     cancel,
+                    self.resolution_config.as_ref(),
+                    &self.filesystem,
                 )?;
                 self.commit_replacement_document(path, Arc::new(snapshot), cancel)?;
             }
@@ -347,11 +382,15 @@ impl<F: FileSystem> ServiceState<F> {
         let snapshot = Arc::new(build_snapshot_with_cancel(
             path.clone(),
             source_id,
-            Arc::<str>::from(text),
-            0,
-            false,
-            Some(metadata),
+            SnapshotContent {
+                text: Arc::<str>::from(text),
+                version: 0,
+                open: false,
+                disk_metadata: Some(metadata),
+            },
             cancel,
+            self.resolution_config.as_ref(),
+            &self.filesystem,
         )?);
         self.commit_new_document(path, snapshot, cancel)
     }
@@ -469,17 +508,31 @@ impl<F: FileSystem> ServiceState<F> {
         self.diagnostics(path)
     }
 }
-
-fn build_snapshot_with_cancel(
-    path: PathBuf,
-    source_id: SourceId,
+/// The document content a snapshot freezes: the text, its client version,
+/// whether the document is open, and the disk metadata a closed document
+/// was read under.
+struct SnapshotContent {
     text: Arc<str>,
     version: u64,
     open: bool,
     disk_metadata: Option<FileMetadata>,
+}
+
+fn build_snapshot_with_cancel<F: FileSystem>(
+    path: PathBuf,
+    source_id: SourceId,
+    content: SnapshotContent,
     cancel: &CancellationToken,
+    resolution: Option<&ResolutionConfig>,
+    filesystem: &F,
 ) -> Result<DocumentSnapshot, ServiceError> {
     cancel.check().map_err(|_| ServiceError::Cancelled)?;
+    let SnapshotContent {
+        text,
+        version,
+        open,
+        disk_metadata,
+    } = content;
     let declaration_file = is_declaration_file(&path);
     let source = Arc::new(SourceText::from_arc(text)?.with_declaration_file(declaration_file));
     let scanned = scanner::scan_with_cancel(source_id, script_kind(&path), source, cancel.clone())
@@ -492,7 +545,18 @@ fn build_snapshot_with_cancel(
         cancel.clone(),
     )
     .map_err(|_| ServiceError::Cancelled)?;
-    let diagnostics = Arc::from(semantic.diagnostics().to_vec());
+    let mut diagnostics = semantic.diagnostics().to_vec();
+    if let Some(config) = resolution {
+        let host = ServiceResolutionHost { filesystem };
+        diagnostics.extend(collect_resolution_diagnostics(
+            parsed.product(),
+            source_id,
+            &path,
+            config,
+            &host,
+        ));
+    }
+    let diagnostics = Arc::from(diagnostics);
     Ok(DocumentSnapshot {
         path,
         version,
@@ -521,6 +585,223 @@ fn script_kind(path: &Path) -> ScriptKind {
     }
 }
 
+/// Cached workspace resolution context: the project root, compiler options
+/// loaded from `tsconfig.json`, and the derived `(kind, mode)` strategy.
+struct ResolutionConfig {
+    root: ProjectRoot,
+    options: CompilerOptions,
+    kind: ModuleResolutionKind,
+    mode: ResolutionMode,
+}
+
+/// Loads the resolution config for `root`. When `tsconfig.json` is present
+/// its `compilerOptions` (including `moduleResolution`) are honored; when
+/// absent the strategy falls back to `(Bundler, Import)`.
+fn load_resolution_config<F: FileSystem>(filesystem: &F, root: &Path) -> Option<ResolutionConfig> {
+    let project_root = ProjectRoot::new(root).ok()?;
+    let config_path = root.join("tsconfig.json");
+    let (options, kind) = match filesystem.read(&config_path) {
+        Ok(source) => {
+            let config = ProjectConfig::parse(&project_root, &config_path, &source).ok()?;
+            let options = config.options().clone();
+            let kind = ModuleResolutionKind::from_options(&options).ok()?;
+            (options, kind)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let config = ProjectConfig::parse(&project_root, &config_path, "{}").ok()?;
+            (config.options().clone(), ModuleResolutionKind::Bundler)
+        }
+        Err(_) => return None,
+    };
+    let mode = ambient_resolution_mode(&options);
+    Some(ResolutionConfig {
+        root: project_root,
+        options,
+        kind,
+        mode,
+    })
+}
+
+/// Derives the ambient resolution mode from the module format option.
+fn ambient_resolution_mode(options: &CompilerOptions) -> ResolutionMode {
+    if options
+        .module()
+        .is_some_and(|module| module.eq_ignore_ascii_case("commonjs"))
+    {
+        ResolutionMode::Require
+    } else {
+        ResolutionMode::Import
+    }
+}
+
+/// Adapts the service's [`FileSystem`] to the resolver's [`ResolutionHost`].
+struct ServiceResolutionHost<'a, F: FileSystem> {
+    filesystem: &'a F,
+}
+
+impl<F: FileSystem> ResolutionHost for ServiceResolutionHost<'_, F> {
+    fn file_exists(&self, path: &Path) -> bool {
+        self.filesystem.metadata(path).is_ok()
+    }
+
+    fn directory_exists(&self, path: &Path) -> bool {
+        self.filesystem.read_dir(path).is_ok()
+    }
+
+    fn read_file(&self, path: &Path) -> Option<Arc<str>> {
+        self.filesystem.read(path).ok().map(Arc::<str>::from)
+    }
+}
+
+/// Walks top-level import/export statements, resolves relative specifiers
+/// against the workspace root, and returns `TS2307` diagnostics for each
+/// unresolvable module. Bare/package specifiers are skipped.
+fn collect_resolution_diagnostics(
+    source: &SourceFile,
+    source_id: SourceId,
+    importer: &Path,
+    config: &ResolutionConfig,
+    host: &dyn ResolutionHost,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut cache = ResolutionCache::new();
+    for statement in source.statements() {
+        for edge in literal_edges(source, statement.data()) {
+            if !is_relative_specifier(&edge.specifier) {
+                continue;
+            }
+            let resolved = if edge.type_only {
+                resolve_type_reference(
+                    &config.root,
+                    &config.options,
+                    importer,
+                    &edge.specifier,
+                    (config.kind, config.mode),
+                    host,
+                    &mut cache,
+                )
+            } else {
+                resolve_module_name(
+                    &config.root,
+                    &config.options,
+                    importer,
+                    &edge.specifier,
+                    (config.kind, config.mode),
+                    host,
+                    &mut cache,
+                )
+            };
+            if resolved.is_err() {
+                diagnostics.push(
+                    Diagnostic::error(
+                        DiagnosticCode::new("2307"),
+                        source_id,
+                        edge.range,
+                        "Cannot find module or its corresponding type declarations.",
+                    )
+                    .with_note(format!("module '{}'", edge.specifier)),
+                );
+            }
+        }
+    }
+    diagnostics
+}
+
+/// One extracted literal import/export edge awaiting resolution.
+struct LiteralEdge {
+    specifier: String,
+    range: TextRange,
+    type_only: bool,
+}
+
+/// Extracts literal specifier text and range from top-level import/export
+/// statements. Non-literal or malformed specifiers yield no edges.
+fn literal_edges(source: &SourceFile, statement: &Statement) -> Vec<LiteralEdge> {
+    let mut edges = Vec::new();
+    match statement {
+        Statement::Import(import) => {
+            let type_only = import_is_type_only(import);
+            push_edge(source, &mut edges, type_only, &import.source);
+        }
+        Statement::ImportEquals(import) => {
+            if let ExternalModuleReference::Require(specifier) = &import.reference {
+                push_edge(source, &mut edges, import.is_type_only, specifier);
+            }
+        }
+        Statement::Export(ExportDeclaration::All(export)) => {
+            push_edge(source, &mut edges, export.type_only, &export.source);
+        }
+        Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
+            type_only,
+            specifiers,
+            source: Some(module),
+            ..
+        })) => {
+            let only_types = *type_only
+                || (!specifiers.is_empty()
+                    && specifiers
+                        .iter()
+                        .all(|specifier| specifier.data().mode == ExportSpecifierMode::TypeOnly));
+            push_edge(source, &mut edges, only_types, module);
+        }
+        _ => {}
+    }
+    edges
+}
+
+/// Extracts the literal specifier text and range from a string-literal node.
+fn push_edge(
+    source: &SourceFile,
+    edges: &mut Vec<LiteralEdge>,
+    type_only: bool,
+    literal: &StringLiteralNode,
+) {
+    let Some(text) = source.token_text(literal.data().token()) else {
+        return;
+    };
+    let Some(value) = crate::program::unquote(text) else {
+        return;
+    };
+    let Ok(specifier) = value.to_utf8_strict() else {
+        return;
+    };
+    edges.push(LiteralEdge {
+        specifier,
+        range: literal.range(),
+        type_only,
+    });
+}
+
+/// Returns `true` for relative specifiers (`./`, `../`, `/`, `.`, `..`).
+fn is_relative_specifier(specifier: &str) -> bool {
+    specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with('/')
+        || specifier == "."
+        || specifier == ".."
+}
+
+/// Mirrors `program::import_is_type_only` for service-tier edge classification.
+fn import_is_type_only(import: &crate::syntax::ImportDeclaration) -> bool {
+    import.type_only || import_clause_is_type_only(import.clause.as_ref())
+}
+
+/// Mirrors `program::import_clause_is_type_only` for service-tier use.
+fn import_clause_is_type_only(clause: Option<&crate::syntax::ImportClause>) -> bool {
+    let Some(clause) = clause else {
+        return false;
+    };
+    clause.default.is_none()
+        && matches!(
+            &clause.binding,
+            Some(ImportBinding::Named(specifiers))
+                if !specifiers.is_empty()
+                    && specifiers.iter().all(|specifier| {
+                        specifier.data().mode == ImportSpecifierMode::TypeOnly
+                    })
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -530,7 +811,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{CancellationToken, ServiceError, ServiceState, build_snapshot_with_cancel};
+    use super::{
+        CancellationToken, ServiceError, ServiceState, SnapshotContent, build_snapshot_with_cancel,
+    };
     use crate::{service::filesystem::OsFileSystem, source::SourceId};
 
     fn state() -> (std::path::PathBuf, ServiceState<OsFileSystem>) {
@@ -684,13 +967,173 @@ mod tests {
             build_snapshot_with_cancel(
                 std::path::PathBuf::from("a.ts"),
                 SourceId::new(0),
-                Arc::<str>::from("const value = 1;"),
-                1,
-                true,
-                None,
+                SnapshotContent {
+                    text: Arc::<str>::from("const value = 1;"),
+                    version: 1,
+                    open: true,
+                    disk_metadata: None,
+                },
                 &cancel,
+                None,
+                &OsFileSystem::new(std::env::temp_dir()).expect("temp filesystem"),
             ),
             Err(ServiceError::Cancelled)
         ));
+    }
+
+    fn resolution_state() -> (std::path::PathBuf, ServiceState<OsFileSystem>) {
+        let (root, state) = state();
+        let mut state = state;
+        state.set_resolution_root(root.clone());
+        (root, state)
+    }
+
+    fn has_2307(snapshot: &super::DocumentSnapshot) -> bool {
+        snapshot
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code().as_str() == "2307")
+    }
+
+    #[test]
+    fn unresolved_relative_import_surfaces_ts2307() {
+        let (root, mut state) = resolution_state();
+        let snapshot = state
+            .open(
+                "main.ts",
+                Arc::<str>::from("import { x } from \"./missing.js\";\n"),
+                1,
+            )
+            .expect("open");
+        assert!(
+            has_2307(&snapshot),
+            "expected TS2307 for unresolvable ./missing.js, got {:?}",
+            snapshot.diagnostics()
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn resolved_relative_import_produces_no_ts2307() {
+        let (root, mut state) = resolution_state();
+        fs::write(root.join("missing.ts"), "export const x = 1;\n").expect("write dependency");
+        let snapshot = state
+            .open(
+                "main.ts",
+                Arc::<str>::from("import { x } from \"./missing.js\";\n"),
+                1,
+            )
+            .expect("open");
+        assert!(
+            !has_2307(&snapshot),
+            "expected no TS2307 when ./missing.ts exists, got {:?}",
+            snapshot.diagnostics()
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn no_resolution_root_means_no_ts2307() {
+        let (root, mut state) = state();
+        let snapshot = state
+            .open(
+                "main.ts",
+                Arc::<str>::from("import { x } from \"./missing.js\";\n"),
+                1,
+            )
+            .expect("open");
+        assert!(
+            !has_2307(&snapshot),
+            "expected no TS2307 without resolution root, got {:?}",
+            snapshot.diagnostics()
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn canonical_absolute_importer_surfaces_ts2307() {
+        let (root, state) = state();
+        let canonical = std::fs::canonicalize(&root).expect("canonical");
+        std::fs::write(
+            canonical.join("case.ts"),
+            "import { x } from \"./missing.js\";\n",
+        )
+        .expect("seed");
+        let mut state = state;
+        state.set_resolution_root(canonical.clone());
+        let path = canonical.join("case.ts");
+        let snapshot = state
+            .open(
+                &path,
+                Arc::<str>::from("import { x } from \"./missing.js\";\n"),
+                1,
+            )
+            .expect("open");
+        assert!(
+            has_2307(&snapshot),
+            "expected TS2307 with a canonical absolute importer, got {:?}",
+            snapshot
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code().as_str())
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn tsconfig_module_resolution_strategy_is_honored() {
+        // NodeNext import mode requires explicit relative extensions, while
+        // the no-tsconfig Bundler default allows the extensionless form.
+        let (root, root_state) = state();
+        let canonical = std::fs::canonicalize(&root).expect("canonical");
+        fs::write(canonical.join("missing.ts"), "export const x = 1;\n").expect("dependency");
+        fs::write(
+            canonical.join("tsconfig.json"),
+            r#"{"compilerOptions": {"moduleResolution": "nodenext"}}"#,
+        )
+        .expect("tsconfig");
+        let mut nodenext_state = root_state;
+        nodenext_state.set_resolution_root(canonical);
+        let snapshot = nodenext_state
+            .open(
+                "main.ts",
+                Arc::<str>::from("import { x } from \"./missing\";\n"),
+                1,
+            )
+            .expect("open");
+        assert!(
+            has_2307(&snapshot),
+            "nodenext must reject the extensionless relative import, got {:?}",
+            snapshot
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code().as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // The same workspace without a tsconfig uses the Bundler default,
+        // where the identical extensionless import resolves.
+        let (plain_root, mut plain_state) = state();
+        fs::write(plain_root.join("missing.ts"), "export const x = 1;\n").expect("dependency");
+        plain_state.set_resolution_root(plain_root.clone());
+        let snapshot = plain_state
+            .open(
+                "main.ts",
+                Arc::<str>::from("import { x } from \"./missing\";\n"),
+                1,
+            )
+            .expect("open");
+        assert!(
+            !has_2307(&snapshot),
+            "bundler default must resolve the extensionless relative import, got {:?}",
+            snapshot
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code().as_str())
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(root).expect("remove root");
+        fs::remove_dir_all(plain_root).expect("remove plain root");
     }
 }

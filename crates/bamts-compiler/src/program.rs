@@ -2030,7 +2030,7 @@ fn push_literal_edge(
     Ok(())
 }
 
-fn unquote(text: &str) -> Option<EcmaString> {
+pub(crate) fn unquote(text: &str) -> Option<EcmaString> {
     let quote = text.as_bytes().first().copied()?;
     if !matches!(quote, b'\'' | b'"') || text.as_bytes().last().copied() != Some(quote) {
         return None;

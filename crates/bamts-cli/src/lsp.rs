@@ -254,8 +254,9 @@ impl Session {
             Ok(filesystem) => filesystem,
             Err(error) => return error_response(id, -32603, &error.to_string()),
         };
-        self.workspace_root = root;
+        self.workspace_root = root.clone();
         self.state = ServiceState::new(filesystem);
+        self.state.set_resolution_root(root);
         self.snapshots.clear();
         self.lifecycle = Lifecycle::AwaitingInitialized;
         json!({
@@ -2430,5 +2431,141 @@ mod tests {
         let mut cursor = Cursor::new(b"Content-Type: application/vscode-jsonrpc\r\n\r\n".to_vec());
         let error = read_message(&mut cursor).expect_err("missing length");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A `BufRead` that serves framed messages in segments, running each
+    /// segment's action just before its bytes become readable. This lets a
+    /// test mutate the filesystem strictly between two processed messages.
+    struct Segment {
+        bytes: Vec<u8>,
+        before: Option<Box<dyn FnOnce()>>,
+    }
+
+    struct SteppingReader {
+        segments: std::vec::IntoIter<Segment>,
+        current: Vec<u8>,
+        offset: usize,
+    }
+
+    impl SteppingReader {
+        fn new(segments: Vec<Segment>) -> Self {
+            Self {
+                segments: segments.into_iter(),
+                current: Vec::new(),
+                offset: 0,
+            }
+        }
+    }
+
+    impl BufRead for SteppingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            while self.offset >= self.current.len() {
+                match self.segments.next() {
+                    Some(segment) => {
+                        if let Some(action) = segment.before {
+                            action();
+                        }
+                        self.current = segment.bytes;
+                        self.offset = 0;
+                    }
+                    None => return Ok(&[]),
+                }
+            }
+            Ok(&self.current[self.offset..])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.offset += amount;
+        }
+    }
+
+    impl io::Read for SteppingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let amount = available.len().min(buffer.len());
+            buffer[..amount].copy_from_slice(&available[..amount]);
+            self.consume(amount);
+            Ok(amount)
+        }
+    }
+
+    #[test]
+    fn unresolvable_import_publishes_ts2307_then_clears_on_fix() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("case.ts");
+        let uri = path_to_uri(&file);
+        std::fs::write(&file, "import { x } from \"./missing.js\";\n").expect("seed");
+        let source = "import { x } from \"./missing.js\";\n";
+        let mut handshake = Vec::new();
+        handshake.extend(frame(&initialize(root.path())));
+        handshake.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        // didOpen with an unresolvable relative import → publish carries TS2307.
+        handshake.extend(frame(&open_document(&uri, source)));
+        // The dependency is written only after that publish, then didChange
+        // re-resolves and the next publish must drop TS2307.
+        let dependency = root.path().join("missing.ts");
+        let mut recovery: Vec<Segment> = Vec::new();
+        recovery.push(Segment {
+            bytes: {
+                let mut bytes = Vec::new();
+                bytes.extend(frame(&change_document(
+                    &uri,
+                    2,
+                    json!([{ "text": source }]),
+                )));
+                bytes.extend(frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "shutdown",
+                    "params": null
+                })));
+                bytes.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+                bytes
+            },
+            before: Some(Box::new(move || {
+                std::fs::write(&dependency, "export const x = 1;\n").expect("write dep");
+            })),
+        });
+        let segments = vec![Segment {
+            bytes: handshake,
+            before: None,
+        }]
+        .into_iter()
+        .chain(recovery)
+        .collect();
+        let mut output = Vec::new();
+        let exit = run(SteppingReader::new(segments), &mut output, root.path()).expect("run");
+        assert_eq!(exit, Exit::Shutdown);
+        let messages = read_all(&output);
+        let publishes: Vec<&Value> = messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str)
+                    == Some("textDocument/publishDiagnostics")
+            })
+            .collect();
+        assert_eq!(publishes.len(), 2, "{messages:?}");
+        let first = &publishes[0]["params"]["diagnostics"];
+        assert!(
+            first
+                .as_array()
+                .expect("diagnostics array")
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "2307" && diagnostic["severity"] == 1),
+            "didOpen publish must carry code 2307 severity Error: {first:?}"
+        );
+        let second = &publishes[1]["params"]["diagnostics"];
+        assert!(
+            !second
+                .as_array()
+                .expect("diagnostics array")
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "2307"),
+            "didChange publish after the fix must drop TS2307: {second:?}"
+        );
     }
 }
