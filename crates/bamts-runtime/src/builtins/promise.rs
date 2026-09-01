@@ -320,12 +320,12 @@ fn constructor<H: Host>(
         let prototype = machine
             .constructed_prototype(new_target)
             .unwrap_or(default_prototype);
-        if prototype != default_prototype {
-            if !machine.internal_set_prototype_of(promise, Some(prototype))? {
-                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
-                    operation: "cannot set promise prototype",
-                }));
-            }
+        if prototype != default_prototype
+            && !machine.internal_set_prototype_of(promise, Some(prototype))?
+        {
+            return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "cannot set promise prototype",
+            }));
         }
     }
     let record = machine.create_promise_resolver(promise)?;
