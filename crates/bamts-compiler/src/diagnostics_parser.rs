@@ -6,6 +6,8 @@
 //! [`map_parse_diagnostic`] to project those records onto the TypeScript 7
 //! parse-code surface without changing ranges, severity, or source identity.
 
+use std::borrow::Cow;
+
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 
 /// Unterminated string literal.
@@ -138,7 +140,9 @@ pub fn map_parse_diagnostic(diagnostic: &Diagnostic) -> Diagnostic {
     let Some(ts_code) = typescript_parse_code(diagnostic.code(), diagnostic.message()) else {
         return diagnostic.clone();
     };
-    let message = typescript_parse_message(ts_code).unwrap_or(diagnostic.message());
+    let message: Cow<'static, str> = typescript_parse_message(ts_code)
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| diagnostic.message_cow());
     let mapped = Diagnostic::new(
         diagnostic.severity(),
         ts_code,

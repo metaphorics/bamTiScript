@@ -464,7 +464,7 @@ impl Session {
                             range: diagnostic.range(),
                             code: diagnostic.code().as_str(),
                             severity: diagnostic.severity(),
-                            message: diagnostic.message(),
+                            message: diagnostic.message().to_owned(),
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2556,12 +2556,11 @@ mod tests {
             .find(|diagnostic| diagnostic["code"] == "2307")
             .expect("didOpen publish carries code 2307");
         assert_eq!(ts2307["severity"], 1, "{first:?}");
-        // The Diagnostic model carries static messages only; the catalog
-        // template's {0} placeholder must never leak onto the wire and the
-        // rendered stem stays readable until message arguments exist.
+        // The catalog template's {0} placeholder is rendered with the
+        // specifier; the rendered message must carry it and never leak '{'.
         assert_eq!(
             ts2307["message"],
-            "Cannot find module or its corresponding type declarations."
+            "Cannot find module './missing.js' or its corresponding type declarations."
         );
         assert!(
             !ts2307["message"]

@@ -11,6 +11,7 @@ pub mod sync;
 
 use bamts_cancel::CancellationToken;
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fmt, io,
     path::{Path, PathBuf},
@@ -18,7 +19,10 @@ use std::{
 };
 
 use crate::{
-    checker::{self, SemanticModel},
+    checker::{
+        self, SemanticModel,
+        diagnostic_messages::{Args, by_u32},
+    },
     diagnostic::{Diagnostic, DiagnosticCode, Recovered},
     lint::{LintProfile, LintTable},
     parser,
@@ -692,15 +696,18 @@ fn collect_resolution_diagnostics(
                 )
             };
             if resolved.is_err() {
-                diagnostics.push(
-                    Diagnostic::error(
-                        DiagnosticCode::new("2307"),
-                        source_id,
-                        edge.range,
+                let message = by_u32(2307)
+                    .and_then(|entry| entry.format(Args::new([edge.specifier.as_str()])).ok())
+                    .map(Cow::Owned)
+                    .unwrap_or(Cow::Borrowed(
                         "Cannot find module or its corresponding type declarations.",
-                    )
-                    .with_note(format!("module '{}'", edge.specifier)),
-                );
+                    ));
+                diagnostics.push(Diagnostic::error(
+                    DiagnosticCode::new("2307"),
+                    source_id,
+                    edge.range,
+                    message,
+                ));
             }
         }
     }

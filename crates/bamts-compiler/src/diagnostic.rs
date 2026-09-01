@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{BTreeMap, HashSet},
     fmt,
@@ -217,7 +218,7 @@ pub struct Diagnostic {
     range: TextRange,
     code: DiagnosticCode,
     severity: DiagnosticSeverity,
-    message: &'static str,
+    message: Cow<'static, str>,
     rule: Option<RuleId>,
     secondary_spans: Vec<SecondarySpan>,
     note: Option<String>,
@@ -230,19 +231,19 @@ pub struct Diagnostic {
 impl Diagnostic {
     /// Creates a diagnostic with a stable source anchor and message.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         severity: DiagnosticSeverity,
         code: DiagnosticCode,
         source_id: SourceId,
         range: TextRange,
-        message: &'static str,
+        message: impl Into<Cow<'static, str>>,
     ) -> Self {
         Self {
             source_id,
             range,
             code,
             severity,
-            message,
+            message: message.into(),
             rule: None,
             secondary_spans: Vec::new(),
             note: None,
@@ -255,22 +256,22 @@ impl Diagnostic {
 
     /// Creates a recovered source error.
     #[must_use]
-    pub const fn error(
+    pub fn error(
         code: DiagnosticCode,
         source_id: SourceId,
         range: TextRange,
-        message: &'static str,
+        message: impl Into<Cow<'static, str>>,
     ) -> Self {
         Self::new(DiagnosticSeverity::Error, code, source_id, range, message)
     }
 
     /// Creates a non-fatal hard-warning.
     #[must_use]
-    pub const fn warning(
+    pub fn warning(
         code: DiagnosticCode,
         source_id: SourceId,
         range: TextRange,
-        message: &'static str,
+        message: impl Into<Cow<'static, str>>,
     ) -> Self {
         Self::new(DiagnosticSeverity::Warning, code, source_id, range, message)
     }
@@ -285,7 +286,7 @@ impl Diagnostic {
         rule: RuleId,
         source_id: SourceId,
         range: TextRange,
-        message: &'static str,
+        message: impl Into<Cow<'static, str>>,
     ) -> Option<Self> {
         let severity = match level {
             LintLevel::Allow => return None,
@@ -330,8 +331,21 @@ impl Diagnostic {
 
     /// Returns the exact compiler message.
     #[must_use]
-    pub const fn message(&self) -> &'static str {
-        self.message
+    pub fn message(&self) -> &str {
+        self.message.as_ref()
+    }
+
+    /// Returns the message as a cloneable owned-or-borrowed string.
+    #[must_use]
+    pub fn message_cow(&self) -> Cow<'static, str> {
+        self.message.clone()
+    }
+
+    /// Replaces the primary source range, preserving all other fields.
+    #[must_use]
+    pub fn with_range(mut self, range: TextRange) -> Self {
+        self.range = range;
+        self
     }
 
     /// Attaches the catalog identity and its copy-pasteable silence instruction.
@@ -445,7 +459,7 @@ impl Ord for Diagnostic {
                 other.code,
             ))
             .then_with(|| self.severity.cmp(&other.severity))
-            .then_with(|| self.message.cmp(other.message))
+            .then_with(|| self.message.cmp(&other.message))
             .then_with(|| self.rule.cmp(&other.rule))
             .then_with(|| self.secondary_spans.cmp(&other.secondary_spans))
             .then_with(|| self.note.cmp(&other.note))

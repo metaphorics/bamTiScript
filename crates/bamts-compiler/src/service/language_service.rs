@@ -54,7 +54,7 @@ pub struct DiagnosticEntry {
     pub range: TextRange,
     pub code: &'static str,
     pub severity: DiagnosticSeverity,
-    pub message: &'static str,
+    pub message: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,7 +240,7 @@ impl<F: FileSystem> ServiceState<F> {
                 range: diagnostic.range(),
                 code: diagnostic.code().as_str(),
                 severity: diagnostic.severity(),
-                message: diagnostic.message(),
+                message: diagnostic.message().to_owned(),
             })
             .collect())
     }

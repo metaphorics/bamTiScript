@@ -913,13 +913,7 @@ impl Parser {
                 Utf16Pos::new(start + range.end().get()),
             )
             .expect("shift preserves range ordering");
-            self.diagnostics.push(Diagnostic::new(
-                diagnostic.severity(),
-                diagnostic.code(),
-                diagnostic.source_id(),
-                shifted,
-                diagnostic.message(),
-            ));
+            self.diagnostics.push(diagnostic.with_range(shifted));
         }
         scanned
             .tokens()
@@ -4074,13 +4068,8 @@ impl Parser {
             .map(|token| Token::new(token.kind(), shift(token.range())))
             .collect();
         for diagnostic in scanner.into_diagnostics() {
-            self.diagnostics.push(Diagnostic::new(
-                diagnostic.severity(),
-                diagnostic.code(),
-                diagnostic.source_id(),
-                shift(diagnostic.range()),
-                diagnostic.message(),
-            ));
+            let shifted = shift(diagnostic.range());
+            self.diagnostics.push(diagnostic.with_range(shifted));
         }
         // Absorb the pre-scanned tokens the span covers; a default token may
         // straddle the JSX end, so re-lex only its trailing fragment.
