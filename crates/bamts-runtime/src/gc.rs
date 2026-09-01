@@ -805,7 +805,11 @@ fn trace_entry(
             trace_properties_and_prototype(properties, *prototype, heap, marks, work);
         }
         HeapEntry::Iterator { state } => match state {
-            IteratorState::Keys { .. } => {}
+            IteratorState::Keys(for_in) => {
+                if let Some(current) = for_in.current {
+                    mark_value(heap, marks, work, current);
+                }
+            }
             IteratorState::Protocol { iterator, next } => {
                 mark_value(heap, marks, work, *iterator);
                 mark_value(heap, marks, work, *next);

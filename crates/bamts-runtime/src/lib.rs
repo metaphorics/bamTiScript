@@ -777,8 +777,28 @@ pub(crate) enum IteratorNextPrepared {
 
 #[derive(Clone, Debug)]
 enum IteratorState {
-    Keys { index: usize, keys: Vec<EcmaString> },
+    Keys(ForInIteratorState),
     Protocol { iterator: Value, next: Value },
+}
+
+/// Shared lazy `for`/`in` traversal state (ECMA-262 14.7.5.15
+/// EnumerateObjectProperties): one prototype level at a time instead of an
+/// eagerly collected whole-chain key list. The state lives inside the heap's
+/// iterator entry so garbage collection can trace `current` between
+/// user-code re-entry points such as proxy traps.
+#[derive(Clone, Debug)]
+struct ForInIteratorState {
+    /// Object whose own keys are being walked; `None` once traversal is
+    /// complete (including nullish sources, which start complete).
+    current: Option<Value>,
+    /// Whether the current object's slot claim and key snapshot were taken.
+    object_was_visited: bool,
+    /// Remaining string own keys of the current level, in own-key order.
+    remaining: VecDeque<EcmaString>,
+    /// Names already decided by a nearer level; they shadow farther levels.
+    visited_names: BTreeSet<EcmaString>,
+    /// Object slots already visited; a repeat is a malformed prototype cycle.
+    visited_objects: BTreeSet<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -11549,10 +11569,10 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn create_iterator(&mut self, src: Value, kind: IteratorKind) -> Result<Value, EvalFailure> {
         if kind == IteratorKind::Keys {
-            let keys = self.enumerable_keys(src)?;
+            let state = self.for_in_iterator_state(src)?;
             return self
                 .allocate(HeapEntry::Iterator {
-                    state: IteratorState::Keys { index: 0, keys },
+                    state: IteratorState::Keys(state),
                 })
                 .map_err(EvalFailure::Runtime);
         }
@@ -11822,6 +11842,185 @@ impl<'a, H: Host> Machine<'a, H> {
         Ok(names)
     }
 
+    /// Builds the initial `for`/`in` state: nullish sources are already
+    /// complete, and every other primitive is boxed through `value_to_object`
+    /// (ECMA-262 14.7.5.15 step 1-2).
+    fn for_in_iterator_state(&mut self, src: Value) -> Result<ForInIteratorState, EvalFailure> {
+        let current = match src.decode() {
+            Some(Decoded::Undefined | Decoded::Null) => None,
+            _ => Some(self.value_to_object(src)?),
+        };
+        Ok(ForInIteratorState {
+            current,
+            object_was_visited: false,
+            remaining: VecDeque::new(),
+            visited_names: BTreeSet::new(),
+            visited_objects: BTreeSet::new(),
+        })
+    }
+
+    /// Executes one `for`/`in` step against the Keys iterator at
+    /// `iterator_index`, returning the next enumerable string key, or `None`
+    /// once traversal is exhausted. All state stays in the heap entry so the
+    /// current object remains traced while proxy traps run user code.
+    fn for_in_next(&mut self, iterator_index: usize) -> Result<Option<EcmaString>, EvalFailure> {
+        loop {
+            let Some(current) = self.for_in_current(iterator_index)? else {
+                return Ok(None);
+            };
+            if !self.for_in_enter_level(iterator_index, current)? {
+                // A repeated object slot means a malformed prototype cycle;
+                // traversal stops safely instead of looping unboundedly.
+                return Ok(None);
+            }
+            while let Some((name, shadowed)) = self.for_in_pop_name(iterator_index)? {
+                if shadowed {
+                    continue;
+                }
+                let key = PropertyKey::Named(name.clone());
+                match self.internal_get_own_property(current, &key)? {
+                    // Deleted before its visit: the name does not enter
+                    // visited_names, so an inherited name may still surface.
+                    None => {}
+                    Some(descriptor) if descriptor.enumerable == Some(true) => {
+                        self.for_in_record_name(iterator_index, name.clone())?;
+                        return Ok(Some(name));
+                    }
+                    // Present but non-enumerable: recorded so it shadows the
+                    // same name on farther prototypes, but never yielded.
+                    Some(_) => self.for_in_record_name(iterator_index, name)?,
+                }
+            }
+            let prototype = self.internal_get_prototype_of(current)?;
+            match &mut self.heap[iterator_index] {
+                HeapEntry::Iterator {
+                    state: IteratorState::Keys(state),
+                } => {
+                    state.current = prototype;
+                    state.object_was_visited = false;
+                }
+                _ => {
+                    return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                        operation: "iterator next on non-iterator",
+                    }));
+                }
+            }
+        }
+    }
+
+    fn for_in_current(&self, iterator_index: usize) -> Result<Option<Value>, EvalFailure> {
+        match &self.heap[iterator_index] {
+            HeapEntry::Iterator {
+                state: IteratorState::Keys(state),
+            } => Ok(state.current),
+            _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator next on non-iterator",
+            })),
+        }
+    }
+
+    /// Claims the current object's slot and snapshots its string own keys once
+    /// per level. Returns `false` when the slot was already visited, marking
+    /// the iterator complete.
+    fn for_in_enter_level(
+        &mut self,
+        iterator_index: usize,
+        current: Value,
+    ) -> Result<bool, EvalFailure> {
+        let already_entered = match &self.heap[iterator_index] {
+            HeapEntry::Iterator {
+                state: IteratorState::Keys(state),
+            } => state.object_was_visited,
+            _ => {
+                return Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                    operation: "iterator next on non-iterator",
+                }));
+            }
+        };
+        if already_entered {
+            return Ok(true);
+        }
+        let unvisited = match self.runtime_slot(current).map_err(EvalFailure::Runtime)? {
+            Some(slot) => match &mut self.heap[iterator_index] {
+                HeapEntry::Iterator {
+                    state: IteratorState::Keys(state),
+                } => {
+                    if state.visited_objects.insert(slot) {
+                        true
+                    } else {
+                        // Repeated object slot: a malformed prototype cycle.
+                        state.current = None;
+                        false
+                    }
+                }
+                _ => false,
+            },
+            None => false,
+        };
+        if !unvisited {
+            return Ok(false);
+        }
+        let keys = self.internal_own_property_keys(current)?;
+        match &mut self.heap[iterator_index] {
+            HeapEntry::Iterator {
+                state: IteratorState::Keys(state),
+            } => {
+                state.object_was_visited = true;
+                state.remaining = keys
+                    .into_iter()
+                    .filter_map(|key| match key {
+                        PropertyKey::Named(name) => Some(name),
+                        PropertyKey::Symbol(_) | PropertyKey::Private(_) => None,
+                    })
+                    .collect();
+                Ok(true)
+            }
+            _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator next on non-iterator",
+            })),
+        }
+    }
+
+    /// Pops the next pending name of the current level together with whether
+    /// a nearer level already decided it (`visited_names`).
+    fn for_in_pop_name(
+        &mut self,
+        iterator_index: usize,
+    ) -> Result<Option<(EcmaString, bool)>, EvalFailure> {
+        match &mut self.heap[iterator_index] {
+            HeapEntry::Iterator {
+                state: IteratorState::Keys(state),
+            } => Ok(match state.remaining.pop_front() {
+                Some(name) => {
+                    let shadowed = state.visited_names.contains(&name);
+                    Some((name, shadowed))
+                }
+                None => None,
+            }),
+            _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator next on non-iterator",
+            })),
+        }
+    }
+
+    fn for_in_record_name(
+        &mut self,
+        iterator_index: usize,
+        name: EcmaString,
+    ) -> Result<(), EvalFailure> {
+        match &mut self.heap[iterator_index] {
+            HeapEntry::Iterator {
+                state: IteratorState::Keys(state),
+            } => {
+                state.visited_names.insert(name);
+                Ok(())
+            }
+            _ => Err(EvalFailure::Throw(ThrowOrigin::TypeError {
+                operation: "iterator next on non-iterator",
+            })),
+        }
+    }
+
     fn iterator_next(&mut self, iterator: Value) -> Result<(bool, Value), EvalFailure> {
         // Fused sync consumption reads the raw result directly; the
         // async-from-sync adapter wraps only the `for await` step path.
@@ -12086,18 +12285,18 @@ impl<'a, H: Host> Machine<'a, H> {
             }))?;
         match &self.heap[iterator_index] {
             HeapEntry::Iterator {
-                state: IteratorState::Keys { index, keys },
+                state: IteratorState::Keys(_),
             } => {
-                let Some(text) = keys.get(*index).cloned() else {
+                let stepped = self.for_in_next(iterator_index)?;
+                let Some(name) = stepped else {
                     return Ok(IteratorNextPrepared::Ready {
                         done: true,
                         value: Value::UNDEFINED,
                     });
                 };
                 let value = self
-                    .allocate(HeapEntry::String(text))
+                    .allocate(HeapEntry::String(name))
                     .map_err(EvalFailure::Runtime)?;
-                self.advance_iterator(iterator_index);
                 Ok(IteratorNextPrepared::Ready { done: false, value })
             }
             HeapEntry::Iterator {
@@ -12153,15 +12352,6 @@ impl<'a, H: Host> Machine<'a, H> {
         })();
         self.pop_native_roots(depth);
         result
-    }
-
-    fn advance_iterator(&mut self, iterator_index: usize) {
-        if let HeapEntry::Iterator {
-            state: IteratorState::Keys { index, .. },
-        } = &mut self.heap[iterator_index]
-        {
-            *index += 1;
-        }
     }
 
     // ---- operators & coercions --------------------------------------------
@@ -21217,6 +21407,327 @@ VmPeak:	64000 kB";
             machine.enumerable_keys(object).unwrap(),
             ["1", "2", "b", "a"].map(EcmaString::encode)
         );
+    }
+
+    /// Drains every key from a `for`/`in` iterator in yield order.
+    fn for_in_keys(machine: &mut Machine<'_, TestHost>, source: Value) -> Vec<EcmaString> {
+        let iterator = machine.create_iterator(source, IteratorKind::Keys).unwrap();
+        let mut keys = Vec::new();
+        loop {
+            let (done, value) = machine.iterator_next(iterator).unwrap();
+            if done {
+                break;
+            }
+            keys.push(machine.string_value(value).unwrap());
+        }
+        keys
+    }
+
+    fn for_in_object(
+        machine: &mut Machine<'_, TestHost>,
+        properties: &[(PropertyKey, Property)],
+        prototype: Option<Value>,
+    ) -> Value {
+        let mut map = PropertyMap::default();
+        for (key, property) in properties {
+            map.insert(key.clone(), property.clone());
+        }
+        machine
+            .allocate(HeapEntry::Object {
+                properties: map,
+                prototype,
+                boxed_primitive: None,
+                extensible: true,
+            })
+            .unwrap()
+    }
+
+    fn data_property(value: u32, enumerable: bool) -> Property {
+        Property::Data {
+            value: Value::int32(value),
+            writable: true,
+            enumerable,
+            configurable: true,
+        }
+    }
+
+    #[test]
+    fn for_in_yields_inherited_keys_in_nearest_first_order() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_prototype = machine.intrinsics.object_prototype;
+        let proto = for_in_object(
+            &mut machine,
+            &[
+                (
+                    PropertyKey::Named(EcmaString::encode("c")),
+                    data_property(3, true),
+                ),
+                (
+                    PropertyKey::Named(EcmaString::encode("a")),
+                    data_property(1, true),
+                ),
+            ],
+            Some(object_prototype),
+        );
+        let child = for_in_object(
+            &mut machine,
+            &[
+                (
+                    PropertyKey::Named(EcmaString::encode("b")),
+                    data_property(2, true),
+                ),
+                (
+                    PropertyKey::Named(EcmaString::encode("a")),
+                    data_property(10, true),
+                ),
+            ],
+            Some(proto),
+        );
+        assert_eq!(
+            for_in_keys(&mut machine, child),
+            ["b", "a", "c"].map(EcmaString::encode),
+            "own keys come first in insertion order; nearest duplicate shadows the prototype"
+        );
+    }
+
+    #[test]
+    fn for_in_non_enumerable_own_shadows_inherited_enumerable() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_prototype = machine.intrinsics.object_prototype;
+        let proto = for_in_object(
+            &mut machine,
+            &[(
+                PropertyKey::Named(EcmaString::encode("x")),
+                data_property(1, true),
+            )],
+            Some(object_prototype),
+        );
+        let child = for_in_object(
+            &mut machine,
+            &[(
+                PropertyKey::Named(EcmaString::encode("x")),
+                data_property(2, false),
+            )],
+            Some(proto),
+        );
+        assert_eq!(
+            for_in_keys(&mut machine, child),
+            Vec::<EcmaString>::new(),
+            "non-enumerable own property shadows the inherited enumerable name"
+        );
+    }
+
+    #[test]
+    fn for_in_skips_deleted_own_key_after_snapshot() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_prototype = machine.intrinsics.object_prototype;
+        let object = for_in_object(
+            &mut machine,
+            &[
+                (
+                    PropertyKey::Named(EcmaString::encode("first")),
+                    data_property(1, true),
+                ),
+                (
+                    PropertyKey::Named(EcmaString::encode("gone")),
+                    data_property(2, true),
+                ),
+            ],
+            Some(object_prototype),
+        );
+        let iterator = machine.create_iterator(object, IteratorKind::Keys).unwrap();
+        let (done, first) = machine.iterator_next(iterator).unwrap();
+        assert!(!done);
+        assert_eq!(
+            machine.string_value(first).unwrap(),
+            EcmaString::encode("first")
+        );
+
+        machine
+            .internal_delete(object, &PropertyKey::Named(EcmaString::encode("gone")))
+            .unwrap();
+        assert_eq!(
+            machine.iterator_next(iterator).unwrap(),
+            (true, Value::UNDEFINED)
+        );
+    }
+
+    #[test]
+    fn for_in_deleted_own_key_does_not_shadow_inherited_name() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_prototype = machine.intrinsics.object_prototype;
+        let proto = for_in_object(
+            &mut machine,
+            &[(
+                PropertyKey::Named(EcmaString::encode("g")),
+                data_property(1, true),
+            )],
+            Some(object_prototype),
+        );
+        let child = for_in_object(
+            &mut machine,
+            &[
+                (
+                    PropertyKey::Named(EcmaString::encode("first")),
+                    data_property(2, true),
+                ),
+                (
+                    PropertyKey::Named(EcmaString::encode("g")),
+                    data_property(3, true),
+                ),
+            ],
+            Some(proto),
+        );
+        let iterator = machine.create_iterator(child, IteratorKind::Keys).unwrap();
+        let (done, first) = machine.iterator_next(iterator).unwrap();
+        assert!(!done);
+        assert_eq!(
+            machine.string_value(first).unwrap(),
+            EcmaString::encode("first")
+        );
+
+        machine
+            .internal_delete(child, &PropertyKey::Named(EcmaString::encode("g")))
+            .unwrap();
+        let (done, inherited) = machine.iterator_next(iterator).unwrap();
+        assert!(!done);
+        assert_eq!(
+            machine.string_value(inherited).unwrap(),
+            EcmaString::encode("g")
+        );
+        assert_eq!(
+            machine.iterator_next(iterator).unwrap(),
+            (true, Value::UNDEFINED)
+        );
+    }
+
+    #[test]
+    fn for_in_nullish_source_completes_immediately() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        assert_eq!(
+            for_in_keys(&mut machine, Value::NULL),
+            Vec::<EcmaString>::new()
+        );
+        assert_eq!(
+            for_in_keys(&mut machine, Value::UNDEFINED),
+            Vec::<EcmaString>::new()
+        );
+    }
+
+    #[test]
+    fn for_in_terminates_on_malformed_prototype_cycle() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_prototype = machine.intrinsics.object_prototype;
+        let a = for_in_object(
+            &mut machine,
+            &[(
+                PropertyKey::Named(EcmaString::encode("a")),
+                data_property(1, true),
+            )],
+            Some(object_prototype),
+        );
+        let b = for_in_object(
+            &mut machine,
+            &[(
+                PropertyKey::Named(EcmaString::encode("b")),
+                data_property(2, true),
+            )],
+            Some(a),
+        );
+        // Create a cycle: a.__proto__ = b, so a -> b -> a -> ...
+        machine.set_prototype(a, b).unwrap();
+        let keys = for_in_keys(&mut machine, a);
+        // Each level's own key is yielded once before the cycle is detected;
+        // the iterator must terminate rather than loop unboundedly.
+        assert_eq!(
+            keys,
+            ["a", "b"].map(EcmaString::encode),
+            "malformed prototype cycle terminates after visiting each slot once"
+        );
+    }
+
+    #[test]
+    fn for_in_gc_keeps_current_object_alive() {
+        let module = verified(
+            Vec::new(),
+            vec![function(0, 1, vec![Instruction::Halt], Vec::new())],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&module, &mut host, Limits::default());
+        let object_prototype = machine.intrinsics.object_prototype;
+        let object = for_in_object(
+            &mut machine,
+            &[
+                (
+                    PropertyKey::Named(EcmaString::encode("first")),
+                    data_property(1, true),
+                ),
+                (
+                    PropertyKey::Named(EcmaString::encode("second")),
+                    data_property(2, true),
+                ),
+            ],
+            Some(object_prototype),
+        );
+        let object_slot = machine.runtime_slot(object).unwrap().unwrap();
+        let iterator = machine.create_iterator(object, IteratorKind::Keys).unwrap();
+        let depth = machine.native_roots.len();
+        machine.push_native_roots(depth, &[iterator]);
+        // Consume one key so `current` is set and the iterator is mid-traversal.
+        let (done, value) = machine.iterator_next(iterator).unwrap();
+        assert!(!done);
+        assert_eq!(
+            machine.string_value(value).unwrap(),
+            EcmaString::encode("first")
+        );
+        // Force GC while the iterator is the only root keeping `object`.
+        machine.set_gc_watermarks_for_test(0, 0);
+        machine.collect_garbage();
+        assert!(
+            !matches!(machine.heap[object_slot], HeapEntry::Vacant),
+            "current for-in object must survive GC while the iterator holds it"
+        );
+        // Drain the rest to confirm the iterator still works after GC.
+        let mut rest = Vec::new();
+        loop {
+            let (done, value) = machine.iterator_next(iterator).unwrap();
+            if done {
+                break;
+            }
+            rest.push(machine.string_value(value).unwrap());
+        }
+        machine.pop_native_roots(depth);
+        assert_eq!(rest, [EcmaString::encode("second")]);
     }
 
     #[test]
