@@ -575,12 +575,8 @@ impl Session {
             .unwrap_or(true);
         match self.state.references(&path, position) {
             Ok(mut locations) => {
-                if !include_declaration
-                    && let Ok(Some(definition)) = self.state.definition(&path, position)
-                {
-                    locations.retain(|location| {
-                        location.path != definition.path || location.range != definition.range
-                    });
+                if !include_declaration {
+                    locations.retain(|location| !location.is_declaration);
                 }
                 let result: Vec<Value> = locations
                     .iter()
@@ -1369,6 +1365,67 @@ mod tests {
             "{rejected:?}"
         );
         assert!(uri_to_path("file://evil.com").is_err());
+    }
+
+    #[test]
+    fn references_exclude_declaration_only_when_asked() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("refs.ts");
+        std::fs::write(&file, "const answer = 1;\nconst copy = answer;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        let reference = |id: u64, include: bool| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "textDocument/references",
+                "params": {
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 1, "character": 13 },
+                    "context": { "includeDeclaration": include }
+                }
+            })
+        };
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "typescript",
+                    "version": 1,
+                    "text": "const answer = 1;\nconst copy = answer;\n"
+                }
+            }
+        })));
+        input.extend(frame(&reference(11, false)));
+        input.extend(frame(&reference(12, true)));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let mut output = Vec::new();
+        run(Cursor::new(input), &mut output, root.path()).expect("run");
+        let messages = read_all(&output);
+        let response = |id: u64| {
+            messages
+                .iter()
+                .find(|message| message.get("id") == Some(&json!(id)))
+                .expect("references response")["result"]
+                .as_array()
+                .expect("locations")
+                .clone()
+        };
+        let excluded = response(11);
+        let included = response(12);
+        // Position 13 on line 1 is the `answer` use; the declaration lives
+        // on line 0 and must drop out only when excluded.
+        assert_eq!(excluded.len(), 1, "{excluded:?}");
+        assert_eq!(excluded[0]["range"]["start"]["line"], 1);
+        assert_eq!(included.len(), 2, "{included:?}");
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct Completion {
 pub struct Location {
     pub path: PathBuf,
     pub range: TextRange,
+    /// Whether this location is the symbol's declaration rather than a use.
+    pub is_declaration: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,6 +137,7 @@ impl<F: FileSystem> ServiceState<F> {
         Ok(Some(Location {
             path: document.path().to_path_buf(),
             range: document.semantic().symbol(symbol).range(),
+            is_declaration: true,
         }))
     }
 
@@ -320,20 +323,21 @@ fn symbol_at(
 fn reference_locations(document: &DocumentSnapshot, symbol: SymbolId) -> Vec<Location> {
     let model = document.semantic();
     let mut ranges = Vec::with_capacity(model.symbol_references().len() + 1);
-    ranges.push(model.symbol(symbol).range());
+    ranges.push((model.symbol(symbol).range(), true));
     ranges.extend(
         model
             .symbol_references()
             .iter()
-            .filter_map(|(range, target)| (*target == symbol).then_some(*range)),
+            .filter_map(|(range, target)| (*target == symbol).then_some((*range, false))),
     );
-    ranges.sort_by_key(|range| (range.start(), range.end()));
+    ranges.sort_by_key(|(range, _)| (range.start(), range.end()));
     ranges.dedup();
     ranges
         .into_iter()
-        .map(|range| Location {
+        .map(|(range, is_declaration)| Location {
             path: document.path().to_path_buf(),
             range,
+            is_declaration,
         })
         .collect()
 }
