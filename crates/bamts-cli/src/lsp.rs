@@ -432,13 +432,19 @@ impl Session {
             Ok(path) => path,
             Err(message) => return Some(vec![invalid_params_notification(message)]),
         };
-        let _ = self.state.close(&path);
-        self.snapshots.remove(&path);
-        Some(vec![json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/publishDiagnostics",
-            "params": { "uri": uri, "diagnostics": [] }
-        })])
+        match self.state.close(&path) {
+            Ok(()) => {
+                self.snapshots.remove(&path);
+                Some(vec![json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": { "uri": uri, "diagnostics": [] }
+                })])
+            }
+            // A failed close leaves the document open server-side, so the
+            // published set must not be cleared while state disagrees.
+            Err(error) => Some(vec![show_message(&error)]),
+        }
     }
     fn publish_diagnostics(&mut self, path: &Path) -> Value {
         let uri = path_to_uri(path);
