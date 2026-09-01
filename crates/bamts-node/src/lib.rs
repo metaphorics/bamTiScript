@@ -486,11 +486,21 @@ fn run_aot_main() -> i32 {
     host.set_script_compiler(Box::new(ScriptCompiler));
     let linked = match linked_program() {
         Ok(linked) => linked,
-        Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Link)),
+        Err(error) => {
+            return finish_aot_process(
+                &host,
+                AotCompletion::Failure(AotMainFailure::Link(error.to_string())),
+            );
+        }
     };
     let program = match decode_aot_program(linked.bytecode()) {
         Ok(program) => program,
-        Err(_) => return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Decode)),
+        Err(error) => {
+            return finish_aot_process(
+                &host,
+                AotCompletion::Failure(AotMainFailure::Decode(error.to_string())),
+            );
+        }
     };
     if let Err(error) =
         initialize_aot_process_context(&mut host, std::env::args_os(), std::env::vars_os())
@@ -502,28 +512,31 @@ fn run_aot_main() -> i32 {
     }
     let outcome = match run_linked_program(&program, &linked, &mut host, &Limits::default()) {
         Ok(outcome) => outcome,
-        Err(_) => {
-            return finish_aot_process(&host, AotCompletion::Failure(AotMainFailure::Runtime));
+        Err(error) => {
+            return finish_aot_process(
+                &host,
+                AotCompletion::Failure(AotMainFailure::Runtime(error.to_string())),
+            );
         }
     };
     finish_aot_process(&host, AotCompletion::Success(&outcome))
 }
 
 #[cfg(any(feature = "aot-main", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AotMainFailure {
-    Link,
-    Decode,
+    Link(String),
+    Decode(String),
     Context(AotProcessContextError),
-    Runtime,
+    Runtime(String),
 }
 
 #[cfg(any(feature = "aot-main", test))]
 impl std::fmt::Display for AotMainFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Link => formatter.write_str("aot link"),
-            Self::Decode => formatter.write_str("aot decode"),
+            Self::Link(detail) => write!(formatter, "aot link: {detail}"),
+            Self::Decode(detail) => write!(formatter, "aot decode: {detail}"),
             Self::Context(AotProcessContextError::Argument) => {
                 formatter.write_str("aot context argument")
             }
@@ -533,7 +546,7 @@ impl std::fmt::Display for AotMainFailure {
             Self::Context(AotProcessContextError::EnvironmentValue) => {
                 formatter.write_str("aot context environment value")
             }
-            Self::Runtime => formatter.write_str("aot runtime"),
+            Self::Runtime(detail) => write!(formatter, "aot runtime: {detail}"),
         }
     }
 }
@@ -907,7 +920,9 @@ mod tests {
 
         let exit_code = write_aot_completion(
             &host,
-            AotCompletion::Failure(AotMainFailure::Runtime),
+            AotCompletion::Failure(AotMainFailure::Runtime(
+                "uncaught TypeError: boom".to_owned(),
+            )),
             &mut stdout,
             &mut stderr,
         )
@@ -916,13 +931,22 @@ mod tests {
         assert_eq!(exit_code, 1);
         assert_eq!(stdout.bytes, b"before failure");
         assert_eq!(stdout.flushes, 1);
-        assert_eq!(stderr, b"host diagnostic\nbamts: aot runtime\n");
+        assert_eq!(
+            stderr,
+            b"host diagnostic\nbamts: aot runtime: uncaught TypeError: boom\n"
+        );
     }
 
     #[test]
     fn aot_failure_labels_are_stable() {
-        assert_eq!(AotMainFailure::Link.to_string(), "aot link");
-        assert_eq!(AotMainFailure::Decode.to_string(), "aot decode");
+        assert_eq!(
+            AotMainFailure::Link("link failed".to_owned()).to_string(),
+            "aot link: link failed"
+        );
+        assert_eq!(
+            AotMainFailure::Decode("bad image".to_owned()).to_string(),
+            "aot decode: bad image"
+        );
         assert_eq!(
             AotMainFailure::Context(AotProcessContextError::Argument).to_string(),
             "aot context argument"

@@ -1172,9 +1172,11 @@ impl BamtsRunner {
                     bamts_runtime::RuntimeErrorKind::UncaughtThrow { .. }
                 ) =>
             {
+                let mut stderr = host.stderr().to_vec();
+                stderr.extend_from_slice(format!("program execution failed: {error}\n").as_bytes());
                 return Ok(process_rejection_outcome(
                     host.stdout().to_vec(),
-                    host.stderr().to_vec(),
+                    stderr,
                     self.max_output_bytes,
                 ));
             }
