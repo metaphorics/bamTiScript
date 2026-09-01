@@ -894,17 +894,29 @@ fn validate_message(message: &Value) -> Result<Incoming, Value> {
     })
 }
 
-/// Resolves the initialize `rootUri`/`rootPath` parameters against the
-/// process root.
+/// Resolves the initialize root against the process root.
 ///
-/// `rootUri` takes precedence, `rootPath` is the legacy fallback, and when
-/// both are null or absent the process root stands in. The resolved path is
-/// canonicalized and must remain within `process_root`.
+/// Precedence follows the protocol's evolution: `rootUri` first, the first
+/// `workspaceFolders` entry when a modern client omits rootUri, legacy
+/// `rootPath` next, and the process root when nothing names a workspace.
+/// The resolved path is canonicalized and must remain within `root`.
 fn initialize_root(params: &Value, process_root: &Path) -> Result<PathBuf, String> {
     if let Some(root_uri) = params.get("rootUri").filter(|value| !value.is_null()) {
         let uri = root_uri
             .as_str()
             .ok_or_else(|| "rootUri must be a string or null".to_owned())?;
+        let path = uri_to_path(uri)?;
+        return canonicalize_confined(&path, process_root);
+    }
+    if let Some(folder) = params
+        .get("workspaceFolders")
+        .and_then(Value::as_array)
+        .and_then(|folders| folders.first())
+    {
+        let uri = folder
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "workspace folder requires a uri".to_owned())?;
         let path = uri_to_path(uri)?;
         return canonicalize_confined(&path, process_root);
     }
@@ -1426,6 +1438,59 @@ mod tests {
         assert_eq!(excluded.len(), 1, "{excluded:?}");
         assert_eq!(excluded[0]["range"]["start"]["line"], 1);
         assert_eq!(included.len(), 2, "{included:?}");
+    }
+
+    #[test]
+    fn initialize_honors_workspace_folders_fallback() {
+        let root = tempfile::tempdir().expect("temp");
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested root");
+        std::fs::write(nested.join("a.ts"), "const a = 1;\n").expect("seed");
+        std::fs::write(root.path().join("outside.ts"), "const b = 2;\n").expect("seed");
+        let mut params = initialize(root.path());
+        params["params"]["rootUri"] = Value::Null;
+        params["params"]["workspaceFolders"] = json!([
+            { "uri": path_to_uri(&nested), "name": "nested" }
+        ]);
+        let mut input = Vec::new();
+        input.extend(frame(&params));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&open_document(
+            &path_to_uri(&nested.join("a.ts")),
+            "const a = 1;\n",
+        )));
+        input.extend(frame(&open_document(
+            &path_to_uri(&root.path().join("outside.ts")),
+            "const b = 2;\n",
+        )));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let mut output = Vec::new();
+        run(Cursor::new(input), &mut output, root.path()).expect("run");
+        let messages = read_all(&output);
+        let publishes: Vec<&Value> = messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str)
+                    == Some("textDocument/publishDiagnostics")
+            })
+            .collect();
+        // The nested folder became the workspace root: its document opens
+        // and publishes, while the file beside the process root is refused.
+        assert_eq!(publishes.len(), 1, "{messages:?}");
+        assert_eq!(
+            publishes[0]["params"]["uri"],
+            json!(path_to_uri(&nested.join("a.ts")))
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message.get("method").and_then(Value::as_str) == Some("window/showMessage")
+            }),
+            "outside document must be refused: {messages:?}"
+        );
     }
 
     #[test]
