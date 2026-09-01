@@ -432,13 +432,14 @@ impl Session {
             Ok(path) => path,
             Err(message) => return Some(vec![invalid_params_notification(message)]),
         };
+        let canonical_uri = path_to_uri(&path);
         match self.state.close(&path) {
             Ok(()) => {
                 self.snapshots.remove(&path);
                 Some(vec![json!({
                     "jsonrpc": "2.0",
                     "method": "textDocument/publishDiagnostics",
-                    "params": { "uri": uri, "diagnostics": [] }
+                    "params": { "uri": canonical_uri, "diagnostics": [] }
                 })])
             }
             // A failed close leaves the document open server-side, so the
@@ -1159,6 +1160,69 @@ mod tests {
             publishes[2]["params"]["diagnostics"]
                 .as_array()
                 .expect("closed")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn close_clears_diagnostics_under_the_canonical_uri() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("caf\u{e9}.ts");
+        std::fs::write(&file, "const value: number = \"wrong\";\n").expect("seed");
+        let canonical = path_to_uri(&file);
+        let variant = canonical.replace("%C3%A9", "%c3%a9");
+        assert_ne!(variant, canonical);
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": variant,
+                    "languageId": "typescript",
+                    "version": 1,
+                    "text": "const value: number = \"wrong\";\n"
+                }
+            }
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": { "textDocument": { "uri": variant } }
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let mut output = Vec::new();
+        run(Cursor::new(input), &mut output, root.path()).expect("run");
+        let messages = read_all(&output);
+        let publishes: Vec<&Value> = messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str)
+                    == Some("textDocument/publishDiagnostics")
+            })
+            .collect();
+        // The open and the clear must address the same canonical URI even
+        // when the client spelled its escapes differently.
+        assert_eq!(publishes.len(), 2, "{messages:?}");
+        assert_eq!(publishes[0]["params"]["uri"], json!(canonical));
+        assert!(
+            publishes[0]["params"]["diagnostics"]
+                .as_array()
+                .expect("diagnostics")
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "BAMTS-C004")
+        );
+        assert_eq!(publishes[1]["params"]["uri"], json!(canonical));
+        assert!(
+            publishes[1]["params"]["diagnostics"]
+                .as_array()
+                .expect("cleared")
                 .is_empty()
         );
     }
