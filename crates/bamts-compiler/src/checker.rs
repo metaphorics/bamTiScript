@@ -24,6 +24,7 @@ pub(crate) mod binder;
 pub mod conditional_types;
 #[path = "checker/decorators.rs"]
 pub mod decorators;
+#[rustfmt::skip]
 #[path = "generated/diagnostic_messages.rs"]
 pub mod diagnostic_messages;
 #[path = "checker/enum_namespace.rs"]
@@ -328,7 +329,13 @@ const PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE: &str =
 pub const NON_VOID_FUNCTION_MUST_RETURN: DiagnosticCode = DiagnosticCode::new("BAMTS-C081");
 const NON_VOID_FUNCTION_MUST_RETURN_MESSAGE: &str =
     "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.";
-
+/// Diagnostic emitted when a type annotation is nested deeper than the
+/// checker's resolution budget. Mirrors the parser's `BAMTS-P010`
+/// `NESTING_TOO_DEEP` guard so pathological inputs fail typed instead of
+/// overflowing the native call stack.
+pub const TYPE_NESTING_TOO_DEEP: DiagnosticCode = DiagnosticCode::new("BAMTS-C082");
+const TYPE_NESTING_TOO_DEEP_MESSAGE: &str =
+    "This type is nested too deeply to resolve; the checker depth budget was exceeded.";
 /// One cooperative checker invocation was cancelled before completing.
 ///
 /// The `_with_cancel` entry points return `Result<Recovered<T>, CheckCancelled>`

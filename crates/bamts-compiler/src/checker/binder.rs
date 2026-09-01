@@ -40,7 +40,7 @@ use super::{
     PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
     SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
     STRICT_NULL_MEMBER_ACCESS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-    SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE,
+    SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
     TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
     USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
     USING_DECLARATION_MISSING_INITIALIZER, WITH_STATEMENT_NOT_ALLOWED,
@@ -68,10 +68,10 @@ use super::{
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
     SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
     SUPER_REFERENCE_NON_DERIVED_MESSAGE, TYPE_ALIAS_CIRCULAR_MESSAGE,
-    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
-    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
-    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
-    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    TYPE_NESTING_TOO_DEEP_MESSAGE, TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
+    UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
+    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
+    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -90,6 +90,14 @@ use crate::syntax::{
     TypeAnnotationNode, TypeLiteral, TypeMember, TypeNode, TypeOperator, TypeReference,
     UnaryOperator, VariableDeclaration, VariableKind,
 };
+
+/// Maximum depth of recursive type resolution before the checker emits
+/// `TYPE_NESTING_TOO_DEEP` and returns the error type. Set higher than the
+/// parser's `MAX_DEPTH` (256) because each parser level can expand into
+/// multiple resolution steps (alias expansion, interface `extends`, type
+/// argument resolution), but still bounded to prevent stack overflow on
+/// pathological inputs.
+const MAX_TYPE_DEPTH: u32 = 512;
 
 /// A lexical scope's identity within a [`SemanticModel`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -4864,6 +4872,10 @@ pub(crate) struct Binder<'src> {
     /// set by `_with_cancel` entry points so long loops and recursive
     /// entrypoints can poll it.
     pub(crate) cancel: Option<bamts_cancel::CancellationToken>,
+    /// Current depth of recursive type resolution (`resolve_type` and its
+    /// callees). Guarded against `MAX_TYPE_DEPTH` to prevent stack overflow
+    /// on pathological inputs, mirroring the parser's `enter()`/`leave()`.
+    type_resolution_depth: u32,
 }
 
 impl<'src> Binder<'src> {
@@ -4971,6 +4983,7 @@ impl<'src> Binder<'src> {
             function_body_stack: Vec::new(),
             return_contexts: Vec::new(),
             this_context: Vec::new(),
+            type_resolution_depth: 0,
             ambient_binding: false,
             is_declaration_file: source.source_text().is_declaration_file(),
             cancel: None,
@@ -13830,6 +13843,15 @@ impl<'src> Binder<'src> {
     // -- the named type algebra ------------------------------------------------
 
     pub(crate) fn resolve_type(&mut self, node: &'src Ty, scope: ScopeId) -> TypeId {
+        if self.type_resolution_depth >= MAX_TYPE_DEPTH {
+            self.emit(
+                TYPE_NESTING_TOO_DEEP,
+                node.range(),
+                TYPE_NESTING_TOO_DEEP_MESSAGE,
+            );
+            return self.types.error_type();
+        }
+        self.type_resolution_depth += 1;
         let resolved = match node.data() {
             TypeNode::Keyword(keyword) => self.keyword_type(*keyword),
             TypeNode::Literal(literal) => self.literal_type(literal),
@@ -13871,21 +13893,26 @@ impl<'src> Binder<'src> {
                     async_iterator_property: None,
                 })
             }
-            TypeNode::This => {
-                let Some(owner) = self.enclosing_this_owner(scope) else {
-                    return self.types.error_type();
-                };
-                let constraint = match self.symbols[owner.get() as usize].kind {
-                    SymbolKind::Class => self
-                        .class_instance_types
-                        .get(&owner)
-                        .copied()
-                        .unwrap_or_else(|| self.types.error_type()),
-                    SymbolKind::Interface => self.types.named(owner),
-                    _ => self.types.error_type(),
-                };
-                self.types.this_type(owner, constraint)
-            }
+            TypeNode::This => match self.enclosing_this_owner(scope) {
+                None => {
+                    let resolved = self.types.error_type();
+                    self.type_nodes.insert(node.id(), resolved);
+                    self.type_resolution_depth -= 1;
+                    return resolved;
+                }
+                Some(owner) => {
+                    let constraint = match self.symbols[owner.get() as usize].kind {
+                        SymbolKind::Class => self
+                            .class_instance_types
+                            .get(&owner)
+                            .copied()
+                            .unwrap_or_else(|| self.types.error_type()),
+                        SymbolKind::Interface => self.types.named(owner),
+                        _ => self.types.error_type(),
+                    };
+                    self.types.this_type(owner, constraint)
+                }
+            },
             TypeNode::Parenthesized(inner) => self.resolve_type(inner, scope),
             TypeNode::Tuple(tuple) => {
                 let mut shape = TupleShape {
@@ -13951,6 +13978,7 @@ impl<'src> Binder<'src> {
             },
             _ => self.types.error_type(),
         };
+        self.type_resolution_depth -= 1;
         self.type_nodes.insert(node.id(), resolved);
         resolved
     }
