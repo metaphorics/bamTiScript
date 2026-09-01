@@ -623,6 +623,11 @@ impl Session {
                     "result": { "changes": changes }
                 })
             }
+            // Unavailability is a null result per the rename contract:
+            // clients gray out the affordance rather than raise an error.
+            Err(ServiceError::RenameUnavailable) => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": null })
+            }
             Err(error) => error_response(id, -32603, &error.to_string()),
         }
     }
@@ -1282,6 +1287,57 @@ mod tests {
                 "failed recomputation must preserve the last good set: {publishes:?}"
             );
         }
+    }
+
+    #[test]
+    fn unavailable_rename_returns_null_result() {
+        let root = tempfile::tempdir().expect("temp");
+        let file = root.path().join("ren.ts");
+        std::fs::write(&file, "const answer = 1;\n").expect("seed");
+        let uri = path_to_uri(&file);
+        let mut input = Vec::new();
+        input.extend(frame(&initialize(root.path())));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "typescript",
+                    "version": 1,
+                    "text": "const answer = 1;\n"
+                }
+            }
+        })));
+        // Position 0 sits on the `const` keyword: nothing renames there.
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 0 },
+                "newName": "renamed"
+            }
+        })));
+        input.extend(frame(&json!({ "jsonrpc": "2.0", "method": "exit" })));
+        let mut output = Vec::new();
+        run(Cursor::new(input), &mut output, root.path()).expect("run");
+        let messages = read_all(&output);
+        let rename_response = messages
+            .iter()
+            .find(|message| message.get("id") == Some(&json!(7)))
+            .expect("rename response");
+        assert!(
+            rename_response.get("error").is_none(),
+            "{rename_response:?}"
+        );
+        assert!(rename_response["result"].is_null(), "{rename_response:?}");
     }
 
     #[test]
