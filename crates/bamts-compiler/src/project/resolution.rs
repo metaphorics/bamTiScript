@@ -725,6 +725,17 @@ fn try_paths_mapping(
     let Some((pattern, targets, capture)) = select_path_mapping(options.paths(), specifier) else {
         return Ok(None);
     };
+    // A paths-mapped `.json` specifier is only resolvable when
+    // `resolveJsonModule` is enabled. With the flag off the module cannot be
+    // found with the current settings (upstream TS2732), so the mapping must
+    // not resolve it even when the target file exists.
+    if !options.resolve_json_module()
+        && Path::new(specifier)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return Ok(None);
+    }
     for target_pattern in targets {
         let substituted = substitute_star(target_pattern, capture.as_deref());
         // Targets from PathMapping are already absolute and confined to the project.
@@ -1977,5 +1988,137 @@ mod tests {
         assert_eq!(runtime.path(), Path::new("/dir/index.ts"));
         assert_eq!(types.path(), Path::new("/dir/index.d.ts"));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn json_specifier_resolves_the_exact_file_when_resolve_json_module_is_on() {
+        let mut host = MemoryHost::default();
+        host.file("/workspace/src/data.json", "{\n  \"a\": 1\n}\n");
+        // A script module beside the JSON file must not win: a `.json`
+        // specifier is planned as an exact file with no extension
+        // substitution.
+        host.file("/workspace/src/data.ts", "export const a = 1;\n");
+        let config = ProjectConfig::parse(
+            &root(),
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions":{"moduleResolution":"bundler","resolveJsonModule":true}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut cache = ResolutionCache::new();
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            "/workspace/src/main.ts",
+            "./data.json",
+            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        )
+        .expect("exact JSON module");
+        assert_eq!(resolved.path(), Path::new("/workspace/src/data.json"));
+        assert!(
+            resolved.trace().steps().iter().all(|step| !matches!(
+                step,
+                ResolutionTraceStep::Candidate { path, .. }
+                    if path.extension().is_some_and(|ext| ext != "json"),
+            )),
+            "no non-JSON candidate may be probed"
+        );
+    }
+
+    #[test]
+    fn json_specifier_probes_the_exact_file_even_when_resolve_json_module_is_off() {
+        let mut host = MemoryHost::default();
+        host.file("/workspace/src/data.json", "{\n  \"a\": 1\n}\n");
+        let config = ProjectConfig::parse(
+            &root(),
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut cache = ResolutionCache::new();
+        // Upstream resolves a relative exact `.json` import even without
+        // `resolveJsonModule` (requireOfJsonFileWithoutResolveJsonModule,
+        // importAssertionsDeprecated): the flag only decides whether `.json`
+        // joins the *searched* extension list.
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            "/workspace/src/main.ts",
+            "./data.json",
+            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        )
+        .expect("exact JSON module resolves without the flag");
+        assert_eq!(resolved.path(), Path::new("/workspace/src/data.json"));
+
+        // A `.json` specifier that names no file fails as a plain cannot-find
+        // miss (upstream TS2732) — never as an unsupported-extension
+        // rejection.
+        let error = resolve_module_name(
+            &root(),
+            &options,
+            "/workspace/src/main.ts",
+            "./missing.json",
+            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        )
+        .expect_err("missing JSON module cannot resolve");
+        assert!(matches!(error, ResolutionError::NotFound { .. }));
+    }
+
+    #[test]
+    fn json_specifier_with_paths_mapping_resolves_through_the_mapping() {
+        let mut host = MemoryHost::default();
+        host.file("/workspace/config/pkg.json", "{\n  \"name\": \"pkg\"\n}\n");
+        let config = ProjectConfig::parse(
+            &root(),
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions":{"moduleResolution":"bundler","baseUrl":".","paths":{"@config/*":["config/*"]},"resolveJsonModule":true}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut cache = ResolutionCache::new();
+        let resolved = resolve_module_name(
+            &root(),
+            &options,
+            "/workspace/src/main.ts",
+            "@config/pkg.json",
+            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        )
+        .expect("paths-mapped JSON module");
+        assert_eq!(resolved.path(), Path::new("/workspace/config/pkg.json"));
+
+        // The searched routes stay flag-gated: with `resolveJsonModule`
+        // disabled a paths-mapped `.json` cannot be found with the current
+        // settings (upstream TS2732 on
+        // requireOfJsonFileWithoutResolveJsonModuleAndPathMapping), even
+        // though the mapped target file exists.
+        let without_flag = ProjectConfig::parse(
+            &root(),
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions":{"moduleResolution":"bundler","baseUrl":".","paths":{"@config/*":["config/*"]}}}"#,
+        )
+        .expect("config");
+        // A fresh cache: the flag-on probe above stored its hit under the
+        // same (directory, specifier) key.
+        let mut fresh = ResolutionCache::new();
+        let error = resolve_module_name(
+            &root(),
+            without_flag.options(),
+            "/workspace/src/main.ts",
+            "@config/pkg.json",
+            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+            &host,
+            &mut fresh,
+        )
+        .expect_err("flag-off paths JSON cannot resolve");
+        assert!(matches!(error, ResolutionError::NotFound { .. }));
     }
 }

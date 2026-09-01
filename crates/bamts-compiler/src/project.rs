@@ -1607,7 +1607,13 @@ fn append_file_candidates(
         "mjs" => &["mts", "d.mts", "mjs"],
         "cjs" => &["cts", "d.cts", "cjs"],
         "ts" | "tsx" | "mts" | "cts" => &[extension],
-        "json" if resolve_json_module => &["json"],
+        // A `.json` specifier names an exact JSON file: TypeScript probes it
+        // as-is and never substitutes other extensions after it, even when
+        // `resolveJsonModule` is disabled (upstream resolves relative exact
+        // `.json` imports without the flag). Whether `.json` joins the
+        // *searched* extension list (extensionless stems, paths mappings) is
+        // decided by the callers that own that policy.
+        "json" => &[extension],
         _ => {
             return Err(ModuleResolutionError::UnsupportedExtension {
                 specifier: Arc::from(specifier),
