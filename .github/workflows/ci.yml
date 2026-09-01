@@ -221,7 +221,11 @@ jobs:
           rustup default "$TOOLCHAIN"
       - name: Sync snapshot
         run: cargo run --locked -p bamts-verification --bin ts_conformance -- sync --verify-pin --write-snapshot
+      - name: Build compiler lane worker
+        run: cargo build --locked --release -p bamts-verification --bin ts_lane_worker
       - name: Write strict conformance receipt
+        env:
+          BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
         run: |
           set -euo pipefail
           zero=$(( ${{ matrix.shard }} - 1 ))

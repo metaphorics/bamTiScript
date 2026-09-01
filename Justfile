@@ -19,3 +19,11 @@ release-gate:
 leaf-gate leaf:
     python3 -c 'import sys,re; t=open(sys.argv[1]).read(); blocks=re.split(r"(?m)^(?=- \[[ x]\] G\d+)",t); body="\n".join(b for b in blocks if "just leaf-gate" not in b); sys.exit(1 if (re.search(r"^- \[ \]",body,re.M) or re.search(r"^  EVIDENCE: pending\s*$",body,re.M)) else 0)' .outline/gates/{{leaf}}.md
     printf 'LEAF %s PASS\n' "{{leaf}}"
+
+# Run one compiler conformance shard locally with the lane worker wired.
+# The compiler runner ships no built-in adapter, so without
+# BAMTS_SUITE_COMPILER_ADAPTER every cell records BLOCKING_FAIL carrying
+# "no registered adapter" and the receipt measures nothing at all.
+conformance-shard index count="4" catalog="typescript-7.0.2":
+    cargo build --locked --release -p bamts-verification --bin ts_lane_worker
+    receipt="target/evidence-local/{{catalog}}/{{index}}.jsonl" && mkdir -p "$(dirname "$receipt")" && BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker cargo run --locked --release -p bamts-verification --bin bamts-verification -- suite run --catalog {{catalog}} --shard "{{index}}/{{count}}" --receipt "$receipt" --runner compiler --platform x86_64-unknown-linux-gnu --workflow local --run-id local --run-attempt 1 --source-sha "$(git rev-parse HEAD)" --job conformance-shard --host "$(uname -sm | tr ' ' '-')" --runtime "node-v24.18.0;rust-$(rustc --version)" && printf 'SHARD %s/%s RECEIPT %s\n' "{{index}}" "{{count}}" "$receipt"
