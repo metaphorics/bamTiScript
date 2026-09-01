@@ -42,6 +42,8 @@ pub enum FormatError {
     ArityMismatch { expected: usize, got: usize },
     /// A placeholder index was not within the expected range.
     BadPlaceholder { index: usize, max: usize },
+    /// A placeholder contained digits that do not parse as a valid index.
+    MalformedPlaceholder { raw: String },
 }
 
 impl std::fmt::Display for FormatError {
@@ -52,6 +54,9 @@ impl std::fmt::Display for FormatError {
             }
             Self::BadPlaceholder { index, max } => {
                 write!(f, "placeholder index {index} out of range (max {max})")
+            }
+            Self::MalformedPlaceholder { raw } => {
+                write!(f, "placeholder `{raw}` is not a valid index")
             }
         }
     }
@@ -151,7 +156,14 @@ impl DiagnosticMessage {
                 }
                 if !digits.is_empty() && chars.peek() == Some(&'}') {
                     chars.next();
-                    let index = digits.parse::<usize>().unwrap();
+                    let index = match digits.parse::<usize>() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Err(FormatError::MalformedPlaceholder {
+                                raw: digits,
+                            });
+                        }
+                    };
                     if index >= N {
                         return Err(FormatError::BadPlaceholder {
                             index,
@@ -17354,6 +17366,22 @@ mod tests {
                 expected: 1,
                 got: 2
             })
+        ));
+    }
+
+    #[test]
+    fn malformed_placeholder_returns_err_not_panic() {
+        let message = DiagnosticMessage {
+            code: 0,
+            bamts_code: "0",
+            ts_code: "TS0",
+            category: TsCategory::Error,
+            template: "{99999999999999999999}",
+            arity: 1,
+        };
+        assert!(matches!(
+            message.format(Args::new(["x"])),
+            Err(FormatError::MalformedPlaceholder { .. })
         ));
     }
 
