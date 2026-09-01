@@ -7,3 +7,15 @@ release-gate:
     cargo run --locked -p bamts-verification --bin bamts-verification -- ledger rebuild --check
     cargo run --locked -p bamts-verification --bin bamts-verification -- completion verify --root product
     printf '%s\n' 'RELEASE GATE PASS'
+
+# Machine-local checker (proven on this host); a portable in-repo checker is a deliberate future decision.
+# Verify one outline leaf gate file without mutating it: the gate whose
+# CHECK is `just leaf-gate <id>` is the leaf's recursive self-gate, so
+# every other gate must already carry a checked box and non-pending
+# evidence. This attests to recorded checkbox state from a prior checker
+# pass, not to freshly re-run checks; the mutating checker's run of this
+# recipe then supplies the self-gate's own evidence (run leaves twice:
+# the first flips the body, the second converges the self-gate).
+leaf-gate leaf:
+    python3 -c 'import sys,re; t=open(sys.argv[1]).read(); blocks=re.split(r"(?m)^(?=- \[[ x]\] G\d+)",t); body="\n".join(b for b in blocks if "just leaf-gate" not in b); sys.exit(1 if (re.search(r"^- \[ \]",body,re.M) or re.search(r"^  EVIDENCE: pending\s*$",body,re.M)) else 0)' .outline/gates/{{leaf}}.md
+    printf 'LEAF %s PASS\n' "{{leaf}}"
