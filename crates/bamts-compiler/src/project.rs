@@ -150,7 +150,6 @@ pub enum JsoncErrorKind {
     LoneSurrogate,
     UnescapedControlCharacter,
     InvalidNumber,
-    DuplicateObjectKey { key: Arc<str> },
     TrailingCharacters,
     NestingTooDeep,
 }
@@ -192,9 +191,6 @@ impl fmt::Display for JsoncError {
                 formatter.write_str("unescaped control character in string")
             }
             JsoncErrorKind::InvalidNumber => formatter.write_str("invalid number"),
-            JsoncErrorKind::DuplicateObjectKey { key } => {
-                write!(formatter, "duplicate object key {key:?}")
-            }
             JsoncErrorKind::TrailingCharacters => {
                 formatter.write_str("characters follow the root value")
             }
@@ -353,23 +349,23 @@ impl<'a> JsoncParser<'a> {
             if self.peek() != Some(b'"') {
                 return self.error(JsoncErrorKind::UnexpectedToken);
             }
-            let key_offset = self.position;
             let key = self.parse_string()?;
-            if entries
-                .iter()
-                .any(|(existing, _)| existing.as_ref() == key.as_ref())
-            {
-                return Err(JsoncError {
-                    offset: key_offset,
-                    kind: JsoncErrorKind::DuplicateObjectKey { key },
-                });
-            }
             self.skip_trivia()?;
             if !self.consume(b':') {
                 return self.error(JsoncErrorKind::UnexpectedToken);
             }
             let value = self.parse_value(depth)?;
-            entries.push((key, value));
+            // TypeScript's tsconfig parser uses last-wins for duplicate keys.
+            // Replace any existing entry with the same key so `get` and
+            // `entries` expose only the surviving value.
+            if let Some(slot) = entries
+                .iter_mut()
+                .find(|(existing, _)| existing.as_ref() == key.as_ref())
+            {
+                slot.1 = value;
+            } else {
+                entries.push((key, value));
+            }
             self.skip_trivia()?;
             if self.consume(b'}') {
                 break;
@@ -2321,17 +2317,48 @@ mod tests {
     }
 
     #[test]
-    fn jsonc_rejects_duplicate_keys_and_unterminated_comments_with_offsets() {
-        let duplicate = parse_jsonc(r#"{"x": 1, "x": 2}"#).expect_err("duplicate must fail");
-        assert!(matches!(
-            duplicate.kind(),
-            JsoncErrorKind::DuplicateObjectKey { key } if key.as_ref() == "x"
-        ));
-        assert_eq!(duplicate.offset(), 9);
+    fn jsonc_duplicate_keys_are_last_wins_and_comments_have_offsets() {
+        // TypeScript's tsconfig parser treats duplicate keys as last-wins.
+        let parsed = parse_jsonc(r#"{"x": "1", "x": "2"}"#).expect("duplicate keys are accepted");
+        let obj = parsed.as_object().expect("root object");
+        assert_eq!(obj.get("x").and_then(JsonValue::as_str), Some("2"));
+        // The surviving entry list contains no duplicate keys.
+        assert_eq!(obj.entries().len(), 1);
 
         let comment = parse_jsonc("{/* never closed").expect_err("comment must terminate");
         assert_eq!(comment.offset(), 1);
         assert_eq!(comment.kind(), &JsoncErrorKind::UnterminatedBlockComment);
+    }
+
+    #[test]
+    fn tsconfig_duplicate_compileroptions_keys_yield_last_value() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"strict": true, "strict": false}}"#,
+        )
+        .expect("duplicate keys are accepted");
+        assert!(
+            !config.options().strict(),
+            "last value wins for duplicate compilerOptions keys"
+        );
+    }
+
+    #[test]
+    fn f12_duplicate_strict_and_declaration_pragmas_parse_last_wins() {
+        // Simulates the tsconfig that build_tsconfig generates for cases like
+        // contextuallyTypedBooleanLiterals.ts, which carry duplicate @strict
+        // and @declaration pragmas. The harness emits one key per pragma
+        // occurrence, so the JSONC parser must accept duplicate keys.
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"target": "es2015", "strict": true, "declaration": true, "strict": true, "declaration": true}}"#,
+        )
+        .expect("duplicate keys from duplicate pragmas must be accepted");
+        assert!(config.options().strict(), "strict=true (last wins)");
     }
 
     #[test]
