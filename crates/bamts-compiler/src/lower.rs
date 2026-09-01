@@ -7523,7 +7523,7 @@ impl<'a> FunctionContext<'a> {
         let prototype_key = self.string_reg(builder, EcmaString::encode("prototype"), range)?;
         self.emit(
             range,
-            Instruction::SetProperty {
+            Instruction::DefineDataProperty {
                 object: ctor,
                 key: prototype_key,
                 value: prototype,
@@ -11075,7 +11075,7 @@ mod tests {
             code.iter().any(|instruction| {
                 matches!(
                     instruction,
-                    Instruction::SetProperty { object, key, value }
+                    Instruction::DefineDataProperty { object, key, value }
                         if *object == raw_ctor
                             && *value == prototype
                             && key_name(code, constants, *key) == "prototype"
