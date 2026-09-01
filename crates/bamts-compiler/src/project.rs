@@ -1455,7 +1455,9 @@ fn parse_path_mappings(
 }
 
 /// File families to prioritize in a relative module search plan.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+///
+/// Ordered `Runtime` before `Types` so flavor-keyed structures can derive `Ord`.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ResolutionFlavor {
     Runtime,
     Types,

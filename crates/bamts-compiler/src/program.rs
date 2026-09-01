@@ -29,6 +29,7 @@ use crate::{
     project::{
         CompilerOptions, ModuleResolutionError, PackageError, PackageJson, PackageMode,
         PackageTarget, ProjectRoot, ResolutionConditions, ResolutionFlavor, plan_relative_module,
+        resolution::ResolutionMode,
     },
     scanner,
     service::filesystem::{FileSystem, FileSystemError, OsFileSystem},
@@ -88,19 +89,34 @@ impl ModuleTarget {
 
 /// One source-anchored, resolved dependency. `target` is the runtime and lowering
 /// identity; `type_target` is a checker-only declaration overlay when one exists.
+/// `flavor` and `mode` record the exact resolution inputs used for `target`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleEdge {
     kind: ModuleEdgeKind,
+    flavor: ResolutionFlavor,
+    mode: ResolutionMode,
     specifier: Arc<str>,
     target: ModuleTarget,
     type_target: Option<ModuleTarget>,
     range: TextRange,
 }
-
 impl ModuleEdge {
     #[must_use]
     pub const fn kind(&self) -> ModuleEdgeKind {
         self.kind
+    }
+    /// Returns the resolution flavor used for `target`.
+    ///
+    /// A separate `type_target` overlay, when present, was resolved as
+    /// [`ResolutionFlavor::Types`].
+    #[must_use]
+    pub const fn flavor(&self) -> ResolutionFlavor {
+        self.flavor
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> ResolutionMode {
+        self.mode
     }
 
     #[must_use]
@@ -644,6 +660,7 @@ impl ProgramLoader {
             canonical_roots.insert(selected);
         }
 
+        let ambient = ambient_resolution_mode(&self.options);
         let mut state = LoadState {
             loader: self,
             identities: HashMap::new(),
@@ -651,6 +668,7 @@ impl ProgramLoader {
             overlay_worklist: Vec::new(),
             type_overlays: Vec::new(),
             session_bytes: 0,
+            ambient,
             cancel,
         };
         let mut root_ids = Vec::with_capacity(canonical_roots.len());
@@ -671,10 +689,7 @@ impl ProgramLoader {
             roots: Arc::from(root_ids),
             modules: Arc::from(state.modules),
             module_indices,
-            commonjs: self
-                .options
-                .module()
-                .is_some_and(|module| module.eq_ignore_ascii_case("commonjs")),
+            commonjs: ambient == ResolutionMode::Require,
             no_implicit_any: self.options.no_implicit_any(),
             strict_null_checks: self.options.strict_null_checks(),
             strict_property_initialization: self.options.strict_property_initialization(),
@@ -706,11 +721,7 @@ impl ProgramLoader {
             factory: self.options.jsx_factory().map(Arc::from),
             fragment_factory: self.options.jsx_fragment_factory().map(Arc::from),
             import_source: self.options.jsx_import_source().map(Arc::from),
-            import_style: if self
-                .options
-                .module()
-                .is_some_and(|module| module.eq_ignore_ascii_case("commonjs"))
-            {
+            import_style: if ambient_resolution_mode(&self.options) == ResolutionMode::Require {
                 JsxRuntimeImportStyle::CommonJs
             } else {
                 JsxRuntimeImportStyle::EsModule
@@ -821,29 +832,31 @@ impl ProgramLoader {
         edge: &UnresolvedEdge,
         cancel: &CancellationToken,
     ) -> Result<ResolvedEdge, ProgramLoadError> {
-        if edge.specifier.starts_with("node:") {
-            return Ok(ResolvedEdge {
-                target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
-                type_overlay: None,
-            });
-        }
-
         let flavor = if edge.kind == ModuleEdgeKind::TypeOnly || is_declaration_path(importer) {
             ResolutionFlavor::Types
         } else {
             ResolutionFlavor::Runtime
         };
+        if edge.specifier.starts_with("node:") {
+            return Ok(ResolvedEdge {
+                target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
+                type_overlay: None,
+                flavor,
+            });
+        }
         if let Some(target) = self.resolve_local(importer, edge, flavor, cancel)? {
             let type_overlay = self.type_overlay(importer, edge, &target, cancel)?;
             return Ok(ResolvedEdge {
                 target,
                 type_overlay,
+                flavor,
             });
         }
         if flavor == ResolutionFlavor::Types && split_package_specifier(&edge.specifier).is_some() {
             return Ok(ResolvedEdge {
                 target: ResolvedEdgeTarget::External(Arc::clone(&edge.specifier)),
                 type_overlay: None,
+                flavor,
             });
         }
         Err(ProgramLoadError::UnresolvedModule(diagnostic(
@@ -964,7 +977,7 @@ impl ProgramLoader {
                 let mode = if flavor == ResolutionFlavor::Types {
                     PackageMode::Types
                 } else {
-                    PackageMode::Import
+                    edge.mode.package_mode()
                 };
                 let conditions = ResolutionConditions::for_mode(mode);
                 let target = package
@@ -1014,7 +1027,7 @@ impl ProgramLoader {
                 let mode = if flavor == ResolutionFlavor::Types {
                     PackageMode::Types
                 } else {
-                    PackageMode::Import
+                    edge.mode.package_mode()
                 };
                 let conditions = ResolutionConditions::for_mode(mode);
                 let target = package
@@ -1030,6 +1043,7 @@ impl ProgramLoader {
                     PackageTarget::External(specifier) => {
                         let external = UnresolvedEdge {
                             kind: edge.kind,
+                            mode: edge.mode,
                             specifier,
                             range: edge.range,
                         };
@@ -1064,12 +1078,14 @@ enum ResolvedEdgeTarget {
 struct ResolvedEdge {
     target: ResolvedEdgeTarget,
     type_overlay: Option<PathBuf>,
+    flavor: ResolutionFlavor,
 }
 
 #[derive(Clone, Debug)]
 struct PendingEdge {
     edge: UnresolvedEdge,
     type_overlay: Option<PathBuf>,
+    flavor: ResolutionFlavor,
 }
 /// Adds one canonical source's UTF-8 bytes to the session total.
 fn accumulate_session_bytes(session_bytes: usize, added: usize) -> Result<usize, usize> {
@@ -1087,6 +1103,7 @@ struct LoadState<'a> {
     overlay_worklist: Vec<PathBuf>,
     type_overlays: Vec<(SourceId, usize, PathBuf)>,
     session_bytes: usize,
+    ambient: ResolutionMode,
     cancel: &'a CancellationToken,
 }
 
@@ -1170,6 +1187,8 @@ impl LoadState<'_> {
                         let dependency_index = parent.dependencies.len();
                         parent.dependencies.push(ModuleEdge {
                             kind: pending.edge.kind,
+                            flavor: pending.flavor,
+                            mode: pending.edge.mode,
                             specifier: pending.edge.specifier,
                             target: ModuleTarget::Local(source_id),
                             type_target: None,
@@ -1235,12 +1254,13 @@ impl LoadState<'_> {
                     let parsed = parser::parse_with_cancel(scanned, self.cancel.clone())
                         .map_err(|_| cancelled_load(&path))?;
                     check_load_cancel(self.cancel, &path)?;
-                    let mut unresolved = collect_edges(parsed.product()).map_err(|range| {
-                        ProgramLoadError::IllFormedModuleSpecifier {
-                            importer: path.clone(),
-                            range,
-                        }
-                    })?;
+                    let mut unresolved =
+                        collect_edges(parsed.product(), self.ambient).map_err(|range| {
+                            ProgramLoadError::IllFormedModuleSpecifier {
+                                importer: path.clone(),
+                                range,
+                            }
+                        })?;
                     let jsx_plan = if parsed.diagnostics().is_empty() {
                         check_load_cancel(self.cancel, &path)?;
                         self.loader.jsx_plan(&path, parsed.product(), &source)?
@@ -1258,6 +1278,7 @@ impl LoadState<'_> {
                     {
                         unresolved.push(UnresolvedEdge {
                             kind: ModuleEdgeKind::StaticRuntime,
+                            mode: self.ambient,
                             specifier: Arc::clone(specifier),
                             range: parsed.product().range(),
                         });
@@ -1292,12 +1313,15 @@ impl LoadState<'_> {
                                     frame.pending_edge = Some(PendingEdge {
                                         edge,
                                         type_overlay: resolved.type_overlay,
+                                        flavor: resolved.flavor,
                                     });
                                     break Some(target_path);
                                 }
                                 ResolvedEdgeTarget::External(specifier) => {
                                     frame.dependencies.push(ModuleEdge {
                                         kind: edge.kind,
+                                        flavor: resolved.flavor,
+                                        mode: edge.mode,
                                         specifier: edge.specifier,
                                         target: ModuleTarget::External(specifier),
                                         type_target: None,
@@ -1335,6 +1359,8 @@ impl LoadState<'_> {
                     let dependency_index = parent.dependencies.len();
                     parent.dependencies.push(ModuleEdge {
                         kind: pending.edge.kind,
+                        flavor: pending.flavor,
+                        mode: pending.edge.mode,
                         specifier: pending.edge.specifier,
                         target: ModuleTarget::Local(source_id),
                         type_target: None,
@@ -1365,11 +1391,15 @@ fn check_load_cancel(cancel: &CancellationToken, path: &Path) -> Result<(), Prog
 #[derive(Clone, Debug)]
 struct UnresolvedEdge {
     kind: ModuleEdgeKind,
+    mode: ResolutionMode,
     specifier: Arc<str>,
     range: TextRange,
 }
 
-fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> {
+fn collect_edges(
+    source: &SourceFile,
+    ambient: ResolutionMode,
+) -> Result<Vec<UnresolvedEdge>, TextRange> {
     let mut edges = Vec::new();
     for statement in source.statements() {
         match statement.data() {
@@ -1379,7 +1409,7 @@ fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> 
                 } else {
                     ModuleEdgeKind::StaticRuntime
                 };
-                push_literal_edge(source, &mut edges, kind, &import.source)?;
+                push_literal_edge(source, &mut edges, kind, ambient, &import.source)?;
             }
             Statement::ImportEquals(import) => {
                 if let crate::syntax::ExternalModuleReference::Require(specifier) =
@@ -1390,7 +1420,13 @@ fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> 
                     } else {
                         ModuleEdgeKind::StaticRuntime
                     };
-                    push_literal_edge(source, &mut edges, kind, specifier)?;
+                    push_literal_edge(
+                        source,
+                        &mut edges,
+                        kind,
+                        ResolutionMode::Require,
+                        specifier,
+                    )?;
                 }
             }
             Statement::Export(ExportDeclaration::All(export)) => {
@@ -1399,7 +1435,7 @@ fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> 
                 } else {
                     ModuleEdgeKind::StaticRuntime
                 };
-                push_literal_edge(source, &mut edges, kind, &export.source)?;
+                push_literal_edge(source, &mut edges, kind, ambient, &export.source)?;
             }
             Statement::Export(ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
                 type_only,
@@ -1420,6 +1456,7 @@ fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> 
                     } else {
                         ModuleEdgeKind::StaticRuntime
                     },
+                    ambient,
                     module,
                 )?;
             }
@@ -1430,6 +1467,7 @@ fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> 
         let mut collector = DynamicEdgeCollector {
             source,
             edges: &mut edges,
+            ambient,
             ill_formed: None,
         };
         collector.scan_statements(source.statements());
@@ -1465,6 +1503,7 @@ fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> 
         let specifier = value.to_utf8_strict().map_err(|_| window[2].range())?;
         edges.push(UnresolvedEdge {
             kind: ModuleEdgeKind::TypeOnly,
+            mode: ambient,
             specifier: Arc::from(specifier),
             range: window[2].range(),
         });
@@ -1475,6 +1514,7 @@ fn collect_edges(source: &SourceFile) -> Result<Vec<UnresolvedEdge>, TextRange> 
 struct DynamicEdgeCollector<'a> {
     source: &'a SourceFile,
     edges: &'a mut Vec<UnresolvedEdge>,
+    ambient: ResolutionMode,
     ill_formed: Option<TextRange>,
 }
 
@@ -1485,7 +1525,8 @@ impl DynamicEdgeCollector<'_> {
         literal: &crate::syntax::StringLiteralNode,
     ) {
         if self.ill_formed.is_none() {
-            self.ill_formed = push_literal_edge(self.source, self.edges, kind, literal).err();
+            self.ill_formed =
+                push_literal_edge(self.source, self.edges, kind, self.ambient, literal).err();
         }
     }
 
@@ -1973,6 +2014,7 @@ fn push_literal_edge(
     source: &SourceFile,
     edges: &mut Vec<UnresolvedEdge>,
     kind: ModuleEdgeKind,
+    mode: ResolutionMode,
     literal: &crate::syntax::StringLiteralNode,
 ) -> Result<(), TextRange> {
     let Some(value) = source.token_text(literal.data().token()).and_then(unquote) else {
@@ -1981,6 +2023,7 @@ fn push_literal_edge(
     let specifier = value.to_utf8_strict().map_err(|_| literal.range())?;
     edges.push(UnresolvedEdge {
         kind,
+        mode,
         specifier: Arc::from(specifier),
         range: literal.range(),
     });
@@ -2127,6 +2170,22 @@ const fn edge_kind(flavor: ResolutionFlavor) -> ModuleEdgeKind {
     match flavor {
         ResolutionFlavor::Runtime => ModuleEdgeKind::StaticRuntime,
         ResolutionFlavor::Types => ModuleEdgeKind::TypeOnly,
+    }
+}
+
+/// Derives the ambient module resolution mode from the module format option.
+///
+/// Edges without an explicit mode — plain imports, re-exports, dynamic
+/// imports, and synthetic JSX runtime demands — resolve with this mode. Only
+/// `import … = require(…)` pins [`ResolutionMode::Require`] per edge.
+fn ambient_resolution_mode(options: &CompilerOptions) -> ResolutionMode {
+    if options
+        .module()
+        .is_some_and(|module| module.eq_ignore_ascii_case("commonjs"))
+    {
+        ResolutionMode::Require
+    } else {
+        ResolutionMode::Import
     }
 }
 
@@ -3408,7 +3467,8 @@ mod tests {
     use super::{
         ExecutableProgram, JsxRoutingDecision, ModuleEdgeKind, ModuleTarget, ProgramLoadError,
         ProgramLoader, ProgramLowerErrorKind, ProgramLowerPhase, ProgramOutputKind,
-        ResolvedProgram, lower_program, lower_program_with_cancel,
+        ResolutionFlavor, ResolutionMode, ResolvedProgram, lower_program,
+        lower_program_with_cancel,
     };
     use crate::checker::ProgramCheckOptions;
     use crate::{
@@ -5316,6 +5376,92 @@ mod tests {
 
         assert_eq!(names(&program), ["index.d.ts", "main.ts"]);
         assert!(matches!(edge.target(), ModuleTarget::Local(_)));
+    }
+
+    #[test]
+    fn records_flavor_and_mode_for_type_only_runtime_and_dynamic_edges() {
+        let fixture = Fixture::new();
+        fixture.write("types.ts", "export interface Shape { value: number }");
+        fixture.write("value.ts", "export const value = 1;");
+        fixture.write("later.ts", "export const later = 2;");
+        fixture.write(
+            "main.ts",
+            "import type { Shape } from './types.js';\n\
+             import { value } from './value.js';\n\
+             const observed: Shape = value;\n\
+             const pending = import('./later.js');\n\
+             void pending;",
+        );
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let dependencies = program.entrypoint().dependencies();
+
+        assert_eq!(
+            names(&program),
+            ["types.ts", "value.ts", "later.ts", "main.ts"]
+        );
+        assert_eq!(dependencies[0].kind(), ModuleEdgeKind::TypeOnly);
+        assert_eq!(dependencies[0].flavor(), ResolutionFlavor::Types);
+        assert_eq!(dependencies[0].mode(), ResolutionMode::Import);
+        assert_eq!(dependencies[1].kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(dependencies[1].flavor(), ResolutionFlavor::Runtime);
+        assert_eq!(dependencies[1].mode(), ResolutionMode::Import);
+        assert_eq!(dependencies[2].kind(), ModuleEdgeKind::DynamicRuntime);
+        assert_eq!(dependencies[2].flavor(), ResolutionFlavor::Runtime);
+        assert_eq!(dependencies[2].mode(), ResolutionMode::Import);
+    }
+
+    #[test]
+    fn import_equals_require_pins_require_mode_and_condition_target() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "node_modules/waybread/package.json",
+            r#"{"name":"waybread","exports":{".":{"import":"./esm.js","require":"./cjs.js"}}}"#,
+        );
+        fixture.write("node_modules/waybread/esm.ts", "export const crumb = 1;");
+        fixture.write("node_modules/waybread/cjs.ts", "export const crumb = 2;");
+        fixture.write(
+            "main.ts",
+            "import loaf = require('waybread');\n\
+             import { crumb } from 'waybread';\n\
+             void loaf; void crumb;",
+        );
+
+        let program = fixture.loader().load("main.ts").unwrap();
+        let dependencies = program.entrypoint().dependencies();
+
+        assert_eq!(names(&program), ["cjs.ts", "esm.ts", "main.ts"]);
+        assert_eq!(dependencies[0].kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(dependencies[0].flavor(), ResolutionFlavor::Runtime);
+        assert_eq!(dependencies[0].mode(), ResolutionMode::Require);
+        assert!(matches!(dependencies[0].target(), ModuleTarget::Local(_)));
+        assert_eq!(dependencies[1].kind(), ModuleEdgeKind::StaticRuntime);
+        assert_eq!(dependencies[1].flavor(), ResolutionFlavor::Runtime);
+        assert_eq!(dependencies[1].mode(), ResolutionMode::Import);
+        assert!(matches!(dependencies[1].target(), ModuleTarget::Local(_)));
+    }
+
+    #[test]
+    fn declaration_importer_edges_resolve_with_types_flavor() {
+        let fixture = Fixture::new();
+        fixture.write("main.ts", "import './lib';");
+        fixture.write("lib.d.ts", "import './peer';");
+        fixture.write("peer.ts", "export const value = 1;");
+
+        let program = fixture.loader().load("main.ts").unwrap();
+
+        assert_eq!(names(&program), ["peer.ts", "lib.d.ts", "main.ts"]);
+        assert_eq!(
+            program.entrypoint().dependencies()[0].flavor(),
+            ResolutionFlavor::Runtime
+        );
+        let lib = &program.modules()[1];
+        assert_eq!(
+            lib.path().file_name().and_then(|name| name.to_str()),
+            Some("lib.d.ts")
+        );
+        assert_eq!(lib.dependencies()[0].flavor(), ResolutionFlavor::Types);
+        assert_eq!(lib.dependencies()[0].mode(), ResolutionMode::Import);
     }
 
     #[test]

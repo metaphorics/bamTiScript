@@ -1,7 +1,10 @@
 //! Upstream-compatible module-resolution trace rendering.
-
+//!
+//! The rendered ESM/CJS mode word follows [`ResolutionMode`], and candidate
+//! narration follows [`ResolutionFlavor`] so it matches the order the resolver
+//! actually probes.
 use super::{
-    ProjectRoot,
+    ProjectRoot, ResolutionFlavor,
     resolution::{
         ModuleResolutionKind, ResolutionError, ResolutionMode, ResolutionTraceStep, ResolvedModule,
     },
@@ -47,7 +50,7 @@ impl ResolutionTraceLog {
         root: &ProjectRoot,
         importer: &Path,
         specifier: &str,
-        strategy: (ModuleResolutionKind, ResolutionMode),
+        strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
         cached: bool,
         result: &Result<ResolvedModule, ResolutionError>,
     ) {
@@ -87,14 +90,18 @@ impl ResolutionTraceLog {
                 strategy.0.trace_name()
             ));
             self.lines.push(format!(
-                "Resolving in CJS mode with conditions '{}', 'types'.",
+                "Resolving in {} mode with conditions '{}', 'types'.",
+                match strategy.1 {
+                    ResolutionMode::Import => "ESM",
+                    ResolutionMode::Require => "CJS",
+                },
                 strategy.1.as_str()
             ));
             self.lines.push(format!(
                 "Loading module as file / folder, candidate module location '{}', target file types: TypeScript, JavaScript, Declaration, JSON.",
                 display_path(&candidate_location)
             ));
-            self.render_candidates(&candidate_location, extension, result);
+            self.render_candidates(&candidate_location, extension, strategy.2, result);
         }
 
         match result {
@@ -124,6 +131,7 @@ impl ResolutionTraceLog {
         &mut self,
         requested: &Path,
         extension: Option<&str>,
+        flavor: ResolutionFlavor,
         result: &Result<ResolvedModule, ResolutionError>,
     ) {
         let trace = match result {
@@ -150,7 +158,7 @@ impl ResolutionTraceLog {
                 display_path(requested)
             ));
         }
-        for candidate in upstream_candidates(requested, extension) {
+        for candidate in upstream_candidates(requested, extension, flavor) {
             let Some(exists) = probes
                 .iter()
                 .find_map(|(path, exists)| (path == &candidate).then_some(*exists))
@@ -173,16 +181,27 @@ impl ResolutionTraceLog {
 }
 
 /// Upstream Bundler-mode probe order for the file-level candidates of one stem.
-fn upstream_candidates(requested: &Path, extension: Option<&str>) -> Vec<PathBuf> {
-    let extensions: &[&str] = match extension {
-        None => &["ts", "tsx", "d.ts", "js", "jsx"],
-        Some("js") => &["ts", "tsx", "d.ts", "js"],
-        Some("jsx") => &["tsx", "d.ts", "jsx"],
-        Some("mjs") => &["mts", "d.mts", "mjs"],
-        Some("cjs") => &["cts", "d.cts", "cjs"],
-        Some("ts" | "tsx" | "mts" | "cts") => &[extension.expect("extension matched an arm")],
-        Some("json") => &["json"],
-        Some(_) => &[],
+/// `ResolutionFlavor::Types` hoists the family's declaration candidate first,
+/// mirroring the ordering [`crate::project::plan_relative_module`] applies.
+fn upstream_candidates(
+    requested: &Path,
+    extension: Option<&str>,
+    flavor: ResolutionFlavor,
+) -> Vec<PathBuf> {
+    let extensions: &[&str] = match (extension, flavor) {
+        (None, ResolutionFlavor::Types) => &["d.ts", "ts", "tsx", "js", "jsx"],
+        (None, ResolutionFlavor::Runtime) => &["ts", "tsx", "d.ts", "js", "jsx"],
+        (Some("js"), ResolutionFlavor::Types) => &["d.ts", "ts", "tsx", "js"],
+        (Some("js"), ResolutionFlavor::Runtime) => &["ts", "tsx", "d.ts", "js"],
+        (Some("jsx"), ResolutionFlavor::Types) => &["d.ts", "tsx", "jsx"],
+        (Some("jsx"), ResolutionFlavor::Runtime) => &["tsx", "d.ts", "jsx"],
+        (Some("mjs"), ResolutionFlavor::Types) => &["d.mts", "mts", "mjs"],
+        (Some("mjs"), ResolutionFlavor::Runtime) => &["mts", "d.mts", "mjs"],
+        (Some("cjs"), ResolutionFlavor::Types) => &["d.cts", "cts", "cjs"],
+        (Some("cjs"), ResolutionFlavor::Runtime) => &["cts", "d.cts", "cjs"],
+        (Some("ts" | "tsx" | "mts" | "cts"), _) => &[extension.expect("extension matched an arm")],
+        (Some("json"), _) => &["json"],
+        (Some(_), _) => &[],
     };
     extensions
         .iter()
@@ -197,4 +216,35 @@ fn display_path(path: &Path) -> String {
         value.make_ascii_lowercase();
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn types_flavor_hoists_declaration_candidate_per_family() {
+        let requested = Path::new("/dir/index.js");
+        assert_eq!(
+            upstream_candidates(requested, Some("js"), ResolutionFlavor::Runtime),
+            vec![
+                PathBuf::from("/dir/index.ts"),
+                PathBuf::from("/dir/index.tsx"),
+                PathBuf::from("/dir/index.d.ts"),
+                PathBuf::from("/dir/index.js"),
+            ]
+        );
+        assert_eq!(
+            upstream_candidates(requested, Some("js"), ResolutionFlavor::Types)
+                .first()
+                .map(|path| path.as_path()),
+            Some(Path::new("/dir/index.d.ts"))
+        );
+        assert_eq!(
+            upstream_candidates(requested, None, ResolutionFlavor::Types)
+                .first()
+                .map(|path| path.as_path()),
+            Some(Path::new("/dir/index.d.ts"))
+        );
+    }
 }

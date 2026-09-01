@@ -346,10 +346,10 @@ struct CacheKey {
     specifier: Arc<str>,
     kind: ModuleResolutionKind,
     mode: ResolutionMode,
-    types: bool,
+    flavor: ResolutionFlavor,
 }
 
-/// Cache keyed by containing directory, specifier, kind, mode, and types-vs-runtime.
+/// Cache keyed by containing directory, specifier, kind, mode, and resolution flavor.
 /// Failed lookups are stored so repeated misses stay deterministic and cheap.
 #[derive(Clone, Debug, Default)]
 pub struct ResolutionCache {
@@ -371,6 +371,12 @@ impl ResolutionCache {
     pub fn is_empty(&self) -> bool {
         self.hits.is_empty()
     }
+}
+/// Host and mutable state used by traced module resolution.
+pub struct TraceResolutionServices<'a> {
+    pub host: &'a dyn ResolutionHost,
+    pub cache: &'a mut ResolutionCache,
+    pub log: &'a mut ResolutionTraceLog,
 }
 
 type ResolverServices<'host, 'cache, 'stack> = (
@@ -400,29 +406,29 @@ pub fn resolve_module_name(
         (root, options),
         importer.as_ref(),
         specifier,
-        (strategy.0, strategy.1, false),
+        (strategy.0, strategy.1, ResolutionFlavor::Runtime),
         (host, cache, &mut BTreeSet::new()),
         None,
     )
 }
 
 /// Like [`resolve_module_name`] while appending sanitized upstream
-/// `traceResolution` lines to `log`.
+/// `traceResolution` lines to `log`. The strategy carries the resolution
+/// flavor so the trace narrates candidates in the order actually probed.
 pub fn resolve_module_name_with_trace(
     root: &ProjectRoot,
     options: &CompilerOptions,
     importer: impl AsRef<Path>,
     specifier: &str,
-    strategy: (ModuleResolutionKind, ResolutionMode),
-    host: &dyn ResolutionHost,
-    cache: &mut ResolutionCache,
-    log: &mut ResolutionTraceLog,
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
+    services: TraceResolutionServices<'_>,
 ) -> Result<ResolvedModule, ResolutionError> {
+    let TraceResolutionServices { host, cache, log } = services;
     resolve_module_name_inner(
         (root, options),
         importer.as_ref(),
         specifier,
-        (strategy.0, strategy.1, false),
+        strategy,
         (host, cache, &mut BTreeSet::new()),
         Some(log),
     )
@@ -443,7 +449,7 @@ pub fn resolve_type_reference(
         (root, options),
         importer.as_ref(),
         specifier,
-        (strategy.0, strategy.1, true),
+        (strategy.0, strategy.1, ResolutionFlavor::Types),
         (host, cache, &mut BTreeSet::new()),
         None,
     )
@@ -453,12 +459,12 @@ fn resolve_module_name_inner(
     context: (&ProjectRoot, &CompilerOptions),
     importer: &Path,
     specifier: &str,
-    strategy: (ModuleResolutionKind, ResolutionMode, bool),
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
     services: ResolverServices<'_, '_, '_>,
     log: Option<&mut ResolutionTraceLog>,
 ) -> Result<ResolvedModule, ResolutionError> {
     let (root, options) = context;
-    let (kind, mode, types) = strategy;
+    let (kind, mode, flavor) = strategy;
     let (host, cache, package_stack) = services;
     if specifier.is_empty() {
         return Err(ResolutionError::EmptySpecifier);
@@ -477,12 +483,19 @@ fn resolve_module_name_inner(
         specifier: Arc::from(specifier),
         kind,
         mode,
-        types,
+        flavor,
     };
     if let Some(cached) = cache.hits.get(&key) {
         let result = cached.clone();
         if let Some(log) = log {
-            log.record_module(root, &importer, specifier, (kind, mode), true, &result);
+            log.record_module(
+                root,
+                &importer,
+                specifier,
+                (kind, mode, flavor),
+                true,
+                &result,
+            );
         }
         return result;
     }
@@ -500,7 +513,7 @@ fn resolve_module_name_inner(
         &importer,
         &containing,
         specifier,
-        (kind, mode, types),
+        (kind, mode, flavor),
         (host, &mut *cache, &mut *package_stack),
         &mut trace,
     );
@@ -543,7 +556,14 @@ fn resolve_module_name_inner(
     };
 
     if let Some(log) = log {
-        log.record_module(root, &importer, specifier, (kind, mode), false, &stored);
+        log.record_module(
+            root,
+            &importer,
+            specifier,
+            (kind, mode, flavor),
+            false,
+            &stored,
+        );
     }
     cache.hits.insert(key, stored.clone());
     stored
@@ -554,12 +574,12 @@ fn resolve_uncached(
     importer: &Path,
     containing: &Path,
     specifier: &str,
-    strategy: (ModuleResolutionKind, ResolutionMode, bool),
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
     services: ResolverServices<'_, '_, '_>,
     trace: &mut ResolutionTrace,
 ) -> Result<ResolvedModule, ResolutionError> {
     let (root, options) = context;
-    let (kind, mode, types) = strategy;
+    let (kind, mode, flavor) = strategy;
     let (host, cache, package_stack) = services;
     if is_url_like(specifier) {
         return Err(ResolutionError::UrlLikeSpecifier {
@@ -572,7 +592,7 @@ fn resolve_uncached(
             (root, options),
             importer,
             specifier,
-            (kind, mode, types),
+            (kind, mode, flavor),
             host,
             trace,
         );
@@ -584,7 +604,7 @@ fn resolve_uncached(
             importer,
             containing,
             specifier,
-            (kind, mode, types),
+            (kind, mode, flavor),
             (host, &mut *cache, &mut *package_stack),
             trace,
         );
@@ -594,7 +614,7 @@ fn resolve_uncached(
         (root, options),
         importer,
         specifier,
-        (kind, mode, types),
+        (kind, mode, flavor),
         host,
         trace,
     )? {
@@ -606,14 +626,14 @@ fn resolve_uncached(
         importer,
         containing,
         specifier,
-        (kind, mode, types),
+        (kind, mode, flavor),
         (host, &mut *cache, &mut *package_stack),
         trace,
     )? {
         return Ok(resolved);
     }
 
-    if types
+    if flavor == ResolutionFlavor::Types
         && let Some(resolved) = try_types_package(
             (root, options),
             containing,
@@ -645,12 +665,12 @@ fn resolve_relative(
     context: (&ProjectRoot, &CompilerOptions),
     importer: &Path,
     specifier: &str,
-    strategy: (ModuleResolutionKind, ResolutionMode, bool),
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
     host: &dyn ResolutionHost,
     trace: &mut ResolutionTrace,
 ) -> Result<ResolvedModule, ResolutionError> {
     let (root, options) = context;
-    let (kind, mode, types) = strategy;
+    let (kind, mode, flavor) = strategy;
     if mode == ResolutionMode::Import
         && !kind.allows_extensionless_relative()
         && Path::new(specifier).extension().is_none()
@@ -661,11 +681,6 @@ fn resolve_relative(
             trace: trace.clone(),
         });
     }
-    let flavor = if types {
-        ResolutionFlavor::Types
-    } else {
-        ResolutionFlavor::Runtime
-    };
     let plan = plan_relative_module(
         root,
         importer,
@@ -701,12 +716,12 @@ fn try_paths_mapping(
     context: (&ProjectRoot, &CompilerOptions),
     importer: &Path,
     specifier: &str,
-    strategy: (ModuleResolutionKind, ResolutionMode, bool),
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
     host: &dyn ResolutionHost,
     trace: &mut ResolutionTrace,
 ) -> Result<Option<ResolvedModule>, ResolutionError> {
     let (root, options) = context;
-    let (kind, mode, types) = strategy;
+    let (kind, mode, flavor) = strategy;
     let Some((pattern, targets, capture)) = select_path_mapping(options.paths(), specifier) else {
         return Ok(None);
     };
@@ -722,7 +737,7 @@ fn try_paths_mapping(
             (root, options),
             importer,
             &as_relative,
-            (kind, mode, types),
+            (kind, mode, flavor),
             host,
             trace,
         ) {
@@ -831,12 +846,12 @@ fn try_node_modules(
     importer: &Path,
     containing: &Path,
     specifier: &str,
-    strategy: (ModuleResolutionKind, ResolutionMode, bool),
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
     services: ResolverServices<'_, '_, '_>,
     trace: &mut ResolutionTrace,
 ) -> Result<Option<ResolvedModule>, ResolutionError> {
     let (root, options) = context;
-    let (kind, mode, types) = strategy;
+    let (kind, mode, flavor) = strategy;
     let (host, cache, package_stack) = services;
     let (package_name, subpath) = split_package_specifier(specifier);
     let mut directory = containing.to_path_buf();
@@ -855,7 +870,7 @@ fn try_node_modules(
                 importer,
                 &package_root,
                 &subpath,
-                (kind, mode, types),
+                (kind, mode, flavor),
                 (host, &mut *cache, &mut *package_stack),
                 trace,
             )?
@@ -878,12 +893,12 @@ fn resolve_installed_package(
     importer: &Path,
     package_root: &Path,
     subpath: &str,
-    strategy: (ModuleResolutionKind, ResolutionMode, bool),
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
     services: ResolverServices<'_, '_, '_>,
     trace: &mut ResolutionTrace,
 ) -> Result<Option<ResolvedModule>, ResolutionError> {
     let (root, options) = context;
-    let (kind, mode, types) = strategy;
+    let (kind, mode, flavor) = strategy;
     let (host, _cache, _package_stack) = services;
     let package_json_path = package_root.join("package.json");
     let package_json_path = match root.confine(&package_json_path) {
@@ -908,7 +923,7 @@ fn resolve_installed_package(
         subpath: Arc::from(export_subpath.as_str()),
     });
 
-    let conditions = conditions_for(kind, mode, types);
+    let conditions = conditions_for(kind, mode, flavor);
     for name in conditions.values() {
         trace.push(ResolutionTraceStep::Condition {
             name: Arc::clone(name),
@@ -919,7 +934,7 @@ fn resolve_installed_package(
     if let Some(source) = host.read_file(&package_json_path) {
         let package = PackageJson::parse(root, &package_json_path, &source)?;
         let has_exports = package.raw().get("exports").is_some();
-        let package_mode = if types {
+        let package_mode = if flavor == ResolutionFlavor::Types {
             PackageMode::Types
         } else {
             mode.package_mode()
@@ -930,7 +945,7 @@ fn resolve_installed_package(
                     (root, options),
                     importer,
                     &target,
-                    (kind, mode, types),
+                    (kind, mode, flavor),
                     Some(package_json_path),
                     host,
                     trace,
@@ -960,7 +975,7 @@ fn resolve_installed_package(
         (root, options),
         &fake_importer,
         &relative,
-        (kind, mode, types),
+        (kind, mode, flavor),
         host,
         trace,
     ) {
@@ -977,20 +992,20 @@ fn finalize_package_target(
     context: (&ProjectRoot, &CompilerOptions),
     importer: &Path,
     target: &Path,
-    strategy: (ModuleResolutionKind, ResolutionMode, bool),
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
     package_json: Option<PathBuf>,
     host: &dyn ResolutionHost,
     trace: &mut ResolutionTrace,
 ) -> Result<Option<ResolvedModule>, ResolutionError> {
     let (root, options) = context;
-    let (kind, mode, types) = strategy;
+    let (kind, mode, flavor) = strategy;
     let confined = root.confine(target)?;
     let as_relative = path_as_dot_relative(root, importer, &confined)?;
     match resolve_relative(
         (root, options),
         importer,
         &as_relative,
-        (kind, mode, types),
+        (kind, mode, flavor),
         host,
         trace,
     ) {
@@ -1010,7 +1025,7 @@ fn finalize_package_target(
                 (root, options),
                 &fake,
                 &format!("./{name}"),
-                (kind, mode, types),
+                (kind, mode, flavor),
                 host,
                 trace,
             ) {
@@ -1031,12 +1046,12 @@ fn resolve_hash_import(
     importer: &Path,
     containing: &Path,
     specifier: &str,
-    strategy: (ModuleResolutionKind, ResolutionMode, bool),
+    strategy: (ModuleResolutionKind, ResolutionMode, ResolutionFlavor),
     services: ResolverServices<'_, '_, '_>,
     trace: &mut ResolutionTrace,
 ) -> Result<ResolvedModule, ResolutionError> {
     let (root, options) = context;
-    let (kind, mode, types) = strategy;
+    let (kind, mode, flavor) = strategy;
     let (host, cache, package_stack) = services;
     let Some(package_json_path) = find_nearest_package_json(root, containing, host) else {
         return Err(ResolutionError::NotFound {
@@ -1063,14 +1078,14 @@ fn resolve_hash_import(
         });
     };
     let package = PackageJson::parse(root, &package_json_path, &source)?;
-    let conditions = conditions_for(kind, mode, types);
+    let conditions = conditions_for(kind, mode, flavor);
     let outcome = package.resolve_import(root, specifier, &conditions);
     let result = match outcome {
         Ok(PackageTarget::Path(path)) => finalize_package_target(
             (root, options),
             importer,
             &path,
-            (kind, mode, types),
+            (kind, mode, flavor),
             Some(package_json_path.clone()),
             host,
             trace,
@@ -1089,7 +1104,7 @@ fn resolve_hash_import(
                 (root, options),
                 importer,
                 external.as_ref(),
-                (kind, mode, types),
+                (kind, mode, flavor),
                 (host, &mut *cache, &mut *package_stack),
                 None,
             )
@@ -1157,13 +1172,13 @@ fn try_types_package(
         let package_json = package_root.join("package.json");
         if let Some(source) = host.read_file(&package_json) {
             let package = PackageJson::parse(root, &package_json, &source)?;
-            let conditions = conditions_for(kind, mode, true);
+            let conditions = conditions_for(kind, mode, ResolutionFlavor::Types);
             if let Ok(target) = package.resolve_export(root, ".", PackageMode::Types, &conditions) {
                 return finalize_package_target(
                     (root, options),
                     &package_json,
                     &target,
-                    (kind, mode, true),
+                    (kind, mode, ResolutionFlavor::Types),
                     Some(package_json.clone()),
                     host,
                     trace,
@@ -1215,9 +1230,9 @@ fn split_package_specifier(specifier: &str) -> (String, String) {
 fn conditions_for(
     kind: ModuleResolutionKind,
     mode: ResolutionMode,
-    types: bool,
+    flavor: ResolutionFlavor,
 ) -> ResolutionConditions {
-    if types {
+    if flavor == ResolutionFlavor::Types {
         return ResolutionConditions::for_mode(PackageMode::Types);
     }
     match kind {
@@ -1748,24 +1763,25 @@ mod tests {
         // Lines pinned byte-for-byte to the upstream baseline blob
         // sha256 1170256ebc7a95579edb54bfe7ce1b8c6ffd8ffcf8a219318822605ad58fdda3
         // (tests/baselines/reference/bundlerRelative1(module=bundler).trace.json,
-        // indices 12..=31) plus its cache-hit re-resolution template.
+        // indices 12..=31) plus its cache-hit re-resolution template. The mode
+        // word follows the per-import ResolutionMode: Import renders ESM.
         let expected: &[&str] = &[
             "======== Resolving module './dir/index' from '/main.ts'. ========",
             "Explicitly specified module resolution kind: 'Bundler'.",
-            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "Resolving in ESM mode with conditions 'import', 'types'.",
             "Loading module as file / folder, candidate module location '/dir/index', target file types: TypeScript, JavaScript, Declaration, JSON.",
             "File '/dir/index.ts' exists - use it as a name resolution result.",
             "======== Module name './dir/index' was successfully resolved to '/dir/index.ts'. ========",
             "======== Resolving module './dir/index.js' from '/main.ts'. ========",
             "Explicitly specified module resolution kind: 'Bundler'.",
-            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "Resolving in ESM mode with conditions 'import', 'types'.",
             "Loading module as file / folder, candidate module location '/dir/index.js', target file types: TypeScript, JavaScript, Declaration, JSON.",
             "File name '/dir/index.js' has a '.js' extension - stripping it.",
             "File '/dir/index.ts' exists - use it as a name resolution result.",
             "======== Module name './dir/index.js' was successfully resolved to '/dir/index.ts'. ========",
             "======== Resolving module './dir/index.ts' from '/main.ts'. ========",
             "Explicitly specified module resolution kind: 'Bundler'.",
-            "Resolving in CJS mode with conditions 'import', 'types'.",
+            "Resolving in ESM mode with conditions 'import', 'types'.",
             "Loading module as file / folder, candidate module location '/dir/index.ts', target file types: TypeScript, JavaScript, Declaration, JSON.",
             "File name '/dir/index.ts' has a '.ts' extension - stripping it.",
             "File '/dir/index.ts' exists - use it as a name resolution result.",
@@ -1795,10 +1811,16 @@ mod tests {
                 &options,
                 "/main.ts",
                 specifier,
-                (ModuleResolutionKind::Bundler, ResolutionMode::Import),
-                &host,
-                &mut cache,
-                &mut log,
+                (
+                    ModuleResolutionKind::Bundler,
+                    ResolutionMode::Import,
+                    ResolutionFlavor::Runtime,
+                ),
+                TraceResolutionServices {
+                    host: &host,
+                    cache: &mut cache,
+                    log: &mut log,
+                },
             )
             .unwrap_or_else(|error| panic!("resolve {specifier}: {error}"));
         }
@@ -1807,15 +1829,153 @@ mod tests {
             &options,
             "/main.ts",
             "./dir/index",
-            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
-            &host,
-            &mut cache,
-            &mut log,
+            (
+                ModuleResolutionKind::Bundler,
+                ResolutionMode::Import,
+                ResolutionFlavor::Runtime,
+            ),
+            TraceResolutionServices {
+                host: &host,
+                cache: &mut cache,
+                log: &mut log,
+            },
         )
         .expect("cache hit");
 
         let produced: Vec<&str> = log.lines().iter().map(String::as_str).collect();
         assert_eq!(produced, expected);
         assert!(log.unsupported().is_empty());
+    }
+    #[test]
+    fn trace_mode_word_follows_resolution_mode() {
+        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let config = ProjectConfig::parse(
+            &fs_root,
+            "/tsconfig.json",
+            r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut host = MemoryHost::default();
+        host.file("/dir/index.ts", "export {};\n");
+
+        for (mode, word) in [
+            (ResolutionMode::Import, "ESM"),
+            (ResolutionMode::Require, "CJS"),
+        ] {
+            let mut cache = ResolutionCache::new();
+            let mut log = ResolutionTraceLog::default();
+            resolve_module_name_with_trace(
+                &fs_root,
+                &options,
+                "/main.ts",
+                "./dir/index.ts",
+                (
+                    ModuleResolutionKind::Bundler,
+                    mode,
+                    ResolutionFlavor::Runtime,
+                ),
+                TraceResolutionServices {
+                    host: &host,
+                    cache: &mut cache,
+                    log: &mut log,
+                },
+            )
+            .expect("relative resolution");
+            let expected = format!(
+                "Resolving in {word} mode with conditions '{}', 'types'.",
+                mode.as_str()
+            );
+            assert!(
+                log.lines().iter().any(|line| line == &expected),
+                "missing `{expected}` in {:?}",
+                log.lines()
+            );
+        }
+    }
+
+    #[test]
+    fn trace_types_flavor_narrates_declaration_candidates_first() {
+        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let config = ProjectConfig::parse(
+            &fs_root,
+            "/tsconfig.json",
+            r#"{"compilerOptions":{"moduleResolution":"bundler"}}"#,
+        )
+        .expect("config");
+        let options = config.options().clone();
+        let mut host = MemoryHost::default();
+        host.file("/dir/index.d.ts", "export {};\n");
+        host.file("/dir/index.ts", "export {};\n");
+
+        for (flavor, chosen, narrated) in [
+            (ResolutionFlavor::Runtime, "index.ts", "dir/index.ts"),
+            (ResolutionFlavor::Types, "index.d.ts", "dir/index.d.ts"),
+        ] {
+            let mut cache = ResolutionCache::new();
+            let mut log = ResolutionTraceLog::default();
+            let resolved = resolve_module_name_with_trace(
+                &fs_root,
+                &options,
+                "/main.ts",
+                "./dir/index",
+                (
+                    ModuleResolutionKind::Bundler,
+                    ResolutionMode::Import,
+                    flavor,
+                ),
+                TraceResolutionServices {
+                    host: &host,
+                    cache: &mut cache,
+                    log: &mut log,
+                },
+            )
+            .expect("resolution");
+            assert_eq!(resolved.path(), Path::new(&format!("/dir/{chosen}")));
+            // Narration stops at the first probed candidate, so the single
+            // narrated file must be the one the resolver actually chose.
+            let narrated_files: Vec<String> = log
+                .lines()
+                .iter()
+                .filter(|line| line.starts_with("File '"))
+                .cloned()
+                .collect();
+            let expected =
+                format!("File '/{narrated}' exists - use it as a name resolution result.");
+            assert_eq!(narrated_files, vec![expected]);
+        }
+    }
+
+    #[test]
+    fn cache_keys_distinguish_runtime_and_types_flavors() {
+        let fs_root = ProjectRoot::new("/").expect("absolute root");
+        let mut host = MemoryHost::default();
+        host.file("/dir/index.d.ts", "export {};\n");
+        host.file("/dir/index.ts", "export {};\n");
+        let options = options_with_resolution("bundler");
+        let mut cache = ResolutionCache::new();
+        let runtime = resolve_module_name(
+            &fs_root,
+            &options,
+            "/main.ts",
+            "./dir/index",
+            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        )
+        .expect("runtime flavor");
+        let types = resolve_type_reference(
+            &fs_root,
+            &options,
+            "/main.ts",
+            "./dir/index",
+            (ModuleResolutionKind::Bundler, ResolutionMode::Import),
+            &host,
+            &mut cache,
+        )
+        .expect("types flavor");
+        assert_eq!(runtime.path(), Path::new("/dir/index.ts"));
+        assert_eq!(types.path(), Path::new("/dir/index.d.ts"));
+        assert_eq!(cache.len(), 2);
     }
 }

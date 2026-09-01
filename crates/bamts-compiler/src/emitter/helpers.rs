@@ -12,6 +12,8 @@
 //! * **Stable order.** `[B, A]` and `[A, B]` produce byte-identical preludes.
 //! * **Closed catalog.** Unknown helpers cannot be manufactured at runtime; the
 //!   [`HelperKind`] enum is the whole set.
+//! * **Exact semantics.** Helpers whose contract is stronger than the external
+//!   provider stay inline even when `importHelpers` is enabled.
 //! * **Negative paths.** Importing helpers into a non-module file under ESM
 //!   style, or requesting a helper the catalog cannot satisfy, yields a typed
 //!   [`Diagnostic`] rather than silent fallback.
@@ -121,6 +123,7 @@ pub enum HelperKind {
     ClassPrivateFieldGet,
     ClassPrivateFieldSet,
     ClassPrivateFieldIn,
+    PropKey,
 }
 
 impl HelperKind {
@@ -146,6 +149,7 @@ impl HelperKind {
             Self::ClassPrivateFieldGet,
             Self::ClassPrivateFieldSet,
             Self::ClassPrivateFieldIn,
+            Self::PropKey,
         ]
     }
 
@@ -171,6 +175,7 @@ impl HelperKind {
             Self::ClassPrivateFieldGet => "__classPrivateFieldGet",
             Self::ClassPrivateFieldSet => "__classPrivateFieldSet",
             Self::ClassPrivateFieldIn => "__classPrivateFieldIn",
+            Self::PropKey => "__propKey",
         }
     }
 
@@ -183,6 +188,12 @@ impl HelperKind {
             Self::ImportStar => &[Self::CreateBinding],
             _ => &[],
         }
+    }
+
+    /// Returns whether the configured external provider satisfies this helper's contract.
+    #[must_use]
+    pub const fn can_import(self) -> bool {
+        !matches!(self, Self::PropKey)
     }
 
     /// Returns the inlined `function` declaration, including a trailing newline.
@@ -242,6 +253,9 @@ impl HelperKind {
             }
             Self::ClassPrivateFieldIn => {
                 "function __classPrivateFieldIn(state, receiver) {\n    if (receiver === null || (typeof receiver !== \"object\" && typeof receiver !== \"function\")) throw new TypeError(\"Cannot use 'in' operator on non-object\");\n    return typeof state === \"function\" ? receiver === state : state.has(receiver);\n}\n"
+            }
+            Self::PropKey => {
+                "function __propKey(value) {\n    var exotic, method, primitive, type = typeof value;\n    if (value === null || (type !== \"object\" && type !== \"function\")) return type === \"symbol\" ? value : \"\" + value;\n    exotic = typeof Symbol === \"function\" && Symbol.toPrimitive ? value[Symbol.toPrimitive] : void 0;\n    if (exotic !== void 0 && exotic !== null) {\n        if (typeof exotic !== \"function\") throw new TypeError(\"@@toPrimitive must be a function\");\n        primitive = exotic.call(value, \"string\");\n        type = typeof primitive;\n        if (primitive !== null && (type === \"object\" || type === \"function\")) throw new TypeError(\"@@toPrimitive must return a primitive value\");\n        return type === \"symbol\" ? primitive : \"\" + primitive;\n    }\n    method = value.toString;\n    if (typeof method === \"function\") {\n        primitive = method.call(value);\n        type = typeof primitive;\n        if (primitive === null || (type !== \"object\" && type !== \"function\")) return type === \"symbol\" ? primitive : \"\" + primitive;\n    }\n    method = value.valueOf;\n    if (typeof method === \"function\") {\n        primitive = method.call(value);\n        type = typeof primitive;\n        if (primitive === null || (type !== \"object\" && type !== \"function\")) return type === \"symbol\" ? primitive : \"\" + primitive;\n    }\n    throw new TypeError(\"Cannot convert object to primitive value\");\n}\n"
             }
         }
     }
@@ -356,8 +370,19 @@ fn emit_closed(
         };
     }
 
-    let import = options.import_helpers;
-    if import && options.style == HelperStyle::EsModule && !file.is_some_and(is_external_module) {
+    let external_imports = options.import_helpers && options.style != HelperStyle::Inline;
+    let (imported, inline_only): (Vec<_>, Vec<_>) = if external_imports {
+        helpers
+            .iter()
+            .copied()
+            .partition(|helper| helper.can_import())
+    } else {
+        (Vec::new(), helpers.clone())
+    };
+    if !imported.is_empty()
+        && options.style == HelperStyle::EsModule
+        && !file.is_some_and(is_external_module)
+    {
         let (source_id, range) = file.map_or((SourceId::new(0), empty_range()), |file| {
             (file.source_id(), file.range())
         });
@@ -375,14 +400,23 @@ fn emit_closed(
         };
     }
 
-    let prelude = if import {
-        match options.style {
-            HelperStyle::Inline => inline_prelude(&helpers),
-            HelperStyle::EsModule => es_import_prelude(&helpers, &options.module_specifier),
-            HelperStyle::CommonJs => cjs_prelude(&helpers, &options.module_specifier),
+    let prelude = match options.style {
+        HelperStyle::Inline => inline_prelude(&inline_only),
+        HelperStyle::EsModule if external_imports => {
+            let mut prelude = if imported.is_empty() {
+                String::new()
+            } else {
+                es_import_prelude(&imported, &options.module_specifier)
+            };
+            prelude.push_str(&inline_prelude(&inline_only));
+            prelude
         }
-    } else {
-        inline_prelude(&helpers)
+        HelperStyle::CommonJs if external_imports => {
+            let mut prelude = cjs_prelude(&imported, &options.module_specifier);
+            prelude.push_str(&inline_prelude(&inline_only));
+            prelude
+        }
+        HelperStyle::EsModule | HelperStyle::CommonJs => inline_prelude(&inline_only),
     };
 
     diagnostics.sort();

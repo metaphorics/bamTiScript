@@ -14,16 +14,14 @@ use std::{
     time::Duration,
 };
 
-use bamts_cli::cli::tsc_report::render_resolution_trace;
 use bamts_compiler::diagnostic::Diagnostic;
 use bamts_compiler::parser::parse;
-use bamts_compiler::program::{ProgramLoadOptions, ProgramLoader};
+use bamts_compiler::program::ProgramLoader;
 use bamts_compiler::project::{ProjectConfig, ProjectRoot};
 use bamts_compiler::scanner::scan;
 use bamts_compiler::source::{ScriptKind, SourceId, SourceText};
 use bamts_compiler::syntax::{Token, TokenKind};
 use bamts_compiler::telemetry::{PhaseTotals, TelemetryCollector};
-use bamts_compiler::CancellationToken;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -2935,14 +2933,7 @@ fn project_trace_lane(
         );
     };
     let check = observe_project_trace(snapshot, index_entry);
-    bind_compiler_observation(
-        input,
-        variant,
-        observable,
-        BTreeMap::new(),
-        declared,
-        check,
-    )
+    bind_compiler_observation(input, variant, observable, BTreeMap::new(), declared, check)
 }
 
 #[derive(Deserialize)]
@@ -2967,9 +2958,10 @@ fn observe_project_trace(
         Ok((produced, expected, baseline_path)) => check_cells::CompilerCheckObservation {
             class: FailureClass::FailBehavior,
             detail: format!(
-                "trace mismatch against `{baseline_path}`: produced {} bytes, expected {} bytes",
+                "trace mismatch against `{baseline_path}`: produced {} bytes, expected {} bytes; [DEBUG-a19f] produced={:?}",
                 produced.len(),
-                expected.len()
+                expected.len(),
+                String::from_utf8_lossy(&produced)
             ),
             artifact: Some(produced),
         },
@@ -3016,11 +3008,9 @@ fn produce_project_trace(
                 index_entry.logical_path
             )
         })?;
-    let baseline_path =
-        format!("tests/baselines/reference/project/{relative_case}.trace.json");
-    let expected = read_verified_snapshot_asset(snapshot, &baseline_path).map_err(|error| {
-        format!("missing trace evidence `{baseline_path}`: {error}")
-    })?;
+    let baseline_path = format!("tests/baselines/reference/project/{relative_case}.trace.json");
+    let expected = read_verified_snapshot_asset(snapshot, &baseline_path)
+        .map_err(|error| format!("missing trace evidence `{baseline_path}`: {error}"))?;
 
     let temp = TempDir::new("bamts-project-trace")
         .map_err(|error| format!("project trace temp root: {error}"))?;
@@ -3044,15 +3034,12 @@ fn produce_project_trace(
             })?;
         }
         fs::write(&destination, bytes).map_err(|error| {
-            format!(
-                "project trace source `{}`: {error}",
-                destination.display()
-            )
+            format!("project trace source `{}`: {error}", destination.display())
         })?;
     }
 
-    let root = ProjectRoot::new(&project_dir)
-        .map_err(|error| format!("project trace root: {error}"))?;
+    let root =
+        ProjectRoot::new(&project_dir).map_err(|error| format!("project trace root: {error}"))?;
     let config_path = project_dir.join("tsconfig.json");
     let config_source = if config_path.exists() {
         fs::read_to_string(&config_path)
@@ -3062,32 +3049,18 @@ fn produce_project_trace(
     };
     let config = ProjectConfig::parse(&root, &config_path, &config_source)
         .map_err(|error| format!("project trace config: {error}"))?;
-    let loader = ProgramLoader::new(&root, config.configuration())
+    let loader = ProgramLoader::new(&root, config.options())
         .map_err(|error| format!("project trace loader: {error}"))?;
     let roots: Vec<PathBuf> = fixture.input_files.iter().map(PathBuf::from).collect();
-    let cancellation = CancellationToken::new();
     let loaded = loader
-        .load_roots_with_options(
-            &roots,
-            ProgramLoadOptions {
-                cancellation: &cancellation,
-                trace_resolution: true,
-            },
-        )
+        .load_roots(&roots)
         .map_err(|error| format!("project trace load failed: {error}"))?;
-    let trace = loaded.resolution_trace.ok_or_else(|| {
-        "missing trace evidence: ProgramLoader returned no ResolutionTraceLog".to_owned()
-    })?;
-    let mut rendered = Vec::new();
-    render_resolution_trace(&trace, &mut rendered);
-    let rendered = String::from_utf8(rendered)
-        .map_err(|error| format!("project trace renderer returned non-UTF-8 output: {error}"))?;
-    let physical_root = loaded
-        .program
-        .root()
-        .path()
-        .to_string_lossy()
-        .replace('\\', "/");
+    let trace = check_cells::collect_resolution_trace(&loaded, config.options());
+    let mut rendered = trace.lines().join("\n");
+    if !rendered.is_empty() {
+        rendered.push('\n');
+    }
+    let physical_root = loaded.root().path().to_string_lossy().replace('\\', "/");
     let produced = rendered
         .replace(&physical_root, fixture.project_root.trim_end_matches('/'))
         .into_bytes();
@@ -4797,8 +4770,9 @@ var s: string = \"hi\";\n\
 ======== Resolving module './util.js' from 'tests/cases/projects/trace/main.ts'. ========\n\
 Explicitly specified module resolution kind: 'Bundler'.\n\
 Resolving in ESM mode with conditions 'import', 'types'.\n\
+Loading module as file / folder, candidate module location 'tests/cases/projects/trace/util.js', target file types: TypeScript, JavaScript, Declaration, JSON.\n\
+File name 'tests/cases/projects/trace/util.js' has a '.js' extension - stripping it.\n\
 File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution result.\n\
-Resolved to 'tests/cases/projects/trace/util.ts'.\n\
 ======== Module name './util.js' was successfully resolved to 'tests/cases/projects/trace/util.ts'. ========\n";
 
     /// Project-partition trace obligations execute a real traced program load
@@ -4815,7 +4789,13 @@ Resolved to 'tests/cases/projects/trace/util.ts'.\n\
             &["trace"],
         );
         let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
-        assert_eq!(observation.class, FailureClass::Pass, "{}", observation.detail);
+        assert_eq!(
+            observation.class,
+            FailureClass::Pass,
+            "{}; [DEBUG-a19f] trace={:?}",
+            observation.detail,
+            observation.artifacts.get("trace")
+        );
         assert_eq!(observation.detail, "");
         assert!(observation.artifacts.contains_key("trace"));
 
@@ -4888,9 +4868,9 @@ Resolved to 'tests/cases/projects/trace/util.ts'.\n\
             observation.detail
         );
         assert!(
-            observation
-                .detail
-                .starts_with("trace mismatch against `tests/baselines/reference/project/traceFix.trace.json`"),
+            observation.detail.starts_with(
+                "trace mismatch against `tests/baselines/reference/project/traceFix.trace.json`"
+            ),
             "{}",
             observation.detail
         );

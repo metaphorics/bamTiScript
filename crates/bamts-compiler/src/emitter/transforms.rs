@@ -103,6 +103,7 @@ impl LanguageFeature {
     pub const fn since(self) -> ScriptTarget {
         match self {
             Self::Classes | Self::Generators | Self::Destructuring => ScriptTarget::Es2015,
+            Self::AsyncFunctions => ScriptTarget::Es2017,
             Self::Exponentiation => ScriptTarget::Es2016,
             Self::ObjectRestSpread | Self::AsyncIteration => ScriptTarget::Es2018,
             Self::OptionalChaining | Self::NullishCoalescing => ScriptTarget::Es2020,
@@ -552,6 +553,7 @@ struct Rewriter<'a> {
     used_helpers: BTreeSet<HelperKind>,
     key_prelude: Vec<Stmt>,
     expression_temp_scopes: Vec<Vec<IdentifierNode>>,
+    parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
 }
 
@@ -629,6 +631,7 @@ impl<'a> Rewriter<'a> {
             used_helpers: BTreeSet::new(),
             key_prelude: Vec::new(),
             expression_temp_scopes: Vec::new(),
+            parameter_initializer_depths: Vec::new(),
             cjs,
         }
     }
@@ -745,25 +748,24 @@ impl<'a> Rewriter<'a> {
                 }
                 Statement::Export(export) => {
                     plan.is_module = true;
-                    match export {
-                        ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) => {
-                            match inner.data() {
-                                Statement::Class(class) => {
-                                    if let Some(name) = &class.name {
-                                        plan.void_0.push(identifier_text(file, name));
-                                    }
+                    if let ExportDeclaration::Named(ExportNamedDeclaration::Declaration(inner)) =
+                        export
+                    {
+                        match inner.data() {
+                            Statement::Class(class) => {
+                                if let Some(name) = &class.name {
+                                    plan.void_0.push(identifier_text(file, name));
                                 }
-                                Statement::Function(_)
-                                | Statement::Interface(_)
-                                | Statement::TypeAlias(_) => {}
-                                _ => {
-                                    for name in declared_binding_names(file, inner) {
-                                        plan.void_0.push(name);
-                                    }
+                            }
+                            Statement::Function(_)
+                            | Statement::Interface(_)
+                            | Statement::TypeAlias(_) => {}
+                            _ => {
+                                for name in declared_binding_names(file, inner) {
+                                    plan.void_0.push(name);
                                 }
                             }
                         }
-                        _ => {}
                     }
                 }
                 _ => {}
@@ -983,7 +985,7 @@ impl<'a> Rewriter<'a> {
     }
     /// `export default function f() {}` / anonymous `default_1` renaming.
     fn cjs_default_function(&mut self, range: TextRange, function: &FunctionLike) -> Vec<Stmt> {
-        let (mut function, name) = match &function.name {
+        let (function, name) = match &function.name {
             Some(ident) => (
                 function.clone(),
                 self.token_text(ident.data().token()).to_owned(),
@@ -995,7 +997,7 @@ impl<'a> Rewriter<'a> {
                 (renamed, String::from("default_1"))
             }
         };
-        let function = self.rewrite_function_like(&mut function, range);
+        let function = self.rewrite_function_like(&function, range);
         let statement = self.node(range, Statement::Function(FunctionDeclaration { function }));
         let mut out = vec![statement];
         let default_value = self.ident_expr(&name);
@@ -3688,14 +3690,41 @@ impl<'a> Rewriter<'a> {
                 "generators require ScriptTarget::Es2015 or later",
             );
         }
+        let parameters = self.rewrite_parameters(&function.parameters);
         if function.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
-            return self.lower_async_function(function, range);
+            let mut rewritten = function.clone();
+            rewritten.parameters = parameters;
+            return self.lower_async_function(&rewritten, range);
         }
         let body = function.body.as_ref().map(|body| self.rewrite_body(body));
         FunctionLike {
+            parameters,
             body,
             ..function.clone()
         }
+    }
+
+    fn rewrite_parameters(&mut self, parameters: &[ParameterNode]) -> Vec<ParameterNode> {
+        parameters
+            .iter()
+            .map(|parameter| {
+                let initializer = parameter.data().initializer.as_deref().map(|initializer| {
+                    let depth = self.expression_temp_scopes.len();
+                    self.parameter_initializer_depths.push(depth);
+                    let rewritten = self.rewrite_expr(initializer);
+                    let popped = self.parameter_initializer_depths.pop();
+                    debug_assert_eq!(popped, Some(depth));
+                    Box::new(rewritten)
+                });
+                self.node(
+                    parameter.range(),
+                    Parameter {
+                        initializer,
+                        ..parameter.data().clone()
+                    },
+                )
+            })
+            .collect()
     }
 
     fn rewrite_body(&mut self, body: &FunctionBody) -> FunctionBody {
@@ -4143,10 +4172,25 @@ impl<'a> Rewriter<'a> {
         )
     }
 
+    fn coerce_property_key(&mut self, key: &Expr) -> Expr {
+        let key = self.rewrite_expr(key);
+        let range = key.range();
+        let prop_key = self.helper_ident(HelperKind::PropKey);
+        self.node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(prop_key),
+                optional: false,
+                type_arguments: None,
+                arguments: vec![CallArgument::Expression(Box::new(key))],
+            }),
+        )
+    }
+
     /// Lowers `lhs **= rhs` below ES2016 to `lhs = Math.pow(lhs, rhs)`.
-    /// Identifier targets read the binding directly; member targets capture
-    /// the base (and computed keys that are not bare identifiers) in temps so
-    /// every side-effectful piece evaluates exactly once, in source order.
+    /// Identifier targets read the binding directly. Member targets capture
+    /// the base and every computed key so getters and right-hand expressions
+    /// cannot redirect the assignment by mutating either value.
     fn lower_compound_exponentiation(
         &mut self,
         expression: &Expr,
@@ -4167,64 +4211,64 @@ impl<'a> Rewriter<'a> {
                 self.node(expression.range(), lowered)
             }
             AssignmentTarget::Member(member) => {
-                // `super.x` targets flow through the static-super Reflect
-                // lowering, which runs after this pass and cannot see through
-                // synthetic temps, so the source form is left for it.
-                if matches!(member.object.data(), Expression::Super) {
-                    return expression.clone();
+                if self
+                    .parameter_initializer_depths
+                    .last()
+                    .is_some_and(|depth| *depth == self.expression_temp_scopes.len())
+                    && let MemberProperty::Computed(key) = &member.property
+                    && !matches!(member.object.data(), Expression::Super)
+                {
+                    return self.lower_parameter_computed_exponentiation(
+                        expression, assignment, member, key, right,
+                    );
                 }
                 let object = self.rewrite_expr(&member.object);
-                let base = self.expression_temp();
-                let base_reference =
-                    self.node(base.range(), Expression::Identifier(base.clone()));
-                let base_target = self.node(base.range(), AssignmentTarget::Identifier(base));
-                let base_assignment = self.node(
-                    object.range(),
-                    Expression::Assignment(AssignmentExpression {
-                        operator: AssignmentOperator::Assign,
-                        left: base_target,
-                        right: Box::new(object),
-                    }),
-                );
+                let (target_object, read_object) = if matches!(object.data(), Expression::Super) {
+                    (object.clone(), object)
+                } else {
+                    let base = self.expression_temp();
+                    let base_reference =
+                        self.node(base.range(), Expression::Identifier(base.clone()));
+                    let base_target = self.node(base.range(), AssignmentTarget::Identifier(base));
+                    let base_assignment = self.node(
+                        object.range(),
+                        Expression::Assignment(AssignmentExpression {
+                            operator: AssignmentOperator::Assign,
+                            left: base_target,
+                            right: Box::new(object),
+                        }),
+                    );
+                    (base_assignment, base_reference)
+                };
                 let (target_property, read_property) = match &member.property {
                     MemberProperty::Computed(key) => {
-                        let key = self.rewrite_expr(key);
-                        if matches!(key.data(), Expression::Identifier(_)) {
-                            (
-                                MemberProperty::Computed(Box::new(key.clone())),
-                                MemberProperty::Computed(Box::new(key)),
-                            )
-                        } else {
-                            let key_temp = self.expression_temp();
-                            let key_reference = self.node(
-                                key_temp.range(),
-                                Expression::Identifier(key_temp.clone()),
-                            );
-                            let key_target = self.node(
-                                key_temp.range(),
-                                AssignmentTarget::Identifier(key_temp),
-                            );
-                            let key_assignment = self.node(
-                                key.range(),
-                                Expression::Assignment(AssignmentExpression {
-                                    operator: AssignmentOperator::Assign,
-                                    left: key_target,
-                                    right: Box::new(key),
-                                }),
-                            );
-                            (
-                                MemberProperty::Computed(Box::new(key_assignment)),
-                                MemberProperty::Computed(Box::new(key_reference)),
-                            )
-                        }
+                        let coerced_key = self.coerce_property_key(key);
+                        let key_range = coerced_key.range();
+                        let key_temp = self.expression_temp();
+                        let key_reference =
+                            self.node(key_temp.range(), Expression::Identifier(key_temp.clone()));
+                        let key_target =
+                            self.node(key_temp.range(), AssignmentTarget::Identifier(key_temp));
+                        let key_assignment = self.node(
+                            key_range,
+                            Expression::Assignment(AssignmentExpression {
+                                operator: AssignmentOperator::Assign,
+                                left: key_target,
+                                right: Box::new(coerced_key),
+                            }),
+                        );
+                        (
+                            MemberProperty::Computed(Box::new(key_assignment)),
+                            MemberProperty::Computed(Box::new(key_reference)),
+                        )
                     }
                     other => (other.clone(), other.clone()),
                 };
-                let read = self.member_expr(&base_reference, read_property, expression.range());
+                let read = self.member_expr(&read_object, read_property, expression.range());
                 let target = self.node(
                     assignment.left.range(),
                     AssignmentTarget::Member(AssignmentMemberTarget {
-                        object: Box::new(base_assignment),
+                        object: Box::new(target_object),
                         property: target_property,
                     }),
                 );
@@ -4241,7 +4285,91 @@ impl<'a> Rewriter<'a> {
         }
     }
 
+    fn lower_parameter_computed_exponentiation(
+        &mut self,
+        expression: &Expr,
+        assignment: &AssignmentExpression,
+        member: &AssignmentMemberTarget,
+        key: &Expr,
+        right: Expr,
+    ) -> Expr {
+        let (target, read) = self.parameter_computed_reference(expression, assignment, member, key);
+        let powered = self.math_pow(read, right, expression.range());
+        self.node(
+            expression.range(),
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left: target,
+                right: Box::new(powered),
+            }),
+        )
+    }
+
+    fn parameter_computed_reference(
+        &mut self,
+        expression: &Expr,
+        assignment: &AssignmentExpression,
+        member: &AssignmentMemberTarget,
+        key: &Expr,
+    ) -> (AssignmentTargetNode, Expr) {
+        let object = self.rewrite_expr(&member.object);
+        let key = self.coerce_property_key(key);
+        let frame = self.expression_temp();
+        let frame_reference = self.node(frame.range(), Expression::Identifier(frame.clone()));
+        let frame_target = self.node(frame.range(), AssignmentTarget::Identifier(frame));
+        let frame_value = self.node(
+            expression.range(),
+            Expression::Array(ArrayLiteral {
+                elements: vec![
+                    ArrayElement::Expression(Box::new(object)),
+                    ArrayElement::Expression(Box::new(key)),
+                ],
+            }),
+        );
+        // Assign only after key coercion returns. A recursive default initializer can then
+        // overwrite the shared temp without corrupting this invocation's reference.
+        let frame_assignment = self.node(
+            expression.range(),
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left: frame_target,
+                right: Box::new(frame_value),
+            }),
+        );
+        let target = {
+            let object = self.reference_frame_slot(&frame_assignment, "0", expression.range());
+            let property = MemberProperty::Computed(Box::new(self.reference_frame_slot(
+                &frame_reference,
+                "1",
+                expression.range(),
+            )));
+            self.node(
+                assignment.left.range(),
+                AssignmentTarget::Member(AssignmentMemberTarget {
+                    object: Box::new(object),
+                    property,
+                }),
+            )
+        };
+        let read = {
+            let object = self.reference_frame_slot(&frame_reference, "0", expression.range());
+            let property = MemberProperty::Computed(Box::new(self.reference_frame_slot(
+                &frame_reference,
+                "1",
+                expression.range(),
+            )));
+            self.member_expr(&object, property, expression.range())
+        };
+        (target, read)
+    }
+
+    fn reference_frame_slot(&mut self, frame: &Expr, index: &str, range: TextRange) -> Expr {
+        let index = self.number_expr(index);
+        self.member_expr(frame, MemberProperty::Computed(Box::new(index)), range)
+    }
+
     fn rewrite_arrow(&mut self, expression: &Expr, arrow: &ArrowFunction) -> Expr {
+        let parameters = self.rewrite_parameters(&arrow.parameters);
         if arrow.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
             let previous = self.replace_await;
             self.replace_await = true;
@@ -4302,13 +4430,45 @@ impl<'a> Rewriter<'a> {
                 Expression::Arrow(ArrowFunction {
                     is_async: false,
                     type_parameters: None,
-                    parameters: arrow.parameters.clone(),
+                    parameters,
                     return_type: None,
                     body: FunctionBody::Expression(Box::new(call)),
                 }),
             );
         }
-        expression.clone()
+        let body = match &arrow.body {
+            FunctionBody::Expression(expr) => {
+                self.expression_temp_scopes.push(Vec::new());
+                let rewritten = self.rewrite_expr(expr);
+                let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+                match self.temp_declaration(temps, expression.range()) {
+                    None => FunctionBody::Expression(Box::new(rewritten)),
+                    Some(declaration) => {
+                        let returned = self.node(
+                            expression.range(),
+                            Statement::Return(ReturnStatement {
+                                argument: Some(Box::new(rewritten)),
+                            }),
+                        );
+                        FunctionBody::Block(self.node(
+                            expression.range(),
+                            Block {
+                                statements: vec![declaration, returned],
+                            },
+                        ))
+                    }
+                }
+            }
+            other => self.rewrite_body(other),
+        };
+        self.node(
+            expression.range(),
+            Expression::Arrow(ArrowFunction {
+                parameters,
+                body,
+                ..arrow.clone()
+            }),
+        )
     }
 }
 
@@ -4636,7 +4796,7 @@ fn scan_function(
             scan_expression(initializer, features);
         }
     }
-    match function.body.as_deref() {
+    match function.body.as_ref() {
         Some(FunctionBody::Block(body)) => scan_statements(
             file,
             &body.data().statements,
@@ -4697,7 +4857,7 @@ fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) 
         }
         Expression::Array(value) => {
             for element in &value.elements {
-                if let ArrayElement::Expression(expression) = element.data() {
+                if let ArrayElement::Expression(expression) = element {
                     scan_expression(expression, features);
                 }
             }
@@ -4712,7 +4872,7 @@ fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) 
                     ObjectMember::Method(method) => {
                         scan_computed_name(&method.name, features);
                         scan_parameter_defaults(&method.function.parameters, features);
-                        scan_nested_body(method.function.body.as_deref(), features);
+                        scan_nested_body(method.function.body.as_ref(), features);
                     }
                     ObjectMember::Spread(spread) => scan_expression(&spread.argument, features),
                     ObjectMember::Missing(_) => {}
@@ -4721,7 +4881,7 @@ fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) 
         }
         Expression::Function(value) => {
             scan_parameter_defaults(&value.function.parameters, features);
-            scan_nested_body(value.function.body.as_deref(), features);
+            scan_nested_body(value.function.body.as_ref(), features);
         }
         Expression::Class(value) => scan_class_expressions(&value.class, features),
         Expression::Arrow(value) => {
@@ -4813,7 +4973,7 @@ fn scan_target(target: &AssignmentTarget, features: &mut BTreeSet<LanguageFeatur
         }
         AssignmentTarget::Array(pattern) => {
             for element in &pattern.elements {
-                if let AssignmentArrayElement::Target(inner) = element.data() {
+                if let AssignmentArrayElement::Target(inner) = element {
                     scan_target(inner.data(), features);
                 }
             }
@@ -4830,10 +4990,7 @@ fn scan_computed_name(name: &PropertyName, features: &mut BTreeSet<LanguageFeatu
 }
 
 /// Scans parameter default values for exponentiation syntax.
-fn scan_parameter_defaults(
-    parameters: &[ParameterNode],
-    features: &mut BTreeSet<LanguageFeature>,
-) {
+fn scan_parameter_defaults(parameters: &[ParameterNode], features: &mut BTreeSet<LanguageFeature>) {
     for parameter in parameters {
         if let Some(initializer) = parameter.data().initializer.as_deref() {
             scan_expression(initializer, features);
@@ -4933,7 +5090,7 @@ fn scan_nested_statements(statements: &[Stmt], features: &mut BTreeSet<LanguageF
             }
             Statement::Function(function) => {
                 scan_parameter_defaults(&function.function.parameters, features);
-                scan_nested_body(function.function.body.as_deref(), features);
+                scan_nested_body(function.function.body.as_ref(), features);
             }
             Statement::Class(class) => scan_class_expressions(class, features),
             Statement::Block(block) => {
@@ -4968,7 +5125,7 @@ fn scan_class_expressions(class: &ClassDeclaration, features: &mut BTreeSet<Lang
             ClassMember::Method(method) => {
                 scan_computed_name(&method.name, features);
                 scan_parameter_defaults(&method.function.parameters, features);
-                scan_nested_body(method.function.body.as_deref(), features);
+                scan_nested_body(method.function.body.as_ref(), features);
             }
             ClassMember::AutoAccessor(accessor) => {
                 scan_computed_name(&accessor.name, features);
@@ -4989,7 +5146,7 @@ mod tests {
     use super::{LanguageFeature, ScriptTarget, analyze, codes, emit_transformed};
     use crate::checker;
     use crate::diagnostic::Recovered;
-    use crate::emitter::{EmitFileNames, EmitOptions, EmitOutput};
+    use crate::emitter::{EmitFileNames, EmitOptions, EmitOutput, ModuleKind};
     use crate::parser;
     use crate::scanner;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -5894,7 +6051,10 @@ console.log(JSON.stringify([bar, bar4, log]));
     fn es5_downlevels_compound_exponentiation_identifiers() {
         // Upstream compoundExponentiationAssignmentLHSIsReference: identifier
         // targets become `x = Math.pow(x, value)` without temps.
-        let output = emit_at("var x = 2;\nvar value = 3;\nx **= value;\n", ScriptTarget::Es5);
+        let output = emit_at(
+            "var x = 2;\nvar value = 3;\nx **= value;\n",
+            ScriptTarget::Es5,
+        );
         let code = javascript(&output);
         assert!(code.contains("x = Math.pow(x, value)"), "{code}");
         assert!(!code.contains("**"), "{code}");
@@ -5911,17 +6071,20 @@ console.log(JSON.stringify([bar, bar4, log]));
             code.contains("(_t0 = pick()).v = Math.pow(_t0.v, 3)"),
             "{code}"
         );
-        assert_eq!(code.matches("pick()").count(), 1, "{code}");
+        assert_eq!(code.matches("_t0 = pick()").count(), 1, "{code}");
         // Declaration plus the pick return; the lowering never re-evaluates it.
         assert_eq!(code.matches("obj").count(), 2, "{code}");
     }
 
     #[test]
     fn es5_compound_exponentiation_captures_computed_keys() {
-        let output = emit_at("var obj = { a: 2 };\nobj[\"a\"] **= 3;\n", ScriptTarget::Es5);
+        let output = emit_at(
+            "var obj = { a: 2 };\nobj[\"a\"] **= 3;\n",
+            ScriptTarget::Es5,
+        );
         let code = javascript(&output);
         assert!(
-            code.contains("(_t0 = obj)[_t1 = \"a\"] = Math.pow(_t0[_t1], 3)"),
+            code.contains("(_t0 = obj)[_t1 = __propKey(\"a\")] = Math.pow(_t0[_t1], 3)"),
             "{code}"
         );
     }
@@ -5948,7 +6111,17 @@ console.log(JSON.stringify([bar, bar4, log]));
         );
         let code = javascript(&output);
         assert!(!code.contains("**"), "{code}");
-        let result = run_node_in_owned_dir(code, "bamts-exponentiation", "program.cjs");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bamts-exponentiation-{nonce}.cjs"));
+        std::fs::write(&path, code).expect("write lowered JavaScript");
+        let result = std::process::Command::new("node")
+            .arg(&path)
+            .output()
+            .expect("execute Node");
+        let _ = std::fs::remove_file(&path);
         assert!(
             result.status.success(),
             "{}\n{code}",
@@ -5964,11 +6137,13 @@ console.log(JSON.stringify([bar, bar4, log]));
     #[test]
     fn es2016_preserves_exponentiation_operators() {
         let source = "var r = a ** 2;\na **= 2;\n";
-        let es2016 = javascript(&emit_at(source, ScriptTarget::Es2016));
+        let es2016_output = emit_at(source, ScriptTarget::Es2016);
+        let es2016 = javascript(&es2016_output);
         assert!(es2016.contains("**"), "{es2016}");
         assert!(es2016.contains("**="), "{es2016}");
         assert!(!es2016.contains("Math.pow"), "{es2016}");
-        let es2015 = javascript(&emit_at(source, ScriptTarget::Es2015));
+        let es2015_output = emit_at(source, ScriptTarget::Es2015);
+        let es2015 = javascript(&es2015_output);
         assert!(es2015.contains("Math.pow(a, 2)"), "{es2015}");
         assert!(!es2015.contains("**"), "{es2015}");
     }
@@ -6000,5 +6175,229 @@ console.log(JSON.stringify([bar, bar4, log]));
         );
         let plain = analyze(&parse("var r = a * b;\n"), &options);
         assert!(!plain.features.contains(&LanguageFeature::Exponentiation));
+    }
+
+    #[test]
+    fn es5_rewrites_exponentiation_inside_synchronous_arrows() {
+        let output = emit_at(
+            "var expression = () => 2 ** 3;\n\
+             var block = () => { var x = 2; x **= 3; return x; };\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert_eq!(code.matches("Math.pow").count(), 2, "{code}");
+        assert!(!code.contains("**"), "{code}");
+    }
+
+    #[test]
+    fn es5_rewrites_exponentiation_inside_parameter_initializers() {
+        let output = emit_at(
+            "function f(x = 2 ** 3) { return x; }\n\
+             var g = (x = 3 ** 2) => x;\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert_eq!(code.matches("Math.pow").count(), 2, "{code}");
+        assert!(!code.contains("**"), "{code}");
+    }
+
+    #[test]
+    fn es5_captures_computed_identifier_keys_before_getters() {
+        let output = emit_at(
+            "var key = \"a\";\n\
+             var obj = { get a() { key = \"b\"; return 2; } };\n\
+             obj[key] **= 3;\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("(_t0 = obj)[_t1 = __propKey(key)] = Math.pow(_t0[_t1], 3)"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es5_compound_exponentiation_coerces_computed_key_once() {
+        let output = emit_at(
+            "var coercions = 0;\n\
+             var property = Symbol(\"x\");\n\
+             var key = {};\n\
+             key[Symbol.toPrimitive] = function (hint) {\n\
+                 coercions += 1;\n\
+                 if (hint !== \"string\") throw new Error(\"wrong hint\");\n\
+                 return property;\n\
+             };\n\
+             var obj = {};\n\
+             obj[property] = 2;\n\
+             obj[key] **= 3;\n\
+             console.log(coercions + \":\" + obj[property]);\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(code)
+            .output()
+            .expect("execute Node");
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "1:8\n", "{code}");
+    }
+
+    #[test]
+    fn es5_property_key_conversion_reads_ordinary_method_once() {
+        let output = emit_at(
+            "var reads = 0;\n\
+             var calls = 0;\n\
+             var key = {};\n\
+             Object.defineProperty(key, \"toString\", {\n\
+                 get: function () {\n\
+                     reads += 1;\n\
+                     return function () { calls += 1; return \"x\"; };\n\
+                 }\n\
+             });\n\
+             var obj = { x: 2 };\n\
+             obj[key] **= 2;\n\
+             console.log(reads + \":\" + calls + \":\" + obj.x);\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(code)
+            .output()
+            .expect("execute Node");
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "1:1:4\n", "{code}");
+    }
+
+    #[test]
+    fn es5_property_key_conversion_without_symbol_uses_ordinary_methods() {
+        let output = emit_at(
+            "var Symbol = void 0;\n\
+             var key = {};\n\
+             var obj = { \"[object Object]\": 2 };\n\
+             obj[key] **= 3;\n\
+             console.log(obj[\"[object Object]\"]);\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(code)
+            .output()
+            .expect("execute Node");
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "8\n", "{code}");
+    }
+
+    #[test]
+    fn imported_helpers_keep_exact_property_key_conversion_inline() {
+        let mut options = options_for(ScriptTarget::Es5);
+        options.import_helpers = true;
+        options.module = Some(ModuleKind::CommonJs);
+        let output = emit_with_options(
+            "var property = Symbol(\"x\");\n\
+             var key = {};\n\
+             key[Symbol.toPrimitive] = function () { return property; };\n\
+             var obj = {};\n\
+             obj[property] = 2;\n\
+             obj[key] **= 3;\n\
+             console.log(obj[property]);\n",
+            options,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("function __propKey"), "{code}");
+        assert!(!code.contains("require(\"tslib\").__propKey"), "{code}");
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(code)
+            .output()
+            .expect("execute Node");
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "8\n", "{code}");
+    }
+
+    #[test]
+    fn es2015_static_super_exponentiation_uses_math_pow() {
+        let output = emit_at(
+            "class Base { static x = 2; }\n\
+             class Derived extends Base { static m() { super.x **= 3; } }\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("Math.pow"), "{code}");
+        assert!(!code.contains("**"), "{code}");
+    }
+    #[test]
+    fn es2015_static_block_super_exponentiation_uses_math_pow() {
+        let output = emit_at(
+            "class Base { static x = 2; }\n\
+             class Derived extends Base { static { super.x **= 3; } }\n\
+             console.log(Derived.x);\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("Math.pow"), "{code}");
+        assert!(!code.contains("**"), "{code}");
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(code)
+            .output()
+            .expect("execute Node");
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "8\n", "{code}");
+    }
+
+    #[test]
+    fn es5_parameter_compound_exponentiation_is_reentrant() {
+        let output = emit_at(
+            "var depth = 0;\n\
+             var outer = { x: 2 };\n\
+             var inner = { x: 5 };\n\
+             function update(target, key, value = target[key] **= 2) { return value; }\n\
+             var reentrant = {};\n\
+             reentrant[Symbol.toPrimitive] = function () {\n\
+                 if (depth++ === 0) update(inner, \"x\");\n\
+                 return \"x\";\n\
+             };\n\
+             console.log(update(outer, reentrant) + \":\" + outer.x + \":\" + inner.x);\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(code)
+            .output()
+            .expect("execute Node");
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            "4:4:25\n",
+            "{code}"
+        );
     }
 }

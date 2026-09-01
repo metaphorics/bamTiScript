@@ -30,7 +30,7 @@ use bamts_compiler::pipeline::{
 };
 use bamts_compiler::program::{ModuleEdgeKind, ProgramLoader, ResolvedProgram};
 use bamts_compiler::project::resolution::{
-    ModuleResolutionKind, ResolutionCache, ResolutionHost, ResolutionMode,
+    ModuleResolutionKind, ResolutionCache, ResolutionHost, TraceResolutionServices,
     resolve_module_name_with_trace,
 };
 use bamts_compiler::project::resolution_trace::ResolutionTraceLog;
@@ -2049,6 +2049,37 @@ fn resolution_kind(options: &CompilerOptions) -> ModuleResolutionKind {
         None => ModuleResolutionKind::Bundler,
     }
 }
+pub(crate) fn collect_resolution_trace(
+    program: &ResolvedProgram,
+    options: &CompilerOptions,
+) -> ResolutionTraceLog {
+    let root = program.root();
+    let kind = resolution_kind(options);
+    let host = FilesystemResolutionHost;
+    let mut cache = ResolutionCache::new();
+    let mut log = ResolutionTraceLog::default();
+    for module in program.modules() {
+        let importer = module.path();
+        for edge in module.dependencies() {
+            if edge.kind() == ModuleEdgeKind::DynamicRuntime {
+                continue;
+            }
+            let _ = resolve_module_name_with_trace(
+                root,
+                options,
+                importer,
+                edge.specifier(),
+                (kind, edge.mode(), edge.flavor()),
+                TraceResolutionServices {
+                    host: &host,
+                    cache: &mut cache,
+                    log: &mut log,
+                },
+            );
+        }
+    }
+    log
+}
 
 /// Record the `trace` observable: compile the case, re-resolve each import
 /// specifier through `resolve_module_name_with_trace` to produce upstream
@@ -2092,39 +2123,7 @@ pub(crate) fn observe_trace(
             artifact: None,
         };
     };
-    let program = case.program();
-    let options = case.options();
-    let root = program.root();
-    let kind = resolution_kind(options);
-    let host = FilesystemResolutionHost;
-    let mut cache = ResolutionCache::new();
-    let mut log = ResolutionTraceLog::default();
-    // Re-resolve each module's static-runtime and type-only import specifiers
-    // through the trace producer. Dynamic imports are skipped: upstream
-    // `traceResolution` does not trace `import()` calls.
-    for module in program.modules() {
-        let importer = module.path();
-        for edge in module.dependencies() {
-            if edge.kind() == ModuleEdgeKind::DynamicRuntime {
-                continue;
-            }
-            let mode = if program.is_commonjs() {
-                ResolutionMode::Require
-            } else {
-                ResolutionMode::Import
-            };
-            let _ = resolve_module_name_with_trace(
-                root,
-                options,
-                importer,
-                edge.specifier(),
-                (kind, mode),
-                &host,
-                &mut cache,
-                &mut log,
-            );
-        }
-    }
+    let log = collect_resolution_trace(case.program(), case.options());
     let unsupported: Vec<&str> = log
         .unsupported()
         .iter()
