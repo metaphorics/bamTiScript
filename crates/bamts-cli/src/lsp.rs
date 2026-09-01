@@ -721,8 +721,19 @@ fn uri_to_path(uri: &str) -> Result<PathBuf, String> {
     let rest = uri
         .strip_prefix("file://")
         .ok_or_else(|| format!("unsupported URI scheme: {uri}"))?;
-    let path = rest.strip_prefix("localhost").unwrap_or(rest);
-    let decoded = percent_decode(path)?;
+    // RFC 8089: only the empty authority and `localhost` denote this
+    // machine. Any other authority is a remote file; treating it as a
+    // relative path would read and write under the server's working
+    // directory instead.
+    let path = match rest.split_once('/') {
+        Some(("", path)) => path,
+        Some(("localhost", path)) => path,
+        Some((authority, _)) => {
+            return Err(format!("nonlocal file URI authority: {authority}"));
+        }
+        None => return Err("file URI has no path".to_owned()),
+    };
+    let decoded = percent_decode(&format!("/{path}"))?;
     Ok(PathBuf::from(decoded))
 }
 
@@ -1338,6 +1349,26 @@ mod tests {
             "{rename_response:?}"
         );
         assert!(rename_response["result"].is_null(), "{rename_response:?}");
+    }
+
+    #[test]
+    fn nonlocal_file_uri_authorities_are_rejected() {
+        assert_eq!(
+            uri_to_path("file:///tmp/a.ts").expect("empty authority"),
+            PathBuf::from("/tmp/a.ts")
+        );
+        assert_eq!(
+            uri_to_path("file://localhost/tmp/a.ts").expect("localhost"),
+            PathBuf::from("/tmp/a.ts")
+        );
+        let rejected = uri_to_path("file://evil.com/share.ts");
+        assert!(
+            rejected.as_deref().is_err_and(|message| {
+                message.contains("nonlocal file URI authority: evil.com")
+            }),
+            "{rejected:?}"
+        );
+        assert!(uri_to_path("file://evil.com").is_err());
     }
 
     #[test]
