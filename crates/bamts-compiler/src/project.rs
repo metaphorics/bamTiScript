@@ -1305,7 +1305,7 @@ fn optional_nested_string(
 fn optional_jsx_emit(object: Option<&JsonObject>) -> Result<Option<JsxEmit>, ConfigError> {
     optional_nested_string(object, "jsx")?
         .map(|value| {
-            value.parse().map_err(|()| {
+            value.trim().to_ascii_lowercase().parse().map_err(|()| {
                 invalid_field(
                     "jsx",
                     r#"one of "preserve", "react", "react-native", "react-jsx", or "react-jsxdev""#,
@@ -1321,10 +1321,14 @@ fn optional_bool(
 ) -> Result<Option<bool>, ConfigError> {
     object
         .and_then(|object| object.get(key))
-        .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| invalid_field(key, "a boolean"))
+        .map(|value| match value {
+            JsonValue::Bool(b) => Ok(*b),
+            JsonValue::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(invalid_field(key, "a boolean")),
+            },
+            _ => Err(invalid_field(key, "a boolean")),
         })
         .transpose()
 }
@@ -2470,7 +2474,7 @@ mod tests {
         let jsx = ProjectConfig::parse(
             &root(),
             "/workspace/corpus/tsconfig.json",
-            r#"{"compilerOptions":{"jsx":"React"}}"#,
+            r#"{"compilerOptions":{"jsx":"invalid-mode"}}"#,
         )
         .expect_err("jsx values use the canonical closed set");
         assert!(matches!(
@@ -2785,5 +2789,184 @@ mod tests {
                 .expect("bare typings entry"),
             PathBuf::from("/workspace/corpus/projects/mitt/index.d.ts")
         );
+    }
+
+    // ── F13: tsconfig field validation accepts TypeScript-coerced forms ──
+
+    #[test]
+    fn f13_string_true_parses_as_boolean_true() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"incremental": "true"}}"#,
+        )
+        .expect("string \"true\" must coerce to boolean");
+        assert!(config.options().incremental());
+    }
+
+    #[test]
+    fn f13_string_false_parses_as_boolean_false() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"incremental": "false"}}"#,
+        )
+        .expect("string \"false\" must coerce to boolean");
+        assert!(!config.options().incremental());
+    }
+
+    #[test]
+    fn f13_string_true_case_insensitive_parses_as_boolean_true() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"composite": "True"}}"#,
+        )
+        .expect("string \"True\" must coerce to boolean");
+        assert!(config.options().composite());
+    }
+
+    #[test]
+    fn f13_string_true_with_whitespace_parses_as_boolean_true() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"incremental": " true "}}"#,
+        )
+        .expect("string \" true \" must coerce to boolean");
+        assert!(config.options().incremental());
+    }
+
+    #[test]
+    fn f13_string_composite_true_parses_as_boolean_true() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"composite": "true"}}"#,
+        )
+        .expect("string \"true\" must coerce to boolean for composite");
+        assert!(config.options().composite());
+    }
+
+    #[test]
+    fn f13_invalid_string_still_rejected_for_boolean_field() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let error = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"incremental": "yes"}}"#,
+        )
+        .expect_err("non-boolean string must be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidField { ref field, .. } if field.as_ref() == "incremental"
+        ));
+    }
+
+    #[test]
+    fn f13_number_still_rejected_for_boolean_field() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let error = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"incremental": 1}}"#,
+        )
+        .expect_err("number must be rejected for boolean field");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidField { ref field, .. } if field.as_ref() == "incremental"
+        ));
+    }
+
+    #[test]
+    fn f13_jsx_preserve_capital_parses_case_insensitively() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"jsx": "Preserve"}}"#,
+        )
+        .expect("capitalized jsx value must be accepted");
+        assert_eq!(config.options().jsx(), Some(JsxEmit::Preserve));
+    }
+
+    #[test]
+    fn f13_jsx_react_uppercase_parses_case_insensitively() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"jsx": "REACT"}}"#,
+        )
+        .expect("uppercase jsx value must be accepted");
+        assert_eq!(config.options().jsx(), Some(JsxEmit::React));
+    }
+
+    #[test]
+    fn f13_jsx_react_native_mixed_case_parses_case_insensitively() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"jsx": "React-Native"}}"#,
+        )
+        .expect("mixed-case jsx value must be accepted");
+        assert_eq!(config.options().jsx(), Some(JsxEmit::ReactNative));
+    }
+
+    #[test]
+    fn f13_jsx_react_jsx_mixed_case_parses_case_insensitively() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"jsx": "React-JSX"}}"#,
+        )
+        .expect("mixed-case jsx value must be accepted");
+        assert_eq!(config.options().jsx(), Some(JsxEmit::ReactJsx));
+    }
+
+    #[test]
+    fn f13_jsx_react_jsxdev_mixed_case_parses_case_insensitively() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"jsx": "React-JSXDev"}}"#,
+        )
+        .expect("mixed-case jsx value must be accepted");
+        assert_eq!(config.options().jsx(), Some(JsxEmit::ReactJsxDev));
+    }
+
+    #[test]
+    fn f13_jsx_with_whitespace_parses_case_insensitively() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let config = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"jsx": "  Preserve  "}}"#,
+        )
+        .expect("whitespace-padded jsx value must be accepted");
+        assert_eq!(config.options().jsx(), Some(JsxEmit::Preserve));
+    }
+
+    #[test]
+    fn f13_jsx_invalid_string_still_rejected() {
+        let root = ProjectRoot::new("/workspace").expect("valid root");
+        let error = ProjectConfig::parse(
+            &root,
+            "/workspace/tsconfig.json",
+            r#"{"compilerOptions": {"jsx": "react-jsx-foo"}}"#,
+        )
+        .expect_err("invalid jsx value must be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidField { ref field, .. } if field.as_ref() == "jsx"
+        ));
     }
 }
