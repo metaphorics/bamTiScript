@@ -16,6 +16,13 @@ fn main() {
     if lsp_transport_requested(&argv) {
         std::process::exit(run_lsp());
     }
+    if bamts_cli::cli::native_execution_requested(&argv) {
+        let outcome = bamts_cli::cli::cli_outcome(argv);
+        if write_stderr(&outcome.stderr) != 0 || write_stdout(&outcome.stdout) != 0 {
+            std::process::exit(1);
+        }
+        std::process::exit(outcome.exit_code);
+    }
     let exit_code = match parse_tsc_args(&argv) {
         Ok(command) => match execute_tsc(&command) {
             Ok(outcome) => {

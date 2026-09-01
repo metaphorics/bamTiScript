@@ -66,6 +66,21 @@ fn cli_outcome_with(
     }
 }
 
+/// Whether any argument selects the native execution front.
+///
+/// The tsc-compatible front rejects `--run`, `-r`, `--jit`, and `--aot` as
+/// unknown compiler options, so their presence routes the whole invocation
+/// to the native parser that documents them. `--target` is deliberately
+/// excluded: tsc owns it as the ECMAScript target flag.
+pub fn native_execution_requested<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .any(|token| matches!(token.as_ref(), "--run" | "-r" | "--jit" | "--aot"))
+}
+
 fn driver_error_outcome(error: &DriverError) -> CommandOutcome {
     let (stderr, truncation) = match error {
         DriverError::ProgramLoad(error) => (
@@ -142,6 +157,19 @@ mod tests {
         assert!(usage.stderr.ends_with(help_message().as_bytes()));
     }
 
+    #[test]
+    fn native_execution_routing_matches_only_native_flags() {
+        assert!(native_execution_requested(["--run"]));
+        assert!(native_execution_requested(["-r", "app.ts"]));
+        assert!(native_execution_requested(["--jit"]));
+        assert!(native_execution_requested(["--aot"]));
+        assert!(!native_execution_requested([
+            "--target", "es2020", "app.ts"
+        ]));
+        assert!(!native_execution_requested(["--build", "src"]));
+        assert!(!native_execution_requested(["app.ts"]));
+        assert!(!native_execution_requested(["--watch"]));
+    }
     #[test]
     fn driver_failures_keep_cli_bytes_and_exit_code() {
         let (directory, context) = context();
