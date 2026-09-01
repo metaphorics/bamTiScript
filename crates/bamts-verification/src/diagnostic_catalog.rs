@@ -55,8 +55,7 @@ const BOILERPLATE: &str = r###"
 //! This module is a stable, deterministic table of the diagnostic messages
 //! in the TypeScript 7.0.2 authority. Every code and template is unique,
 //! the table is sorted by code, and placeholders are checked at format time.
-//! in the TypeScript 7.0.2 authority. Every code and template is unique,
-//! the table is sorted by code, and placeholders are checked at format time.
+
 
 use crate::diagnostic::{DiagnosticCode, DiagnosticSeverity};
 
