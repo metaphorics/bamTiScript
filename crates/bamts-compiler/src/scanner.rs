@@ -138,22 +138,25 @@ pub fn scan_regex_slice(text: &str) -> (usize, bool) {
             }
         }
         if term {
-            let mut fe = tend;
+            // The flag run is consumed in UTF-16 units like the rest of this
+            // function, so the `v` predicate is decided per code point rather
+            // than by slicing `text`: a UTF-16 count is not a byte offset, and
+            // astral pattern characters make the two diverge mid-code-point.
             let mut fc = dc.clone();
             let mut fcon = tend;
+            let mut flags_have_v = false;
             while {
                 let mut peek = fc.clone();
                 match peek.next() {
                     Some(c) if is_id_continue(c) => {
+                        flags_have_v |= c == 'v';
                         take(&mut fc, &mut fcon);
-                        fe = fcon;
                         true
                     }
                     _ => false,
                 }
             } {}
-            let flags = &text[tend..fe];
-            if flags.contains('v') {
+            if flags_have_v {
                 // Use depth result
                 let mut chars2 = text.chars();
                 let mut consumed2 = 0usize;
@@ -2545,6 +2548,66 @@ mod tests {
         let regex = scanner.rescan_regex();
         assert_eq!(regex.kind(), TokenKind::RegularExpressionLiteral);
         assert_eq!(regex.range().end().get(), "/[[a]/]/v".len());
+        assert_eq!(scanner.next_token().kind(), TokenKind::Semicolon);
+    }
+
+    #[test]
+    fn astral_code_point_identifier_advances_two_utf16_units() {
+        // U+1D627 is a single astral code point: 4 UTF-8 bytes, 2 UTF-16 units.
+        // As a standalone identifier it scans as one token whose range is two
+        // UTF-16 units wide, never panicking on the 4-byte boundary.
+        let standalone = "\u{1D627}";
+        let product = scan_text(standalone).into_product();
+        let ident = &product.tokens()[0];
+        assert_eq!(ident.kind(), TokenKind::Identifier);
+        assert_eq!(ident.range().start().get(), 0);
+        assert_eq!(ident.range().end().get(), 2);
+        assert_eq!(product.token_text(ident), Some(standalone));
+        assert_tiles(standalone);
+
+        // Two astral code points inside one identifier span 4 UTF-16 units, and
+        // the following `=` begins exactly at unit 4 (not at the 8-byte offset).
+        let source = "\u{1D627}\u{1D627}=1";
+        let product = scan_text(source).into_product();
+        let ident = &product.tokens()[0];
+        assert_eq!(ident.kind(), TokenKind::Identifier);
+        assert_eq!(ident.range().len(), 4);
+        assert_eq!(product.tokens()[1].kind(), TokenKind::Eq);
+        assert_eq!(product.tokens()[1].range().start().get(), 4);
+        assert_eq!(product.tokens()[2].kind(), TokenKind::NumericLiteral);
+        assert_eq!(product.tokens()[2].range().start().get(), 5);
+        assert_tiles(source);
+    }
+
+    #[test]
+    fn astral_regex_pattern_and_flags_do_not_panic() {
+        // F14: a 4-byte UTF-8 code point in the pattern body made the flag run
+        // slice `text` at a UTF-16 count treated as a byte offset, panicking
+        // inside a character. The flag predicate is now decided per code point.
+        for body in [
+            "/[\u{1D608}-\u{1D621}]/v;",
+            "/[\u{1D608}-\u{1D621}][\u{1D621}-\u{1D608}]/v;",
+        ] {
+            let source =
+                Arc::new(SourceText::new(body).expect("test source fits the per-file budget"));
+            let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::JavaScript, &source);
+            assert_eq!(scanner.next_token().kind(), TokenKind::Slash);
+            let regex = scanner.rescan_regex();
+            assert_eq!(regex.kind(), TokenKind::RegularExpressionLiteral);
+            // The whole literal including the `v` flag is consumed; only `;` remains.
+            assert_eq!(scanner.next_token().kind(), TokenKind::Semicolon);
+        }
+
+        // Astral flags (the regularExpressionWithNonBMPFlags shape): the flag
+        // run is consumed as identifier-continue code points without slicing.
+        let with_astral_flags = "/(?foo.)/\u{1D628}\u{1D62E}\u{1D634};";
+        let source = Arc::new(
+            SourceText::new(with_astral_flags).expect("test source fits the per-file budget"),
+        );
+        let mut scanner = Scanner::new(SourceId::new(0), ScriptKind::JavaScript, &source);
+        assert_eq!(scanner.next_token().kind(), TokenKind::Slash);
+        let regex = scanner.rescan_regex();
+        assert_eq!(regex.kind(), TokenKind::RegularExpressionLiteral);
         assert_eq!(scanner.next_token().kind(), TokenKind::Semicolon);
     }
 }
