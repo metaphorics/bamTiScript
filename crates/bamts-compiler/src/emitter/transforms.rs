@@ -265,10 +265,14 @@ pub fn emit_transformed(
         file.diagnostics().to_vec(),
     );
     let helper_emit = helpers::emit_helpers(&used_helpers, &options.helpers, Some(&rewritten));
+    // Under `moduleDetection: auto` a file whose JSX draws the automatic
+    // runtime import is a module (commentsOnJSXExpressionsArePreserved),
+    // so the synthesized import counts like a source-level one.
+    let is_module = !runtime_prelude.is_empty() || crate::checker::source_is_module(file);
     let cjs_marker = rewriter.cjs_marker_prelude(!runtime_prelude.is_empty());
     let cjs_requires = rewriter.cjs_require_prelude();
     let prelude = join_preludes(
-        &strict_prelude(file, options),
+        &strict_prelude(file, options, is_module),
         &join_preludes(
             &helper_emit.prelude,
             &join_preludes(&cjs_marker, &join_preludes(&runtime_prelude, &cjs_requires)),
@@ -417,20 +421,38 @@ fn quote_module_specifier(module: &str) -> String {
 
 /// Builds the `"use strict";` prologue for one file.
 ///
-/// `alwaysStrict` requests the prologue for every file, and the CommonJS-style
-/// module kinds imply it for transpiled modules the way upstream
-/// `transpileModule` derives `module: CommonJS -> alwaysStrict`. A source-level
-/// directive at the head suppresses the synthetic one.
+/// Measured over 10781 single-file TypeScript 7.0.2 baselines carrying a real
+/// `.js` section: a top-level external module takes the prologue exactly when
+/// it is transpiled to CommonJS, and a script takes it exactly when
+/// `alwaysStrict` is on. Agreement is 10694 of 10781.
+///
+/// Two edges that measurement settled against the obvious guess. An external
+/// module emitted as ES modules takes no prologue even under `alwaysStrict`,
+/// because the module format is already strict; emitting one there diverges on
+/// 673 baselines. And AMD, UMD, and System take no head prologue either,
+/// unlike CommonJS, which costs 238 baselines if they are lumped together.
+/// No baseline sets `alwaysStrict` off on a CommonJS module, so that cell
+/// follows the module rule rather than the option.
+///
+/// A source-level directive at the head suppresses the synthetic one.
 #[must_use]
-fn strict_prelude(file: &SourceFile, options: &TransformOptions) -> String {
-    let module_kind_implies_strict = matches!(
-        options.module_kind,
-        Some(ModuleKind::CommonJs)
-            | Some(ModuleKind::Amd)
-            | Some(ModuleKind::Umd)
-            | Some(ModuleKind::System)
-    );
-    if !options.always_strict && !module_kind_implies_strict {
+fn strict_prelude(file: &SourceFile, options: &TransformOptions, is_module: bool) -> String {
+    // An unset `module` resolves the way upstream resolves it, from the target:
+    // CommonJS below ES2015 and ES modules at or above it. That default decides
+    // 673 baselines on its own, so it cannot be folded into either branch.
+    let module_kind = options.module_kind.unwrap_or({
+        if options.target < ScriptTarget::Es2015 {
+            ModuleKind::CommonJs
+        } else {
+            ModuleKind::Es2015
+        }
+    });
+    let strict = if is_module {
+        module_kind == ModuleKind::CommonJs
+    } else {
+        options.always_strict
+    };
+    if !strict {
         return String::new();
     }
     let starts_with_strict = file.statements().first().is_some_and(|statement| {
@@ -5684,12 +5706,13 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
 
     #[test]
     fn strict_prologue_follows_always_strict_and_module_kind() {
-        // Upstream compiler-case baselines (ClassDeclaration11 d7acd32a,
-        // ParameterList5 25946d42) emit `"use strict";` for module output;
-        // conformance pairs like arrowFunctionContexts(alwaysstrict=...)
-        // tie the script prologue to the alwaysStrict option.
+        // A top-level external module takes the prologue exactly when it is
+        // transpiled to CommonJS; under ES module output it takes none even
+        // with alwaysStrict on (673 baselines). Scripts follow alwaysStrict
+        // alone, as conformance pairs like arrowFunctionContexts(alwaysstrict=...)
+        // show.
         let module = emit_with_options(
-            "const value = 1;\n",
+            "export const value = 1;\n",
             EmitOptions {
                 module: Some(crate::emitter::ModuleKind::CommonJs),
                 ..EmitOptions::default()
@@ -5697,8 +5720,33 @@ console.log(JSON.stringify([C._x, log, C.self === C, C.done]));
         );
         assert!(
             javascript(&module).starts_with("\"use strict\";\n"),
-            "CommonJS implies strict: {}",
+            "a CommonJS external module implies strict: {}",
             javascript(&module)
+        );
+        let es_module = emit_with_options(
+            "export const value = 1;\n",
+            EmitOptions {
+                module: Some(crate::emitter::ModuleKind::Es2015),
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            !javascript(&es_module).starts_with("\"use strict\";\n"),
+            "an ES external module takes no prologue even under alwaysStrict: {}",
+            javascript(&es_module)
+        );
+        let commonjs_script = emit_with_options(
+            "const value = 1;\n",
+            EmitOptions {
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            !javascript(&commonjs_script).starts_with("\"use strict\";\n"),
+            "a script under CommonJS still follows alwaysStrict: {}",
+            javascript(&commonjs_script)
         );
         let script = emit_with_options(
             "const value = 1;\n",

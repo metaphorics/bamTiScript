@@ -2259,7 +2259,7 @@ mod tests {
     #[test]
     fn always_strict_emits_use_strict_prologue() {
         let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export const a = 1;\n");
+        fixture.write("src/a.ts", "const a = 1;\n");
         fixture.write(
             "tsconfig.json",
             r#"{"files":["src/a.ts"],"compilerOptions":{"alwaysStrict":true,"outDir":"dist"}}"#,
@@ -2287,7 +2287,7 @@ mod tests {
     #[test]
     fn strict_implies_always_strict_prologue() {
         let fixture = Fixture::new();
-        fixture.write("src/a.ts", "export const a = 1;\n");
+        fixture.write("src/a.ts", "const a = 1;\n");
         fixture.write(
             "tsconfig.json",
             r#"{"files":["src/a.ts"],"compilerOptions":{"strict":true,"outDir":"dist"}}"#,

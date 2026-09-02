@@ -789,6 +789,13 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
     if !options.iter().any(|(name, _)| name == "strict") {
         options.push(("strict".to_owned(), "true".to_owned()));
     }
+    // The authority harness pins `alwaysStrict` on rather than deriving it from
+    // `strict`, which is why 2456 baselines declaring `@strict: false` still
+    // carry a `"use strict"` prologue. Leaving it unset lets the compiler fall
+    // back to `strict` and drops the prologue on every one of them.
+    if !options.iter().any(|(name, _)| name == "alwaysStrict") {
+        options.push(("alwaysStrict".to_owned(), "true".to_owned()));
+    }
     let compiler_options = options
         .iter()
         .map(|(name, value)| format!("\"{name}\": {value}"))
