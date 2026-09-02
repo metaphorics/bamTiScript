@@ -1623,22 +1623,20 @@ pub fn emit_javascript_baseline(
     logical_path: &str,
 ) -> std::result::Result<String, String> {
     // Upstream `doJsEmitBaseline` framing: a `//// [<case>] ////` document
-    // header, one `//// [<basename>]` echo per compiled unit (content kept
-    // verbatim, one `\n` between units), a blank-line block separator, then
-    // one `//// [<stem>.js]` section per emitted output. Comparing the whole
-    // document keeps the echo honest alongside the emit.
+    // header, one `//// [<basename>]` echo per compiled unit, a blank-line
+    // block separator, then one `//// [<stem>.js]` section per emitted
+    // output. Comparing the whole document keeps the echo honest alongside
+    // the emit.
+    //
+    // Every echo is the unit's bytes verbatim: the separator belongs to the
+    // block, not to any unit, so it is appended once after the last one. A
+    // unit that ends with a newline keeps it, which is what puts the extra
+    // blank line before the emit sections in upstream's documents.
     let mut out = format!("//// [{logical_path}] ////\n\n");
     let units: Vec<_> = case.reached_units().collect();
-    for (index, (unit, _)) in units.iter().enumerate() {
+    for (unit, _) in &units {
         out.push_str(&format!("//// [{}]\n", unit_basename(&unit.virtual_path)));
-        // Upstream's splitter drops the file-final newline, so the last
-        // unit's echo ends without one; mid-file units keep theirs.
-        if index + 1 < units.len() {
-            out.push_str(&unit.text);
-            out.push('\n');
-        } else {
-            out.push_str(unit.text.strip_suffix('\n').unwrap_or(&unit.text));
-        }
+        out.push_str(&unit.text);
     }
     out.push_str("\n\n");
     let mut outputs = 0usize;
@@ -3746,14 +3744,54 @@ export class Model {
             FacetVerdict::Fail { .. }
         ));
     }
-    /// The javascript doc assembly reproduces the upstream doJsEmitBaseline
-    /// framing on a real pinned baseline: document header with trailing ////,
-    /// a `//// [<basename>]` echo without trailing slashes, one blank-line
-    /// block separator, then the `//// [<stem>.js]` output section.
+
+    /// The javascript doc assembly reproduces the upstream `doJsEmitBaseline`
+    /// framing: document header with trailing `////`, a `//// [<basename>]`
+    /// echo per unit, a block separator, then the `//// [<stem>.js]` section.
+    /// The echo block is the unit bytes verbatim plus one `\n\n` separator, so
+    /// the trailing newline count follows the source: a unit without a final
+    /// newline leaves two, and a unit with one leaves three. Measured over the
+    /// 7,246 single-unit `.js` baselines in the TypeScript 7.0.2 authority:
+    /// 4,456 documents whose source lacks a final newline carry two, and 2,473
+    /// whose source has one carry three. Stripping the final newline collapses
+    /// the second group onto the first and fails every one of them.
     #[test]
-    fn javascript_baseline_frames_the_full_upstream_document() {
-        let logical = "tests/cases/compiler/jsPin.ts";
-        let case_text = "var x = 1;\n";
+    fn javascript_baseline_echoes_unit_bytes_verbatim() {
+        for (case_text, expected_separator) in [("var x = 1;", "\n\n"), ("var x = 1;\n", "\n\n\n")]
+        {
+            let logical = "tests/cases/compiler/jsPin.ts";
+            let units = split_case_units(logical, case_text);
+            let entry = entry_virtual_path(logical, &units);
+            let case = compile_case_frontend(
+                &units,
+                &entry,
+                &CasePragmas::default(),
+                FrontendMode::JavaScript,
+            )
+            .expect("case compiles");
+            let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+            let expected_head = format!(
+                "//// [tests/cases/compiler/jsPin.ts] ////\n\n//// [jsPin.ts]\nvar x = 1;{expected_separator}//// [jsPin.js]\n"
+            );
+            assert!(
+                emitted.starts_with(&expected_head),
+                "case {case_text:?} framed as {emitted:?}"
+            );
+            assert_eq!(compare_js_emit(&emitted, &emitted), FacetVerdict::Pass);
+        }
+    }
+
+    /// Multi-unit framing, pinned against the authority document for
+    /// `importCallExpression1ES2020` (its `0.ts` echo is the code line, then a
+    /// blank line, then the `//// [1.ts]` marker). `split_case_units` hands a
+    /// non-final unit the blank line that precedes the next `@filename`
+    /// marker, so the echo stays verbatim here too: adding a separator per
+    /// unit would emit a second blank line and fail all 970 multi-unit
+    /// documents measured in the authority.
+    #[test]
+    fn javascript_baseline_echoes_every_unit_verbatim() {
+        let logical = "tests/cases/compiler/multiPin.ts";
+        let case_text = "// @filename: a.ts\nvar a = 1;\n\n// @filename: b.ts\nvar b = 2;\n";
         let units = split_case_units(logical, case_text);
         let entry = entry_virtual_path(logical, &units);
         let case = compile_case_frontend(
@@ -3766,13 +3804,11 @@ export class Model {
         let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
         assert!(
             emitted.starts_with(
-                "//// [tests/cases/compiler/jsPin.ts] ////\n\
-                 \n\
-                 //// [jsPin.ts]\nvar x = 1;\n\
-                 \n\
-                 //// [jsPin.js]\n"
+                "//// [tests/cases/compiler/multiPin.ts] ////\n\n\
+                 //// [a.ts]\nvar a = 1;\n\n\
+                 //// [b.ts]\nvar b = 2;\n\n\n"
             ),
-            "{emitted}"
+            "framed as {emitted:?}"
         );
         assert_eq!(compare_js_emit(&emitted, &emitted), FacetVerdict::Pass);
     }

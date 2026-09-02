@@ -4280,7 +4280,11 @@ var s: string = \"hi\";\n\
     /// Framing pin against the byte-exact upstream ClassDeclaration10.js
     /// baseline: document header with trailing ////, verbatim unit echo, one
     /// blank-line separator, then the `//// [ClassDeclaration10.js]` output.
-    const CLASS_DECLARATION_10_SOURCE: &str = "class C {\n   constructor();\n   foo();\n}\n";
+    // Byte-exact from the authority case file, which ends at `}` with no final
+    // newline. The echo is verbatim, so the source's own ending decides the
+    // separator width in the pinned baseline below; adding a newline here would
+    // fabricate a document upstream never produced.
+    const CLASS_DECLARATION_10_SOURCE: &str = "class C {\n   constructor();\n   foo();\n}";
     const CLASS_DECLARATION_10_BASELINE: &str = "//// [tests/cases/compiler/ClassDeclaration10.ts] ////\n\
         \n\
         //// [ClassDeclaration10.ts]\nclass C {\n\
