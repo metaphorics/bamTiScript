@@ -347,13 +347,33 @@ impl LaneRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LaneOutcome {
-    Completed { artifacts: BTreeMap<String, String> },
-    BlockingFail { detail: String },
-    InapplicableLanguageService { detail: String },
-    InapplicableOutOfScopeHostFeature { detail: String },
-    InapplicableV8Internal { detail: String },
-    InapplicableCatalogError { detail: String },
-    ExternalBlocked { detail: String },
+    Completed {
+        artifacts: BTreeMap<String, String>,
+    },
+    BlockingFail {
+        detail: String,
+    },
+    /// The worker observed a deadline expiration before the obligation
+    /// completed.  Mapped to [`TerminalState::Timeout`]; the receipt schema
+    /// is unchanged because `Timeout` already exists as a terminal state.
+    Timeout {
+        detail: String,
+    },
+    InapplicableLanguageService {
+        detail: String,
+    },
+    InapplicableOutOfScopeHostFeature {
+        detail: String,
+    },
+    InapplicableV8Internal {
+        detail: String,
+    },
+    InapplicableCatalogError {
+        detail: String,
+    },
+    ExternalBlocked {
+        detail: String,
+    },
 }
 
 /// Worker response bound to the exact request binding, request ID, and key.
@@ -687,6 +707,7 @@ fn derive_from_response(
         LaneOutcome::BlockingFail { detail } => {
             (TerminalState::BlockingFail, BTreeMap::new(), detail)
         }
+        LaneOutcome::Timeout { detail } => (TerminalState::Timeout, BTreeMap::new(), detail),
         LaneOutcome::InapplicableLanguageService { detail } => (
             TerminalState::InapplicableLanguageService,
             BTreeMap::new(),

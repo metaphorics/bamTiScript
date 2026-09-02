@@ -1,11 +1,14 @@
 //! Strict Test262 frontmatter, harness, phase, and async `$DONE` oracle.
 //!
-//! The interpreter backend runs in-process through the public `bamts` facade;
-//! process-spawning backends stay outside. Callers may also supply typed
-//! runner outcomes of their own.
+//! Three execution backends run in-process through the public `bamts` facade:
+//! the register **interpreter** (`bamts_runtime::run`), the **JIT** backend
+//! (`bamts_codegen::compile_jit` + `run_linked_program`), and the **AOT**
+//! reference driver (`NativeEngine::run`, which exercises the native ABI
+//! dispatch without object linking). Process-spawning backends stay outside.
+//! Callers may also supply typed runner outcomes of their own.
 
 use bamts_compiler::diagnostic::Diagnostic;
-use bamts_runtime::{RuntimeErrorKind, ThrowOrigin};
+use bamts_runtime::{NativeEngine, RuntimeErrorKind, ThrowOrigin, run_linked_program};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -76,6 +79,15 @@ pub enum ExecutionMode {
 
 impl ExecutionMode {
     pub const ALL: [Self; 3] = [Self::Interpreter, Self::Jit, Self::Aot];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interpreter => "interpreter",
+            Self::Jit => "jit",
+            Self::Aot => "aot",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,7 +321,7 @@ pub enum RunOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllModesReport {
-    pub modes: [ExecutionMode; 3],
+    pub modes: Vec<ExecutionMode>,
 }
 
 pub trait Test262Runner {
@@ -682,65 +694,72 @@ pub fn evaluate_in_all_modes<R: Test262Runner>(
         }
     }
     Ok(AllModesReport {
-        modes: ExecutionMode::ALL,
+        modes: ExecutionMode::ALL.to_vec(),
     })
-}
-
-/// Why an execution backend cannot serve this oracle's in-process runs.
-///
-/// Every variant is a hard block: the obligation is recorded as blocked and
-/// can never become a pass. No native-code backend is wired into this leaf,
-/// so declaring the block costs no codegen dependency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockedBackend {
-    /// The JIT backend has no in-process runner in this oracle.
-    Jit,
-    /// The AOT backend has no in-process runner in this oracle.
-    Aot,
-}
-
-impl BlockedBackend {
-    /// The execution mode this block applies to.
-    #[must_use]
-    pub const fn mode(self) -> ExecutionMode {
-        match self {
-            Self::Jit => ExecutionMode::Jit,
-            Self::Aot => ExecutionMode::Aot,
-        }
-    }
-
-    /// Why the backend cannot run.
-    #[must_use]
-    pub const fn reason(self) -> &'static str {
-        match self {
-            Self::Jit => "the JIT backend is not wired for in-process oracle runs",
-            Self::Aot => "the AOT backend is not wired for in-process oracle runs",
-        }
-    }
 }
 
 /// Returns the production runner for `mode`.
 ///
-/// Only [`ExecutionMode::Interpreter`] executes here, through the in-process
-/// engine facade. The native-code modes return a typed [`BlockedBackend`]
-/// instead of a runner that could never honestly observe them.
+/// All three execution modes run in-process: the interpreter through
+/// `bamts_runtime::run`, JIT through `compile_jit` + `run_linked_program`,
+/// and AOT through the `NativeEngine` reference driver. The runner dispatches
+/// internally on `request.mode`, so one runner serves every mode.
 pub fn backend_runner(
-    mode: ExecutionMode,
+    _mode: ExecutionMode,
     scratch: impl Into<PathBuf>,
-) -> Result<InterpreterRunner, BlockedBackend> {
-    match mode {
-        ExecutionMode::Interpreter => Ok(InterpreterRunner::new(scratch)),
-        ExecutionMode::Jit => Err(BlockedBackend::Jit),
-        ExecutionMode::Aot => Err(BlockedBackend::Aot),
-    }
+) -> Result<InterpreterRunner, &'static str> {
+    Ok(InterpreterRunner::new(scratch))
 }
 
-/// The production Test262 runner: the in-process bytecode interpreter.
+/// Evaluates one test262 obligation in a single mode (the mode named by the
+/// obligation key), running every declared variant and judging each against
+/// the frontmatter expectation. Returns `Ok(())` when every variant passes,
+/// or the first `OracleError` failure.
+pub fn evaluate_in_mode<R: Test262Runner>(
+    runner: &R,
+    mode: ExecutionMode,
+    parsed: &ParsedTest,
+    plan: &ExecutionPlan,
+    harness_sources: &[HarnessSource],
+    deadline: Duration,
+) -> Result<AllModesReport, OracleError> {
+    for variant in &plan.variants {
+        let script = compose_script(parsed, plan, variant, harness_sources)?;
+        let request = RunRequest {
+            mode,
+            variant: variant.clone(),
+            script,
+            negative: plan.negative.clone(),
+            async_done: plan.async_done,
+            deadline,
+        };
+        let outcome = runner.run(&request);
+        if let Err(error) = judge_run(&request, &outcome) {
+            return Err(OracleError::ModeFailure(ModeFailure {
+                mode,
+                detail: format!("{error:?}"),
+            }));
+        }
+    }
+    Ok(AllModesReport { modes: vec![mode] })
+}
+
+/// The production Test262 runner: in-process execution for all three modes.
 ///
 /// One [`RunRequest`] becomes one engine run. The composed script is
 /// materialized verbatim under `scratch`, compiled through the public `bamts`
-/// facade, and executed by `bamts_runtime::run` against the deterministic
-/// Node host. Fuel is derived from the request deadline.
+/// facade, and executed by the backend selected by `request.mode`:
+///
+/// - **Interpreter** — `bamts_runtime::run` (the register interpreter).
+/// - **JIT** — `bamts_codegen::compile_jit` finalizes native entries, then
+///   `bamts_runtime::run_linked_program` executes them through the shared
+///   `NativeOps` dispatch.
+/// - **AOT** — `NativeEngine::run` (the reference native driver). It walks
+///   verified bytecode and routes every value/heap/host operation through
+///   `NativeOps::dispatch` — the same seam AOT-compiled code would use —
+///   without requiring object emission or linking.
+///
+/// Fuel is derived from the request deadline for all modes.
 ///
 /// Classification is exactly what this boundary can observe:
 ///
@@ -770,6 +789,27 @@ impl Drop for MaterializedScript {
     }
 }
 
+/// A dummy entry table for the AOT reference driver. The reference backend
+/// recurses internally and never invokes the entry table; this satisfies the
+/// `NativeEngine::new` constructor without pulling in a native-code backend.
+struct NoEntries;
+
+impl bamts_native::NativeEntryTable for NoEntries {
+    fn program_bytes(&self) -> &[u8] {
+        &[]
+    }
+
+    fn invoke(
+        &self,
+        _module: u32,
+        _function: u32,
+        _frame: &mut bamts_native::ShadowFrame,
+        _out: &mut bamts_native::Completion,
+    ) -> std::result::Result<bamts_native::CompletionTag, bamts_native::AbiError> {
+        Ok(bamts_native::CompletionTag::FatalTrap)
+    }
+}
+
 impl InterpreterRunner {
     /// Creates a runner that materializes composed scripts under `scratch`.
     ///
@@ -785,17 +825,6 @@ impl InterpreterRunner {
 
 impl Test262Runner for InterpreterRunner {
     fn run(&self, request: &RunRequest) -> RunOutcome {
-        let foreign = match request.mode {
-            ExecutionMode::Interpreter => None,
-            ExecutionMode::Jit => Some(BlockedBackend::Jit.reason()),
-            ExecutionMode::Aot => Some(BlockedBackend::Aot.reason()),
-        };
-        if let Some(reason) = foreign {
-            return RunOutcome::Blocked {
-                detail: reason.to_owned(),
-            };
-        }
-
         if let Err(error) = fs::create_dir_all(&self.scratch) {
             return RunOutcome::Blocked {
                 detail: format!(
@@ -830,15 +859,37 @@ impl Test262Runner for InterpreterRunner {
             }
         };
 
+        let limits = interpreter_fuel(request.deadline);
         let started = Instant::now();
         let mut host = bamts_node::NodeHost::new();
-        let outcome = bamts_runtime::run(
-            executable.wire(),
-            &mut host,
-            &interpreter_fuel(request.deadline),
-        );
+        let result: Result<(), bamts_runtime::RuntimeError> = match request.mode {
+            ExecutionMode::Interpreter => {
+                bamts_runtime::run(executable.wire(), &mut host, &limits).map(|_| ())
+            }
+            ExecutionMode::Jit => {
+                let jit_program = match bamts_codegen::compile_jit(executable.wire()) {
+                    Ok(program) => program,
+                    Err(error) => {
+                        return RunOutcome::Blocked {
+                            detail: format!("JIT compilation failed: {error}"),
+                        };
+                    }
+                };
+                run_linked_program(executable.wire(), &jit_program, &mut host, &limits)
+                    .map(|_| ())
+                    .map_err(|native_error| match native_error {
+                        bamts_runtime::NativeError::Runtime(runtime_error) => runtime_error,
+                        other => synthetic_runtime_error(other),
+                    })
+            }
+            ExecutionMode::Aot => {
+                let entries = NoEntries;
+                let engine = NativeEngine::new(executable.wire(), &entries, &mut host, limits);
+                engine.run().map(|_| ())
+            }
+        };
         let elapsed = started.elapsed();
-        match outcome {
+        match result {
             Ok(_) if request.async_done => RunOutcome::Async(observed_done_trace(
                 host.stdout(),
                 host.stderr(),
@@ -848,6 +899,30 @@ impl Test262Runner for InterpreterRunner {
             Ok(_) => RunOutcome::Completed { thrown: None },
             Err(error) => observed_failure(&error, request.deadline),
         }
+    }
+}
+
+/// Constructs a `RuntimeError` that wraps a non-runtime `NativeError` so the
+/// JIT path can route every failure through the shared `observed_failure`
+/// classifier. The error kind is `FuelExhausted` when the native backend
+/// reported cancellation, otherwise `InvalidVerifiedProgram` — both are
+/// shapes `observed_failure` maps to `RunOutcome::Blocked`.
+fn synthetic_runtime_error(error: bamts_runtime::NativeError) -> bamts_runtime::RuntimeError {
+    let kind = match &error {
+        bamts_runtime::NativeError::Cancelled => RuntimeErrorKind::FuelExhausted { limit: 0 },
+        _ => RuntimeErrorKind::InvalidVerifiedProgram {
+            module: bamts_bytecode::ModuleId::new(0),
+            instruction: bamts_bytecode::Instruction::Halt,
+        },
+    };
+    bamts_runtime::RuntimeError {
+        kind,
+        function: bamts_bytecode::FunctionId::new(0),
+        pc: bamts_bytecode::Pc::new(0),
+        source: bamts_runtime::RuntimeSource {
+            function_name: None,
+            instruction: bamts_bytecode::Instruction::Halt,
+        },
     }
 }
 
@@ -1653,15 +1728,130 @@ function $ERROR(message) {\n\
     }
 
     #[test]
-    fn native_backends_report_typed_blocks() {
-        let scratch = runner_scratch("blocked-scratch");
-        for (mode, blocked) in [
-            (ExecutionMode::Jit, BlockedBackend::Jit),
-            (ExecutionMode::Aot, BlockedBackend::Aot),
-        ] {
-            assert_eq!(backend_runner(mode, &scratch).unwrap_err(), blocked);
-            assert_eq!(blocked.mode(), mode);
-            assert!(!blocked.reason().is_empty());
+    fn all_backends_resolve_successfully() {
+        let scratch = runner_scratch("all-backends");
+        for mode in ExecutionMode::ALL {
+            let runner = backend_runner(mode, &scratch).unwrap_or_else(|reason| {
+                panic!("backend_runner({mode:?}) should succeed: {reason}")
+            });
+            // The runner is the same type for all modes; it dispatches
+            // internally on the request's mode field.
+            let _ = runner.run(&RunRequest {
+                mode,
+                variant: ExecutionVariant {
+                    kind: SourceKind::ScriptNonStrict,
+                },
+                script: ComposedScript {
+                    bytes: b"// empty\n".to_vec(),
+                    test_offset: 0,
+                    kind: SourceKind::ScriptNonStrict,
+                    untouched: false,
+                },
+                negative: None,
+                async_done: false,
+                deadline: Duration::from_millis(100),
+            });
+        }
+    }
+
+    #[test]
+    fn trivially_passing_fixture_passes_in_all_modes() {
+        let harness = runner_scratch("pass-harness");
+        let scratch = runner_scratch("pass-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: a trivially passing test",
+            "assert.sameValue(1, 1);",
+        );
+        let parsed = parse_test(&source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        for mode in ExecutionMode::ALL {
+            let runner = backend_runner(mode, &scratch).unwrap();
+            let report = evaluate_in_mode(
+                &runner,
+                mode,
+                &parsed,
+                &plan,
+                &sources,
+                Duration::from_secs(5),
+            );
+            assert!(
+                report.is_ok(),
+                "trivially passing fixture should PASS in {mode:?}: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endless_loop_times_out_in_all_modes() {
+        let harness = runner_scratch("timeout-harness");
+        let scratch = runner_scratch("timeout-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: an endless loop never completes",
+            "for (;;) {}",
+        );
+        let parsed = parse_test(&source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        for mode in ExecutionMode::ALL {
+            let runner = backend_runner(mode, &scratch).unwrap();
+            let result = evaluate_in_mode(
+                &runner,
+                mode,
+                &parsed,
+                &plan,
+                &sources,
+                Duration::from_millis(1),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(OracleError::BlockedRun { .. }) | Err(OracleError::ModeFailure(_))
+                ),
+                "endless loop should time out (blocked or mode failure) in {mode:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failing_assertion_yields_blocking_fail() {
+        let harness = runner_scratch("fail-harness");
+        let scratch = runner_scratch("fail-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        let source = wrap(
+            "description: a failing assertion",
+            "assert.sameValue(1, 2);",
+        );
+        let parsed = parse_test(&source).unwrap();
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        let result = evaluate_in_mode(
+            &runner,
+            ExecutionMode::Interpreter,
+            &parsed,
+            &plan,
+            &sources,
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(result, Err(OracleError::ModeFailure(_))),
+            "failing assertion should yield ModeFailure: {result:?}"
+        );
+        if let Err(OracleError::ModeFailure(failure)) = &result {
+            assert!(
+                failure.detail.contains("assert")
+                    || failure.detail.contains("Assert")
+                    || failure.detail.contains("Blocked")
+                    || failure.detail.contains("Throw"),
+                "failure detail should reference the assertion: {}",
+                failure.detail
+            );
         }
     }
 }

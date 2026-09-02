@@ -11,7 +11,7 @@ autobins = false
 default-run = "bamts-verification"
 
 [dependencies]
-bamts = { workspace = true, features = ["aot"] }
+bamts = { workspace = true, features = ["aot", "host-jit"] }
 bamts-bytecode.workspace = true
 bamts-cli.workspace = true
 bamts-codegen.workspace = true
@@ -52,3 +52,7 @@ path = "src/bin/bh1_jit.rs"
 [[bin]]
 name = "ts_lane_worker"
 path = "src/bin/ts_lane_worker.rs"
+
+[[bin]]
+name = "runtime_lane_worker"
+path = "src/bin/runtime_lane_worker.rs"
