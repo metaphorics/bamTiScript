@@ -30,14 +30,14 @@ use super::{
     ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
     CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
     CONSTRUCTOR_TYPE_PARAMETERS, DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
-    DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION,
-    EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE,
-    FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
-    FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
-    FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-    IMPORT_CONFLICTS_WITH_LOCAL, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
-    MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
-    NEW_TARGET_OUTSIDE_FUNCTION, NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
+    DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION, EXCESS_PROPERTY,
+    EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID,
+    FOR_OF_ITERABLE_REQUIRED, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT,
+    FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
+    GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPORT_CONFLICTS_WITH_LOCAL,
+    INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE,
+    MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NEW_TARGET_OUTSIDE_FUNCTION,
+    NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
     PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
     SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
     STRICT_NULL_MEMBER_ACCESS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
@@ -54,8 +54,7 @@ use super::{
     BARE_SUPER_EXPRESSION_MESSAGE, CANNOT_FIND_NAME_MESSAGE, CANNOT_FIND_NAMESPACE_MESSAGE,
     CANNOT_FIND_TYPE_MESSAGE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE,
     CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE, DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE,
-    DUPLICATE_MESSAGE, EXCESS_PROPERTY_MESSAGE,
-    EXPRESSION_NOT_CALLABLE_MESSAGE,
+    DUPLICATE_MESSAGE, EXCESS_PROPERTY_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE,
     EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE, FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
     FOR_OF_ITERABLE_REQUIRED_MESSAGE, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE,
     FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
@@ -6482,12 +6481,7 @@ impl<'src> Binder<'src> {
 
     /// Like [`emit`](Self::emit) but accepts an owned message for diagnostics
     /// whose wording includes the offending identifier name.
-    fn emit_with_message(
-        &mut self,
-        code: DiagnosticCode,
-        range: TextRange,
-        message: String,
-    ) {
+    fn emit_with_message(&mut self, code: DiagnosticCode, range: TextRange, message: String) {
         if self.probing_contextual_type {
             return;
         }
@@ -6568,6 +6562,25 @@ impl<'src> Binder<'src> {
                                 .accepts_type_merge_from(kind)
                     })
             });
+        // TS2397: A global declaration in a script whose name collides with a
+        // built-in global identifier (`globalThis` or `undefined`). Class and
+        // interface declarations named `undefined` are excluded because they
+        // carry their own specific diagnostics (TS2414, TS2427); no such
+        // special diagnostic exists for `globalThis`, so all declaration kinds
+        // are flagged. The check runs before the merge early-return so a
+        // namespace named `undefined` or `globalThis` that merges with a
+        // preceding class/enum/interface still emits C087 (undefinedTypeAssignment4).
+        if !self.is_module
+            && scope == self.module_scope
+            && !(name == "undefined" && matches!(kind, SymbolKind::Class | SymbolKind::Interface))
+            && matches!(name, "globalThis" | "undefined")
+        {
+            self.emit_with_message(
+                DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
+                range,
+                format!("Declaration name conflicts with built-in global identifier '{name}'."),
+            );
+        }
         if let Some(existing) = merge {
             if kind.occupies_value() {
                 self.scopes[scope.0 as usize]
@@ -6640,23 +6653,6 @@ impl<'src> Binder<'src> {
             } else {
                 self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
             }
-        }
-        // TS2397: A global declaration in a script whose name collides with a
-        // built-in global identifier (`globalThis` or `undefined`). Class and
-        // interface declarations named `undefined` are excluded because they
-        // carry their own specific diagnostics (TS2414, TS2427).
-        if !self.is_module
-            && scope == self.module_scope
-            && !matches!(kind, SymbolKind::Class | SymbolKind::Interface)
-            && matches!(name, "globalThis" | "undefined")
-        {
-            self.emit_with_message(
-                DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
-                range,
-                format!(
-                    "Declaration name conflicts with built-in global identifier '{name}'."
-                ),
-            );
         }
         id
     }
@@ -17618,13 +17614,12 @@ mod tests {
         ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
         ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION,
         CONSTRUCTOR_TYPE_PARAMETERS, DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
-        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
-        FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
-        GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, MISSING_METHOD_RETURN_TYPE,
-        PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
-        STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind,
-        SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE, TupleShape, Type, TypeParameterBounds,
-        TypeTable, bind_source,
+        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
+        FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
+        MISSING_METHOD_RETURN_TYPE, PROPERTY_NOT_INITIALIZED, PropertyType,
+        SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+        SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
+        TupleShape, Type, TypeParameterBounds, TypeTable, bind_source,
     };
     use crate::diagnostic::Diagnostic;
     use crate::source::{ScriptKind, SourceId, SourceText};
@@ -19728,8 +19723,7 @@ mod tests {
 
     #[test]
     fn namespace_global_this_in_script_reports_ts2397() {
-        let (_model, diagnostics) =
-            bound("namespace globalThis { export function foo() {} }");
+        let (_model, diagnostics) = bound("namespace globalThis { export function foo() {} }");
         assert!(
             diagnostics
                 .iter()
@@ -19790,6 +19784,55 @@ mod tests {
                 .iter()
                 .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
             "function undefined in a script should report TS2397: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_type_assignment4_namespace_emits_ts2397_after_class_and_interface() {
+        // Mirrors the authority baseline undefinedTypeAssignment4.ts: class and
+        // interface named `undefined` get TS2414/TS2427 (not TS2397), but the
+        // namespace merge must still emit TS2397. The namespace merges with the
+        // preceding class declaration, so the check must fire before the merge
+        // early-return in `declare()`.
+        let (_model, diagnostics) = bound(
+            "class undefined { foo: string; }
+interface undefined { member: number; }
+namespace undefined { export var x = 42; }",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "namespace undefined should report TS2397 even when merging with preceding class/interface: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn class_global_this_in_script_reports_ts2397() {
+        // No upstream baseline has `class globalThis`, but TS2397 has no
+        // special class-specific diagnostic for `globalThis` (unlike `undefined`
+        // which gets TS2414). So class globalThis should be flagged.
+        let (_model, diagnostics) = bound("class globalThis { foo: string; }");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "class globalThis in a script should report TS2397: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn interface_global_this_in_script_reports_ts2397() {
+        // No upstream baseline has `interface globalThis`, but TS2397 has no
+        // special interface-specific diagnostic for `globalThis` (unlike
+        // `undefined` which gets TS2427). So interface globalThis should be
+        // flagged.
+        let (_model, diagnostics) = bound("interface globalThis { member: number; }");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "interface globalThis in a script should report TS2397: {diagnostics:?}"
         );
     }
 }
