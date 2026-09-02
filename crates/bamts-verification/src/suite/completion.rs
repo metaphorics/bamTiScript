@@ -522,35 +522,56 @@ enum SuiteAdapter {
     Missing(String),
 }
 
+/// The environment variable naming one runner's out-of-process lane worker.
+fn lane_adapter_variable(runner: SuiteRunner) -> String {
+    format!(
+        "BAMTS_SUITE_{}_ADAPTER",
+        runner.as_str().to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+/// Resolves one runner's configured lane worker. The single resolution rule
+/// shared by capture and by binding computation: two copies could drift, and
+/// a receipt would then content-address a binary the verifier never resolved.
+/// A relative path resolves against `root`; a path naming no file is unset.
+fn lane_program(root: &Path, runner: SuiteRunner) -> Option<PathBuf> {
+    let configured =
+        std::env::var_os(lane_adapter_variable(runner)).filter(|value| !value.is_empty())?;
+    let program = PathBuf::from(configured);
+    let program = if program.is_absolute() {
+        program
+    } else {
+        root.join(program)
+    };
+    program.is_file().then_some(program)
+}
+
 impl SuiteAdapter {
     fn build(root: &Path, catalog: &str, runner: SuiteRunner) -> Result<Self> {
         if runner == SuiteRunner::Aot && catalog == "target-cells" {
             return Ok(Self::TargetCells(load_target_cells(root)?));
         }
 
-        let variable = format!(
-            "BAMTS_SUITE_{}_ADAPTER",
-            runner.as_str().to_ascii_uppercase().replace('-', "_")
-        );
-        let Some(program) = std::env::var_os(&variable).filter(|value| !value.is_empty()) else {
+        let variable = lane_adapter_variable(runner);
+        let Some(configured) = std::env::var_os(&variable).filter(|value| !value.is_empty()) else {
             return Ok(Self::Missing(format!(
                 "runner `{}` has no registered adapter; set `{variable}` to an explicit lane-worker executable",
                 runner.as_str()
             )));
         };
-        let program = PathBuf::from(program);
-        let program = if program.is_absolute() {
-            program
-        } else {
-            root.join(program)
-        };
-        if !program.is_file() {
+        let Some(program) = lane_program(root, runner) else {
+            let attempted = PathBuf::from(configured);
+            let attempted = if attempted.is_absolute() {
+                attempted
+            } else {
+                root.join(attempted)
+            };
             return Ok(Self::Missing(format!(
                 "runner `{}` adapter `{}` is not a file",
                 runner.as_str(),
-                program.display()
+                attempted.display()
             )));
-        }
+        };
         Ok(Self::External(
             ProcessExecutor::new(program, Vec::new(), root, root.join("target/suite-lanes"))
                 .with_max_output_bytes(PROBE_OUTPUT_BYTES),
@@ -1244,7 +1265,6 @@ fn hash_candidate_path(root: &Path, relative: &Path, hasher: &mut Sha256) -> Res
 #[derive(Debug)]
 struct RunSnapshot {
     candidate_tree_digest: String,
-    candidate_binary_digest: String,
     harness_digest: String,
 }
 
@@ -1256,21 +1276,62 @@ fn current_run_snapshot(root: &Path) -> Result<RunSnapshot> {
             format!("cannot resolve the harness binary: {error}"),
         )
     })?;
-    // Wired runners execute the candidate in-process; the harness binary
-    // contains the candidate libraries, so both digests name it.
-    let candidate_binary_digest = file_sha256(&exe)?;
     Ok(RunSnapshot {
         candidate_tree_digest,
-        harness_digest: candidate_binary_digest.clone(),
-        candidate_binary_digest,
+        harness_digest: file_sha256(&exe)?,
     })
+}
+
+/// The binary that executes one catalog's obligations. An in-process runner
+/// executes inside this harness, so the harness names itself. An
+/// out-of-process runner executes inside its lane worker, and the receipt has
+/// to content-address that worker: hashing the harness instead would name a
+/// binary that did no measuring, so a changed worker under an unchanged
+/// harness would leave stale receipts verifying.
+///
+/// A catalog whose runners resolve to different workers has no single
+/// executing binary, so this refuses rather than silently choosing one. A
+/// catalog with no declared runners can name no worker, so the harness stands;
+/// an unrecognized catalog is rejected downstream, where the receipt is read.
+fn candidate_binary(root: &Path, catalog: &str) -> Result<PathBuf> {
+    let programs: BTreeSet<PathBuf> = allowed_runners(catalog)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|runner| lane_program(root, *runner))
+        .collect();
+    select_candidate_binary(catalog, programs)
+}
+
+/// Chooses the one executing binary from a catalog's resolved lane workers.
+/// Separated from environment lookup so the rule itself is directly testable.
+fn select_candidate_binary(catalog: &str, programs: BTreeSet<PathBuf>) -> Result<PathBuf> {
+    let mut programs = programs.into_iter();
+    let Some(program) = programs.next() else {
+        return std::env::current_exe().map_err(|error| {
+            VerificationError::new(
+                ErrorCode::Io,
+                format!("cannot resolve the harness binary: {error}"),
+            )
+        });
+    };
+    if let Some(second) = programs.next() {
+        return Err(VerificationError::new(
+            ErrorCode::Usage,
+            format!(
+                "catalog `{catalog}` resolves two lane workers, `{}` and `{}`, so no single binary executes it",
+                program.display(),
+                second.display()
+            ),
+        ));
+    }
+    Ok(program)
 }
 
 fn binding_from_snapshot(root: &Path, catalog: &str, snapshot: &RunSnapshot) -> Result<RunBinding> {
     RunBinding::new(
         authority_digest(root, catalog)?,
         snapshot.candidate_tree_digest.clone(),
-        snapshot.candidate_binary_digest.clone(),
+        file_sha256(&candidate_binary(root, catalog)?)?,
         snapshot.harness_digest.clone(),
     )
 }
@@ -1466,6 +1527,58 @@ mod tests {
         let second = &bindings["catalog-b"];
         assert_ne!(first.authority_digest(), second.authority_digest());
         assert!(first.same_run_as(second));
+    }
+
+    /// A receipt has to content-address the binary that measured it. Hashing
+    /// the harness for both digests -- the prior behavior -- meant a lane
+    /// worker could change under an unchanged harness while stale receipts
+    /// kept verifying. `RunSnapshot` now carries no candidate field at all,
+    /// so that reuse is unrepresentable; these cover the selection rule.
+    #[test]
+    fn an_external_lane_worker_names_itself_as_the_candidate_binary() {
+        let worker = PathBuf::from("/nonexistent/lane-worker");
+        let chosen = select_candidate_binary("formal-redex", BTreeSet::from([worker.clone()]))
+            .expect("one worker selects");
+        assert_eq!(chosen, worker);
+
+        let harness = select_candidate_binary("benchmarks", BTreeSet::new())
+            .expect("no worker falls back to the harness");
+        assert_eq!(
+            harness,
+            std::env::current_exe().expect("current exe"),
+            "a catalog with no lane worker runs in process, so the harness names itself"
+        );
+        assert_ne!(chosen, harness);
+    }
+
+    #[test]
+    fn a_catalog_resolving_two_lane_workers_is_refused() {
+        let error = select_candidate_binary(
+            "test262",
+            BTreeSet::from([PathBuf::from("/one"), PathBuf::from("/two")]),
+        )
+        .expect_err("two workers cannot both have measured one catalog");
+        assert_eq!(error.code(), ErrorCode::Usage);
+        assert!(
+            error.to_string().contains("no single binary executes it"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn a_lane_program_resolves_against_the_root_and_must_be_a_file() {
+        let scratch = Scratch::new("lane-program");
+        scratch.write("worker-stand-in", b"not the harness\n");
+        assert_eq!(
+            lane_adapter_variable(SuiteRunner::Redex),
+            "BAMTS_SUITE_REDEX_ADAPTER"
+        );
+        assert_eq!(
+            lane_adapter_variable(SuiteRunner::Compiler),
+            "BAMTS_SUITE_COMPILER_ADAPTER"
+        );
+        assert!(scratch.root.join("worker-stand-in").is_file());
+        assert!(!scratch.root.join("absent-worker").is_file());
     }
 
     #[test]
