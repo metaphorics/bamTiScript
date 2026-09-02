@@ -182,6 +182,7 @@ mod tests {
         error(RuntimeErrorKind::UncaughtThrow {
             value: Value::UNDEFINED,
             origin: ThrowOrigin::Bytecode,
+            constructor_name: None,
         })
     }
 

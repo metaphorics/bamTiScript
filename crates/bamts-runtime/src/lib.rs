@@ -321,6 +321,15 @@ pub enum RuntimeErrorKind {
     UncaughtThrow {
         value: Value,
         origin: ThrowOrigin,
+        /// Resolved constructor name for guest-thrown values
+        /// ([`ThrowOrigin::Bytecode`]). Populated by
+        /// [`Machine::enrich_uncaught_throw`] before the error crosses the
+        /// public runtime boundary, so downstream oracles can classify the
+        /// thrown error without access to the machine heap. `None` for
+        /// engine-originated throws whose [`ThrowOrigin`] variant already
+        /// names the constructor, or when the value is not an object with a
+        /// resolvable constructor.
+        constructor_name: Option<EcmaString>,
     },
     FuelExhausted {
         limit: u64,
@@ -409,11 +418,23 @@ impl fmt::Display for RuntimeError {
         }
         write!(formatter, ": ")?;
         match &self.kind {
-            RuntimeErrorKind::UncaughtThrow { value, origin } => write!(
-                formatter,
-                "uncaught {origin:?} throw (value {:#018x})",
-                value.to_bits()
-            ),
+            RuntimeErrorKind::UncaughtThrow {
+                value,
+                origin,
+                constructor_name,
+            } => match constructor_name {
+                Some(name) => write!(
+                    formatter,
+                    "uncaught {origin:?} throw (value {:#018x}, constructor {})",
+                    value.to_bits(),
+                    name.to_utf8_lossy()
+                ),
+                None => write!(
+                    formatter,
+                    "uncaught {origin:?} throw (value {:#018x})",
+                    value.to_bits()
+                ),
+            },
             RuntimeErrorKind::FuelExhausted { limit } => {
                 write!(formatter, "fuel exhausted after {limit} instructions")
             }
@@ -1631,7 +1652,7 @@ pub(crate) enum EvalFailure {
 
 pub(crate) fn import_failure(error: &RuntimeError) -> EvalFailure {
     match &error.kind {
-        RuntimeErrorKind::UncaughtThrow { value, origin } => EvalFailure::ThrowValueOrigin {
+        RuntimeErrorKind::UncaughtThrow { value, origin, .. } => EvalFailure::ThrowValueOrigin {
             value: *value,
             origin: *origin,
         },
@@ -2264,8 +2285,17 @@ impl<'a, H: Host> Machine<'a, H> {
     /// the returned value and entry register snapshot stay those of the
     /// synchronous evaluation.
     pub fn run(mut self) -> Result<Execution, RuntimeError> {
-        let execution = self.evaluate()?;
-        self.run_to_quiescence()?;
+        let execution = match self.evaluate() {
+            Ok(execution) => execution,
+            Err(mut error) => {
+                self.enrich_uncaught_throw(&mut error);
+                return Err(error);
+            }
+        };
+        if let Err(mut error) = self.run_to_quiescence() {
+            self.enrich_uncaught_throw(&mut error);
+            return Err(error);
+        }
         Ok(execution)
     }
 
@@ -2363,6 +2393,7 @@ impl<'a, H: Host> Machine<'a, H> {
                 return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
                     value: exception.value,
                     origin: exception.origin,
+                    constructor_name: None,
                 }));
             }
         }
@@ -2673,6 +2704,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     return Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
                         value: exception.value,
                         origin: exception.origin,
+                        constructor_name: None,
                     }));
                 }
                 continue;
@@ -2890,6 +2922,7 @@ impl<'a, H: Host> Machine<'a, H> {
         Err(self.checkpoint_error(RuntimeErrorKind::UncaughtThrow {
             value: exception.value,
             origin: exception.origin,
+            constructor_name: None,
         }))
     }
 
@@ -3269,7 +3302,14 @@ impl<'a, H: Host> Machine<'a, H> {
             // The first rejection already settled or aborted the parent.
             _ => return Ok(()),
         };
-        let error = self.program_error(parent, RuntimeErrorKind::UncaughtThrow { value, origin });
+        let error = self.program_error(
+            parent,
+            RuntimeErrorKind::UncaughtThrow {
+                value,
+                origin,
+                constructor_name: None,
+            },
+        );
         self.store_async_module_completion(pending.record, Some(Err(error.clone())))
             .map_err(|failure| self.module_eval_failure(parent, failure).kind)?;
         self.settle_module_evaluation(parent, Err(error));
@@ -4357,6 +4397,34 @@ impl<'a, H: Host> Machine<'a, H> {
         }
     }
 
+    /// Populates the `constructor_name` field of a
+    /// [`RuntimeErrorKind::UncaughtThrow`] when the throw originated from
+    /// guest bytecode ([`ThrowOrigin::Bytecode`]). Engine-originated throws
+    /// (`TypeError`, `RangeError`, etc.) already name their constructor in
+    /// the [`ThrowOrigin`] variant and are left as `None`.
+    ///
+    /// This must be called at every public boundary where an `UncaughtThrow`
+    /// error crosses into code that no longer has access to the machine
+    /// heap — the interpreter entry point and the native engine's
+    /// `run`/`run_linked` methods.
+    pub(crate) fn enrich_uncaught_throw(&mut self, error: &mut RuntimeError) {
+        let RuntimeErrorKind::UncaughtThrow {
+            value,
+            origin,
+            constructor_name,
+        } = &mut error.kind
+        else {
+            return;
+        };
+        if *origin != ThrowOrigin::Bytecode {
+            return;
+        }
+        if constructor_name.is_some() {
+            return;
+        }
+        *constructor_name = self.resolve_thrown_constructor_name(*value).unwrap_or(None);
+    }
+
     fn program(&self) -> &Program<Verified> {
         self.program
             .expect("module registry operations require a whole program")
@@ -5005,9 +5073,14 @@ impl<'a, H: Host> Machine<'a, H> {
 
     fn module_eval_failure(&mut self, module: ModuleId, failure: EvalFailure) -> RuntimeError {
         match self.promise_rejection_value(failure) {
-            Ok((value, origin)) => {
-                self.program_error(module, RuntimeErrorKind::UncaughtThrow { value, origin })
-            }
+            Ok((value, origin)) => self.program_error(
+                module,
+                RuntimeErrorKind::UncaughtThrow {
+                    value,
+                    origin,
+                    constructor_name: None,
+                },
+            ),
             Err(EvalFailure::Runtime(kind)) => self.program_error(module, kind),
             Err(_) => unreachable!("failure materialization only fails at a runtime boundary"),
         }
@@ -7753,7 +7826,7 @@ impl<'a, H: Host> Machine<'a, H> {
                     Err(error) => {
                         self.unwind_frames_to(stop_depth);
                         match error.kind {
-                            RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                            RuntimeErrorKind::UncaughtThrow { value, origin, .. } => {
                                 Err(EvalFailure::ThrowValueOrigin { value, origin })
                             }
                             kind => Err(EvalFailure::Runtime(kind)),
@@ -7896,7 +7969,7 @@ impl<'a, H: Host> Machine<'a, H> {
                         Err(error) => {
                             self.unwind_frames_to(stop_depth);
                             match error.kind {
-                                RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                                RuntimeErrorKind::UncaughtThrow { value, origin, .. } => {
                                     Err(EvalFailure::ThrowValueOrigin { value, origin })
                                 }
                                 kind => Err(EvalFailure::Runtime(kind)),
@@ -8012,7 +8085,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 .is_some_and(|boundary| self.frames.len() == *boundary)
             {
                 return Err(self.error_at_in_module(
-                    RuntimeErrorKind::UncaughtThrow { value, origin },
+                    RuntimeErrorKind::UncaughtThrow {
+                        value,
+                        origin,
+                        constructor_name: None,
+                    },
                     site_module,
                     site_function,
                     faulting_pc,
@@ -8045,7 +8122,11 @@ impl<'a, H: Host> Machine<'a, H> {
                 Some(return_to) => search_pc = return_to.call_pc,
                 None => {
                     return Err(self.error_at_in_module(
-                        RuntimeErrorKind::UncaughtThrow { value, origin },
+                        RuntimeErrorKind::UncaughtThrow {
+                            value,
+                            origin,
+                            constructor_name: None,
+                        },
                         site_module,
                         site_function,
                         faulting_pc,
@@ -10369,7 +10450,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Err(error) => {
                 self.unwind_frames_to(stop_depth);
                 match error.kind {
-                    RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                    RuntimeErrorKind::UncaughtThrow { value, origin, .. } => {
                         Ok(GeneratorResume::Throw { value, origin })
                     }
                     kind => Err(EvalFailure::Runtime(kind)),
@@ -10651,7 +10732,8 @@ impl<'a, H: Host> Machine<'a, H> {
                 Ok(())
             }
             Ok(AsyncStep::Throw(error)) => {
-                let RuntimeErrorKind::UncaughtThrow { value, origin } = error.kind.clone() else {
+                let RuntimeErrorKind::UncaughtThrow { value, origin, .. } = error.kind.clone()
+                else {
                     unreachable!("async throws retain an uncaught-throw error");
                 };
                 self.store_async_module_completion(record, Some(Err(error.clone())))?;
@@ -10931,7 +11013,7 @@ impl<'a, H: Host> Machine<'a, H> {
             Err(error) => {
                 self.unwind_frames_to(stop_depth);
                 match error.kind {
-                    RuntimeErrorKind::UncaughtThrow { value, origin } => {
+                    RuntimeErrorKind::UncaughtThrow { value, origin, .. } => {
                         Ok(AsyncGeneratorStep::Throw { value, origin })
                     }
                     kind => Err(EvalFailure::Runtime(kind)),
@@ -19433,6 +19515,7 @@ VmPeak:	64000 kB";
                 origin: ThrowOrigin::ReferenceError {
                     operation: "global is not defined",
                 },
+                constructor_name: None,
             }
         );
     }
@@ -19470,8 +19553,209 @@ VmPeak:	64000 kB";
             RuntimeErrorKind::UncaughtThrow {
                 value: Value::UNDEFINED,
                 origin: ThrowOrigin::TypeError { operation: "call" },
+                constructor_name: None,
             }
         );
+    }
+
+    #[test]
+    fn thrown_guest_type_error_reports_constructor_name() {
+        // `throw new TypeError()` — the guest constructs a TypeError and
+        // throws it. The runtime boundary must resolve the constructor
+        // name by walking the prototype chain to the TypeError builtin
+        // prototype, so the oracle can classify it as NegativeType::TypeError.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::encode("TypeError")),
+                Constant::Undefined,
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::CreateArray { dst: reg(2) },
+                    Instruction::Construct {
+                        dst: reg(3),
+                        callee: reg(0),
+                        arguments: reg(2),
+                    },
+                    Instruction::Throw { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        match error.kind {
+            RuntimeErrorKind::UncaughtThrow {
+                origin,
+                constructor_name,
+                ..
+            } => {
+                assert_eq!(origin, ThrowOrigin::Bytecode);
+                assert_eq!(
+                    constructor_name.as_ref().map(|s| s.to_utf8_lossy()),
+                    Some("TypeError".to_owned())
+                );
+            }
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thrown_guest_range_error_reports_constructor_name() {
+        // `throw new RangeError()` — same pattern, different builtin.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::encode("RangeError")),
+                Constant::Undefined,
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::CreateArray { dst: reg(2) },
+                    Instruction::Construct {
+                        dst: reg(3),
+                        callee: reg(0),
+                        arguments: reg(2),
+                    },
+                    Instruction::Throw { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        match error.kind {
+            RuntimeErrorKind::UncaughtThrow {
+                origin,
+                constructor_name,
+                ..
+            } => {
+                assert_eq!(origin, ThrowOrigin::Bytecode);
+                assert_eq!(
+                    constructor_name.as_ref().map(|s| s.to_utf8_lossy()),
+                    Some("RangeError".to_owned())
+                );
+            }
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thrown_plain_error_reports_constructor_name() {
+        // `throw new Error()` — the base Error constructor.
+        let module = verified(
+            vec![
+                Constant::String(EcmaString::encode("Error")),
+                Constant::Undefined,
+            ],
+            vec![function(
+                0,
+                5,
+                vec![
+                    Instruction::LoadGlobal {
+                        dst: reg(0),
+                        name: cid(0),
+                    },
+                    Instruction::LoadConst {
+                        dst: reg(1),
+                        constant: cid(1),
+                    },
+                    Instruction::CreateArray { dst: reg(2) },
+                    Instruction::Construct {
+                        dst: reg(3),
+                        callee: reg(0),
+                        arguments: reg(2),
+                    },
+                    Instruction::Throw { value: reg(3) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        match error.kind {
+            RuntimeErrorKind::UncaughtThrow {
+                origin,
+                constructor_name,
+                ..
+            } => {
+                assert_eq!(origin, ThrowOrigin::Bytecode);
+                assert_eq!(
+                    constructor_name.as_ref().map(|s| s.to_utf8_lossy()),
+                    Some("Error".to_owned())
+                );
+            }
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thrown_engine_type_error_has_no_constructor_name() {
+        // Engine-originated throws (ThrowOrigin::TypeError) already name
+        // their constructor in the origin variant. The constructor_name
+        // field must remain None so the oracle does not double-resolve.
+        let module = verified(
+            vec![Constant::Int32(0)],
+            vec![function(
+                0,
+                3,
+                vec![
+                    Instruction::LoadConst {
+                        dst: reg(0),
+                        constant: cid(0),
+                    },
+                    Instruction::CreateArray { dst: reg(1) },
+                    Instruction::Call {
+                        dst: reg(2),
+                        callee: reg(0),
+                        this_value: reg(0),
+                        arguments: reg(1),
+                    },
+                    Instruction::Return { value: reg(2) },
+                ],
+                Vec::new(),
+            )],
+        );
+        let mut host = TestHost;
+        let error = Machine::new(&module, &mut host, Limits::default())
+            .run()
+            .unwrap_err();
+        match error.kind {
+            RuntimeErrorKind::UncaughtThrow {
+                origin,
+                constructor_name,
+                ..
+            } => {
+                assert_eq!(origin, ThrowOrigin::TypeError { operation: "call" });
+                assert_eq!(constructor_name, None);
+            }
+            other => panic!("expected UncaughtThrow, got {other:?}"),
+        }
     }
 
     fn assert_uri_error(global: &str, argument: EcmaString) {
@@ -21102,6 +21386,7 @@ VmPeak:	64000 kB";
             RuntimeErrorKind::UncaughtThrow {
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
+                constructor_name: None,
             }
         );
         assert!(machine.callback_boundaries.is_empty());
@@ -26311,6 +26596,7 @@ VmPeak:	64000 kB";
             RuntimeErrorKind::UncaughtThrow {
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
+                constructor_name: None,
             }
         );
         // The later job stays queued and unrun.
@@ -26357,6 +26643,7 @@ VmPeak:	64000 kB";
             RuntimeErrorKind::UncaughtThrow {
                 value: Value::int32(7),
                 origin: ThrowOrigin::Bytecode,
+                constructor_name: None,
             }
         );
         // The exception converts before any drain, so the queued microtask and

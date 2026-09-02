@@ -7,6 +7,7 @@
 //! dispatch without object linking). Process-spawning backends stay outside.
 //! Callers may also supply typed runner outcomes of their own.
 
+use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
 use bamts_runtime::{NativeEngine, RuntimeErrorKind, ThrowOrigin, run_linked_program};
 use serde::Deserialize;
@@ -959,45 +960,60 @@ fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
     }
 }
 
-/// Maps an engine throw origin onto the Test262 negative type it names.
+/// Maps an engine throw origin (and, for guest-thrown values, the resolved
+/// constructor name) onto the Test262 negative type it names.
 ///
-/// [`ThrowOrigin::Bytecode`] is a guest-thrown value; its constructor is not
-/// observable through the public runtime boundary, so there is no mapping.
+/// Engine-originated throws (`TypeError`, `RangeError`, `ReferenceError`,
+/// `UriError`) name their constructor in the [`ThrowOrigin`] variant.
+/// Guest-thrown values ([`ThrowOrigin::Bytecode`]) carry a resolved
+/// `constructor_name` that the runtime boundary extracts by walking the
+/// thrown value's prototype chain to a builtin error constructor or a
+/// user-defined class name. Per the test262 INTERPRETING.md rule, the
+/// negative `type` must match the constructor's name exactly.
 #[must_use]
-fn classify_thrown(origin: ThrowOrigin) -> Option<NegativeType> {
+fn classify_thrown(origin: ThrowOrigin, constructor_name: Option<&EcmaString>) -> Option<NegativeType> {
     match origin {
         ThrowOrigin::TypeError { .. } => Some(NegativeType::TypeError),
         ThrowOrigin::RangeError { .. } => Some(NegativeType::RangeError),
         ThrowOrigin::ReferenceError { .. } => Some(NegativeType::ReferenceError),
         ThrowOrigin::UriError { .. } => Some(NegativeType::UriError),
-        ThrowOrigin::Bytecode => None,
+        ThrowOrigin::Bytecode => {
+            let name = constructor_name?.to_utf8_lossy();
+            NegativeType::parse(&name).ok()
+        }
     }
 }
 
 /// Classifies an engine failure into a thrown runtime error or a block.
 fn observed_failure(error: &bamts_runtime::RuntimeError, deadline: Duration) -> RunOutcome {
     match &error.kind {
-        RuntimeErrorKind::UncaughtThrow { origin, .. } => match classify_thrown(*origin) {
-            Some(error_type) => RunOutcome::Completed {
-                thrown: Some(ThrownError {
-                    phase: NegativePhase::Runtime,
-                    error_type,
-                }),
-            },
-            None => {
-                let site = error
-                    .source
-                    .function_name
-                    .as_ref()
-                    .map_or_else(|| "<anonymous>".to_owned(), |name| name.to_utf8_lossy());
-                RunOutcome::Blocked {
-                    detail: format!(
-                        "guest threw a value whose constructor is unobservable at this \
-                         boundary (throw site: {site})"
-                    ),
+        RuntimeErrorKind::UncaughtThrow { origin, constructor_name, .. } => {
+            match classify_thrown(*origin, constructor_name.as_ref()) {
+                Some(error_type) => RunOutcome::Completed {
+                    thrown: Some(ThrownError {
+                        phase: NegativePhase::Runtime,
+                        error_type,
+                    }),
+                },
+                None => {
+                    let site = error
+                        .source
+                        .function_name
+                        .as_ref()
+                        .map_or_else(|| "<anonymous>".to_owned(), |name| name.to_utf8_lossy());
+                    let constructor = constructor_name
+                        .as_ref()
+                        .map(|name| format!(" (constructor: {})", name.to_utf8_lossy()))
+                        .unwrap_or_default();
+                    RunOutcome::Blocked {
+                        detail: format!(
+                            "guest threw a value whose constructor does not \
+                             map to a Test262 negative type{constructor} (throw site: {site})"
+                        ),
+                    }
                 }
             }
-        },
+        }
         RuntimeErrorKind::FuelExhausted { .. } => RunOutcome::Blocked {
             detail: format!("fuel exhausted within the {deadline:?} deadline"),
         },
@@ -1697,13 +1713,13 @@ function $ERROR(message) {\n\
     }
 
     #[test]
-    fn unobservable_guest_throws_block_the_run() {
+    fn guest_throw_is_classified_not_blocked() {
         let harness = runner_scratch("guest-harness");
         let scratch = runner_scratch("guest-scratch");
         write_harness(&harness, "assert.js", ASSERT_JS);
         write_harness(&harness, "sta.js", STA_JS);
         let source = wrap(
-            "description: a guest throw carries no observable type",
+            "description: a guest throw is classified by constructor name",
             "throw new Test262Error('unmatched');",
         );
         let parsed = parse_test(&source).unwrap();
@@ -1712,9 +1728,16 @@ function $ERROR(message) {\n\
         let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
         for variant in &plan.variants {
             let result = run_variant(&runner, &parsed, &plan, &sources, variant);
+            // The runtime boundary now resolves the thrown value's
+            // constructor name (Test262Error) so the oracle classifies it
+            // as Runtime/Test262Error. Since the test expects success,
+            // this is an ExpectationMismatch, not a BlockedRun.
             assert!(
-                matches!(result, Err(OracleError::BlockedRun { .. })),
-                "a guest throw must block, never pass or mismatch: {result:?}"
+                matches!(&result,
+                    Err(OracleError::ExpectationMismatch { expected, actual })
+                        if expected == "success" && actual == "Runtime/Test262Error"
+                ),
+                "a guest throw with a known constructor must be classified, not blocked: {result:?}"
             );
         }
     }
@@ -1863,19 +1886,17 @@ function $ERROR(message) {\n\
             &sources,
             Duration::from_secs(5),
         );
+        // assert.sameValue(1, 2) throws a Test262Error via the harness.
+        // The runtime boundary now resolves the constructor name, so the
+        // oracle classifies it as Runtime/Test262Error. Since the test
+        // expects success, this is an ExpectationMismatch wrapped in
+        // ModeFailure by evaluate_in_mode.
         assert!(
-            matches!(result, Err(OracleError::ModeFailure(_))),
-            "failing assertion should yield ModeFailure: {result:?}"
+            matches!(&result,
+                Err(OracleError::ModeFailure(failure))
+                    if failure.detail.contains("Runtime/Test262Error")
+            ),
+            "failing assertion should yield ModeFailure with Runtime/Test262Error: {result:?}"
         );
-        if let Err(OracleError::ModeFailure(failure)) = &result {
-            assert!(
-                failure.detail.contains("assert")
-                    || failure.detail.contains("Assert")
-                    || failure.detail.contains("Blocked")
-                    || failure.detail.contains("Throw"),
-                "failure detail should reference the assertion: {}",
-                failure.detail
-            );
-        }
     }
 }

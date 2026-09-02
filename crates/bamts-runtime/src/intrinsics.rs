@@ -1,5 +1,8 @@
 use crate::vm::generator_async::GeneratorCompletion;
-use crate::{EvalFailure, HeapEntry, Host, Machine, NativeCallable, PropertyMap, ThrowOrigin};
+use crate::{
+    EvalFailure, Found, HeapEntry, Host, Machine, NativeCallable, Property, PropertyMap,
+    ThrowOrigin,
+};
 use bamts_bytecode::{EcmaString, EcmaStringBuilder};
 use bamts_native::{Decoded, Value};
 use std::collections::BTreeMap;
@@ -998,6 +1001,105 @@ impl<'a, H: Host> Machine<'a, H> {
             }
         }
         Ok(false)
+    }
+
+    /// Resolves the constructor name of a thrown value by walking its
+    /// prototype chain to a builtin error constructor
+    /// (`TypeError`, `RangeError`, `SyntaxError`, `ReferenceError`,
+    /// `EvalError`, `URIError`, `Error`) or a user-defined class name.
+    ///
+    /// This is the public-boundary resolution used by
+    /// [`RuntimeErrorKind::UncaughtThrow`] enrichment. It does not invoke
+    /// user code (no getters, no `toString`); it reads only own data
+    /// properties and the static `error_prototypes` table.
+    pub(crate) fn resolve_thrown_constructor_name(
+        &self,
+        value: Value,
+    ) -> Result<Option<EcmaString>, EvalFailure> {
+        let Some(mut index) = self.runtime_slot(value).map_err(EvalFailure::Runtime)? else {
+            return Ok(None);
+        };
+        // Walk the prototype chain. At each level, check whether this
+        // prototype is one of the installed builtin error prototypes. If
+        // it is, the BuiltinId names the constructor. If the immediate
+        // prototype is NOT a builtin error prototype, try reading the
+        // `constructor` own data property on the thrown object's prototype
+        // to get a user-defined class name.
+        for _ in 0..=self.heap.len() {
+            let proto_value = Value::heap_ref(
+                bamts_native::SlotId::from_parts(
+                    crate::RUNTIME_HEAP_SEGMENT,
+                    u32::try_from(index + 1).expect("heap index fits in u32"),
+                )
+                .expect("heap index is nonzero"),
+            );
+            if let Some((id, _)) = self
+                .intrinsics
+                .builtins
+                .error_prototypes
+                .iter()
+                .find(|(_, prototype)| *prototype == proto_value)
+            {
+                return Ok(Some(EcmaString::encode(
+                    self.intrinsics.builtins.get(*id).name,
+                )));
+            }
+            // Try to read `constructor` own data property on this prototype.
+            if let Some(Found::Value(constructor)) = self.own_get_ascii(index, "constructor")
+                && let Some(ctor_index) = self
+                    .runtime_slot(constructor)
+                    .map_err(EvalFailure::Runtime)?
+                && let Some(name) = self.function_name(ctor_index)
+            {
+                return Ok(Some(name));
+            }
+            match self.prototype_index(index)? {
+                Some(next) => index = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Reads the `name` property of a function at `index` without invoking
+    /// user code. Returns `None` for non-functions or unnamed functions.
+    fn function_name(&self, index: usize) -> Option<EcmaString> {
+        match &self.heap[index] {
+            HeapEntry::Function {
+                module,
+                function,
+                properties,
+                ..
+            } => {
+                if let Some(Property::Data { value, .. }) = properties.get_ascii("name")
+                    && let Some(text) = self.string_from_value(*value)
+                {
+                    return Some(text);
+                }
+                let metadata = &self.module_code(*module).functions()[function.get() as usize];
+                metadata
+                    .name()
+                    .map(|id| self.constant_text(*module, id).clone())
+            }
+            HeapEntry::NativeFunction { properties, .. } => {
+                if let Some(Property::Data { value, .. }) = properties.get_ascii("name") {
+                    self.string_from_value(*value)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Extracts an [`EcmaString`] from a [`Value`] if it holds a string
+    /// heap entry. Does not invoke user code.
+    fn string_from_value(&self, value: Value) -> Option<EcmaString> {
+        let index = self.runtime_slot(value).ok().flatten()?;
+        match &self.heap[index] {
+            HeapEntry::String(text) => Some(text.clone()),
+            _ => None,
+        }
     }
     pub fn ordinary_number_to_string(number: f64) -> String {
         crate::format_number(number)

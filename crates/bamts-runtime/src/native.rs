@@ -561,14 +561,22 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         if let Some((site, fault_pc)) = self.pending_fault.take() {
             return self.error_at(
                 site.module,
-                RuntimeErrorKind::UncaughtThrow { value, origin },
+                RuntimeErrorKind::UncaughtThrow {
+                    value,
+                    origin,
+                    constructor_name: None,
+                },
                 site.function.get() as usize,
                 fault_pc,
             );
         }
         self.error_at(
             module,
-            RuntimeErrorKind::UncaughtThrow { value, origin },
+            RuntimeErrorKind::UncaughtThrow {
+                value,
+                origin,
+                constructor_name: None,
+            },
             function,
             pc,
         )
@@ -701,7 +709,13 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             Ok(execution)
         })();
         self.machine.borrow_mut().clear_kept_alive_for_job();
-        result
+        match result {
+            Ok(execution) => Ok(execution),
+            Err(mut error) => {
+                self.machine.borrow_mut().enrich_uncaught_throw(&mut error);
+                Err(error)
+            }
+        }
     }
 
     fn evaluate_reference_module(
@@ -3137,7 +3151,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             InvokeOutcome::Threw(value, origin) => {
                 let error = self.error_at(
                     module,
-                    RuntimeErrorKind::UncaughtThrow { value, origin },
+                    RuntimeErrorKind::UncaughtThrow {
+                        value,
+                        origin,
+                        constructor_name: None,
+                    },
                     function.get() as usize,
                     0,
                 );
@@ -3423,8 +3441,6 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
         }
     }
 
-    // -- Linked backend ------------------------------------------------------
-
     fn run_linked(&mut self) -> Result<ExecutionOutcome, NativeError> {
         let result = (|| {
             if self.cancel.is_cancelled() {
@@ -3458,6 +3474,11 @@ impl<'m, 'h, H: Host> NativeEngine<'m, 'h, H> {
             Ok(execution.outcome)
         })();
         self.machine.borrow_mut().clear_kept_alive_for_job();
+        if let Err(NativeError::Runtime(error)) = &result {
+            let mut error = error.clone();
+            self.machine.borrow_mut().enrich_uncaught_throw(&mut error);
+            return Err(NativeError::Runtime(error));
+        }
         result
     }
 
@@ -9583,6 +9604,7 @@ mod tests {
                     RuntimeErrorKind::UncaughtThrow {
                         value: Value::UNDEFINED,
                         origin: ThrowOrigin::TypeError { operation },
+                        constructor_name: None,
                     }
                 );
             };
@@ -9866,6 +9888,7 @@ mod tests {
                     origin: ThrowOrigin::ReferenceError {
                         operation: "global is not defined",
                     },
+                    constructor_name: None,
                 }
             );
         };
