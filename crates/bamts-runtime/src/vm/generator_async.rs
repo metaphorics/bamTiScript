@@ -312,7 +312,7 @@ pub(crate) fn resume_async_function<H: Host>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Limits, PromiseState};
+    use crate::{Limits, PromiseState, PropertyMap};
     use bamts_bytecode::{
         Constant, ConstantId, Function, FunctionFlags, FunctionId, Instruction, Module, ModuleId,
         Pc, Program, ProgramModule, Register, Verified,
@@ -859,6 +859,259 @@ mod tests {
                 .get_named_property(result, "value")
                 .expect("iterator result value is readable"),
             captured
+        );
+    }
+
+    #[test]
+    fn for_await_over_sync_array_completes_through_async_from_sync() {
+        use crate::IteratorKind;
+        let program = verified(
+            vec![Constant::Int32(42), Constant::Undefined],
+            vec![
+                function(0, 0, FunctionFlags::default(), vec![Instruction::Halt]),
+                function(
+                    0,
+                    8,
+                    FunctionFlags {
+                        is_async: true,
+                        is_generator: false,
+                        is_constructable: false,
+                    },
+                    vec![
+                        Instruction::CreateArray { dst: reg(0) },
+                        Instruction::LoadConst {
+                            dst: reg(1),
+                            constant: cid(0),
+                        },
+                        Instruction::ArrayPush {
+                            array: reg(0),
+                            value: reg(1),
+                        },
+                        Instruction::GetIterator {
+                            dst: reg(1),
+                            src: reg(0),
+                            kind: IteratorKind::Async,
+                        },
+                        Instruction::LoadConst {
+                            dst: reg(6),
+                            constant: cid(1),
+                        },
+                        // loop head @5
+                        Instruction::IteratorStep {
+                            dst: reg(2),
+                            iterator: reg(1),
+                        },
+                        Instruction::Await {
+                            dst: reg(3),
+                            src: reg(2),
+                            resume: pc(7),
+                        },
+                        Instruction::IteratorResult {
+                            done: reg(4),
+                            value: reg(5),
+                            result: reg(3),
+                        },
+                        Instruction::JumpIfTrue {
+                            condition: reg(4),
+                            target: pc(11),
+                        },
+                        // body @9
+                        Instruction::Move {
+                            dst: reg(6),
+                            src: reg(5),
+                        },
+                        // loop back @10
+                        Instruction::Jump { target: pc(5) },
+                        // exit @11
+                        Instruction::Return { value: reg(6) },
+                    ],
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let promise = start_async_function(
+            &mut machine,
+            RuntimeFunction {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+            },
+            &[],
+            None,
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            &[],
+        )
+        .expect("async function starts");
+        machine
+            .drain_microtasks()
+            .expect("microtask drain completes the async function");
+        let index = machine
+            .runtime_slot(promise)
+            .unwrap()
+            .expect("promise is a runtime object");
+        assert!(
+            matches!(
+                &machine.heap[index],
+                HeapEntry::Promise {
+                    state: PromiseState::Fulfilled { value },
+                    ..
+                } if *value == number(42)
+            ),
+            "for-await-of over [42] should fulfill with 42"
+        );
+    }
+
+    #[test]
+    fn async_generator_throw_on_suspended_start_then_next_completes() {
+        let program = verified(
+            vec![Constant::Int32(99)],
+            vec![
+                function(0, 0, FunctionFlags::default(), vec![Instruction::Halt]),
+                function(
+                    0,
+                    2,
+                    FunctionFlags {
+                        is_async: true,
+                        is_generator: true,
+                        is_constructable: false,
+                    },
+                    vec![
+                        Instruction::LoadConst {
+                            dst: reg(0),
+                            constant: cid(0),
+                        },
+                        Instruction::Throw { value: reg(0) },
+                    ],
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+        let generator = machine
+            .create_async_generator(GeneratorStart {
+                target: RuntimeFunction {
+                    module: ModuleId::new(0),
+                    function: FunctionId::new(1),
+                },
+                captures: Vec::new(),
+                context: None,
+                this_value: Value::UNDEFINED,
+                new_target: Value::UNDEFINED,
+                args: Vec::new(),
+            })
+            .expect("async generator allocates");
+        // throw on SuspendedStart: completes the generator and rejects the
+        // front request promise.
+        let throw_method = machine.get_named_property(generator, "throw").unwrap();
+        let throw_promise = machine
+            .call_value(throw_method, generator, &[number(99)])
+            .expect("throw returns a promise");
+        let throw_index = machine
+            .runtime_slot(throw_promise)
+            .unwrap()
+            .expect("throw promise is a runtime object");
+        assert!(
+            matches!(
+                &machine.heap[throw_index],
+                HeapEntry::Promise {
+                    state: PromiseState::Rejected { .. },
+                    ..
+                }
+            ),
+            "throw on SuspendedStart rejects immediately"
+        );
+        let next_method = machine.get_named_property(generator, "next").unwrap();
+        let next_promise = machine
+            .call_value(next_method, generator, &[Value::UNDEFINED])
+            .expect("next returns a promise");
+        let next_index = machine
+            .runtime_slot(next_promise)
+            .unwrap()
+            .expect("next promise is a runtime object");
+        assert!(
+            matches!(
+                &machine.heap[next_index],
+                HeapEntry::Promise {
+                    state: PromiseState::Fulfilled { .. },
+                    ..
+                }
+            ),
+            "next on Completed resolves with done:true"
+        );
+    }
+    #[test]
+    fn promise_rejection_propagates_through_then_chain() {
+        let program = verified(
+            Vec::new(),
+            vec![
+                function(0, 0, FunctionFlags::default(), vec![Instruction::Halt]),
+                function(
+                    1,
+                    1,
+                    FunctionFlags::default(),
+                    vec![Instruction::Return { value: reg(0) }],
+                ),
+            ],
+        );
+        let mut host = TestHost;
+        let mut machine = Machine::new(&program, &mut host, Limits::default());
+
+        let promise = machine.create_promise().unwrap();
+        let handler = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                context: None,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+
+        let then_method = machine.get_named_property(promise, "then").unwrap();
+        let derived = machine
+            .call_value(then_method, promise, &[handler, handler])
+            .unwrap();
+
+        let done_handler = machine
+            .allocate(HeapEntry::Function {
+                module: ModuleId::new(0),
+                function: FunctionId::new(1),
+                captures: Vec::new(),
+                context: None,
+                properties: PropertyMap::default(),
+                prototype: Some(machine.intrinsics.function_prototype),
+                extensible: true,
+            })
+            .unwrap();
+        let then_method2 = machine.get_named_property(derived, "then").unwrap();
+        let final_promise = machine
+            .call_value(then_method2, derived, &[done_handler, done_handler])
+            .unwrap();
+
+        machine
+            .reject_promise(promise, number(42), ThrowOrigin::Bytecode)
+            .unwrap();
+
+        machine
+            .drain_microtasks()
+            .expect("microtask drain completes the chain");
+
+        let final_index = machine
+            .runtime_slot(final_promise)
+            .unwrap()
+            .expect("final promise is a runtime object");
+        assert!(
+            matches!(
+                &machine.heap[final_index],
+                HeapEntry::Promise {
+                    state: PromiseState::Fulfilled { .. },
+                    ..
+                }
+            ),
+            "rejection chain should fulfill the final derived promise"
         );
     }
 }

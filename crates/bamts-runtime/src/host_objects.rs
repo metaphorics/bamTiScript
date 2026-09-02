@@ -74,6 +74,8 @@ pub(crate) fn install<H: Host>(
         put(heap, process, name, function);
     }
 
+    let print_fn = register(heap, builtins, "print", 1, print_fn::<H> as _);
+    globals.insert(EcmaString::encode("print"), print_fn);
     globals.insert(EcmaString::encode("console"), console);
     globals.insert(EcmaString::encode("process"), process);
 
@@ -252,6 +254,18 @@ fn console_write<H: Host>(
     } else {
         machine.host.write_stdout(&text_bytes_lossy(&line));
     }
+    Ok(BuiltinOutcome::Value(Value::UNDEFINED))
+}
+
+fn print_fn<H: Host>(
+    machine: &mut Machine<'_, H>,
+    _this: Value,
+    args: &[Value],
+    _constructing: bool,
+) -> Result<BuiltinOutcome, EvalFailure> {
+    let text = machine.to_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    machine.host.write_stdout(&text_bytes_lossy(&text));
+    machine.host.write_stdout(b"\n");
     Ok(BuiltinOutcome::Value(Value::UNDEFINED))
 }
 

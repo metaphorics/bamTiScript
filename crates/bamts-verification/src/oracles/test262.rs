@@ -1024,11 +1024,14 @@ fn interpreter_fuel(deadline: Duration) -> bamts_runtime::Limits {
     }
 }
 
-/// Observes `$DONE` markers in the captured host output.
+/// Observes completion markers in the captured host output.
 ///
-/// `$DONE()` records a success; `$DONE(` followed by any other byte records
-/// an error. Every marker is stamped with the post-run elapsed time, and
-/// [`judge_done`] owns every ordering rule.
+/// The canonical Test262 `doneprintHandle.js` prints
+/// `Test262:AsyncTestComplete` (success) or `Test262:AsyncTestFailure:…`
+/// (error) via the global `print` function.  The internal test harness
+/// additionally emits `$DONE()` / `$DONE(…)` through `console.log`.
+/// Both marker families are recognised so production and fixture flows
+/// share the same judge path.
 #[must_use]
 fn observed_done_trace(
     stdout: &[u8],
@@ -1039,15 +1042,30 @@ fn observed_done_trace(
     let mut events = Vec::new();
     for stream in [stdout, stderr] {
         let mut cursor = 0;
-        while let Some(found) = find_marker(&stream[cursor..], b"$DONE(") {
-            let at = cursor + found;
-            let kind = if stream.get(at + MARKER_OPEN.len()) == Some(&b')') {
-                DoneEventKind::Success
+        loop {
+            let (at, kind) = if let Some(found) =
+                find_marker(&stream[cursor..], COMPLETE_MARKER)
+            {
+                (cursor + found, DoneEventKind::Success)
+            } else if let Some(found) =
+                find_marker(&stream[cursor..], FAILURE_MARKER)
+            {
+                (cursor + found, DoneEventKind::Error)
+            } else if let Some(found) =
+                find_marker(&stream[cursor..], MARKER_OPEN)
+            {
+                let at = cursor + found;
+                let kind = if stream.get(at + MARKER_OPEN.len()) == Some(&b')') {
+                    DoneEventKind::Success
+                } else {
+                    DoneEventKind::Error
+                };
+                (at, kind)
             } else {
-                DoneEventKind::Error
+                break;
             };
             events.push(DoneEvent { kind, at: elapsed });
-            cursor = at + MARKER_OPEN.len();
+            cursor = at + 1;
         }
     }
     AsyncTrace {
@@ -1057,8 +1075,14 @@ fn observed_done_trace(
     }
 }
 
-/// The `$DONE(` invocation prefix in Test262 harness output.
+/// The `$DONE(` invocation prefix used by the internal test harness.
 const MARKER_OPEN: &[u8] = b"$DONE(";
+
+/// Canonical Test262 async-completion marker (success).
+const COMPLETE_MARKER: &[u8] = b"Test262:AsyncTestComplete";
+
+/// Canonical Test262 async-completion marker (failure).
+const FAILURE_MARKER: &[u8] = b"Test262:AsyncTestFailure";
 
 fn find_marker(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
