@@ -1,10 +1,18 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Deterministic receipt-aware TypeScript product release root.
+#
+# A receipt content-addresses the binary that measured it, so the process
+# verifying a receipt has to resolve the same lane worker the process that
+# wrote it resolved. That makes BAMTS_SUITE_COMPILER_ADAPTER load-bearing at
+# verification time, not only at capture time: without it, `ledger rebuild`
+# resolves the harness, the receipt names the worker, and every row is
+# rejected as a stale candidate binding.
 release-gate:
+    cargo build --locked --release -p bamts-verification --bin ts_lane_worker
     cargo run --locked -p bamts-verification --bin bamts-verification -- completion regenerate --check
     cargo run --locked -p bamts-verification --bin ts_conformance -- audit-ledger --require-complete
-    cargo run --locked -p bamts-verification --bin bamts-verification -- ledger rebuild --check
+    BAMTS_SUITE_COMPILER_ADAPTER=target/release/ts_lane_worker cargo run --locked -p bamts-verification --bin bamts-verification -- ledger rebuild --check
     cargo run --locked -p bamts-verification --bin bamts-verification -- completion verify --root product
     printf '%s\n' 'RELEASE GATE PASS'
 

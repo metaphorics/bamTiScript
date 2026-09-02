@@ -188,8 +188,13 @@ jobs:
           pattern: weekly-typescript-compiler-x64-${{ github.run_id }}-${{ github.run_attempt }}-shard-*
           path: target/receipts
           merge-multiple: true
+      - name: Build compiler lane worker
+        shell: bash
+        run: cargo build --locked --release -p bamts-verification --bin ts_lane_worker
       - name: Merge complete compatible matrix
         shell: bash
+        env:
+          BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
         run: |
           set -euo pipefail
           cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
@@ -197,6 +202,8 @@ jobs:
             --out verification/evidence/weekly-merged/typescript-7.0.2-compiler-x86_64-unknown-linux-gnu.jsonl
       - name: Check canonical merged receipt
         shell: bash
+        env:
+          BAMTS_SUITE_COMPILER_ADAPTER: target/release/ts_lane_worker
         run: |
           cargo run --locked -p bamts-verification --bin bamts-verification -- suite merge \
             --catalog typescript-7.0.2 --receipts target/receipts \

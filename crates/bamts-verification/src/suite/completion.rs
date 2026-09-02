@@ -1565,20 +1565,24 @@ mod tests {
         );
     }
 
+    /// The adapter variable name is part of the operator contract: it appears
+    /// in workflow environments, the release gate, and the typed message a
+    /// missing adapter records into a receipt. Renaming a runner silently
+    /// renames the variable, so pin both spellings a workflow relies on.
     #[test]
-    fn a_lane_program_resolves_against_the_root_and_must_be_a_file() {
-        let scratch = Scratch::new("lane-program");
-        scratch.write("worker-stand-in", b"not the harness\n");
+    fn each_runner_names_its_own_adapter_variable() {
+        assert_eq!(
+            lane_adapter_variable(SuiteRunner::Compiler),
+            "BAMTS_SUITE_COMPILER_ADAPTER"
+        );
         assert_eq!(
             lane_adapter_variable(SuiteRunner::Redex),
             "BAMTS_SUITE_REDEX_ADAPTER"
         );
         assert_eq!(
-            lane_adapter_variable(SuiteRunner::Compiler),
-            "BAMTS_SUITE_COMPILER_ADAPTER"
+            lane_adapter_variable(SuiteRunner::Interpreter),
+            "BAMTS_SUITE_INTERPRETER_ADAPTER"
         );
-        assert!(scratch.root.join("worker-stand-in").is_file());
-        assert!(!scratch.root.join("absent-worker").is_file());
     }
 
     #[test]
