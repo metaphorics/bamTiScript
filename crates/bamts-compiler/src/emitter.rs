@@ -592,7 +592,7 @@ pub(crate) fn print_with_jsx_plan(
         indent: 0,
         pending_indent: false,
         anchor: file.range(),
-        pending_mark: None,
+        last_mapped_end: None,
         jsx_plan,
         diagnostics: Vec::new(),
         decl_ambient: false,
@@ -752,7 +752,9 @@ struct Emitter<'a> {
     source_name: &'a str,
     generated_line: usize,
     generated_column: usize,
-    pending_mark: Option<TextRange>,
+    /// The source range of the most recent `raw_mapped` write, used to
+    /// compute the EOL mapping's source position at line boundaries.
+    last_mapped_end: Option<TextRange>,
     out: String,
     jsx_plan: Option<&'a JsxSourceDesugarPlan>,
     indent: usize,
@@ -769,6 +771,75 @@ impl<'a> Emitter<'a> {
         if text.is_empty() {
             return;
         }
+        self.flush_indent();
+        self.write_text(text);
+    }
+
+    /// Writes `text` and records a source-map mapping from the current
+    /// generated position to the source position of `range.start()`.
+    ///
+    /// Unlike the old `mark` + `raw` deferred pattern, this records the
+    /// mapping immediately after flushing indentation but before writing
+    /// the text, so the generated column is exactly where `text` begins.
+    /// `range` should be the source range of the token or node being
+    /// written; `range.end()` is tracked for the next EOL mapping.
+    fn raw_mapped(&mut self, text: &str, range: TextRange) {
+        if text.is_empty() {
+            return;
+        }
+        self.flush_indent();
+        self.record_mapping(range);
+        self.last_mapped_end = Some(range);
+        self.write_text(text);
+    }
+
+    /// Like `raw_mapped` but records the mapping at a specific source position
+    /// rather than a range start. Used for synthetic punctuation whose source
+    /// position is derived (e.g. the space before `=` in `var x = 1`).
+    fn raw_mapped_pos(&mut self, text: &str, pos: Utf16Pos) {
+        if text.is_empty() {
+            return;
+        }
+        let range = TextRange::new(pos, pos)
+            .unwrap_or(TextRange::new(Utf16Pos::ZERO, Utf16Pos::ZERO).unwrap());
+        self.raw_mapped(text, range);
+    }
+
+    /// Records an end-of-line mapping: the current generated column
+    /// (after the last token on this line, before the newline) maps to
+    /// the source position just past the last mapped token's end.
+    fn end_of_line(&mut self) {
+        let Some(builder) = self.map.as_mut() else {
+            return;
+        };
+        let Some(range) = self.last_mapped_end else {
+            return;
+        };
+        let Ok((line, column)) = self.source.line_column(range.end()) else {
+            return;
+        };
+        builder.add_mapping(
+            self.source_name,
+            LineColumn::new(self.generated_line, self.generated_column),
+            LineColumn::new(line, column),
+            None,
+        );
+    }
+
+    fn newline(&mut self) {
+        if self.map.is_some() {
+            self.end_of_line();
+        }
+        self.out.push_str(self.options.newline.as_str());
+        if self.map.is_some() {
+            self.generated_line += 1;
+            self.generated_column = 0;
+        }
+        self.pending_indent = true;
+    }
+
+    /// Flushes pending indentation, updating `generated_column`.
+    fn flush_indent(&mut self) {
         if self.pending_indent {
             let spaces = self.indent * self.options.indent_width as usize;
             for _ in 0..spaces {
@@ -779,9 +850,10 @@ impl<'a> Emitter<'a> {
             }
             self.pending_indent = false;
         }
-        if let Some(range) = self.pending_mark.take() {
-            self.record_mapping(range);
-        }
+    }
+
+    /// Writes text to `out`, tracking `generated_line` / `generated_column`.
+    fn write_text(&mut self, text: &str) {
         if self.map.is_some() {
             for ch in text.chars() {
                 if ch == '\n' {
@@ -795,30 +867,12 @@ impl<'a> Emitter<'a> {
         self.out.push_str(text);
     }
 
-    fn newline(&mut self) {
-        self.out.push_str(self.options.newline.as_str());
-        if self.map.is_some() {
-            self.generated_line += 1;
-            self.generated_column = 0;
-        }
-        self.pending_indent = true;
-    }
-
     /// Returns the current indentation level in spaces.
     fn current_indent_spaces(&self) -> usize {
         self.indent * self.options.indent_width as usize
     }
-
-    /// Defers a mapping mark for `range` until the next actual write, so the
-    /// recorded generated column includes any intervening indentation.
-    fn mark(&mut self, range: TextRange) {
-        if self.map.is_some() {
-            self.pending_mark = Some(range);
-        }
-    }
-
     /// Records the current generated position against the original position
-    /// of `range.start()`, resolving a mark deferred by [`Emitter::mark`].
+    /// of `range.start()`.
     fn record_mapping(&mut self, range: TextRange) {
         let Some(builder) = self.map.as_mut() else {
             return;
@@ -857,10 +911,10 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_token(&mut self, token: &Token) {
+        let range = token.range();
         match self.text(token) {
-            Some(text) => self.raw(text),
+            Some(text) => self.raw_mapped(text, range),
             None => {
-                let range = token.range();
                 self.diag(
                     codes::UNRESOLVED_TOKEN,
                     "token text is not a valid slice of the source",
@@ -871,8 +925,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_ident(&mut self, ident: &IdentifierNode) {
+        let range = ident.range();
         if let Some(text) = self.generated_text(ident.id()).map(str::to_owned) {
-            self.raw(&text);
+            self.raw_mapped(&text, range);
         } else {
             self.emit_token(ident.data().token());
         }
@@ -900,7 +955,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             quoted.push('"');
-            self.raw(&quoted);
+            self.raw_mapped(&quoted, literal.range());
         } else {
             self.emit_token(literal.data().token());
         }
@@ -936,7 +991,7 @@ impl<'a> Emitter<'a> {
     fn emit_statement(&mut self, statement: &Stmt) -> bool {
         let previous = self.anchor;
         self.anchor = statement.range();
-        self.mark(statement.range());
+        let stmt_range = statement.range();
         let emitted = match statement.data() {
             Statement::Import(import) => self.emit_import(import, false),
             Statement::ImportEquals(import) => {
@@ -950,7 +1005,10 @@ impl<'a> Emitter<'a> {
             Statement::Export(export) => self.emit_export_js(export),
             Statement::Variable(declaration) => {
                 self.emit_variable_head(declaration);
-                self.raw(";");
+                let semi_start = Utf16Pos::new(stmt_range.end().get().saturating_sub(1));
+                let semi_end = stmt_range.end();
+                let semi_range = TextRange::new(semi_start, semi_end).unwrap_or(stmt_range);
+                self.raw_mapped(";", semi_range);
                 true
             }
             Statement::Function(function) => {
@@ -1095,23 +1153,30 @@ impl<'a> Emitter<'a> {
         } else {
             self.emit_expression_prec(expression, 0);
         }
-        self.raw(";");
+        let semi_start = Utf16Pos::new(self.anchor.end().get().saturating_sub(1));
+        let semi_end = self.anchor.end();
+        let semi_range = TextRange::new(semi_start, semi_end).unwrap_or(self.anchor);
+        self.raw_mapped(";", semi_range);
     }
 
     fn emit_if(&mut self, statement: &Stmt) {
         let Statement::If(if_statement) = statement.data() else {
             return;
         };
-        self.raw("if (");
+        self.raw_mapped("if (", self.anchor);
         self.emit_expression(&if_statement.test);
-        self.raw(")");
+        self.raw_mapped_pos(")", if_statement.test.range().end());
         self.emit_control_body(&if_statement.consequent);
         if let Some(alternate) = &if_statement.alternate {
+            let alt_range = alternate.range();
             if matches!(alternate.data(), Statement::If(_)) {
-                self.raw(" else ");
+                self.raw_mapped_pos(" else ", if_statement.consequent.range().end());
+                let prev = self.anchor;
+                self.anchor = alt_range;
                 self.emit_if(alternate);
+                self.anchor = prev;
             } else {
-                self.raw(" else");
+                self.raw_mapped_pos(" else", if_statement.consequent.range().end());
                 self.emit_control_body(alternate);
             }
         }
@@ -1123,14 +1188,14 @@ impl<'a> Emitter<'a> {
             Statement::Block(block) => self.emit_block(block.data()),
             Statement::Empty => self.raw("{}"),
             _ => {
-                self.raw("{");
+                self.raw_mapped("{", statement.range());
                 self.newline();
                 self.indent += 1;
                 if self.emit_statement(statement) {
                     self.newline();
                 }
                 self.indent -= 1;
-                self.raw("}");
+                self.raw_mapped_pos("}", statement.range().end());
             }
         }
     }
@@ -1151,11 +1216,10 @@ impl<'a> Emitter<'a> {
         self.indent -= 1;
         self.raw("}");
     }
-
     fn emit_switch(&mut self, switch: &SwitchStatement) {
-        self.raw("switch (");
+        self.raw_mapped("switch (", self.anchor);
         self.emit_expression(&switch.discriminant);
-        self.raw(") ");
+        self.raw_mapped_pos(") ", switch.discriminant.range().end());
         if switch.cases.is_empty() {
             self.raw("{}");
             return;
@@ -1163,15 +1227,16 @@ impl<'a> Emitter<'a> {
         self.raw("{");
         self.newline();
         self.indent += 1;
-        for case in &switch.cases {
-            let case = case.data();
+        for case_node in &switch.cases {
+            let case = case_node.data();
+            let case_range = case_node.range();
             match &case.test {
                 Some(test) => {
-                    self.raw("case ");
+                    self.raw_mapped("case ", case_range);
                     self.emit_expression(test);
-                    self.raw(":");
+                    self.raw_mapped_pos(":", test.range().end());
                 }
-                None => self.raw("default:"),
+                None => self.raw_mapped("default:", case_range),
             }
             self.newline();
             if !case.consequent.is_empty() {
@@ -1189,7 +1254,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_for(&mut self, statement: &ForStatement) {
-        self.raw("for (");
+        self.raw_mapped("for (", self.anchor);
         match &statement.initializer {
             Some(ForInitializer::Variable(declaration)) => self.emit_variable_head(declaration),
             Some(ForInitializer::Expression(expression)) => {
@@ -1207,7 +1272,7 @@ impl<'a> Emitter<'a> {
             self.raw(" ");
             self.emit_expression(update);
         }
-        self.raw(")");
+        self.raw_mapped_pos(")", self.anchor.end());
         self.emit_control_body(&statement.body);
     }
 
@@ -1241,36 +1306,37 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_try(&mut self, statement: &TryStatement) {
-        self.raw("try ");
+        self.raw_mapped("try ", self.anchor);
         self.emit_block(statement.block.data());
         if let Some(handler) = &statement.handler {
+            let handler_range = handler.range();
             let handler = handler.data();
-            self.raw(" catch");
+            self.raw_mapped(" catch", handler_range);
             if let Some(binding) = &handler.binding {
                 self.raw(" (");
                 self.emit_pattern(binding);
-                self.raw(")");
+                self.raw_mapped_pos(")", binding.range().end());
             }
             self.raw(" ");
             self.emit_block(handler.body.data());
         }
         if let Some(finalizer) = &statement.finalizer {
-            self.raw(" finally ");
+            self.raw_mapped(" finally ", finalizer.range());
             self.emit_block(finalizer.data());
         }
     }
 
     fn emit_variable_head(&mut self, declaration: &VariableDeclaration) {
-        self.raw(variable_kind_str(declaration.kind));
+        self.raw_mapped(variable_kind_str(declaration.kind), declaration.range);
         self.raw(" ");
-        for (index, declarator) in declaration.declarations.iter().enumerate() {
+        for (index, declarator_node) in declaration.declarations.iter().enumerate() {
             if index > 0 {
                 self.raw(", ");
             }
-            let declarator = declarator.data();
+            let declarator = declarator_node.data();
             self.emit_pattern(&declarator.binding);
             if let Some(initializer) = &declarator.initializer {
-                self.raw(" = ");
+                self.raw_mapped_pos(" = ", declarator.binding.range().end());
                 self.emit_expression_prec(initializer, P_ASSIGN);
             }
         }
@@ -1990,7 +2056,6 @@ impl<'a> Emitter<'a> {
     fn emit_expression_prec(&mut self, expression: &Expr, min_prec: u8) {
         let previous = self.anchor;
         self.anchor = expression.range();
-        self.mark(expression.range());
         let prec = self.expression_prec(expression);
         let parenthesize = prec < min_prec;
         if parenthesize {
@@ -2249,12 +2314,12 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_ident_expression(&mut self, ident: &IdentifierNode) {
+        let range = ident.range();
         if let Some(text) = self.generated_text(ident.id()).map(str::to_owned) {
-            self.raw(&text);
+            self.raw_mapped(&text, range);
             return;
         }
         let Some(text) = self.text(ident.data().token()) else {
-            let range = ident.range();
             self.diag(
                 codes::UNRESOLVED_TOKEN,
                 "token text is not a valid slice of the source",
@@ -2264,13 +2329,13 @@ impl<'a> Emitter<'a> {
         };
         if let Some(member) = self.enum_facts.member_use(ident.id()) {
             let enum_name = self.model.symbol(member.enum_symbol()).name().to_owned();
-            self.raw(&enum_name);
+            self.raw_mapped(&enum_name, range);
             self.raw("[");
             self.emit_enum_string(member.name());
             self.raw("]");
             return;
         }
-        self.raw(text);
+        self.raw_mapped(text, range);
     }
 
     fn emit_literal(&mut self, literal: &Literal) {
@@ -2290,7 +2355,8 @@ impl<'a> Emitter<'a> {
         }
         .map(str::to_owned);
         if let Some(text) = generated {
-            self.raw(&text);
+            let range = literal_range(literal);
+            self.raw_mapped(&text, range);
             return;
         }
         match literal {
@@ -2299,7 +2365,7 @@ impl<'a> Emitter<'a> {
             Literal::BigInt(node) => self.emit_token(node.data().token()),
             Literal::Boolean(node) => self.emit_token(node.data().token()),
             Literal::Null(node) => match self.text(node.data().token()) {
-                Some(text) if !text.is_empty() => self.raw(text),
+                Some(text) if !text.is_empty() => self.raw_mapped(text, node.range()),
                 _ => self.raw("null"),
             },
             Literal::Regex(node) => self.emit_token(node.data().token()),
@@ -2577,11 +2643,11 @@ impl<'a> Emitter<'a> {
             } else {
                 self.emit_expression_prec(&binary.left, P_EXPONENT + 1);
             }
-            self.raw(" ** ");
+            self.raw_mapped_pos(" ** ", binary.left.range().end());
             self.emit_expression_prec(&binary.right, P_EXPONENT);
         } else {
             self.emit_expression_prec(&binary.left, prec);
-            self.raw(" ");
+            self.raw_mapped_pos(" ", binary.left.range().end());
             self.raw(binary_str(binary.operator));
             self.raw(" ");
             self.emit_expression_prec(&binary.right, prec + 1);
@@ -2986,7 +3052,6 @@ impl<'a> Emitter<'a> {
     fn emit_declaration(&mut self, statement: &Stmt) -> bool {
         let previous = self.anchor;
         self.anchor = statement.range();
-        self.mark(statement.range());
         // Emit leading JSDoc comments for declarations that retain them.
         let needs_jsdoc = matches!(
             statement.data(),
@@ -4110,6 +4175,17 @@ const fn variable_kind_str(kind: VariableKind) -> &'static str {
         VariableKind::Const => "const",
         VariableKind::Using => "using",
         VariableKind::AwaitUsing => "await using",
+    }
+}
+
+fn literal_range(literal: &Literal) -> TextRange {
+    match literal {
+        Literal::String(node) => node.range(),
+        Literal::Number(node) => node.range(),
+        Literal::BigInt(node) => node.range(),
+        Literal::Boolean(node) => node.range(),
+        Literal::Null(node) => node.range(),
+        Literal::Regex(node) => node.range(),
     }
 }
 

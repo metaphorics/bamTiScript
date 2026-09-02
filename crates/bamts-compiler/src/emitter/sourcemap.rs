@@ -328,6 +328,60 @@ impl SourceMap {
 }
 
 /// Accumulates mappings during emit and finalizes a [`SourceMap`].
+///
+/// # tsc Token-Level Mapping Rule
+///
+/// Derived from 30 authority `.js.map` baselines under
+/// `target/authority/typescript-7.0.2-tests/tests/baselines/reference/`
+/// (sourceMap-SemiColon1, sourceMap-Comment1, sourceMap-Comments,
+/// sourceMap-Comments2, sourceMap-EmptyFile1, sourceMap-FileWithComments,
+/// sourceMap-InterfacePrecedingVariableDeclaration1, sourceMap-LineBreaks,
+/// sourceMap-NewLine1, sourceMap-SemiColon1, sourceMap-SingleSpace1,
+/// sourceMap-SkippedNode, sourceMap-StringLiteralWithNewLine,
+/// sourceMapForFunctionInInternalModuleWithCommentPrecedingStatement01,
+/// sourceMapForFunctionWithCommentPrecedingStatement01,
+/// sourceMapPercentEncoded, sourceMapSample, sourceMapValidationClass,
+/// sourceMapValidationClassWithDefaultConstructor,
+/// sourceMapValidationClassWithDefaultConstructorAndCapturedThisStatement,
+/// sourceMapValidationClassWithDefaultConstructorAndExtendsClause,
+/// sourceMapValidationClasses, sourceMapValidationDebugger,
+/// sourceMapValidationDestructuringForArrayBindingPattern,
+/// sourceMapValidationDestructuringForObjectBindingPattern,
+/// sourceMapValidationDestructuringForOfStatement,
+/// sourceMapValidationFunctions, sourceMapValidationTryCatchFinally,
+/// esDecorators-classDeclaration-sourceMap ×3):
+///
+/// 1. **4-field segments only.** Every segment carries exactly four VLQ
+///    fields: generated-column delta, source-index delta, source-line
+///    delta, source-column delta. No 1-field (generated-only) or 5-field
+///    (with name-index) segments appear in any of the 30 baselines.
+///
+/// 2. **Empty `names` table.** The `names` array is `[]` in all 30
+///    baselines. No name-index population is needed.
+///
+/// 3. **Prologue line is unmapped.** When `always_strict` is true, the
+///    `"use strict";` prologue occupies generated line 0 and carries no
+///    mappings. This appears as a leading `;` in the mappings string
+///    (an empty segment group for line 0).
+///
+/// 4. **Per-token mapping.** Each emitted token — keyword, identifier,
+///    literal, or punctuation — receives its own mapping at the token's
+///    start position in both the generated output and the original source.
+///    For example, `var x = 10;` produces six segments: `var`→src(0,0),
+///    `x`→src(0,4), ` `→src(0,5), `10`→src(0,8), `;`→src(0,10),
+///    EOL→src(0,11).
+///
+/// 5. **EOL mapping.** After the last token on each generated line, a
+///    final mapping is recorded at the current generated column pointing
+///    to the end position of the corresponding source construct. This
+///    marks the line boundary in the source.
+///
+/// 6. **Empty files produce empty mappings.** A source file with no
+///    emitable statements (e.g. sourceMap-EmptyFile1, sourceMap-NewLine1,
+///    sourceMap-SingleSpace1) yields `mappings: ""`.
+///
+/// 7. **Single source index.** All 30 baselines reference exactly one
+///    source file; `sourceIndex` is always 0 and never advances.
 #[derive(Clone, Debug, Default)]
 pub struct SourceMapBuilder {
     file: Option<String>,
@@ -1138,6 +1192,136 @@ mod tests {
                 .expect("inline source map")
                 .sources_content(),
             Some(&[Some(source.to_owned())][..])
+        );
+    }
+
+    #[test]
+    fn token_level_mappings_var_statement() {
+        // Authority: sourceMapValidationTryCatchFinally.js.map
+        // Source: "var x = 10;\ntry {\n..."
+        // The first generated line after the prologue is "var x = 10;"
+        // Expected mappings for that line: var(0)->src(0,0), x(4)->src(0,4),
+        // space(5)->src(0,5), 10(8)->src(0,8), ;(10)->src(0,10), EOL(11)->src(0,11)
+        // Baseline VLQ: ";AAAA,IAAI,CAAC,GAAG,EAAE,CAAC"
+        let source = "var x = 10;\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        // The prologue "use strict"; is line 0 (empty mappings).
+        // "var x = 10;" is line 1.
+        // Expected: ";AAAA,IAAI,CAAC,GAAG,EAAE,CAAC"
+        //   ; = empty line 0 (prologue)
+        //   AAAA = gen(1,0) -> src(0,0)  "var"
+        //   IAAI = gen(1,4) -> src(0,4)  "x"
+        //   CAAC = gen(1,5) -> src(0,5)  " = " (space before =)
+        //   GAAG = gen(1,8) -> src(0,8)  "10"
+        //   EAAE = gen(1,10)-> src(0,10) ";"
+        //   CAAC = gen(1,11)-> src(0,11) EOL
+        assert_eq!(
+            mappings, ";AAAA,IAAI,CAAC,GAAG,EAAE,CAAC",
+            "mappings mismatch for 'var x = 10;'\n  got: {mappings}"
+        );
+    }
+
+    #[test]
+    fn token_level_mappings_two_var_statements() {
+        // Authority pattern: sourceMapPercentEncoded.js.map
+        // Source: "var x = 0;\nvar y = 1;\n"
+        // Baseline VLQ: ";AAAA,IAAI,CAAC,GAAG,CAAC,CAAC;AACV,IAAI,CAAC,GAAG,CAAC,CAAC"
+        let source = "var x = 0;\nvar y = 1;\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        // Expected: prologue line 0 empty, then two var lines
+        //   Line 1: var(0)->src(0,0), x(4)->src(0,4), space(5)->src(0,5),
+        //           0(8)->src(0,8), ;(9)->src(0,9), EOL(10)->src(0,10)
+        //   Line 2: var(0)->src(1,0), y(4)->src(1,4), space(5)->src(1,5),
+        //           1(8)->src(1,8), ;(9)->src(1,9), EOL(10)->src(1,10)
+        assert_eq!(
+            mappings, ";AAAA,IAAI,CAAC,GAAG,CAAC,CAAC;AACV,IAAI,CAAC,GAAG,CAAC,CAAC",
+            "mappings mismatch for two var statements\n  got: {mappings}"
+        );
+    }
+
+    #[test]
+    fn token_level_mappings_interface_preceding_var() {
+        // Authority: sourceMap-InterfacePrecedingVariableDeclaration1(target=es2015).js.map
+        // Source: "interface I {}\nvar x = 0;\n"
+        // The interface is erased; only "var x = 0;" is emitted.
+        // Generated: "use strict";\nvar x = 0;\n
+        let source = "interface I {}\nvar x = 0;\n";
+        //   ; = empty line 0 (prologue)
+        //   AACA = gen(1,0) -> src(0,1,0)  "var" (src line 1, after interface line 0)
+        //   IAAI = gen(1,4) -> src(0,1,4)  "x"
+        //   CAAC = gen(1,5) -> src(0,1,5)  " " (space before =)
+        //   GAAG = gen(1,8) -> src(0,1,8)  "0"
+        //   CAAC = gen(1,9) -> src(0,1,9)  ";"
+        //   CAAC = gen(1,10)-> src(0,1,10) EOL
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        assert_eq!(
+            mappings, ";AACA,IAAI,CAAC,GAAG,CAAC,CAAC",
+            "mappings mismatch for interface preceding var\n  got: {mappings}"
+        );
+    }
+    #[test]
+    fn token_level_mappings_const_statement() {
+        // Authority: sourceMap-Comment1 pattern (const keyword + identifier)
+        // Source: "const x = 1;\n"
+        // The const keyword maps to src(0,0), identifier to src(0,6),
+        // space to src(0,7), literal to src(0,10), semicolon to src(0,11),
+        // EOL to src(0,12).
+        let source = "const x = 1;\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        // const = 5 chars, space = 1, x = 1, space = 1, = = 1, space = 1, 1 = 1, ; = 1
+        // gen: const(0), x(6), space(7), 1(10), ;(11), EOL(12)
+        // src: const(0), x(6), space(7), 1(10), ;(11), EOL(12)
+        assert_eq!(
+            mappings, ";AAAA,MAAM,CAAC,GAAG,CAAC,CAAC",
+            "mappings mismatch for const statement\n  got: {mappings}"
         );
     }
 
