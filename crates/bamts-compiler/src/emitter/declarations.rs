@@ -751,4 +751,207 @@ mod tests {
             "expected inferred literal type for class property, got: {code}"
         );
     }
+
+    /// Object type literals break across lines in `.d.ts` output.
+    ///
+    /// Authority: `tests/baselines/reference/DeclarationErrorsNoEmitOnError.js:14-21`
+    /// ```text
+    /// //// [DeclarationErrorsNoEmitOnError.d.ts]
+    /// type T = {
+    ///     x: number;
+    /// };
+    /// ```
+    #[test]
+    fn object_type_literal_breaks_across_lines() {
+        let output = emit_dts(
+            "type T = { x : number }\nexport interface I { f: T; }\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("type T = {\n    x: number;\n};"),
+            "expected multi-line object type, got: {code}"
+        );
+    }
+
+    /// Mapped types break across lines in `.d.ts` output.
+    ///
+    /// Authority: `tests/baselines/reference/mappedTypes3.js:5-7`
+    /// ```text
+    /// type Boxified<T> = {
+    ///     [K in keyof T]: Box<T[K]>;
+    /// }
+    /// ```
+    #[test]
+    fn mapped_type_breaks_across_lines() {
+        let output = emit_dts(
+            "class Box<P> { value: P; }\ntype Boxified<T> = { [K in keyof T]: Box<T[K]>; }\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("type Boxified<T> = {\n    [K in keyof T]: Box<T[K]>;\n}"),
+            "expected multi-line mapped type, got: {code}"
+        );
+    }
+
+    /// Constructor type uses arrow form `=> T`, not colon form `: T`.
+    ///
+    /// Authority: `tests/baselines/reference/exportClassExtendingIntersection.js:72-73`
+    /// ```text
+    /// export type Constructor<T> = new (...args: any[]) => T;
+    /// ```
+    #[test]
+    fn constructor_type_uses_arrow_form() {
+        let output = emit_dts(
+            "export type Constructor<T> = new (...args: any[]) => T;\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("new (...args: any[]) => T"),
+            "expected arrow form for constructor type, got: {code}"
+        );
+        assert!(
+            !code.contains("new (...args: any[]): T"),
+            "expected no colon form for constructor type, got: {code}"
+        );
+    }
+
+    /// Empty class body emits `{\n}` not `{}`.
+    ///
+    /// Authority: `tests/baselines/reference/declarationEmitFirstTypeArgumentGenericFunctionType.js:54-56`
+    /// ```text
+    /// declare class X<A> {
+    /// }
+    /// ```
+    #[test]
+    fn empty_class_body_emits_newline() {
+        let output = emit_dts("class X<A> {\n}\n", DeclarationOptions::default());
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("declare class X<A> {\n}"),
+            "expected empty class body with newline, got: {code}"
+        );
+        assert!(
+            !code.contains("declare class X<A> {}"),
+            "expected no inline empty class body, got: {code}"
+        );
+    }
+
+    /// Synthesized object type from a class expression breaks across lines.
+    ///
+    /// Authority: `tests/baselines/reference/emitClassExpressionInDeclarationFile.js:69-74`
+    /// ```text
+    /// export declare var simpleExample: {
+    ///     new (): {
+    ///         tags(): void;
+    ///     };
+    ///     getTags(): void;
+    /// };
+    /// ```
+    #[test]
+    fn synthesized_object_type_breaks_across_lines() {
+        let output = emit_dts(
+            "export var simpleExample = class {\n    static getTags() { }\n    tags() { }\n}\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("export declare var simpleExample: {\n"),
+            "expected multi-line synthesized object type, got: {code}"
+        );
+        assert!(
+            code.contains("new (): {"),
+            "expected nested object type for construct signature return, got: {code}"
+        );
+    }
+
+    /// Consecutive JSDoc blocks before a declaration are all retained.
+    ///
+    /// Authority: `tests/baselines/reference/importDeferJsdoc.js:21-28`
+    /// ```text
+    /// //// [foo.d.ts]
+    /// /**
+    ///  * @import defer * as ns from "./types"
+    ///  */
+    /// /**
+    ///  * @type { ns.X }
+    ///  */
+    /// declare let a: ns.X;
+    /// ```
+    #[test]
+    fn consecutive_jsdoc_blocks_are_retained() {
+        let output = emit_dts(
+            "/**\n * @import defer * as ns from \"./types\"\n */\n\n/**\n * @type { ns.X }\n */\nlet a = 2;\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("@import defer"),
+            "expected @import defer JSDoc retained, got: {code}"
+        );
+        assert!(
+            code.contains("@type { ns.X }"),
+            "expected @type JSDoc retained, got: {code}"
+        );
+    }
+
+    /// Functions without explicit return type get inferred `: void` in `.d.ts`.
+    ///
+    /// Authority: `tests/baselines/reference/mappedTypes3.js:18`
+    /// ```text
+    /// declare function f1(b: Bacon): void;
+    /// ```
+    #[test]
+    fn inferred_void_return_type_is_emitted() {
+        let output = emit_dts(
+            "interface Bacon { kind: string; }\nfunction f1(b: Bacon) { }\nexport { f1 };\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("declare function f1(b: Bacon): void;"),
+            "expected inferred void return type, got: {code}"
+        );
+    }
+
+    /// Generic function-type arguments in type arguments are wrapped in
+    /// parens to disambiguate `<<T>() => T>` from a misplaced `<<`.
+    ///
+    /// Authority: `tests/baselines/reference/declarationEmitFirstTypeArgumentGenericFunctionType.js:54`
+    /// ```text
+    /// declare var prop11: X<(<Tany>() => Tany)>;
+    /// ```
+    #[test]
+    fn generic_function_type_argument_wrapped_in_parens() {
+        let output = emit_dts(
+            "class X<T> {}\nvar prop11: X<<U>() => U>;\nexport { prop11 };\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("X<(<U>() => U)>"),
+            "expected parens around generic function type argument, got: {code}"
+        );
+    }
+
+    /// Non-generic function-type arguments stay unwrapped.
+    ///
+    /// Authority: `tests/baselines/reference/declFileForFunctionTypeAsTypeParameter.js`
+    /// ```text
+    /// declare class C extends X<() => number> {
+    /// ```
+    #[test]
+    fn non_generic_function_type_argument_not_wrapped() {
+        let output = emit_dts(
+            "class X<T> {}\nclass C extends X<() => number> {}\nexport { C };\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("X<() => number>"),
+            "expected no parens around non-generic function type argument, got: {code}"
+        );
+    }
 }

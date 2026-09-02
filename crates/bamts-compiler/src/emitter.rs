@@ -24,7 +24,7 @@ pub mod transpile;
 
 use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
 
-use crate::checker::{SemanticModel, Type, TypeId, render_type};
+use crate::checker::{SemanticModel, Type, TypeId, render_type_declaration};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
 use crate::jsx_desugar::JsxSourceDesugarPlan;
@@ -802,6 +802,11 @@ impl<'a> Emitter<'a> {
             self.generated_column = 0;
         }
         self.pending_indent = true;
+    }
+
+    /// Returns the current indentation level in spaces.
+    fn current_indent_spaces(&self) -> usize {
+        self.indent * self.options.indent_width as usize
     }
 
     /// Defers a mapping mark for `range` until the next actual write, so the
@@ -3201,34 +3206,62 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Extracts a `/** ... */` JSDoc comment immediately preceding `range`
-    /// in the source text, if one exists. Returns the raw comment text
-    /// including delimiters.
+    /// Extracts all consecutive `/** ... */` JSDoc comments immediately
+    /// preceding `range`, in source order. Multiple adjacent JSDoc blocks
+    /// separated only by whitespace are all retained (e.g. `@import defer`
+    /// followed by `@type`).
     fn extract_jsdoc(&self, range: TextRange) -> Option<String> {
         let source = self.source;
         let byte_start = source.utf16_to_byte(range.start()).ok()?;
         let text = source.as_str();
-        let before = text.get(..byte_start)?;
-        // Find the last `/**` before the range start. `/**/` is an empty
-        // block comment, not JSDoc, so the delimiter must not close itself.
-        let comment_start = before.rfind("/**")?;
-        let after_open = text.get(comment_start..)?;
-        if after_open.starts_with("/**/") {
-            return None;
+
+        // Walk backwards from the declaration, collecting consecutive JSDoc
+        // blocks separated only by whitespace.
+        let mut comments: Vec<&str> = Vec::new();
+        let mut cursor = byte_start;
+        loop {
+            let before = text.get(..cursor)?;
+            // Skip trailing whitespace between the comment end and cursor.
+            let trimmed_end = before.trim_end();
+            if trimmed_end.len() == before.len() {
+                // No whitespace before cursor — no comment here.
+                break;
+            }
+            let after_trim = text.get(trimmed_end.len()..cursor)?;
+            if !after_trim.chars().all(|ch| ch.is_whitespace()) {
+                break;
+            }
+            // Find the last `/**` before the trimmed position.
+            let Some(comment_start) = trimmed_end.rfind("/**") else {
+                break;
+            };
+            let after_open = text.get(comment_start..)?;
+            if after_open.starts_with("/**/") {
+                break;
+            }
+            let Some(close_offset) = after_open.find("*/") else {
+                break;
+            };
+            let comment_end = comment_start + close_offset + 2;
+            // Verify only whitespace between comment end and cursor.
+            let between = text.get(comment_end..cursor)?;
+            if !between.chars().all(|ch| ch.is_whitespace()) {
+                break;
+            }
+            comments.push(text.get(comment_start..comment_end)?);
+            cursor = comment_start;
         }
-        let close_offset = after_open.find("*/")?;
-        let comment_end = comment_start + close_offset + 2;
-        // Only whitespace between the comment end and the declaration start.
-        let between = text.get(comment_end..byte_start)?;
-        if between.chars().all(|ch| ch.is_whitespace()) {
-            Some(text.get(comment_start..comment_end)?.to_owned())
-        } else {
+        if comments.is_empty() {
             None
+        } else {
+            // Reverse to get source order (earliest first).
+            comments.reverse();
+            Some(comments.join("\n"))
         }
     }
 
-    /// Emits a JSDoc comment preceding a declaration at `range`, if one
-    /// exists in the source text. The comment is printed on its own line
+    /// Emits all JSDoc comments preceding a declaration at `range`, if any
+    /// exist in the source text. Each comment is printed on its own line
     /// with the current indentation, followed by a newline.
     fn emit_jsdoc_for_range(&mut self, range: TextRange) {
         if let Some(jsdoc) = self.extract_jsdoc(range) {
@@ -3257,7 +3290,7 @@ impl<'a> Emitter<'a> {
             (Type::NumberLiteral(_), VariableKind::Let | VariableKind::Var) => "number".to_owned(),
             (Type::StringLiteral(_), VariableKind::Let | VariableKind::Var) => "string".to_owned(),
             (Type::BigIntLiteral(_), VariableKind::Let | VariableKind::Var) => "bigint".to_owned(),
-            _ => render_type(self.model, type_id),
+            _ => render_type_declaration(self.model, type_id, self.current_indent_spaces()),
         }
     }
 
@@ -3306,6 +3339,25 @@ impl<'a> Emitter<'a> {
         if let Some(return_type) = &function.return_type {
             self.raw(": ");
             self.emit_type(&return_type.data().type_node);
+        } else if let Some(name) = &function.name {
+            // No explicit return annotation: look up the function's symbol
+            // and infer the return type from its signature as tsc does.
+            let name_text = self.text(name.data().token()).unwrap_or("");
+            if let Some(symbol) = self
+                .model
+                .lookup_value(self.model.module_scope(), name_text)
+            {
+                let type_id = self.model.symbol_type(symbol);
+                if let Type::Function(signature) = self.model.types().get(type_id) {
+                    let ret = signature.return_type();
+                    let rendered =
+                        render_type_declaration(self.model, ret, self.current_indent_spaces());
+                    if !rendered.is_empty() {
+                        self.raw(": ");
+                        self.raw(&rendered);
+                    }
+                }
+            }
         }
         self.raw(";");
     }
@@ -3383,6 +3435,8 @@ impl<'a> Emitter<'a> {
         }
         if has {
             self.indent -= 1;
+        } else {
+            self.newline();
         }
         self.raw("}");
     }
@@ -3438,7 +3492,8 @@ impl<'a> Emitter<'a> {
                 } else if let Some(initializer) = &property.initializer
                     && let Some(type_id) = self.model.node_type(initializer.id())
                 {
-                    let rendered = render_type(self.model, type_id);
+                    let rendered =
+                        render_type_declaration(self.model, type_id, self.current_indent_spaces());
                     if !rendered.is_empty() {
                         self.raw(": ");
                         self.raw(&rendered);
@@ -3648,7 +3703,31 @@ impl<'a> Emitter<'a> {
             if index > 0 {
                 self.raw(", ");
             }
+            // tsc wraps generic function-type and constructor-type arguments
+            // (those with their own type parameters) in parentheses to
+            // disambiguate `<<T>() => T>` from a misplaced `<<`. Non-generic
+            // function types like `() => number` stay unwrapped.
+            // See baselines: declarationEmitFirstTypeArgumentGenericFunctionType.d.ts
+            // and declFileForFunctionTypeAsTypeParameter.d.ts.
+            let needs_parens = match self.unwrap_type(argument).data() {
+                TypeNode::Function(ft) => ft
+                    .type_parameters
+                    .as_ref()
+                    .is_some_and(|tp| !tp.parameters.is_empty()),
+                TypeNode::Constructor(ct) => ct
+                    .function
+                    .type_parameters
+                    .as_ref()
+                    .is_some_and(|tp| !tp.parameters.is_empty()),
+                _ => false,
+            };
+            if needs_parens {
+                self.raw("(");
+            }
             self.emit_type(argument);
+            if needs_parens {
+                self.raw(")");
+            }
         }
         self.raw(">");
     }
@@ -3679,7 +3758,7 @@ impl<'a> Emitter<'a> {
                     self.raw("abstract ");
                 }
                 self.raw("new ");
-                self.emit_function_type_body(&constructor.function);
+                self.emit_function_type_body_arrow(&constructor.function);
             }
             TypeNode::Query(query) => {
                 self.raw("typeof ");
@@ -3844,18 +3923,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_object_type(&mut self, object: &ObjectType) {
-        if object.members.is_empty() {
-            self.raw("{}");
-            return;
-        }
-        self.raw("{ ");
-        for (index, member) in object.members.iter().enumerate() {
-            if index > 0 {
-                self.raw(" ");
-            }
-            self.emit_type_member(member.data());
-        }
-        self.raw(" }");
+        self.emit_type_members_block(&object.members);
     }
 
     fn emit_type_members_block(&mut self, members: &[TypeMemberNode]) {
@@ -3961,7 +4029,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_mapped_type(&mut self, mapped: &MappedType) {
-        self.raw("{ ");
+        self.raw("{");
+        self.newline();
+        self.indent += 1;
         match mapped.readonly_modifier {
             MappedModifier::Preserve => {}
             MappedModifier::Add => self.raw("readonly "),
@@ -3987,7 +4057,10 @@ impl<'a> Emitter<'a> {
             self.raw(": ");
             self.emit_type(value_type);
         }
-        self.raw("; }");
+        self.raw(";");
+        self.indent -= 1;
+        self.newline();
+        self.raw("}");
     }
 
     fn emit_template_literal_type(&mut self, template: &TemplateLiteralType) {

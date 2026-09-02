@@ -11,6 +11,18 @@ pub fn render_type(model: &SemanticModel, type_id: TypeId) -> String {
     render_type_grouped(model, type_id, false, &mut visiting_aliases)
 }
 
+/// Renders an interned type as a declaration-emit string.
+///
+/// Like [`render_type`] but formats object types with multiple members across
+/// multiple lines (indented by `indent` spaces), matching tsc's `.d.ts`
+/// output for synthesized types. Single call/construct signatures keep the
+/// inline arrow form.
+#[must_use]
+pub fn render_type_declaration(model: &SemanticModel, type_id: TypeId, indent: usize) -> String {
+    let mut visiting_aliases = Vec::new();
+    render_type_declaration_grouped(model, type_id, false, indent, &mut visiting_aliases)
+}
+
 fn render_type_grouped(
     model: &SemanticModel,
     type_id: TypeId,
@@ -165,6 +177,275 @@ fn render_type_grouped(
                 format!("typeof {name}<{arguments}>")
             }
         }
+    }
+}
+
+fn render_type_declaration_grouped(
+    model: &SemanticModel,
+    type_id: TypeId,
+    group: bool,
+    indent: usize,
+    visiting_aliases: &mut Vec<SymbolId>,
+) -> String {
+    match model.types().get(type_id) {
+        Type::ObjectType(object) => {
+            render_object_type_declaration(model, object, indent, visiting_aliases)
+        }
+        Type::Function(signature) => {
+            let body =
+                render_signature_declaration(model, signature, " => ", indent, visiting_aliases);
+            if group { format!("({body})") } else { body }
+        }
+        Type::Union(members) => {
+            let body = members
+                .iter()
+                .map(|member| {
+                    render_type_declaration_grouped(model, *member, true, indent, visiting_aliases)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if group { format!("({body})") } else { body }
+        }
+        Type::Intersection(members) => {
+            let body = members
+                .iter()
+                .map(|member| {
+                    render_type_declaration_grouped(model, *member, true, indent, visiting_aliases)
+                })
+                .collect::<Vec<_>>()
+                .join(" & ");
+            if group { format!("({body})") } else { body }
+        }
+        Type::Array(element) => format!(
+            "{}[]",
+            render_type_declaration_grouped(model, *element, true, indent, visiting_aliases)
+        ),
+        Type::Tuple(shape) => {
+            let mut elements = Vec::with_capacity(
+                shape.prefix.len() + usize::from(shape.rest.is_some()) + shape.suffix.len(),
+            );
+            elements.extend(shape.prefix.iter().enumerate().map(|(index, element)| {
+                let optional = index >= usize::try_from(shape.required).expect("tuple length fits");
+                let rendered = render_type_declaration_grouped(
+                    model,
+                    *element,
+                    optional,
+                    indent,
+                    visiting_aliases,
+                );
+                if optional {
+                    format!("{rendered}?")
+                } else {
+                    rendered
+                }
+            }));
+            if let Some(rest) = shape.rest {
+                elements.push(format!(
+                    "...{}[]",
+                    render_type_declaration_grouped(model, rest, true, indent, visiting_aliases)
+                ));
+            }
+            elements.extend(shape.suffix.iter().map(|element| {
+                render_type_declaration_grouped(model, *element, false, indent, visiting_aliases)
+            }));
+            format!("[{}]", elements.join(", "))
+        }
+        // For all other type kinds, delegate to the inline renderer.
+        _ => render_type_grouped(model, type_id, group, visiting_aliases),
+    }
+}
+
+fn render_signature_declaration(
+    model: &SemanticModel,
+    signature: &FunctionSignature,
+    return_separator: &str,
+    indent: usize,
+    visiting_aliases: &mut Vec<SymbolId>,
+) -> String {
+    let type_params = if signature.type_parameters().is_empty() {
+        String::new()
+    } else {
+        let names = signature
+            .type_parameters()
+            .iter()
+            .zip(signature.type_parameter_bounds())
+            .map(|(symbol, bounds)| {
+                let mut rendered = model.symbol(*symbol).name().to_owned();
+                if let Some(constraint) = bounds.constraint() {
+                    rendered.push_str(" extends ");
+                    rendered.push_str(&render_type_declaration_grouped(
+                        model,
+                        constraint,
+                        false,
+                        indent,
+                        visiting_aliases,
+                    ));
+                }
+                if let Some(default) = bounds.default() {
+                    rendered.push_str(" = ");
+                    rendered.push_str(&render_type_declaration_grouped(
+                        model,
+                        default,
+                        false,
+                        indent,
+                        visiting_aliases,
+                    ));
+                }
+                rendered
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("<{names}>")
+    };
+    let params = signature
+        .parameters()
+        .iter()
+        .map(|param| {
+            format!(
+                "{}{}{}: {}",
+                if param.rest() { "..." } else { "" },
+                param.name(),
+                if param.optional() { "?" } else { "" },
+                render_type_declaration_grouped(
+                    model,
+                    param.type_id(),
+                    false,
+                    indent,
+                    visiting_aliases
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{type_params}({params}){return_separator}{}",
+        render_type_declaration_grouped(
+            model,
+            signature.return_type(),
+            false,
+            indent,
+            visiting_aliases
+        )
+    )
+}
+
+fn render_object_type_declaration(
+    model: &SemanticModel,
+    object: &ObjectType,
+    indent: usize,
+    visiting_aliases: &mut Vec<SymbolId>,
+) -> String {
+    // Single call/construct signature with no properties or index signatures
+    // stays inline (arrow form), matching tsc's declaration output.
+    if object.properties.is_empty()
+        && object.index_signatures.is_empty()
+        && object.call_signatures.len() + object.construct_signatures.len() == 1
+    {
+        if let Some(signature) = object.call_signatures.first() {
+            return render_signature_declaration(
+                model,
+                signature,
+                " => ",
+                indent,
+                visiting_aliases,
+            );
+        }
+        if let Some(entry) = object.construct_signatures.first() {
+            return format!(
+                "{}new {}",
+                if entry.is_abstract { "abstract " } else { "" },
+                render_signature_declaration(
+                    model,
+                    &entry.signature,
+                    " => ",
+                    indent,
+                    visiting_aliases
+                )
+            );
+        }
+    }
+
+    let inner_indent = indent + 4;
+    let pad = " ".repeat(inner_indent);
+    let close_pad = " ".repeat(indent);
+
+    let mut members = Vec::with_capacity(
+        object.call_signatures.len()
+            + object.construct_signatures.len()
+            + object.index_signatures.len()
+            + object.properties.len(),
+    );
+    members.extend(object.call_signatures.iter().map(|signature| {
+        render_signature_declaration(model, signature, ": ", inner_indent, visiting_aliases)
+    }));
+    members.extend(object.construct_signatures.iter().map(|entry| {
+        format!(
+            "{}new {}",
+            if entry.is_abstract { "abstract " } else { "" },
+            render_signature_declaration(
+                model,
+                &entry.signature,
+                ": ",
+                inner_indent,
+                visiting_aliases
+            )
+        )
+    }));
+    members.extend(object.index_signatures.iter().map(|signature| {
+        let parameters = signature
+            .parameters
+            .iter()
+            .map(|parameter| {
+                format!(
+                    "{}: {}",
+                    parameter.name(),
+                    render_type_declaration_grouped(
+                        model,
+                        parameter.type_id(),
+                        false,
+                        inner_indent,
+                        visiting_aliases
+                    )
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{}[{parameters}]: {}",
+            if signature.readonly { "readonly " } else { "" },
+            render_type_declaration_grouped(
+                model,
+                signature.value_type,
+                false,
+                inner_indent,
+                visiting_aliases
+            )
+        )
+    }));
+    members.extend(object.properties.iter().map(|property| {
+        format!(
+            "{}{}{}: {}",
+            if property.readonly() { "readonly " } else { "" },
+            property.name(),
+            if property.optional() { "?" } else { "" },
+            render_type_declaration_grouped(
+                model,
+                property.type_id(),
+                false,
+                inner_indent,
+                visiting_aliases
+            )
+        )
+    }));
+    if members.is_empty() {
+        "{}".to_owned()
+    } else {
+        let body = members
+            .iter()
+            .map(|m| format!("{pad}{m};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{{\n{body}\n{close_pad}}}")
     }
 }
 
