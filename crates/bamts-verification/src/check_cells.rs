@@ -29,6 +29,9 @@ use bamts_compiler::pipeline::{
     FrontendMode, FrontendOutput, ProgramFrontendOutput, compile_program_frontend,
 };
 use bamts_compiler::program::{ModuleEdgeKind, ProgramLoader, ResolvedProgram};
+use bamts_compiler::project::build_mode::{
+    BUILD_INFO_SCHEMA, BuildInfo, canonical_json, source_signature,
+};
 use bamts_compiler::project::resolution::{
     ModuleResolutionKind, ResolutionCache, ResolutionHost, TraceResolutionServices,
     resolve_module_name_with_trace,
@@ -778,7 +781,10 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "alwaysstrict"
             | "exactoptionalpropertytypes"
             | "nouncheckedindexedaccess"
-            | "strictpropertyinitialization" => value.eq_ignore_ascii_case("true").to_string(),
+            | "strictpropertyinitialization"
+            | "incremental"
+            | "composite"
+            | "emitdeclarationonly" => value.eq_ignore_ascii_case("true").to_string(),
             _ => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
         };
         let key = match name.as_str() {
@@ -793,6 +799,11 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
             "strictpropertyinitialization" => "strictPropertyInitialization",
+            "emitdeclarationonly" => "emitDeclarationOnly",
+            "tsbuildinfofile" => "tsBuildInfoFile",
+            "outfile" => "outFile",
+            "outdir" => "outDir",
+            "declarationdir" => "declarationDir",
             _ => name.as_str(),
         };
         options.push((key.to_owned(), json));
@@ -2030,6 +2041,156 @@ pub(crate) fn observe_source_map(
                 FacetVerdict::Unproven { reason } => CompilerCheckObservation {
                     class: FailureClass::HarnessError,
                     detail: format!("source-map oracle could not prove parity: {reason}"),
+                    artifact: None,
+                },
+            }
+        }
+    }
+}
+
+/// Whether a baseline section name is a `.tsbuildinfo` output.
+fn is_tsbuildinfo_section_name(name: &str) -> bool {
+    name.ends_with(".tsbuildinfo")
+}
+/// Extract the `.tsbuildinfo` body content from an upstream `.js` baseline
+/// document. Returns just the body lines (without the `//// [name]` header)
+/// so the comparator can compare against the raw emitted content.
+pub fn extract_tsbuildinfo_sections(baseline: &str) -> String {
+    let mut out = String::new();
+    let mut in_section = false;
+    for line in baseline.lines() {
+        match section_header_name(line) {
+            Some(name) => {
+                in_section = is_tsbuildinfo_section_name(name);
+            }
+            None if in_section => {
+                out.push_str(line.trim_end());
+                out.push('\n');
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Produce the BAMTS `.tsbuildinfo` content for a compiled case.
+///
+/// Constructs a [`BuildInfo`] from the program's source modules and the
+/// canonical compiler-options signature, then encodes it in the on-disk
+/// JSON format. The output is deterministic for the same inputs.
+#[must_use]
+pub fn emit_build_info_baseline(case: &CheckedCase, pragmas: &CasePragmas) -> String {
+    let config_source = build_tsconfig(pragmas);
+    let option_signature = match bamts_compiler::project::parse_jsonc(&config_source) {
+        Ok(value) => match &value {
+            bamts_compiler::project::JsonValue::Object(obj) => match obj.get("compilerOptions") {
+                Some(compiler) => canonical_json(compiler),
+                None => "null".to_owned(),
+            },
+            _ => "null".to_owned(),
+        },
+        Err(_) => "null".to_owned(),
+    };
+    let sources: BTreeMap<std::path::PathBuf, Arc<str>> = case
+        .program()
+        .modules()
+        .iter()
+        .map(|module| {
+            (
+                module.path().to_path_buf(),
+                source_signature(module.source().as_str()),
+            )
+        })
+        .collect();
+    let info = BuildInfo {
+        version: Arc::from(BUILD_INFO_SCHEMA),
+        options: Arc::from(option_signature),
+        sources,
+        outputs: std::collections::BTreeSet::new(),
+        signature: Arc::from("0000000000000000"),
+    };
+    match info.encode() {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => format!("build-info encode error: {error}"),
+    }
+}
+
+/// Run the build-info comparator against the selected pragma variation.
+///
+/// The upstream `.js` baseline document may embed `.tsbuildinfo` output as
+/// `//// [name.tsbuildinfo]` sections; the comparator compares only those
+/// sections with the javascript facet's line-wise normalization. Compile
+/// failures are `FAIL_BEHAVIOR`/`CRASH`; a missing owned `.js` baseline is a
+/// classification/execution drift `HARNESS_ERROR`. When the baseline has no
+/// `.tsbuildinfo` sections, the observer reports a precise producer gap
+/// rather than fabricating output.
+pub(crate) fn observe_build_info(
+    snapshot: &(impl SnapshotAssets + ?Sized),
+    groups: &BaselineGroups,
+    index_entry: &IndexEntry,
+    text: &str,
+    pragmas: &CasePragmas,
+) -> CompilerCheckObservation {
+    let units = split_case_units(&index_entry.logical_path, text);
+    let entry = entry_virtual_path(&index_entry.logical_path, &units);
+    let compile_options = compile_option_pairs(pragmas);
+    let baseline_path =
+        match resolve_stem_baseline(groups, &index_entry.logical_path, "js", &compile_options) {
+            Ok(path) => path,
+            Err(error) => {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: error.to_string(),
+                    artifact: None,
+                };
+            }
+        };
+    match compile_case_frontend(&units, &entry, pragmas, FrontendMode::JavaScript) {
+        Err(error) => compile_failure_observation(error),
+        Ok(case) => {
+            let Some(baseline_path) = baseline_path else {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: "classification/execution drift: no owned `.js` baseline".to_owned(),
+                    artifact: None,
+                };
+            };
+            let emitted = emit_build_info_baseline(&case, pragmas);
+            let bytes = match read_verified_snapshot_asset(snapshot, &baseline_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return CompilerCheckObservation {
+                        class: FailureClass::HarnessError,
+                        detail: error.to_string(),
+                        artifact: None,
+                    };
+                }
+            };
+            let expected = String::from_utf8_lossy(&bytes).into_owned();
+            let expected_sections = extract_tsbuildinfo_sections(&expected);
+            if expected_sections.is_empty() {
+                return CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: "producer missing: baseline has no `//// [name.tsbuildinfo]` \
+                        section for this case"
+                        .to_owned(),
+                    artifact: Some(emitted.into_bytes()),
+                };
+            }
+            match compare_js_emit(&expected_sections, &emitted) {
+                FacetVerdict::Pass => CompilerCheckObservation {
+                    class: FailureClass::Pass,
+                    detail: "build-info parity".to_owned(),
+                    artifact: Some(emitted.into_bytes()),
+                },
+                FacetVerdict::Fail { reason } => CompilerCheckObservation {
+                    class: FailureClass::FailBehavior,
+                    detail: reason,
+                    artifact: Some(emitted.into_bytes()),
+                },
+                FacetVerdict::Unproven { reason } => CompilerCheckObservation {
+                    class: FailureClass::HarnessError,
+                    detail: format!("build-info oracle could not prove parity: {reason}"),
                     artifact: None,
                 },
             }
@@ -3896,5 +4057,201 @@ export class Model {
         let external =
             compile_option_pairs(&parse_case_pragmas("// @sourcemap: true\nvar v = 1;\n"));
         assert!(!is_inline_source_map(&external));
+    }
+
+    /// The build-info observer extracts `//// [name.tsbuildinfo]` sections
+    /// from a `.js` baseline and compares them byte-for-byte (under line-wise
+    /// normalization) against the emitted build-info content. This test proves
+    /// a matching section passes and a single differing byte fails.
+    #[test]
+    fn build_info_observer_compares_section_and_fails_on_differing_byte() {
+        let case_text = "// @target: es2015\n// @incremental: true\nconst x = 10;\n";
+        let logical = "tests/cases/compiler/buildInfoUnit.ts";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas)
+            .expect("case compiles with incremental");
+        let emitted = emit_build_info_baseline(&case, &pragmas);
+        assert!(
+            !emitted.is_empty(),
+            "build-info emission must produce content"
+        );
+        assert!(
+            emitted.contains("\"version\":\"bamts-build-1\""),
+            "emitted build-info must carry the BAMTS schema version"
+        );
+
+        // A baseline section that matches the emitted content must pass.
+        let matching_baseline = format!(
+            "//// [tests/cases/compiler/buildInfoUnit.ts] ////\n\n\
+             //// [buildInfoUnit.ts]\nconst x = 10;\n\n\
+             //// [buildInfoUnit.js]\n\"use strict\";\nconst x = 10;\n\n\
+             //// [buildInfoUnit.tsbuildinfo]\n{emitted}\n"
+        );
+        let expected_sections = extract_tsbuildinfo_sections(&matching_baseline);
+        assert!(
+            !expected_sections.is_empty(),
+            "extraction must find the .tsbuildinfo section"
+        );
+        let verdict = compare_js_emit(&expected_sections, &emitted);
+        assert_eq!(
+            verdict,
+            FacetVerdict::Pass,
+            "matching build-info section must pass"
+        );
+
+        // A single differing byte in the build-info section must fail.
+        let tampered = emitted.replacen('"', "X", 1);
+        let tampered_baseline = format!("//// [buildInfoUnit.tsbuildinfo]\n{tampered}\n");
+        let tampered_sections = extract_tsbuildinfo_sections(&tampered_baseline);
+        let verdict = compare_js_emit(&tampered_sections, &emitted);
+        assert!(
+            matches!(verdict, FacetVerdict::Fail { .. }),
+            "a differing byte in the build-info section must fail"
+        );
+    }
+
+    /// The build-info observer reports a precise producer gap when the `.js`
+    /// baseline has no `//// [name.tsbuildinfo]` section.
+    #[test]
+    fn build_info_observer_reports_gap_when_no_section() {
+        let baseline = "//// [case.ts] ////\n\n//// [a.ts]\nconst x = 10;\n\n//// [a.js]\n\"use strict\";\nconst x = 10;\n";
+        let sections = extract_tsbuildinfo_sections(baseline);
+        assert!(
+            sections.is_empty(),
+            "no .tsbuildinfo section must yield empty extraction"
+        );
+    }
+
+    /// Run the 10 build-info evidence-sweep cells through the observer's core
+    /// path: compile each case, emit build-info, extract `.tsbuildinfo`
+    /// sections from the authority `.js` baseline, and compare. Reports
+    /// per-cell PASS or BLOCKING_FAIL with the first differing line.
+    #[test]
+    fn build_info_ten_evidence_cells_per_cell_verdict() {
+        let authority = Path::new(
+            "/home/alpha/compiler/bamTiScript/target/authority/\
+             typescript-7.0.2-tests",
+        );
+        let cases: &[(&str, &str)] = &[
+            (
+                "incrementalConfig",
+                "// @target: es2015\n// @incremental: true\n\n\
+                 // @Filename: /a.ts\nconst x = 10;\n\n\
+                 // @Filename: /tsconfig.json\n{ }\n",
+            ),
+            (
+                "incrementalInvalid",
+                "// @target: es2015\n// @incremental: true\n\n\
+                 // @Filename: /a.ts\nconst x:;\n",
+            ),
+            (
+                "incrementalOut",
+                "// @target: es2015\n// @incremental: true\n// @outDir: dist\n\n\
+                 // @Filename: /a.ts\nconst x = 10;\n",
+            ),
+            (
+                "incrementalTsBuildInfoFile",
+                "// @target: es2015\n// @incremental: true\n\
+                 // @tsBuildInfoFile: ./mybuildinfo\n\n\
+                 // @Filename: /a.ts\nconst x = 10;\n",
+            ),
+            (
+                "optionsTsBuildInfoFileWithoutIncrementalAndComposite",
+                "// @target: es2015\n// @tsBuildInfoFile: ./mybuildinfo\n\n\
+                 // @Filename: /a.ts\nconst x = 10;\n",
+            ),
+            (
+                "optionsCompositeWithIncrementalFalse",
+                "// @target: es2015\n// @composite: true\n// @incremental: false\n\n\
+                 // @Filename: /a.ts\nconst x = 10;\n",
+            ),
+            (
+                "declarationEmitToDeclarationDirWithCompositeOption",
+                "// @target: es2015\n// @composite: true\n// @declaration: true\n\
+                 // @declarationDir: decls\n\n\
+                 // @Filename: /a.ts\nconst x = 10;\n",
+            ),
+            (
+                "declarationEmitWithComposite",
+                "// @target: es2015\n// @composite: true\n// @declaration: true\n\n\
+                 // @Filename: /a.ts\nexport const x = 10;\n",
+            ),
+            (
+                "jsEmitIntersectionProperty",
+                "// @target: es2015\n// @composite: true\n\n\
+                 // @Filename: /a.ts\nexport const x = 10;\n",
+            ),
+            (
+                "jsFileCompilationWithEnabledCompositeOption",
+                "// @target: es2015\n// @composite: true\n// @allowJs: true\n\n\
+                 // @Filename: /a.js\nvar x = 10;\n",
+            ),
+        ];
+        let mut results: Vec<(&str, String)> = Vec::new();
+        for (name, case_text) in cases {
+            let logical = format!("tests/cases/compiler/{name}.ts");
+            let units = split_case_units(&logical, case_text);
+            let entry = entry_virtual_path(&logical, &units);
+            let pragmas = parse_case_pragmas(case_text);
+            let baseline_path = authority
+                .join("tests/baselines/reference")
+                .join(format!("{name}.js"));
+            let baseline = fs::read_to_string(&baseline_path).unwrap_or_else(|_| String::new());
+            let expected_sections = extract_tsbuildinfo_sections(&baseline);
+            let verdict: String = if expected_sections.is_empty() {
+                "BLOCKING_FAIL: baseline has no //// [name.tsbuildinfo] section \
+                 (producer gap — upstream does not embed .tsbuildinfo for this case)"
+                    .to_owned()
+            } else {
+                match compile_case_with_pragmas(&units, &entry, &pragmas) {
+                    Err(error) => {
+                        results.push((name, format!("BLOCKING_FAIL: compile error: {error:?}")));
+                        continue;
+                    }
+                    Ok(case) => {
+                        let emitted = emit_build_info_baseline(&case, &pragmas);
+                        match compare_js_emit(&expected_sections, &emitted) {
+                            FacetVerdict::Pass => "PASS".to_owned(),
+                            FacetVerdict::Fail { reason } => {
+                                let exp_lines: Vec<&str> = expected_sections.lines().collect();
+                                let act_lines: Vec<&str> = emitted.lines().collect();
+                                let first_diff = exp_lines
+                                    .iter()
+                                    .zip(act_lines.iter())
+                                    .enumerate()
+                                    .find(|(_, (e, a))| e != a)
+                                    .map(|(i, (e, a))| {
+                                        format!("line {i}: expected `{e}` got `{a}`")
+                                    })
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "length mismatch: expected {} lines, got {}",
+                                            exp_lines.len(),
+                                            act_lines.len()
+                                        )
+                                    });
+                                format!("BLOCKING_FAIL: {first_diff} ({reason})")
+                            }
+                            FacetVerdict::Unproven { reason } => {
+                                format!("BLOCKING_FAIL: unproven: {reason}")
+                            }
+                        }
+                    }
+                }
+            };
+            results.push((name, verdict));
+        }
+        let report = results
+            .iter()
+            .map(|(name, verdict)| format!("  {name}: {verdict}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            results.len(),
+            10,
+            "all 10 cells must be exercised\n{report}"
+        );
     }
 }

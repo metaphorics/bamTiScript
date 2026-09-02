@@ -2848,6 +2848,13 @@ pub fn observe_compiler_lane(
         ObservableKind::Trace => {
             check_cells::observe_trace(snapshot, &ctx.baseline_groups, index_entry, &text, &pragmas)
         }
+        ObservableKind::BuildInfo => check_cells::observe_build_info(
+            snapshot,
+            &ctx.baseline_groups,
+            index_entry,
+            &text,
+            &pragmas,
+        ),
         other => {
             return CompilerLaneObservation::blocking(
                 snapshot_input,
