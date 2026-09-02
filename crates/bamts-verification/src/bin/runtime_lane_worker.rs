@@ -266,17 +266,6 @@ mod tests {
             .expect("binding")
     }
 
-    fn test_key(mode: ExecutionMode) -> ObligationKey {
-        ObligationKey::new(
-            "test262",
-            "test262/test/pass fixture.js",
-            "default#runtime",
-            mode,
-            "test-platform",
-        )
-        .expect("key")
-    }
-
     #[test]
     fn oracle_mode_maps_correctly() {
         assert_eq!(

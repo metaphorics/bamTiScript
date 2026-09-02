@@ -4261,11 +4261,9 @@ export class Model {
     /// node can report before/after numbers.
     #[test]
     fn enum_types_facet_sample_60_cells() {
-        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT")
-            .unwrap_or_else(|_| {
-                "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests"
-                    .to_owned()
-            });
+        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
+            "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests".to_owned()
+        });
         let cases_dir = format!("{authority_root}/tests/cases/compiler");
         let conformance_dir = format!("{authority_root}/tests/cases/conformance/enums");
         let baseline_dir = format!("{authority_root}/tests/baselines/reference");
@@ -4278,7 +4276,7 @@ export class Model {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let name = path.file_name().unwrap().to_string_lossy().to_owned();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
                 if !name.starts_with("enum") || !name.ends_with(".ts") {
                     continue;
                 }
@@ -4302,7 +4300,10 @@ export class Model {
         case_paths.sort_by(|a, b| a.0.cmp(&b.0));
         let sample: Vec<_> = case_paths.into_iter().take(60).collect();
         let total = sample.len();
-        assert!(total >= 60, "expected at least 60 enum cases with .types baselines, found {total}");
+        assert!(
+            total >= 60,
+            "expected at least 60 enum cases with .types baselines, found {total}"
+        );
 
         let mut exact_matches = 0usize;
         let mut mismatches = 0usize;
@@ -4366,23 +4367,24 @@ export class Model {
     /// records, counting verbatim line matches.
     #[test]
     fn enum_member_access_records_parity() {
-        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT")
-            .unwrap_or_else(|_| {
-                "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests"
-                    .to_owned()
-            });
+        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
+            "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests".to_owned()
+        });
         let baseline_dir = format!("{authority_root}/tests/baselines/reference");
         let mut case_paths: Vec<(String, String)> = Vec::new();
         for (rel_dir, dir) in [
             ("tests/cases/compiler", "tests/cases/compiler"),
-            ("tests/cases/conformance/enums", "tests/cases/conformance/enums"),
+            (
+                "tests/cases/conformance/enums",
+                "tests/cases/conformance/enums",
+            ),
         ] {
             let Ok(entries) = std::fs::read_dir(format!("{authority_root}/{dir}")) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let name = path.file_name().unwrap().to_string_lossy().to_owned();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
                 if !name.starts_with("enum") || !name.ends_with(".ts") {
                     continue;
                 }
@@ -4414,8 +4416,7 @@ export class Model {
                 continue;
             };
             let emitted = emit_types_baseline(&case, logical);
-            let emitted_lines: std::collections::HashSet<&str> =
-                emitted.lines().collect();
+            let emitted_lines: std::collections::HashSet<&str> = emitted.lines().collect();
             let mut per_case = (0usize, 0usize);
             for line in expected.lines().filter(|line| {
                 line.starts_with('>')
@@ -4433,9 +4434,8 @@ export class Model {
             }
             let _ = per_case;
         }
-        let mut report = format!(
-            "enum_member_access_records: total={member_records} matched={matched_records}"
-        );
+        let mut report =
+            format!("enum_member_access_records: total={member_records} matched={matched_records}");
         for sample in &unmatched_samples {
             report.push('\n');
             report.push_str(sample);

@@ -46,7 +46,6 @@ use crate::{
         LaneBinding, LaneExecutor, LaneOutcome, LaneProcessResult, LaneRequest, LaneResponse,
         ProcessExecutor, ProcessObservation, derive_row,
     },
-    oracles::{self, ProcessBoundary},
     schema,
     shard::{ObligationKey, ShardIdentity, ShardSpec, validate_catalog},
     suite::{DEFAULT_SNAPSHOT_REL, verify_snapshot},
@@ -57,8 +56,6 @@ use crate::{
 const CASE_TIMEOUT_MS: u64 = 30_000;
 /// Manifest schema tag produced by `catalog regenerate`.
 const MANIFEST_SCHEMA: &str = "bamti.verification-manifest/v1";
-/// Bounded runtime for host-identity probes.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_OUTPUT_BYTES: usize = 1 << 16;
 
 /// CLIs and workers take this API verbatim.
@@ -1122,20 +1119,14 @@ fn authority_digest(root: &Path, catalog: &str) -> Result<String> {
 fn file_sha256(path: &Path) -> Result<String> {
     use std::io::BufReader;
     let file = File::open(path).map_err(|error| {
-        VerificationError::new(
-            ErrorCode::Io,
-            format!("{}: {error}", path.display()),
-        )
+        VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
     })?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = std::io::Read::read(&mut reader, &mut buffer).map_err(|error| {
-            VerificationError::new(
-                ErrorCode::Io,
-                format!("{}: {error}", path.display()),
-            )
+            VerificationError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
         })?;
         if read == 0 {
             break;
@@ -1145,8 +1136,12 @@ fn file_sha256(path: &Path) -> Result<String> {
     Ok(schema::sha256_hex(&hasher.finalize()))
 }
 
+/// Bounded runtime for host-identity probes.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Runs `git` through the bounded corpus process boundary.
 fn git_probe(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    use crate::oracles::{self, ProcessBoundary};
     let invocation = oracles::ProcessInvocation {
         program: PathBuf::from("git"),
         argv: args.iter().map(|arg| (*arg).into()).collect(),
@@ -1203,7 +1198,10 @@ fn candidate_tree_digest(root: &Path) -> Result<String> {
             format!("git reported a malformed tree digest `{tree}`"),
         ));
     }
-    let status = git_probe(root, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    let status = git_probe(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
     if !status.is_empty() {
         return Err(VerificationError::new(
             ErrorCode::Schema,
@@ -1664,8 +1662,8 @@ mod tests {
             .expect("deletion status");
             assert_eq!(status, expected_status.as_slice());
 
-            let error = candidate_tree_digest(&scratch.root)
-                .expect_err("dirty tree must be rejected");
+            let error =
+                candidate_tree_digest(&scratch.root).expect_err("dirty tree must be rejected");
             assert_eq!(error.code(), ErrorCode::Schema);
         }
     }
@@ -2047,7 +2045,14 @@ mod tests {
                     })
                     .collect();
                 let binding = if index == 2 {
-                    RunBinding::new(hex(9), hex(2), hex(3), hex(4), ToolchainPin::new("rustc-1.97.1", hex(5)).expect("toolchain pin")).expect("binding")
+                    RunBinding::new(
+                        hex(9),
+                        hex(2),
+                        hex(3),
+                        hex(4),
+                        ToolchainPin::new("rustc-1.97.1", hex(5)).expect("toolchain pin"),
+                    )
+                    .expect("binding")
                 } else {
                     binding_for_tests(&root)
                 };

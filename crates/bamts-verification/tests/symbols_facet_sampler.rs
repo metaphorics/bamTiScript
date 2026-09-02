@@ -71,10 +71,11 @@ enum Outcome {
 
 /// Parse the sample file list and optional cfg mapping.
 fn load_sample() -> Vec<SampleCase> {
-    let sample_path = env::var("BAMTS_SYMBOLS_SAMPLE")
-        .expect("BAMTS_SYMBOLS_SAMPLE must point to a sample list file (one logical path per line)");
-    let cfg_path = env::var("BAMTS_SYMBOLS_CFG")
-        .unwrap_or_else(|_| format!("{sample_path}.cfg.jsonl"));
+    let sample_path = env::var("BAMTS_SYMBOLS_SAMPLE").expect(
+        "BAMTS_SYMBOLS_SAMPLE must point to a sample list file (one logical path per line)",
+    );
+    let cfg_path =
+        env::var("BAMTS_SYMBOLS_CFG").unwrap_or_else(|_| format!("{sample_path}.cfg.jsonl"));
 
     let cases: Vec<String> = fs::read_to_string(&sample_path)
         .unwrap_or_else(|_| panic!("failed to read sample list: {sample_path}"))
@@ -90,10 +91,10 @@ fn load_sample() -> Vec<SampleCase> {
             if line.is_empty() {
                 continue;
             }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                if let (Some(case), Some(cfg)) = (val["case"].as_str(), val["cfg"].as_str()) {
-                    cfg_map.insert(case.to_owned(), cfg.to_owned());
-                }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+                && let (Some(case), Some(cfg)) = (val["case"].as_str(), val["cfg"].as_str())
+            {
+                cfg_map.insert(case.to_owned(), cfg.to_owned());
             }
         }
     }
@@ -410,10 +411,10 @@ fn classify_diff(
 
 fn extract_decl(line: &str) -> String {
     // Extract everything inside Symbol(...)
-    if let Some(start) = line.find("Symbol(") {
-        if let Some(end) = line.rfind(')') {
-            return line[start..=end].to_owned();
-        }
+    if let Some(start) = line.find("Symbol(")
+        && let Some(end) = line.rfind(')')
+    {
+        return line[start..=end].to_owned();
     }
     String::new()
 }
@@ -613,7 +614,10 @@ fn symbols_facet_sample() {
     // Group mismatches by family
     for result in &results {
         if let Outcome::Mismatch { family, .. } = &result.outcome {
-            families.entry(family.clone()).or_default().push(result.clone());
+            families
+                .entry(family.clone())
+                .or_default()
+                .push(result.clone());
         }
     }
 
@@ -636,7 +640,7 @@ fn symbols_facet_sample() {
 
     report.push_str("=== FAMILY TABLE (sorted by count) ===\n");
     let mut sorted_families: Vec<_> = families.iter().collect();
-    sorted_families.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted_families.sort_by_key(|(_, cases)| std::cmp::Reverse(cases.len()));
 
     for (family, cases) in &sorted_families {
         let count = cases.len();
