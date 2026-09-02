@@ -1172,6 +1172,9 @@ impl<'a> AstFactCollector<'a> {
                 }
             }
             AssignmentTarget::Identifier(_) | AssignmentTarget::Missing(_) => {}
+            AssignmentTarget::Invalid(operand) => {
+                self.visit_expr(operand, in_constructor);
+            }
         }
     }
 

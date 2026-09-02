@@ -754,6 +754,9 @@ where
             }
         }
         AssignmentTarget::Identifier(_) | AssignmentTarget::Missing(_) => {}
+        AssignmentTarget::Invalid(operand) => {
+            visit_node(NodeRef::Expression(operand), visitor)?;
+        }
     }
     ControlFlow::Continue(())
 }

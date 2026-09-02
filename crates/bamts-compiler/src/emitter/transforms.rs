@@ -1937,6 +1937,7 @@ impl<'a> Rewriter<'a> {
                 }
             }
             AssignmentTarget::Missing(_) => {}
+            AssignmentTarget::Invalid(_) => {}
         }
     }
 
@@ -4304,7 +4305,8 @@ impl<'a> Rewriter<'a> {
             }
             AssignmentTarget::Object(_)
             | AssignmentTarget::Array(_)
-            | AssignmentTarget::Missing(_) => expression.clone(),
+            | AssignmentTarget::Missing(_)
+            | AssignmentTarget::Invalid(_) => expression.clone(),
         }
     }
 
@@ -5002,6 +5004,9 @@ fn scan_target(target: &AssignmentTarget, features: &mut BTreeSet<LanguageFeatur
             }
         }
         AssignmentTarget::Identifier(_) | AssignmentTarget::Missing(_) => {}
+        AssignmentTarget::Invalid(operand) => {
+            scan_expression(operand, features);
+        }
     }
 }
 

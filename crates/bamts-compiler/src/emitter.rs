@@ -2710,6 +2710,9 @@ impl<'a> Emitter<'a> {
                     "cannot emit a missing assignment target",
                 );
             }
+            AssignmentTarget::Invalid(operand) => {
+                self.emit_expression_prec(operand, 0);
+            }
         }
     }
 

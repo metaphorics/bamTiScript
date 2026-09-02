@@ -2096,8 +2096,8 @@ mod tests {
         ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE,
         CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
         DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
-        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, MISSING_METHOD_RETURN_TYPE,
-        MIXED_EXPORT_ASSIGNMENT, PARAMETER_DECORATOR_NOT_SUPPORTED,
+        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, INVALID_ASSIGNMENT_TARGET,
+        MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, PARAMETER_DECORATOR_NOT_SUPPORTED,
         PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
         ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
         SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
@@ -2119,7 +2119,6 @@ mod tests {
     use std::sync::Arc;
 
     // ---- direct algebra tests -------------------------------------------------
-
     #[test]
     fn top_and_bottom_types_bound_the_lattice() {
         let table = TypeTable::new();
@@ -11717,5 +11716,98 @@ function check(options: Options = {}) {
             .collect();
         assert_eq!(spans.len(), 2);
         assert_ne!(spans[0], spans[1]);
+    }
+    // ---- invalid assignment target retains the operand (BAMTS-C086 on nullish) --
+
+    fn checker_codes_strict_null(text: &str) -> Vec<String> {
+        checker_codes_of(&check_text_strict_null(text))
+    }
+
+    #[test]
+    fn increment_of_null_reports_invalid_target_and_nullish_operand() {
+        // `++null` – TS authority reports TS2357 (invalid increment operand)
+        // and TS18050 (null cannot be used here).  Our C036 covers the
+        // invalid-target diagnostic and C086 covers the nullish-operand
+        // diagnostic.
+        let codes = checker_codes_strict_null("var r = ++null;");
+        assert!(
+            codes
+                .iter()
+                .any(|c| c == INVALID_ASSIGNMENT_TARGET.as_str()),
+            "++null must report the invalid-target code C036, got {codes:?}"
+        );
+        assert!(
+            codes
+                .iter()
+                .any(|c| c == VALUE_CANNOT_BE_USED_HERE.as_str()),
+            "++null must report the nullish-operand code C086, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn compound_assignment_to_null_reports_invalid_target_and_nullish_operand() {
+        // `null *= 1` – TS authority reports TS2364 and TS18050 for compound
+        // assignment to a null literal.  Our C036 covers the invalid-target
+        // diagnostic and C086 covers the nullish-operand diagnostic.
+        let codes = checker_codes_strict_null("null *= 1;");
+        assert!(
+            codes
+                .iter()
+                .any(|c| c == INVALID_ASSIGNMENT_TARGET.as_str()),
+            "null *= 1 must report the invalid-target code C036, got {codes:?}"
+        );
+        assert!(
+            codes
+                .iter()
+                .any(|c| c == VALUE_CANNOT_BE_USED_HERE.as_str()),
+            "null *= 1 must report the nullish-operand code C086, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn valid_assignment_target_is_unchanged() {
+        // A plain identifier assignment must not report C036 or C086.
+        let codes = checker_codes_strict_null("var x; x = 1;");
+        assert!(
+            !codes
+                .iter()
+                .any(|c| c == INVALID_ASSIGNMENT_TARGET.as_str()),
+            "x = 1 must not report C036, got {codes:?}"
+        );
+        assert!(
+            !codes
+                .iter()
+                .any(|c| c == VALUE_CANNOT_BE_USED_HERE.as_str()),
+            "x = 1 must not report C086, got {codes:?}"
+        );
+    }
+    #[test]
+    fn grounded_cell_increment_null_matches_authority_multiset() {
+        // Authority: incrementOperatorWithAnyOtherTypeInvalidOperations.ts
+        // line 38 `++null` reports {TS2357, TS18050}.
+        // Our mapping: TS2357→C036 (INVALID_ASSIGNMENT_TARGET),
+        // TS18050→C086 (VALUE_CANNOT_BE_USED_HERE).
+        let codes = checker_codes_strict_null("var r = ++null;");
+        let c036 = INVALID_ASSIGNMENT_TARGET.as_str();
+        let c086 = VALUE_CANNOT_BE_USED_HERE.as_str();
+        let c036_count = codes.iter().filter(|c| c.as_str() == c036).count();
+        let c086_count = codes.iter().filter(|c| c.as_str() == c086).count();
+        assert_eq!(c036_count, 1, "expected exactly 1 C036, got {codes:?}");
+        assert_eq!(c086_count, 1, "expected exactly 1 C086, got {codes:?}");
+    }
+
+    #[test]
+    fn grounded_cell_compound_null_matches_authority_multiset() {
+        // Authority: compoundAssignmentLHSIsValue.ts line 48 `null *= value`
+        // reports TS2362 (arithmetic type check).  Our C036 covers the
+        // invalid-target diagnostic and C086 covers the nullish-operand
+        // diagnostic for `null *= 1`.
+        let codes = checker_codes_strict_null("null *= 1;");
+        let c036 = INVALID_ASSIGNMENT_TARGET.as_str();
+        let c086 = VALUE_CANNOT_BE_USED_HERE.as_str();
+        let c036_count = codes.iter().filter(|c| c.as_str() == c036).count();
+        let c086_count = codes.iter().filter(|c| c.as_str() == c086).count();
+        assert_eq!(c036_count, 1, "expected exactly 1 C036, got {codes:?}");
+        assert_eq!(c086_count, 1, "expected exactly 1 C086, got {codes:?}");
     }
 }

@@ -5354,13 +5354,9 @@ impl Parser {
                     self.expression_to_target(expr)
                 }
                 _ => {
+                    let id = expr.id();
                     let range = expr.range();
-                    self.node_at(
-                        range,
-                        AssignmentTarget::Missing(MissingNode::new(
-                            NodeKind::MissingAssignmentTarget,
-                        )),
-                    )
+                    Node::new(id, range, AssignmentTarget::Invalid(Box::new(expr)))
                 }
             }
         }
@@ -5369,19 +5365,15 @@ impl Parser {
     fn expression_to_target(&mut self, expr: Expr) -> AssignmentTargetNode {
         let range = expr.range();
         let id = expr.id();
-        match expr.into_data() {
+        let data = expr.into_data();
+        match data {
             Expression::Identifier(name) => {
                 Node::new(id, range, AssignmentTarget::Identifier(name))
             }
             Expression::Member(member) => {
                 if member.optional {
-                    return Node::new(
-                        id,
-                        range,
-                        AssignmentTarget::Missing(MissingNode::new(
-                            NodeKind::MissingAssignmentTarget,
-                        )),
-                    );
+                    let original = Node::new(id, range, Expression::Member(member));
+                    return Node::new(id, range, AssignmentTarget::Invalid(Box::new(original)));
                 }
                 Node::new(
                     id,
@@ -5401,11 +5393,10 @@ impl Parser {
                 let target = self.object_literal_to_target(object, range);
                 Node::new(id, range, target)
             }
-            _ => Node::new(
-                id,
-                range,
-                AssignmentTarget::Missing(MissingNode::new(NodeKind::MissingAssignmentTarget)),
-            ),
+            other => {
+                let original = Node::new(id, range, other);
+                Node::new(id, range, AssignmentTarget::Invalid(Box::new(original)))
+            }
         }
     }
 
@@ -8456,5 +8447,45 @@ mod tests {
             "/[[a]/]/v".len()
         );
         assert_tokens_tile(&recovered);
+    }
+    #[test]
+    fn invalid_assignment_target_retains_the_operand_node() {
+        // `++null` – the parser must produce `AssignmentTarget::Invalid`
+        // wrapping the `null` literal, not `AssignmentTarget::Missing`.
+        let source = Arc::new(
+            SourceText::new("var r = ++null;").expect("test source fits the per-file budget"),
+        );
+        let tokens = scan(SourceId::new(0), ScriptKind::TypeScript, source);
+        let parsed = parse(tokens);
+        let program = parsed.product();
+        let stmt = program.statements().last().expect("at least one statement");
+        let crate::syntax::Statement::Variable(decl) = stmt.data() else {
+            panic!("expected a variable declaration, got {:?}", stmt.data());
+        };
+        let init = decl
+            .declarations
+            .first()
+            .expect("one declarator")
+            .data()
+            .initializer
+            .as_ref()
+            .expect("initializer");
+        let crate::syntax::Expression::Update(update) = init.data() else {
+            panic!("expected an update expression, got {:?}", init.data());
+        };
+        match update.argument.data() {
+            crate::syntax::AssignmentTarget::Invalid(operand) => {
+                // The operand must be the `null` literal.
+                assert!(
+                    matches!(
+                        operand.data(),
+                        crate::syntax::Expression::Literal(crate::syntax::Literal::Null(_))
+                    ),
+                    "Invalid operand should be the null literal, got {:?}",
+                    operand.data()
+                );
+            }
+            other => panic!("expected AssignmentTarget::Invalid, got {other:?}"),
+        }
     }
 }

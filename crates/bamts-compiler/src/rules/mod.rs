@@ -1555,6 +1555,9 @@ fn visit_assignment_target(
             }
         }
         AssignmentTarget::Identifier(_) | AssignmentTarget::Missing(_) => {}
+        AssignmentTarget::Invalid(operand) => {
+            visit_expression(operand, script_kind, findings);
+        }
     }
 }
 

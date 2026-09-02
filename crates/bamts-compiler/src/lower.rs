@@ -4106,6 +4106,9 @@ impl<'a> FunctionContext<'a> {
             AssignmentTarget::Missing(missing) => {
                 Err(self.missing(assignment.left.range(), missing.expected()))
             }
+            AssignmentTarget::Invalid(_) => {
+                Err(self.missing(assignment.left.range(), NodeKind::AssignmentExpression))
+            }
         }
     }
     fn lower_identifier_assignment(
@@ -4295,6 +4298,9 @@ impl<'a> FunctionContext<'a> {
             }
             AssignmentTarget::Missing(missing) => {
                 Err(self.missing(update.argument.range(), missing.expected()))
+            }
+            AssignmentTarget::Invalid(_) => {
+                Err(self.missing(update.argument.range(), NodeKind::UpdateExpression))
             }
         }
     }
@@ -6339,6 +6345,9 @@ impl<'a> FunctionContext<'a> {
                 Ok(())
             }
             AssignmentTarget::Missing(missing) => Err(self.missing(range, missing.expected())),
+            AssignmentTarget::Invalid(_) => {
+                Err(self.missing(range, NodeKind::AssignmentExpression))
+            }
         }
     }
     fn assign_object_property(
@@ -9788,6 +9797,9 @@ impl<'a> FreeVarScanner<'a> {
                 }
             }
             AssignmentTarget::Missing(_) => {}
+            AssignmentTarget::Invalid(operand) => {
+                self.scan_expression(operand);
+            }
         }
     }
 }

@@ -1987,6 +1987,9 @@ impl DynamicEdgeCollector<'_> {
                 }
             }
             AssignmentTarget::Identifier(_) | AssignmentTarget::Missing(_) => {}
+            AssignmentTarget::Invalid(operand) => {
+                self.scan_expression(operand);
+            }
         }
     }
 }

@@ -362,6 +362,8 @@ pub enum NodeKind {
     ClassMember,
     ObjectMember,
     Decorator,
+    /// Appended after `Decorator`: `NodeKind` discriminants are append-only.
+    InvalidAssignmentTarget,
 }
 
 /// The complete syntax-kind space, with token and node categories represented
@@ -928,6 +930,10 @@ pub enum AssignmentTarget {
     Object(AssignmentObjectPattern),
     Array(AssignmentArrayPattern),
     Missing(MissingNode),
+    /// A parsed-but-invalid assignment target (e.g. `++null`, `null *= x`).
+    /// The operand is retained so the checker can report TS18050 on a nullish
+    /// value alongside the invalid-target diagnostic.
+    Invalid(Box<Expr>),
 }
 
 impl NodeData for AssignmentTarget {
@@ -938,6 +944,7 @@ impl NodeData for AssignmentTarget {
             Self::Object(_) => NodeKind::ObjectAssignmentTarget,
             Self::Array(_) => NodeKind::ArrayAssignmentTarget,
             Self::Missing(_) => NodeKind::MissingAssignmentTarget,
+            Self::Invalid(_) => NodeKind::InvalidAssignmentTarget,
         }
     }
 }

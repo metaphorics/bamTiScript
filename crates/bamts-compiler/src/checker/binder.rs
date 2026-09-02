@@ -6105,6 +6105,7 @@ impl<'src> Binder<'src> {
                 .invalidate(self.flow, &key);
             }
             AssignmentTarget::Missing(_) => {}
+            AssignmentTarget::Invalid(_) => {}
         }
     }
 
@@ -6149,6 +6150,7 @@ impl<'src> Binder<'src> {
                 }
             }
             AssignmentTarget::Missing(_) => {}
+            AssignmentTarget::Invalid(_) => {}
         }
     }
 
@@ -8903,7 +8905,10 @@ impl<'src> Binder<'src> {
                 self.resolve_variable(variable, scope, require_using_initializer);
             }
             ForBinding::Target(target) => {
-                if matches!(target.data(), AssignmentTarget::Missing(_)) {
+                if matches!(
+                    target.data(),
+                    AssignmentTarget::Missing(_) | AssignmentTarget::Invalid(_)
+                ) {
                     self.emit(
                         FOR_IN_LEFT_HAND_SIDE_INVALID,
                         target.range(),
@@ -8991,7 +8996,10 @@ impl<'src> Binder<'src> {
                 }
             }
             ForBinding::Target(target) => {
-                if matches!(target.data(), AssignmentTarget::Missing(_)) {
+                if matches!(
+                    target.data(),
+                    AssignmentTarget::Missing(_) | AssignmentTarget::Invalid(_)
+                ) {
                     self.emit(
                         FOR_IN_LEFT_HAND_SIDE_INVALID,
                         target.range(),
@@ -13780,6 +13788,15 @@ impl<'src> Binder<'src> {
                     target.range(),
                     INVALID_ASSIGNMENT_TARGET_MESSAGE,
                 );
+            }
+            AssignmentTarget::Invalid(operand) => {
+                self.emit(
+                    INVALID_ASSIGNMENT_TARGET,
+                    target.range(),
+                    INVALID_ASSIGNMENT_TARGET_MESSAGE,
+                );
+                self.resolve_expr(operand, scope);
+                self.check_non_null_operand(operand, scope);
             }
         }
     }
