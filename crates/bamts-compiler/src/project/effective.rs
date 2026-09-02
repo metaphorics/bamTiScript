@@ -48,6 +48,28 @@ pub struct ProjectOptionOverrides {
     pub check_js: Option<bool>,
     pub jsx: Option<Arc<str>>,
     pub source_root: Option<Arc<str>>,
+    // Enum / string-valued compiler options forwarded from argv.
+    pub target: Option<Arc<str>>,
+    pub module: Option<Arc<str>>,
+    pub module_resolution: Option<Arc<str>>,
+    pub module_detection: Option<Arc<str>>,
+    pub new_line: Option<Arc<str>>,
+    pub jsx_factory: Option<Arc<str>>,
+    pub jsx_fragment_factory: Option<Arc<str>>,
+    pub jsx_import_source: Option<Arc<str>>,
+    pub resolve_json_module: Option<bool>,
+    pub declaration_dir: Option<PathBuf>,
+    pub base_url: Option<PathBuf>,
+    // Boolean compiler options forwarded from argv.
+    pub emit_declaration_only: Option<bool>,
+    pub incremental: Option<bool>,
+    pub composite: Option<bool>,
+    pub es_module_interop: Option<bool>,
+    pub isolated_modules: Option<bool>,
+    pub verbatim_module_syntax: Option<bool>,
+    pub trace_resolution: Option<bool>,
+    // List-valued compiler option forwarded from argv.
+    pub lib: Option<Arc<[String]>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1261,6 +1283,14 @@ fn apply_overrides(
         ("allowJs", overrides.allow_js),
         ("checkJs", overrides.check_js),
         ("alwaysStrict", overrides.always_strict),
+        ("emitDeclarationOnly", overrides.emit_declaration_only),
+        ("incremental", overrides.incremental),
+        ("composite", overrides.composite),
+        ("esModuleInterop", overrides.es_module_interop),
+        ("isolatedModules", overrides.isolated_modules),
+        ("verbatimModuleSyntax", overrides.verbatim_module_syntax),
+        ("traceResolution", overrides.trace_resolution),
+        ("resolveJsonModule", overrides.resolve_json_module),
     ] {
         if let Some(value) = value {
             set_named_entry(&mut compiler, key, JsonValue::Bool(value));
@@ -1271,6 +1301,8 @@ fn apply_overrides(
         ("rootDir", overrides.root_dir.as_deref()),
         ("outFile", overrides.out_file.as_deref()),
         ("tsBuildInfoFile", overrides.ts_build_info_file.as_deref()),
+        ("declarationDir", overrides.declaration_dir.as_deref()),
+        ("baseUrl", overrides.base_url.as_deref()),
     ] {
         if let Some(value) = value {
             let value = root
@@ -1279,22 +1311,32 @@ fn apply_overrides(
             set_named_entry(&mut compiler, key, JsonValue::String(path_to_arc(&value)));
         }
     }
-    if let Some(value) = overrides.map_root.as_deref() {
-        set_named_entry(
-            &mut compiler,
-            "mapRoot",
-            JsonValue::String(Arc::from(value)),
-        );
+    for (key, value) in [
+        ("mapRoot", overrides.map_root.as_deref()),
+        ("sourceRoot", overrides.source_root.as_deref()),
+        ("jsx", overrides.jsx.as_deref()),
+        ("target", overrides.target.as_deref()),
+        ("module", overrides.module.as_deref()),
+        ("moduleResolution", overrides.module_resolution.as_deref()),
+        ("moduleDetection", overrides.module_detection.as_deref()),
+        ("newLine", overrides.new_line.as_deref()),
+        ("jsxFactory", overrides.jsx_factory.as_deref()),
+        (
+            "jsxFragmentFactory",
+            overrides.jsx_fragment_factory.as_deref(),
+        ),
+        ("jsxImportSource", overrides.jsx_import_source.as_deref()),
+    ] {
+        if let Some(value) = value {
+            set_named_entry(&mut compiler, key, JsonValue::String(Arc::from(value)));
+        }
     }
-    if let Some(value) = overrides.source_root.as_deref() {
-        set_named_entry(
-            &mut compiler,
-            "sourceRoot",
-            JsonValue::String(Arc::from(value)),
-        );
-    }
-    if let Some(value) = &overrides.jsx {
-        set_named_entry(&mut compiler, "jsx", JsonValue::String(Arc::clone(value)));
+    if let Some(lib) = &overrides.lib {
+        let entries: Vec<JsonValue> = lib
+            .iter()
+            .map(|item| JsonValue::String(Arc::from(item.as_str())))
+            .collect();
+        set_named_entry(&mut compiler, "lib", JsonValue::Array(Arc::from(entries)));
     }
     if !compiler.is_empty() {
         set_named_entry(

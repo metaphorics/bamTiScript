@@ -10,6 +10,8 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
+use bamts_compiler::checker::diagnostic_messages::{Args, by_u32};
+
 use crate::args::{
     ArgsError, CliArgs, DiagnosticsFormat, ExecutionTarget, JsCompatMode, JsCompatOptions, Mode,
     OutputOptions,
@@ -318,15 +320,40 @@ pub enum ModeOptionClassification {
 /// them keeps classification total over the parse table. `showConfig`
 /// prints the effective configuration instead of compiling; direct
 /// dispatch routes it after ordinary argument validation.
+///
+/// The set is every `CompilerOptions` field the project layer carries
+/// (typed struct field or raw `compilerOptions` key forwarded through
+/// `ProjectOptionOverrides`) plus the dispatch controls. An option the
+/// parser admits but the project pipeline cannot carry stays
+/// `Unsupported` so the driver fails closed with TS5047.
 const DIRECT_CONSUMED: &[&str] = &[
     "allowJs",
     "alwaysStrict",
+    "baseUrl",
     "checkJs",
+    "composite",
     "declaration",
+    "declarationDir",
+    "declarationMap",
+    "emitDeclarationOnly",
+    "esModuleInterop",
     "help",
     "ignoreConfig",
+    "incremental",
     "init",
+    "inlineSourceMap",
+    "inlineSources",
+    "isolatedModules",
     "jsx",
+    "jsxFactory",
+    "jsxFragmentFactory",
+    "jsxImportSource",
+    "lib",
+    "mapRoot",
+    "module",
+    "moduleDetection",
+    "moduleResolution",
+    "newLine",
     "noEmit",
     "noEmitOnError",
     "noImplicitAny",
@@ -335,11 +362,18 @@ const DIRECT_CONSUMED: &[&str] = &[
     "outFile",
     "pretty",
     "project",
+    "resolveJsonModule",
+    "rootDir",
     "showConfig",
     "sourceMap",
+    "sourceRoot",
     "strict",
     "strictNullChecks",
     "strictPropertyInitialization",
+    "target",
+    "traceResolution",
+    "tsBuildInfoFile",
+    "verbatimModuleSyntax",
     "version",
 ];
 
@@ -349,19 +383,37 @@ const DIRECT_CONSUMED: &[&str] = &[
 /// direct files-plus-config conflict, which project dispatch never
 /// reaches, so project mode rejects it. `showConfig` prints the effective
 /// merged configuration instead of compiling; project dispatch routes it
-/// after `EffectiveProject::load`.
+/// after `EffectiveProject::load`. The compiler-option surface mirrors
+/// [`DIRECT_CONSUMED`] so argv and tsconfig route through one option set.
 const PROJECT_CONSUMED: &[&str] = &[
     "allowJs",
     "alwaysStrict",
+    "baseUrl",
     "checkJs",
+    "composite",
     "declaration",
+    "declarationDir",
     "declarationMap",
+    "emitDeclarationOnly",
+    "esModuleInterop",
     "help",
+    "incremental",
     "init",
     "inlineSourceMap",
+    "inlineSources",
+    "isolatedModules",
     "jsx",
+    "jsxFactory",
+    "jsxFragmentFactory",
+    "jsxImportSource",
+    "lib",
     "listFiles",
     "listFilesOnly",
+    "mapRoot",
+    "module",
+    "moduleDetection",
+    "moduleResolution",
+    "newLine",
     "noEmit",
     "noEmitOnError",
     "noImplicitAny",
@@ -370,12 +422,18 @@ const PROJECT_CONSUMED: &[&str] = &[
     "outFile",
     "pretty",
     "project",
+    "resolveJsonModule",
     "rootDir",
     "showConfig",
+    "sourceMap",
+    "sourceRoot",
     "strict",
     "strictNullChecks",
     "strictPropertyInitialization",
+    "target",
+    "traceResolution",
     "tsBuildInfoFile",
+    "verbatimModuleSyntax",
     "version",
 ];
 
@@ -607,11 +665,23 @@ where
                 index + 1
             }
             OptionKind::Enum => {
-                if spec.name == "target" && value.eq_ignore_ascii_case("es5") {
+                // `target=ES3` was removed in TypeScript 7.0.2 (TS5108).
+                // `target=ES5` is deprecated but still accepted (TS5107 is a
+                // runtime warning, not a parse failure), so it parses cleanly
+                // and is stored as the canonical lower-case spelling.
+                if spec.name == "target" && value.eq_ignore_ascii_case("es3") {
                     self.errors.push(TscArgError::new(
                         5108,
-                        "Option 'target=ES5' has been removed. Please remove it from your configuration.",
+                        by_u32(5108)
+                            .expect("TS5108 is in the generated catalog")
+                            .format(Args::new(["target", "ES3"]))
+                            .expect("arity matches"),
                     ));
+                } else if spec.name == "target" && value.eq_ignore_ascii_case("es5") {
+                    self.options.insert(
+                        spec.name.to_owned(),
+                        TscOptionValue::String("es5".to_owned()),
+                    );
                 } else if let Some(canonical) = match_enum(value, spec.enum_values) {
                     self.options.insert(
                         spec.name.to_owned(),
@@ -681,12 +751,18 @@ where
         if let Some(suggestion) = did_you_mean(input_name, self.is_build) {
             self.errors.push(TscArgError::new(
                 5025,
-                format!("Unknown compiler option '{original}'. Did you mean '{suggestion}'?"),
+                by_u32(5025)
+                    .expect("TS5025 is in the generated catalog")
+                    .format(Args::new([original, suggestion]))
+                    .expect("arity matches"),
             ));
         } else {
             self.errors.push(TscArgError::new(
                 5023,
-                format!("Unknown compiler option '{original}'."),
+                by_u32(5023)
+                    .expect("TS5023 is in the generated catalog")
+                    .format(Args::new([original]))
+                    .expect("arity matches"),
             ));
         }
     }
@@ -837,12 +913,13 @@ fn invalid_enum(spec: OptionSpec, _value: &str) -> TscArgError {
         .map(|item| format!("'{item}'"))
         .collect::<Vec<_>>()
         .join(", ");
+    let flag = format!("--{}", spec.name);
     TscArgError::new(
         6046,
-        format!(
-            "Argument for '--{name}' option must be: {expected}.",
-            name = spec.name
-        ),
+        by_u32(6046)
+            .expect("TS6046 is in the generated catalog")
+            .format(Args::new([&flag, &expected]))
+            .expect("arity matches"),
     )
 }
 
@@ -1344,25 +1421,72 @@ mod tests {
 
     #[test]
     fn invalid_enum_lists_allowed_values() {
-        let text = parse_err(&["--target", "es3", "a.ts"]).pretty_false();
+        let text = parse_err(&["--target", "es99", "a.ts"]).pretty_false();
         assert!(text.contains("TS6046"));
         assert!(text.contains("Argument for '--target'"));
-        assert!(!text.contains("'es5'"));
         assert!(text.contains("'es6'"));
         assert!(text.contains("'esnext'"));
     }
 
     #[test]
-    fn removed_es5_target_reports_its_dedicated_diagnostic() {
-        let errors = parse_err(&["--target", "es5", "a.ts"]);
+    fn removed_es3_target_reports_its_dedicated_diagnostic() {
+        let errors = parse_err(&["--target", "es3", "a.ts"]);
         let text = errors.pretty_false();
         assert_eq!(
             errors.exit_status(),
             TscExitStatus::DiagnosticsPresentOutputsGenerated
         );
         assert!(text.contains("TS5108"));
-        assert!(text.contains("Option 'target=ES5' has been removed."));
+        assert!(text.contains("Option 'target=ES3' has been removed."));
         assert!(!text.contains("TS6046"));
+    }
+
+    #[test]
+    fn es5_target_parses_case_insensitively() {
+        let lower = parse(&["--target", "es5", "a.ts"]);
+        assert_eq!(lower.option_str("target"), Some("es5"));
+        let upper = parse(&["--target", "ES5", "a.ts"]);
+        assert_eq!(upper.option_str("target"), Some("es5"));
+    }
+
+    #[test]
+    fn previously_failing_flags_parse_and_yield_expected_values() {
+        let target = parse(&["--target", "es2015", "a.ts"]);
+        assert_eq!(target.option_str("target"), Some("es2015"));
+
+        let module = parse(&["--module", "commonjs", "a.ts"]);
+        assert_eq!(module.option_str("module"), Some("commonjs"));
+
+        let lib = parse(&["--lib", "es2015", "a.ts"]);
+        assert_eq!(
+            lib.options.get("lib"),
+            Some(&TscOptionValue::List(vec!["es2015".to_owned()]))
+        );
+
+        let jsx = parse(&["--jsx", "react", "a.ts"]);
+        assert_eq!(jsx.option_str("jsx"), Some("react"));
+
+        let emit = parse(&["--emitDeclarationOnly", "a.ts"]);
+        assert_eq!(
+            emit.options.get("emitDeclarationOnly"),
+            Some(&TscOptionValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn enum_values_are_case_insensitive() {
+        assert_eq!(
+            parse(&["--target", "ES2015", "a.ts"]).option_str("target"),
+            Some("es2015")
+        );
+        assert_eq!(
+            parse(&["--module", "CommonJS", "a.ts"]).option_str("module"),
+            Some("commonjs")
+        );
+        assert_eq!(
+            parse(&["--jsx", "react-jsx", "a.ts"]).option_str("jsx"),
+            Some("react-jsx")
+        );
     }
 
     #[test]
@@ -1602,7 +1726,7 @@ mod tests {
         );
         assert_eq!(
             classify_option("target", Project),
-            ModeOptionClassification::Unsupported
+            ModeOptionClassification::Consumed
         );
         assert_eq!(
             classify_option("verbose", Build),
@@ -1631,7 +1755,7 @@ mod tests {
         let command = parse(&["--watch", "--incremental"]);
         assert_eq!(
             command.first_unsupported_option(TscDispatchMode::Direct),
-            Some("incremental")
+            Some("watch")
         );
     }
 

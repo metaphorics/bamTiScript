@@ -867,6 +867,7 @@ fn execute_tsc_build(
 
 fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOverrides {
     let boolean = |name: &str| command.options.get(name).and_then(|value| value.as_bool());
+    let string = |name: &str| command.option_str(name).map(Arc::<str>::from);
     ProjectOptionOverrides {
         no_emit: boolean("noEmit"),
         no_emit_on_error: boolean("noEmitOnError"),
@@ -892,6 +893,29 @@ fn project_overrides(command: &ParsedTscCommand) -> ProjectOptionOverrides {
         check_js: boolean("checkJs"),
         jsx: command.option_str("jsx").map(Arc::from),
         source_root: command.option_str("sourceRoot").map(Arc::from),
+        target: string("target"),
+        module: string("module"),
+        module_resolution: string("moduleResolution"),
+        module_detection: string("moduleDetection"),
+        new_line: string("newLine"),
+        jsx_factory: string("jsxFactory"),
+        jsx_fragment_factory: string("jsxFragmentFactory"),
+        jsx_import_source: string("jsxImportSource"),
+        resolve_json_module: boolean("resolveJsonModule"),
+        declaration_dir: command.option_str("declarationDir").map(PathBuf::from),
+        base_url: command.option_str("baseUrl").map(PathBuf::from),
+        emit_declaration_only: boolean("emitDeclarationOnly"),
+        incremental: boolean("incremental"),
+        composite: boolean("composite"),
+        es_module_interop: boolean("esModuleInterop"),
+        isolated_modules: boolean("isolatedModules"),
+        verbatim_module_syntax: boolean("verbatimModuleSyntax"),
+        trace_resolution: boolean("traceResolution"),
+        lib: command
+            .options
+            .get("lib")
+            .and_then(|value| value.as_list())
+            .map(|items| Arc::from(items.to_vec())),
     }
 }
 

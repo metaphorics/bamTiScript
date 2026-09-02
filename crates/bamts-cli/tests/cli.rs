@@ -83,7 +83,7 @@ fn tsc_argument_diagnostics_use_stdout() {
     let project = ScratchDirectory::new();
     let output = project
         .command()
-        .args(["--target", "es5", "--ignoreConfig"])
+        .args(["--target", "es3", "--ignoreConfig"])
         .current_dir(&project.path)
         .output()
         .expect("tsc argument validation starts");
@@ -685,8 +685,7 @@ fn project_mode_rejects_unimplemented_options() {
     );
 
     for (option, name) in [
-        (vec!["--incremental"], "incremental"),
-        (vec!["--target", "esnext"], "target"),
+        (vec!["--watch"], "watch"),
         (vec!["--ignoreConfig"], "ignoreConfig"),
     ] {
         let output = project
@@ -1115,11 +1114,11 @@ fn direct_mode_preserves_its_option_surface() {
 
     let rejected = project
         .command()
-        .args(["--ignoreConfig", "hello.ts", "--incremental"])
+        .args(["--ignoreConfig", "hello.ts", "--diagnostics"])
         .current_dir(&project.path)
         .output()
         .expect("direct rejection starts");
-    assert_not_implemented(&rejected, "incremental");
+    assert_not_implemented(&rejected, "diagnostics");
 
     let unset_watch = project
         .command()
