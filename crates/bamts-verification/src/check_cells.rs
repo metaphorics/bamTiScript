@@ -2430,6 +2430,18 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
     }
     for (unit, output) in units {
         let section = unit_basename(&unit.virtual_path);
+        // Skip the empty entry unit that multi-file cases (`@filename:`
+        // sections) leave behind — it has no source content and upstream
+        // does not emit a section for it.
+        if output
+            .source_file()
+            .source_text()
+            .as_str()
+            .trim()
+            .is_empty()
+        {
+            continue;
+        }
         emit_unit_symbols(
             output.semantic_model(),
             output.source_file(),
@@ -2528,6 +2540,22 @@ fn emit_unit_symbols(
             }
         }
     }
+    // Deduplicate records by (start, end, display, rendered): the binder can
+    // record the same (range, symbol) pair multiple times in
+    // `symbol_references`, producing identical `>name : Symbol(...)` lines.
+    // Upstream emits each unique (position, name, symbol) pair once, so
+    // duplicates must be collapsed before the pairwise line comparison.
+    // Sort by the full identity key, dedup consecutive, then re-sort upstream.
+    records.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then(a.end.cmp(&b.end))
+            .then(a.display.cmp(&b.display))
+            .then(a.rendered.cmp(&b.rendered))
+    });
+    records.dedup_by(|a, b| {
+        a.start == b.start && a.end == b.end && a.display == b.display && a.rendered == b.rendered
+    });
     // Upstream order: by start position, outer node before inner on ties.
     records.sort_by(|left, right| left.start.cmp(&right.start).then(right.end.cmp(&left.end)));
     let mut by_line: BTreeMap<usize, Vec<&SymbolRecord>> = BTreeMap::new();
@@ -3713,6 +3741,147 @@ export const a2 = 3;
             compare_symbols(baseline, &emitted),
             FacetVerdict::Pass,
             "emitted:\n{emitted}"
+        );
+    }
+
+    /// Records are ordered by reference-site position (line, then character),
+    /// matching upstream's source-order symbol table iteration. A case with
+    /// declarations and references on multiple lines must emit `>name` records
+    /// in source position order, not binder allocation order.
+    #[test]
+    fn emit_symbols_records_ordered_by_reference_position() {
+        let logical = "tests/cases/compiler/orderPin.ts";
+        // `zebra` is declared last but alphabetically first; `alpha` is
+        // declared first. Records must appear in source line order:
+        // alpha (line 0), zebra (line 1), alpha-ref (line 2).
+        let case_text = "var alpha = 0;\nvar zebra = alpha;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        // Extract all symbol lines in order.
+        let symbol_lines: Vec<&str> = emitted.lines().filter(|l| l.starts_with('>')).collect();
+        // Expected source-order: alpha (line 0), zebra (line 1), alpha ref (line 2).
+        assert!(
+            symbol_lines.iter().any(|l| l.starts_with(">alpha")),
+            "missing alpha declaration record:\n{emitted}"
+        );
+        assert!(
+            symbol_lines.iter().any(|l| l.starts_with(">zebra")),
+            "missing zebra declaration record:\n{emitted}"
+        );
+        // The alpha declaration must come before the zebra declaration
+        // (source order), even though the binder may allocate zebra first.
+        let alpha_pos = symbol_lines
+            .iter()
+            .position(|l| l.starts_with(">alpha"))
+            .expect("alpha record exists");
+        let zebra_pos = symbol_lines
+            .iter()
+            .position(|l| l.starts_with(">zebra"))
+            .expect("zebra record exists");
+        assert!(
+            alpha_pos < zebra_pos,
+            "alpha declaration must precede zebra declaration (source order):\n{emitted}"
+        );
+    }
+
+    /// Duplicate records (same position, display, and rendered string) are
+    /// collapsed. The binder can record the same (range, symbol) pair
+    /// multiple times in `symbol_references`; upstream emits each unique
+    /// `>name : Symbol(...)` line once. Without deduplication, the pairwise
+    /// line comparison diverges and every subsequent line is classified as
+    /// "wrong-symbol-entirely".
+    #[test]
+    fn emit_symbols_records_deduplicated() {
+        let logical = "tests/cases/compiler/dedupPin.ts";
+        // `Ship` is referenced in a type annotation `Ship[]`. The binder
+        // may record this reference multiple times; the emitter must
+        // collapse duplicates so `>Ship` appears once per line.
+        let case_text = "class Ship {}\nclass Board {\n    ships: Ship[] = [];\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        // Count `>Ship` reference lines on the `ships: Ship[] = [];` line.
+        // The declaration `>Ship` is on line 0 (`class Ship {}`), and the
+        // reference `>Ship` is on line 2 (`ships: Ship[] = [];`). Both have
+        // the same Decl, but they are at different positions so both are
+        // kept. The deduplication only collapses records at the SAME position.
+        // Without deduplication, the binder's duplicate references would
+        // produce 2–3 `>Ship` lines on the `ships` line.
+        let lines: Vec<&str> = emitted.lines().collect();
+        let ships_line_idx = lines
+            .iter()
+            .position(|l| l.contains("ships: Ship[]"))
+            .expect("ships line exists");
+        // Symbol records follow the source line; collect consecutive `>` lines.
+        let ship_refs_on_line: Vec<&&str> = lines[ships_line_idx + 1..]
+            .iter()
+            .take_while(|l| l.starts_with('>'))
+            .filter(|l| l.starts_with(">Ship :"))
+            .collect();
+        // There should be exactly one `>Ship` reference on the ships line.
+        assert_eq!(
+            ship_refs_on_line.len(),
+            1,
+            "Ship reference on ships line must appear exactly once (deduplicated), \
+             got {ship_refs_on_line:?}:\n{emitted}"
+        );
+    }
+
+    /// Decl anchors within a Symbol(...) record are ordered by (section, line,
+    /// character) and deduplicated. A namespace declared in two units merges
+    /// into one symbol with two Decl anchors; the emitter must list them in
+    // (section, line, character) order with no duplicates.
+    #[test]
+    fn emit_symbols_decl_anchors_ordered_and_deduplicated() {
+        let logical = "tests/cases/compiler/mergePin.ts";
+        // `namespace X` in two files merges into one symbol with two Decl
+        // anchors: Decl(a.ts, 0, 0) and Decl(b.ts, 0, 0). The anchors must
+        // be ordered by (section, line, character) — a.ts before b.ts — and
+        // deduplicated, even though `emit_symbols_baseline` collects the
+        // anchor under both the bare name and the qualified name.
+        let source = "// @filename: a.ts\nnamespace X { export var a = 1; }\n\
+            // @filename: b.ts\nnamespace X { export var b = 2; }\n";
+        let pragmas = parse_case_pragmas(source);
+        let units = split_case_units(logical, source);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case_with_pragmas(&units, &entry, &pragmas).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        // Find the X declaration line in a.ts section.
+        let x_decl_line = emitted
+            .lines()
+            .find(|l| l.starts_with(">X :") && l.contains("Decl(a.ts, 0, 0)"))
+            .unwrap_or_else(|| panic!("missing X declaration with Decl(a.ts, 0, 0):\n{emitted}"));
+        // Extract Decl(...) entries.
+        let decls: Vec<String> = x_decl_line
+            .match_indices("Decl(")
+            .map(|(start, _)| {
+                let rest = &x_decl_line[start + 5..];
+                let end = rest.find(')').unwrap_or(rest.len());
+                rest[..end].to_owned()
+            })
+            .collect();
+        // Must have exactly two Decl entries for the merged namespace.
+        assert_eq!(
+            decls.len(),
+            2,
+            "merged namespace must have exactly 2 Decl entries, got {decls:?}:\n{emitted}"
+        );
+        // Ordered by (section, line, character): a.ts before b.ts.
+        assert!(
+            decls[0].starts_with("a.ts, 0,") && decls[1].starts_with("b.ts, 0,"),
+            "Decl entries must be ordered by (section, line, char), got {decls:?}:\n{emitted}"
+        );
+        // No duplicate Decl entries.
+        let mut sorted = decls.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            decls.len(),
+            "Decl entries must be deduplicated, got {decls:?}:\n{emitted}"
         );
     }
 
