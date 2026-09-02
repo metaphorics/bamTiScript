@@ -11619,6 +11619,31 @@ function check(options: Options = {}) {
     }
 
     #[test]
+    fn a_union_partner_suppresses_concatenation_only_when_every_member_is_a_string() {
+        // The relations engine's rule for a union source is "every member", so
+        // a union carrying one non-string member still coerces and the nullable
+        // operand is reported. An any-member test would wrongly suppress these.
+        assert_eq!(
+            nullable_operand_reports("declare var u: \"a\" | \"b\"; var a = u + null;"),
+            0
+        );
+        assert_eq!(
+            nullable_operand_reports("declare var u: \"a\" | 1; var a = u + null;"),
+            1
+        );
+        assert_eq!(
+            nullable_operand_reports("declare var u: string | number; var a = u + null;"),
+            1
+        );
+        // The boxed wrapper interfaces are not string-assignable either, which
+        // `additionOperatorWithNullValueAndInvalidOperator` pins.
+        assert_eq!(
+            nullable_operand_reports("declare var d: Number; var a = null + d;"),
+            1
+        );
+    }
+
+    #[test]
     fn unary_coercions_reject_a_nullable_operand_but_tests_accept_one() {
         // `bitwiseNotOperatorWithAnyOtherType` and its plus/negate siblings
         // report; `!x`, `typeof x`, and `void x` never coerce, so they accept.

@@ -3513,16 +3513,13 @@ impl TypeTable {
         }
     }
 
-    /// Whether `null` or `undefined` is one of the type's own constituents.
+    /// Whether the type is exactly `null` or exactly `undefined`.
     ///
-    /// This is the constituent test upstream's nullable-operand check uses, so
-    /// a union reports when any member is nullable.
-    pub fn is_nullable(&self, type_id: TypeId) -> bool {
-        match self.get(type_id) {
-            Type::Null | Type::Undefined => true,
-            Type::Union(members) => members.iter().any(|member| self.is_nullable(*member)),
-            _ => false,
-        }
+    /// Deliberately not a union test. Upstream reports a nullable operand only
+    /// where the operand spells one of those two values, so a union that merely
+    /// contains them is not reported and must not answer true here.
+    pub fn is_nullish(&self, type_id: TypeId) -> bool {
+        matches!(self.get(type_id), Type::Null | Type::Undefined)
     }
     fn optional_access_view(&mut self, type_id: TypeId) -> TypeId {
         let non_nullable = self.non_nullable(type_id);
@@ -16715,7 +16712,7 @@ impl<'src> Binder<'src> {
             return;
         }
         let operand_type = self.type_of_expr(operand, scope);
-        if !self.types.is_nullable(operand_type) {
+        if !self.types.is_nullish(operand_type) {
             return;
         }
         self.emit(
@@ -16764,13 +16761,30 @@ impl<'src> Binder<'src> {
         }
     }
 
-    /// Whether a value of this type can be assigned to a string. `any` and
-    /// `null`/`undefined` without `strictNullChecks` both qualify, which is
-    /// what suppresses the `+` operand check for them.
+    /// Whether a value of this type can be assigned to a string, which is what
+    /// makes `+` concatenate rather than coerce.
+    ///
+    /// A union qualifies only when every member does, matching the relations
+    /// engine's own rule for a union source: `"a" | 1` and `string | number`
+    /// both coerce, so `null + u` reports for them. An any-member test would
+    /// wrongly suppress both.
+    ///
+    /// Deliberately not `types_assignable(type_id, string)`. The engine accepts
+    /// the boxed `Number` interface as assignable to `string`, which would
+    /// suppress `null + d` where `d: Number` and the authority reports it
+    /// (`additionOperatorWithNullValueAndInvalidOperator`). That is a defect in
+    /// assignability, not in this rule, and it is not this rule's to inherit.
     fn is_assignable_to_string_like(&self, type_id: TypeId) -> bool {
-        self.is_string_like(type_id)
-            || matches!(self.types.get(type_id), Type::Any)
-            || (!self.strict_null_checks && self.types.is_nullable(type_id))
+        match self.types.get(type_id) {
+            Type::Any | Type::String | Type::StringLiteral(_) => true,
+            // Without `strictNullChecks` a nullable value is string-assignable,
+            // so `+` concatenates and no operand is rejected.
+            Type::Null | Type::Undefined => !self.strict_null_checks,
+            Type::Union(members) => members
+                .iter()
+                .all(|member| self.is_assignable_to_string_like(*member)),
+            _ => false,
+        }
     }
 
     /// Whether the expression spells a nullable value directly: the `null`
