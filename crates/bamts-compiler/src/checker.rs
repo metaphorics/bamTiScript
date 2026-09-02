@@ -1185,13 +1185,23 @@ fn build_imported_symbol_type<'a>(
         files,
     )?;
     let source_model = files.get(&linked.source)?;
-    let value_type_id = source_model.symbol_type(linked.symbol);
+    let symbol_kind = source_model.symbol(linked.symbol).kind();
+    // A class symbol's value plane is its constructor type; the structural
+    // static side hangs off it, and the type plane is its instance type.
+    let value_type_id = if symbol_kind == SymbolKind::Class {
+        source_model.constructor_type(linked.symbol)
+    } else {
+        source_model.symbol_type(linked.symbol)
+    };
     let value_type = source_model.types().get(value_type_id);
     if matches!(value_type, Type::Error | Type::Any | Type::Unknown) {
         return None;
     }
-    let type_plane_id = match (source_model.symbol(linked.symbol).kind(), value_type) {
-        (SymbolKind::Class, Type::ObjectType(object)) => {
+    let type_plane_id = match (symbol_kind, value_type) {
+        (SymbolKind::Class, Type::ConstructorType { structural, .. }) => {
+            let Type::ObjectType(object) = source_model.types().get(*structural) else {
+                return None;
+            };
             let mut signatures = object.construct_signatures.iter();
             signatures.next().and_then(|first| {
                 let return_type = first.signature.return_type();
@@ -2822,8 +2832,12 @@ mod tests {
         );
     }
 
+    /// The checker follows tsc's default `lib`, not the runtime's builtin
+    /// surface: a value the default library declares resolves even when the
+    /// bamts runtime does not implement it. Runtime absence is a test262
+    /// matter, never a checker diagnostic.
     #[test]
-    fn runtime_absent_value_names_report_cannot_find_name() {
+    fn default_lib_value_names_resolve_regardless_of_runtime_support() {
         let names = [
             "eval",
             "decodeURI",
@@ -2838,7 +2852,6 @@ mod tests {
             "Uint32Array",
             "BigInt64Array",
             "BigUint64Array",
-            "Float16Array",
             "Float32Array",
             "Float64Array",
             "ArrayBuffer",
@@ -2850,19 +2863,17 @@ mod tests {
             "WeakRef",
             "Intl",
             "Iterator",
-            "AsyncIterator",
             "AbortSignal",
             "URL",
             "URLSearchParams",
             "TextEncoder",
             "TextDecoder",
-            "TextEncoderStream",
-            "TextDecoderStream",
         ];
         let result = check_text(&names.join(";"));
-        assert_eq!(
-            checker_codes(&result),
-            vec![CANNOT_FIND_NAME.as_str(); names.len()]
+        assert!(
+            !checker_codes(&result).contains(&CANNOT_FIND_NAME.as_str()),
+            "default-lib values must resolve: {:?}",
+            result.diagnostics()
         );
     }
 

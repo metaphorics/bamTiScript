@@ -2242,7 +2242,11 @@ impl TypeTable {
         arguments: Vec<TypeId>,
         structural: TypeId,
     ) -> TypeId {
-        self.intern(Type::ConstructorType { symbol, arguments, structural })
+        self.intern(Type::ConstructorType {
+            symbol,
+            arguments,
+            structural,
+        })
     }
 
     /// Returns the parameter-relative self head used inside a class declaration.
@@ -4060,7 +4064,11 @@ impl TypeTable {
                     let constraint = copy(target, source, constraint, imported, next_symbol);
                     target.this_type(owner, constraint)
                 }
-                Type::ConstructorType { symbol, arguments, structural } => {
+                Type::ConstructorType {
+                    symbol,
+                    arguments,
+                    structural,
+                } => {
                     let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
                     let arguments = arguments
                         .iter()
@@ -4907,9 +4915,9 @@ pub(crate) struct Binder<'src> {
     /// values can resolve declared instance members.
     pub(crate) class_instance_types: HashMap<SymbolId, TypeId>,
     /// Constructor (static-side) types keyed by the class symbol. For class
- /// declarations, `symbol_types[owner]` stores the instance type and this
- /// map holds the `typeof C` constructor type for value-position references.
- pub(crate) class_constructor_types: HashMap<SymbolId, TypeId>,
+    /// declarations, `symbol_types[owner]` stores the instance type and this
+    /// map holds the `typeof C` constructor type for value-position references.
+    pub(crate) class_constructor_types: HashMap<SymbolId, TypeId>,
     reg_exp_instance_type: Option<TypeId>,
     /// Shared by provisional and final class-shape passes so a generic method's
     /// type parameters keep one semantic identity.
@@ -13729,16 +13737,8 @@ impl<'src> Binder<'src> {
                 }
                 None
             }
-            Type::ConstructorType { structural, .. } => {
-                self.property_type_for_member_raw(
-                    structural,
-                    name,
-                    range,
-                    read,
-                    receiver,
-                    owner_hint,
-                )
-            }
+            Type::ConstructorType { structural, .. } => self
+                .property_type_for_member_raw(structural, name, range, read, receiver, owner_hint),
             Type::This {
                 owner, constraint, ..
             } => self.property_type_for_member_raw(
@@ -13813,9 +13813,7 @@ impl<'src> Binder<'src> {
                 }
                 false
             }
-            Type::ConstructorType { structural, .. } => {
-                self.property_is_readonly(structural, name)
-            }
+            Type::ConstructorType { structural, .. } => self.property_is_readonly(structural, name),
             Type::AppliedAlias { .. } => {
                 if let Some(view) = self.types.prepare_applied_alias_view(object_type) {
                     return self.property_is_readonly(view, name);
