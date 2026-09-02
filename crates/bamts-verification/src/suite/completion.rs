@@ -27,6 +27,7 @@ use std::{
     fs::{self, File},
     io::BufWriter,
     path::{Path, PathBuf},
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 
@@ -1185,26 +1186,13 @@ fn git_probe(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// digest.  Two captures of the same committed tree always produce the
 /// same digest because it is solely `sha256("git-tree\0" + HEAD_tree_hash)`.
 fn candidate_tree_digest(root: &Path) -> Result<String> {
-    let tree = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD^{tree}"])
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| {
-            VerificationError::new(
-                ErrorCode::ToolFailed,
-                format!("git rev-parse probe failed: {error}"),
-            )
-        })?;
-    if !tree.status.success() {
-        return Err(VerificationError::new(
-            ErrorCode::ToolFailed,
-            format!("git rev-parse exited {}", tree.status),
-        ));
-    }
-    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_owned();
+    // Use git_probe (pinned environment) so the user's global gitconfig —
+    // especially `core.excludesfile` — cannot silently hide untracked files
+    // from the dirty-tree check.  A raw `Command::new("git")` inherits HOME,
+    // reads ~/.gitconfig, and may honor a global excludesfile that masks
+    // embedded repositories or other untracked content.
+    let tree_bytes = git_probe(root, &["rev-parse", "HEAD^{tree}"])?;
+    let tree = String::from_utf8_lossy(&tree_bytes).trim().to_owned();
     if !matches!(tree.len(), 40 | 64)
         || !tree
             .bytes()
@@ -1215,26 +1203,8 @@ fn candidate_tree_digest(root: &Path) -> Result<String> {
             format!("git reported a malformed tree digest `{tree}`"),
         ));
     }
-    let status = std::process::Command::new("git")
-        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| {
-            VerificationError::new(
-                ErrorCode::ToolFailed,
-                format!("git status probe failed: {error}"),
-            )
-        })?;
-    if !status.status.success() {
-        return Err(VerificationError::new(
-            ErrorCode::ToolFailed,
-            format!("git status exited {}", status.status),
-        ));
-    }
-    if !status.stdout.is_empty() {
+    let status = git_probe(root, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    if !status.is_empty() {
         return Err(VerificationError::new(
             ErrorCode::Schema,
             "candidate tree is dirty; a v2 receipt requires a clean committed tree",
@@ -1281,23 +1251,44 @@ fn rustc_version_string() -> Result<String> {
         .replace(' ', "-"))
 }
 
-#[derive(Debug)]
-struct RunSnapshot {
-    candidate_tree_digest: String,
-    harness_digest: String,
-}
-
-fn current_run_snapshot(root: &Path) -> Result<RunSnapshot> {
-    let candidate_tree_digest = candidate_tree_digest(root)?;
+/// Cached harness binary path and SHA-256 digest.  The executing binary
+/// does not change during one process lifetime, so the expensive
+/// `file_sha256` of a potentially multi-hundred-MB test binary is computed
+/// at most once per process and reused by every `current_run_binding` call.
+static HARNESS_EXE: LazyLock<Result<(PathBuf, String), VerificationError>> = LazyLock::new(|| {
     let exe = std::env::current_exe().map_err(|error| {
         VerificationError::new(
             ErrorCode::Io,
             format!("cannot resolve the harness binary: {error}"),
         )
     })?;
+    let digest = file_sha256(&exe)?;
+    Ok((exe, digest))
+});
+
+/// Returns the harness binary path and its SHA-256 digest, computing and
+/// caching them on the first call.
+fn harness_exe_digest() -> Result<&'static (PathBuf, String)> {
+    HARNESS_EXE.as_ref().map_err(VerificationError::clone)
+}
+
+#[derive(Debug)]
+struct RunSnapshot {
+    candidate_tree_digest: String,
+    /// Path of the harness binary (`std::env::current_exe`), kept so
+    /// `binding_from_snapshot` can skip re-hashing when the candidate
+    /// binary is the harness itself.
+    harness_path: PathBuf,
+    harness_digest: String,
+}
+
+fn current_run_snapshot(root: &Path) -> Result<RunSnapshot> {
+    let candidate_tree_digest = candidate_tree_digest(root)?;
+    let (harness_path, harness_digest) = harness_exe_digest()?;
     Ok(RunSnapshot {
         candidate_tree_digest,
-        harness_digest: file_sha256(&exe)?,
+        harness_path: harness_path.clone(),
+        harness_digest: harness_digest.clone(),
     })
 }
 
@@ -1326,12 +1317,8 @@ fn candidate_binary(root: &Path, catalog: &str) -> Result<PathBuf> {
 fn select_candidate_binary(catalog: &str, programs: BTreeSet<PathBuf>) -> Result<PathBuf> {
     let mut programs = programs.into_iter();
     let Some(program) = programs.next() else {
-        return std::env::current_exe().map_err(|error| {
-            VerificationError::new(
-                ErrorCode::Io,
-                format!("cannot resolve the harness binary: {error}"),
-            )
-        });
+        let (exe, _) = harness_exe_digest()?;
+        return Ok(exe.clone());
     };
     if let Some(second) = programs.next() {
         return Err(VerificationError::new(
@@ -1347,10 +1334,19 @@ fn select_candidate_binary(catalog: &str, programs: BTreeSet<PathBuf>) -> Result
 }
 
 fn binding_from_snapshot(root: &Path, catalog: &str, snapshot: &RunSnapshot) -> Result<RunBinding> {
+    let candidate = candidate_binary(root, catalog)?;
+    // When the candidate binary is the harness itself (the in-process
+    // runner case), reuse the already-computed digest instead of hashing
+    // the same multi-hundred-MB file a second time.
+    let candidate_digest = if candidate == snapshot.harness_path {
+        snapshot.harness_digest.clone()
+    } else {
+        file_sha256(&candidate)?
+    };
     RunBinding::new(
         authority_digest(root, catalog)?,
         snapshot.candidate_tree_digest.clone(),
-        file_sha256(&candidate_binary(root, catalog)?)?,
+        candidate_digest,
         snapshot.harness_digest.clone(),
         toolchain_pin(root)?,
     )
