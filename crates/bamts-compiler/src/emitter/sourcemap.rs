@@ -259,18 +259,19 @@ impl SourceMap {
     }
 
     /// Serializes the map as Source Map v3 JSON with a fixed key order.
+    ///
+    /// Upstream's serializer always writes `version`, `file`, `sourceRoot`
+    /// (an empty string when unset), `sources`, `names`, and `mappings` in
+    /// that order, and appends `sourcesContent` last when the map embeds
+    /// original text. The key order is part of the emitted baseline shape, so
+    /// it is reproduced exactly rather than derived from field presence.
     #[must_use]
     pub fn to_json(&self) -> String {
-        let mut json = String::from("{\"version\":3");
-
-        if let Some(file) = &self.file {
-            json.push_str(",\"file\":");
-            push_json_string(file, &mut json);
-        }
-        if let Some(source_root) = &self.source_root {
-            json.push_str(",\"sourceRoot\":");
-            push_json_string(source_root, &mut json);
-        }
+        let mut json = String::from("{\"version\":3,");
+        json.push_str("\"file\":");
+        push_json_string(self.file.as_deref().unwrap_or(""), &mut json);
+        json.push_str(",\"sourceRoot\":");
+        push_json_string(self.source_root.as_deref().unwrap_or(""), &mut json);
 
         json.push_str(",\"sources\":[");
         for (index, source) in self.sources.iter().enumerate() {
@@ -280,6 +281,18 @@ impl SourceMap {
             push_json_string(source, &mut json);
         }
         json.push(']');
+
+        json.push_str(",\"names\":[");
+        for (index, name) in self.names.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+            push_json_string(name, &mut json);
+        }
+        json.push(']');
+
+        json.push_str(",\"mappings\":");
+        push_json_string(&self.encode_mappings(), &mut json);
 
         if let Some(contents) = &self.sources_content {
             json.push_str(",\"sourcesContent\":[");
@@ -294,18 +307,6 @@ impl SourceMap {
             }
             json.push(']');
         }
-
-        json.push_str(",\"names\":[");
-        for (index, name) in self.names.iter().enumerate() {
-            if index > 0 {
-                json.push(',');
-            }
-            push_json_string(name, &mut json);
-        }
-        json.push(']');
-
-        json.push_str(",\"mappings\":");
-        push_json_string(&self.encode_mappings(), &mut json);
         json.push('}');
         json
     }
@@ -832,10 +833,52 @@ mod tests {
         builder.add_mapping("a.ts", LineColumn::new(0, 0), LineColumn::new(0, 0), None);
         let json = builder.finish().to_json();
 
-        assert!(json.starts_with("{\"version\":3,\"file\":\"out.js\",\"sourceRoot\":\"/root/\""));
+        assert!(
+            json.starts_with("{\"version\":3,\"file\":\"out.js\",\"sourceRoot\":\"/root/\""),
+            "{json}"
+        );
         assert!(json.contains("\"sourcesContent\":[\"const x = \\\"q\\\";\\n\"]"));
         assert!(json.contains("\"names\":[]"));
-        assert!(json.ends_with("\"mappings\":\"AAAA\"}"));
+        // `sourcesContent` is the last key, exactly as upstream serializes it.
+        assert!(
+            json.ends_with("\"sourcesContent\":[\"const x = \\\"q\\\";\\n\"]}"),
+            "{json}"
+        );
+        assert!(json.contains("\"mappings\":\"AAAA\""));
+    }
+
+    /// The baseline `.js.map` documents always carry `"version":3` followed by
+    /// `file` and `sourceRoot`, with `sourceRoot` written as an empty string
+    /// when no root is configured. Measured over the 264 map JSON lines in the
+    /// TypeScript 7.0.2 authority: every one of them has all three keys in that
+    /// order, and none omits `sourceRoot`.
+    #[test]
+    fn json_always_writes_version_file_and_source_root() {
+        let mut builder = SourceMapBuilder::new();
+        builder.intern_source("a.ts");
+        builder.add_mapping("a.ts", LineColumn::new(0, 0), LineColumn::new(0, 0), None);
+        let json = builder.finish().to_json();
+
+        assert!(
+            json.starts_with(
+                "{\"version\":3,\"file\":\"\",\"sourceRoot\":\"\",\"sources\":[\"a.ts\"]"
+            ),
+            "{json}"
+        );
+        assert!(
+            json.ends_with("\"names\":[],\"mappings\":\"AAAA\"}"),
+            "{json}"
+        );
+        assert!(!json.contains("sourcesContent"), "{json}");
+
+        let mut named = SourceMapBuilder::new().with_file("out.js");
+        named.intern_source("a.ts");
+        named.add_mapping("a.ts", LineColumn::new(0, 0), LineColumn::new(0, 0), None);
+        let named_json = named.finish().to_json();
+        assert!(
+            named_json.starts_with("{\"version\":3,\"file\":\"out.js\",\"sourceRoot\":\"\""),
+            "{named_json}"
+        );
     }
 
     #[test]

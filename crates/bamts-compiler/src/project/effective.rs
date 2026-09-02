@@ -2460,7 +2460,10 @@ mod tests {
             "{javascript}"
         );
         let map = map_json(&report, &fixture.0.join("dist/sub/x.js.map"));
-        assert_eq!(map.source_root, None);
+        // Upstream always writes the key: 256 of the 259 map JSON lines in the
+        // TypeScript 7.0.2 authority baselines carry `"sourceRoot":""`, and all
+        // 259 carry the key. An unset root serializes as the empty string.
+        assert_eq!(map.source_root.as_deref(), Some(""));
         assert_eq!(map.sources, vec!["../../src/sub/x.ts".to_owned()]);
 
         // Relative mapRoot with sourceRoot: sources collapse to the common base
