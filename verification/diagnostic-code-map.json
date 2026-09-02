@@ -392,6 +392,12 @@
       "tsCode": 18050
     },
     {
+      "bamtsCode": "BAMTS-C087",
+      "evidence": "Declaration name conflicts with built-in global identifier -> TS2397 in the TypeScript 7.0.2 authority baselines: globalThisCollision (var globalThis), undefinedTypeAssignment2 (var undefined), undefinedTypeAssignment3 (var undefined), undefinedTypeAssignment4 (namespace undefined), extendGlobalThis2 (namespace globalThis).",
+      "status": "mapped",
+      "tsCode": 2397
+    },
+    {
       "bamtsCode": "BAMTS-L001",
       "evidence": "Unterminated string literal -> TS1002 via tsc --noEmit on \"\\n.",
       "status": "mapped",

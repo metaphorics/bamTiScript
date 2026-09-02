@@ -29,7 +29,8 @@ use super::{
     ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_CONST, ASSIGNMENT_TO_FUNCTION, ASSIGNMENT_TO_NAMESPACE,
     ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
     CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
-    CONSTRUCTOR_TYPE_PARAMETERS, DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION,
+    CONSTRUCTOR_TYPE_PARAMETERS, DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
+    DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION,
     EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE,
     FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
     FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
@@ -53,7 +54,8 @@ use super::{
     BARE_SUPER_EXPRESSION_MESSAGE, CANNOT_FIND_NAME_MESSAGE, CANNOT_FIND_NAMESPACE_MESSAGE,
     CANNOT_FIND_TYPE_MESSAGE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED_MESSAGE,
     CONSTRUCTOR_TYPE_PARAMETERS_MESSAGE, DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE,
-    DUPLICATE_MESSAGE, EXCESS_PROPERTY_MESSAGE, EXPRESSION_NOT_CALLABLE_MESSAGE,
+    DUPLICATE_MESSAGE, EXCESS_PROPERTY_MESSAGE,
+    EXPRESSION_NOT_CALLABLE_MESSAGE,
     EXPRESSION_NOT_CONSTRUCTABLE_MESSAGE, FOR_IN_LEFT_HAND_SIDE_INVALID_MESSAGE,
     FOR_OF_ITERABLE_REQUIRED_MESSAGE, FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT_MESSAGE,
     FUNCTION_IMPLEMENTATION_WRONG_NAME_MESSAGE, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION_MESSAGE,
@@ -83,8 +85,8 @@ use crate::syntax::{
     Accessibility, ArrayElement, ArrowFunction, AssignmentExpression, AssignmentOperator,
     AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, CallArgument,
     CallExpression, ClassDeclaration, ClassMember, ConditionalExpression, DeclarationModifiers,
-    EntityName, Expr, Expression, ForBinding, ForInitializer, ForOfMode, FunctionBody,
-    FunctionLike, FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration,
+    EntityName, Expr, Expression, ExternalModuleReference, ForBinding, ForInitializer, ForOfMode,
+    FunctionBody, FunctionLike, FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration,
     JsxAttributeInitializer, JsxAttributeItem, JsxChild, KeywordType, Literal, LogicalOperator,
     MemberProperty, MetaProperty, NamespaceName, NewExpression, NodeId, ObjectLiteral,
     ObjectMember, ParameterNode, PropertyModifier, PropertyName, SourceFile, Statement, Stmt,
@@ -4211,13 +4213,26 @@ enum TypeDef<'src> {
     },
 }
 
+/// Whether the file is an external module: it carries a top-level `import` or
+/// `export` that names a module.
+///
+/// `import I = A.B.C` aliases a namespace and leaves the file a script, while
+/// `import I = require("m")` references a module, so only the `Require` form
+/// counts. `ExternalModuleReference` already separates them. Counting the alias
+/// form makes a script look like a module, which flips its implicit strictness
+/// in the checker and suppresses the emitter's `"use strict"` prologue;
+/// `constEnums` is the baseline that proves it.
 pub(crate) fn source_is_module(source: &SourceFile) -> bool {
-    source.statements().iter().any(|statement| {
-        matches!(
-            statement.data(),
-            Statement::Import(_) | Statement::Export(_) | Statement::ImportEquals(_)
-        )
-    })
+    source
+        .statements()
+        .iter()
+        .any(|statement| match statement.data() {
+            Statement::Import(_) | Statement::Export(_) => true,
+            Statement::ImportEquals(import) => {
+                matches!(import.reference, ExternalModuleReference::Require(_))
+            }
+            _ => false,
+        })
 }
 
 /// Returns whether the directive prologue of a statement list contains
@@ -4896,6 +4911,10 @@ pub(crate) struct Binder<'src> {
     /// Whether the source file is a `.d.ts`/`.d.mts`/`.d.cts` declaration file.
     /// Top-level statements in such files must be declarations.
     is_declaration_file: bool,
+    /// Whether the source file is an external module. Script files expose
+    /// top-level declarations to the global scope, where they can collide with
+    /// built-in global identifiers (`globalThis`, `undefined`) per TS2397.
+    is_module: bool,
     /// Cooperative cancellation signal. `None` for the non-cancellable path;
     /// set by `_with_cancel` entry points so long loops and recursive
     /// entrypoints can poll it.
@@ -5014,6 +5033,7 @@ impl<'src> Binder<'src> {
             type_resolution_depth: 0,
             ambient_binding: false,
             is_declaration_file: source.source_text().is_declaration_file(),
+            is_module,
             cancel: None,
         };
         let global_scope = checker.new_scope(ScopeKind::Global, None);
@@ -6460,6 +6480,38 @@ impl<'src> Binder<'src> {
         ));
     }
 
+    /// Like [`emit`](Self::emit) but accepts an owned message for diagnostics
+    /// whose wording includes the offending identifier name.
+    fn emit_with_message(
+        &mut self,
+        code: DiagnosticCode,
+        range: TextRange,
+        message: String,
+    ) {
+        if self.probing_contextual_type {
+            return;
+        }
+        let line = self
+            .source
+            .source_text()
+            .line_column(range.start())
+            .expect("diagnostic range belongs to its source")
+            .0;
+        if consume_diagnostic_suppression(
+            &self.diagnostic_suppressions,
+            &mut self.expected_diagnostics,
+            line,
+        ) {
+            return;
+        }
+        self.diagnostics.push(Diagnostic::error(
+            code,
+            self.source.source_id(),
+            range,
+            message,
+        ));
+    }
+
     // -- declaration binding ---------------------------------------------------
 
     fn declare(
@@ -6588,6 +6640,23 @@ impl<'src> Binder<'src> {
             } else {
                 self.emit(DUPLICATE_DECLARATION, range, DUPLICATE_MESSAGE);
             }
+        }
+        // TS2397: A global declaration in a script whose name collides with a
+        // built-in global identifier (`globalThis` or `undefined`). Class and
+        // interface declarations named `undefined` are excluded because they
+        // carry their own specific diagnostics (TS2414, TS2427).
+        if !self.is_module
+            && scope == self.module_scope
+            && !matches!(kind, SymbolKind::Class | SymbolKind::Interface)
+            && matches!(name, "globalThis" | "undefined")
+        {
+            self.emit_with_message(
+                DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
+                range,
+                format!(
+                    "Declaration name conflicts with built-in global identifier '{name}'."
+                ),
+            );
         }
         id
     }
@@ -17548,7 +17617,8 @@ mod tests {
     use super::{
         ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
         ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION,
-        CONSTRUCTOR_TYPE_PARAMETERS, DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
+        CONSTRUCTOR_TYPE_PARAMETERS, DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
+        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE,
         FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
         GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, MISSING_METHOD_RETURN_TYPE,
         PROPERTY_NOT_INITIALIZED, PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER,
@@ -19618,6 +19688,108 @@ mod tests {
                 .iter()
                 .any(|(_, symbol)| *symbol == mod_alias),
             "`b(mod)` records a reference row for `mod`"
+        );
+    }
+
+    // -- TS2397: declaration name conflicts with built-in global identifier --
+
+    #[test]
+    fn var_global_this_in_script_reports_ts2397() {
+        let (_model, diagnostics) = bound("var globalThis;");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "var globalThis in a script should report TS2397: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn var_undefined_in_script_reports_ts2397() {
+        let (_model, diagnostics) = bound("var undefined = null;");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "var undefined in a script should report TS2397: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_undefined_in_script_reports_ts2397() {
+        let (_model, diagnostics) = bound("namespace undefined { export var x = 42; }");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "namespace undefined in a script should report TS2397: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_global_this_in_script_reports_ts2397() {
+        let (_model, diagnostics) =
+            bound("namespace globalThis { export function foo() {} }");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "namespace globalThis in a script should report TS2397: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn var_global_this_in_module_does_not_report_ts2397() {
+        let (_model, diagnostics) = bound("export var globalThis;");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "var globalThis in a module should NOT report TS2397: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn class_undefined_in_script_does_not_report_ts2397() {
+        let (_model, diagnostics) = bound("class undefined { foo: string; }");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "class undefined should NOT report TS2397 (it gets TS2414): {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn interface_undefined_in_script_does_not_report_ts2397() {
+        let (_model, diagnostics) = bound("interface undefined { member: number; }");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "interface undefined should NOT report TS2397 (it gets TS2427): {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn var_global_this_in_js_script_reports_ts2397() {
+        let (_model, diagnostics) = bound_js("var globalThis;");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "var globalThis in a JS script should report TS2397: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn function_undefined_in_script_reports_ts2397() {
+        let (_model, diagnostics) = bound("function undefined() {}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
+            "function undefined in a script should report TS2397: {diagnostics:?}"
         );
     }
 }

@@ -183,6 +183,11 @@ pub const ARGUMENT_NOT_ASSIGNABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C
 /// arithmetic, bitwise, and relational operators, and `+` unless one side is
 /// string-like. Corresponds to TypeScript's TS18050.
 pub const VALUE_CANNOT_BE_USED_HERE: DiagnosticCode = DiagnosticCode::new("BAMTS-C086");
+/// Diagnostic emitted when a global declaration in a script conflicts with a
+/// built-in global identifier (`globalThis` or `undefined`). Corresponds to
+/// TypeScript's TS2397.
+pub const DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL: DiagnosticCode =
+    DiagnosticCode::new("BAMTS-C087");
 /// Diagnostic emitted when the number of arguments in a call does not match
 /// the callable's parameter count.
 pub const ARGUMENT_COUNT_MISMATCH: DiagnosticCode = DiagnosticCode::new("BAMTS-C054");
