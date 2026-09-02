@@ -24,7 +24,7 @@ pub mod transpile;
 
 use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
 
-use crate::checker::SemanticModel;
+use crate::checker::{SemanticModel, Type, TypeId, render_type};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{EnumFacts, EnumMemberPlan, EnumScalar};
 use crate::jsx_desugar::JsxSourceDesugarPlan;
@@ -2963,6 +2963,21 @@ impl<'a> Emitter<'a> {
         let previous = self.anchor;
         self.anchor = statement.range();
         self.mark(statement.range());
+        // Emit leading JSDoc comments for declarations that retain them.
+        let needs_jsdoc = matches!(
+            statement.data(),
+            Statement::Variable(_)
+                | Statement::Function(_)
+                | Statement::Class(_)
+                | Statement::Interface(_)
+                | Statement::TypeAlias(_)
+                | Statement::Enum(_)
+                | Statement::Namespace(_)
+                | Statement::Export(_)
+        );
+        if needs_jsdoc {
+            self.emit_jsdoc_for_range(statement.range());
+        }
         let emitted = match statement.data() {
             Statement::Import(import) => self.emit_import(import, true),
             Statement::ImportEquals(import) => {
@@ -3167,6 +3182,66 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Extracts a `/** ... */` JSDoc comment immediately preceding `range`
+    /// in the source text, if one exists. Returns the raw comment text
+    /// including delimiters.
+    fn extract_jsdoc(&self, range: TextRange) -> Option<String> {
+        let source = self.source;
+        let byte_start = source.utf16_to_byte(range.start()).ok()?;
+        let text = source.as_str();
+        let before = text.get(..byte_start)?;
+        // Find the last `/**` before the range start. `/**/` is an empty
+        // block comment, not JSDoc, so the delimiter must not close itself.
+        let comment_start = before.rfind("/**")?;
+        let after_open = text.get(comment_start..)?;
+        if after_open.starts_with("/**/") {
+            return None;
+        }
+        let close_offset = after_open.find("*/")?;
+        let comment_end = comment_start + close_offset + 2;
+        // Only whitespace between the comment end and the declaration start.
+        let between = text.get(comment_end..byte_start)?;
+        if between.chars().all(|ch| ch.is_whitespace()) {
+            Some(text.get(comment_start..comment_end)?.to_owned())
+        } else {
+            None
+        }
+    }
+
+    /// Emits a JSDoc comment preceding a declaration at `range`, if one
+    /// exists in the source text. The comment is printed on its own line
+    /// with the current indentation, followed by a newline.
+    fn emit_jsdoc_for_range(&mut self, range: TextRange) {
+        if let Some(jsdoc) = self.extract_jsdoc(range) {
+            self.raw(&jsdoc);
+            self.newline();
+        }
+    }
+
+    /// Returns `true` if `expression` is a bare `Symbol()` call.
+    fn is_symbol_call(&self, expression: &crate::syntax::Expression) -> bool {
+        if let crate::syntax::Expression::Call(call) = expression {
+            if let crate::syntax::Expression::Identifier(ident) = call.callee.data() {
+                return self.text(ident.data().token()) == Some("Symbol");
+            }
+        }
+        false
+    }
+
+    /// Renders a type for declaration emit, widening literal types for
+    /// `let`/`var` bindings as tsc does.
+    fn render_inferred_type(&self, type_id: TypeId, kind: VariableKind) -> String {
+        match (self.model.types().get(type_id), kind) {
+            (Type::BooleanLiteral(_), VariableKind::Let | VariableKind::Var) => {
+                "boolean".to_owned()
+            }
+            (Type::NumberLiteral(_), VariableKind::Let | VariableKind::Var) => "number".to_owned(),
+            (Type::StringLiteral(_), VariableKind::Let | VariableKind::Var) => "string".to_owned(),
+            (Type::BigIntLiteral(_), VariableKind::Let | VariableKind::Var) => "bigint".to_owned(),
+            _ => render_type(self.model, type_id),
+        }
+    }
+
     fn emit_variable_decl(&mut self, declaration: &VariableDeclaration) {
         self.emit_declare_prefix();
         self.raw(variable_kind_str(declaration.kind));
@@ -3180,6 +3255,22 @@ impl<'a> Emitter<'a> {
             if let Some(annotation) = &declarator.type_annotation {
                 self.raw(": ");
                 self.emit_type(&annotation.data().type_node);
+            } else if let Some(initializer) = &declarator.initializer {
+                // No explicit annotation: infer the type from the initializer
+                // as tsc does in `.d.ts` emit.
+                if self.is_symbol_call(initializer.data()) {
+                    if declaration.kind == VariableKind::Const {
+                        self.raw(": unique symbol");
+                    } else {
+                        self.raw(": symbol");
+                    }
+                } else if let Some(type_id) = self.model.node_type(initializer.id()) {
+                    let rendered = self.render_inferred_type(type_id, declaration.kind);
+                    if !rendered.is_empty() {
+                        self.raw(": ");
+                        self.raw(&rendered);
+                    }
+                }
             }
         }
         self.raw(";");
@@ -3264,6 +3355,9 @@ impl<'a> Emitter<'a> {
             self.indent += 1;
         }
         for member in members {
+            if self.class_member_emits_decl(member.data()) {
+                self.emit_jsdoc_for_range(member.range());
+            }
             if self.emit_class_member_decl(member.data()) {
                 self.newline();
             }
@@ -3322,6 +3416,14 @@ impl<'a> Emitter<'a> {
                 if let Some(annotation) = &property.type_annotation {
                     self.raw(": ");
                     self.emit_type(&annotation.data().type_node);
+                } else if let Some(initializer) = &property.initializer {
+                    if let Some(type_id) = self.model.node_type(initializer.id()) {
+                        let rendered = render_type(self.model, type_id);
+                        if !rendered.is_empty() {
+                            self.raw(": ");
+                            self.raw(&rendered);
+                        }
+                    }
                 }
                 self.raw(";");
                 true

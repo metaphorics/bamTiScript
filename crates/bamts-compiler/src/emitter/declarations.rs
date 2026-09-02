@@ -588,4 +588,167 @@ mod tests {
             "export interface I {\n    x: number;\n}\nexport type T = I;\n"
         );
     }
+
+    #[test]
+    fn const_literal_type_is_inferred() {
+        let output = emit_dts(
+            "export const n = 42;\nexport const s = \"hello\";\nexport const b = true;\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("export declare const n: 42;"),
+            "expected literal type for const n, got: {code}"
+        );
+        assert!(
+            code.contains("export declare const s: \"hello\";"),
+            "expected literal type for const s, got: {code}"
+        );
+        assert!(
+            code.contains("export declare const b: true;"),
+            "expected literal type for const b, got: {code}"
+        );
+    }
+
+    #[test]
+    fn let_literal_type_is_widened() {
+        let output = emit_dts(
+            "export let n = 42;\nexport let s = \"hello\";\nexport let b = true;\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("export declare let n: number;"),
+            "expected widened type for let n, got: {code}"
+        );
+        assert!(
+            code.contains("export declare let s: string;"),
+            "expected widened type for let s, got: {code}"
+        );
+        assert!(
+            code.contains("export declare let b: boolean;"),
+            "expected widened type for let b, got: {code}"
+        );
+    }
+
+    #[test]
+    fn const_symbol_call_emits_unique_symbol() {
+        let output = emit_dts(
+            "export const sym = Symbol();\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("export declare const sym: unique symbol;"),
+            "expected unique symbol for const Symbol(), got: {code}"
+        );
+    }
+
+    #[test]
+    fn let_symbol_call_emits_symbol() {
+        let output = emit_dts(
+            "export let sym = Symbol();\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("export declare let sym: symbol;"),
+            "expected symbol for let Symbol(), got: {code}"
+        );
+    }
+
+    #[test]
+    fn const_object_literal_type_is_inferred() {
+        let output = emit_dts(
+            "export const obj = { x: 1, y: \"hello\" };\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("export declare const obj:"),
+            "expected type annotation for const obj, got: {code}"
+        );
+        // tsc widens property types in object literals even for const.
+        assert!(
+            code.contains("x: number"),
+            "expected widened property type x: number, got: {code}"
+        );
+        assert!(
+            code.contains("y: string"),
+            "expected widened property type y: string, got: {code}"
+        );
+    }
+
+    #[test]
+    fn const_arrow_function_type_is_inferred() {
+        let output = emit_dts(
+            "export const fn = (x: number) => x + 1;\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("export declare const fn:"),
+            "expected type annotation for const fn, got: {code}"
+        );
+        assert!(
+            code.contains("=>"),
+            "expected function type with =>, got: {code}"
+        );
+    }
+
+    #[test]
+    fn jsdoc_comment_is_retained_on_variable() {
+        let output = emit_dts(
+            "/** This is a JSDoc comment */\nexport const x = 1;\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("/** This is a JSDoc comment */"),
+            "expected JSDoc comment retained, got: {code}"
+        );
+    }
+
+    #[test]
+    fn jsdoc_comment_is_retained_on_class_member() {
+        let output = emit_dts(
+            "/** A class with documented members */\nexport class C {\n    /** @return {number} */\n    method(): number { return 1; }\n}\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("/** A class with documented members */"),
+            "expected JSDoc on class, got: {code}"
+        );
+        assert!(
+            code.contains("/** @return {number} */"),
+            "expected JSDoc on class member, got: {code}"
+        );
+    }
+
+    #[test]
+    fn jsdoc_comment_is_retained_on_function() {
+        let output = emit_dts(
+            "/** Adds two numbers */\nexport function add(a: number, b: number): number { return a + b; }\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("/** Adds two numbers */"),
+            "expected JSDoc on function, got: {code}"
+        );
+    }
+
+    #[test]
+    fn class_property_inferred_type_from_initializer() {
+        let output = emit_dts(
+            "export class C { x = 42; }\n",
+            DeclarationOptions::default(),
+        );
+        let code = &output.declaration.as_ref().unwrap().code;
+        assert!(
+            code.contains("x: 42"),
+            "expected inferred literal type for class property, got: {code}"
+        );
+    }
 }
