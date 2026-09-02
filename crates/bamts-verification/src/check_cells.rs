@@ -5207,4 +5207,128 @@ class C {\n\
             "decorated property must anchor at Decl(decoratorProp.ts, 2, 9), got:\n{x_line}\n{emitted}"
         );
     }
+
+    /// Qualification rule 1: class member declarations render with the
+    /// parent-qualified symbol name (`Symbol(C.foo, ...)`), not bare.
+    /// Cited baseline: `classExtendingClass.symbols` — the first class `C`
+    /// with members `foo`, `thing`, `other` all qualified as `C.foo`,
+    /// `C.thing`, `C.other`.
+    #[test]
+    fn emit_symbols_qualifies_class_member_declarations() {
+        let logical = "tests/cases/conformance/classes/classDeclarations/classHeritageSpecification/classExtendingClass.ts";
+        let case_text = "class C {\n    foo: string;\n    thing() { }\n    static other() { }\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/conformance/classes/classDeclarations/classHeritageSpecification/classExtendingClass.ts] ////\n\
+            \n\
+            === classExtendingClass.ts ===\n\
+            class C {\n\
+            >C : Symbol(C, Decl(classExtendingClass.ts, 0, 0))\n\
+            \n\
+                foo: string;\n\
+            >foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))\n\
+            \n\
+                thing() { }\n\
+            >thing : Symbol(C.thing, Decl(classExtendingClass.ts, 1, 16))\n\
+            \n\
+                static other() { }\n\
+            >other : Symbol(C.other, Decl(classExtendingClass.ts, 2, 15))\n\
+            }\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Qualification rule 2: interface member declarations render with the
+    /// parent-qualified symbol name (`Symbol(I.a, ...)`), not bare.
+    /// Cited baseline: `contextualTypingFunctionReturningFunction.symbols`:
+    /// ```text
+    /// >I : Symbol(I, Decl(contextualTypingFunctionReturningFunction.ts, 0, 0))
+    /// >a : Symbol(I.a, Decl(contextualTypingFunctionReturningFunction.ts, 0, 13))
+    /// >b : Symbol(I.b, Decl(contextualTypingFunctionReturningFunction.ts, 1, 20))
+    /// ```
+    /// The `>s` and `>n` parameter rows from the same baseline are a known
+    /// binder coverage gap (interface call-signature parameters not bound as
+    /// symbols); they are handed off to Ts2304CrossFile and excluded here.
+    #[test]
+    fn emit_symbols_qualifies_interface_member_declarations() {
+        let logical = "tests/cases/compiler/contextualTypingFunctionReturningFunction.ts";
+        let case_text = "interface I {\n\ta(s: string): void;\n\tb(): (n: number) => void;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        // Assert the three cited interface-member rows exactly.
+        let i_line = emitted
+            .lines()
+            .find(|l| l.starts_with(">I :"))
+            .unwrap_or_else(|| panic!("missing I symbol line:\n{emitted}"));
+        assert_eq!(
+            i_line, ">I : Symbol(I, Decl(contextualTypingFunctionReturningFunction.ts, 0, 0))",
+            "emitted:\n{emitted}"
+        );
+        let a_line = emitted
+            .lines()
+            .find(|l| l.starts_with(">a :"))
+            .unwrap_or_else(|| panic!("missing a symbol line:\n{emitted}"));
+        assert_eq!(
+            a_line, ">a : Symbol(I.a, Decl(contextualTypingFunctionReturningFunction.ts, 0, 13))",
+            "emitted:\n{emitted}"
+        );
+        let b_line = emitted
+            .lines()
+            .find(|l| l.starts_with(">b :"))
+            .unwrap_or_else(|| panic!("missing b symbol line:\n{emitted}"));
+        assert_eq!(
+            b_line, ">b : Symbol(I.b, Decl(contextualTypingFunctionReturningFunction.ts, 1, 20))",
+            "emitted:\n{emitted}"
+        );
+    }
+
+    /// Qualification rule 3: a member-access reference `c.foo` where `c` is
+    /// typed as class `C` renders the full access path `>c.foo` and the bare
+    /// property identifier `>foo`, both with the member's qualified symbol
+    /// `Symbol(C.foo, ...)`. The base `>c` renders with its own bare symbol.
+    /// Cited baseline: `classExtendingClass.symbols` lines 25–27:
+    /// ```text
+    /// >d.foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))
+    /// >d : Symbol(d, Decl(classExtendingClass.ts, 10, 3))
+    /// >foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))
+    /// ```
+    /// This test uses a same-class (non-inherited) access so the binder's
+    /// direct member-scope lookup succeeds.
+    #[test]
+    fn emit_symbols_qualifies_member_access_references() {
+        let logical = "tests/cases/conformance/classes/classDeclarations/classHeritageSpecification/classExtendingClass.ts";
+        let case_text = "class C {\n    foo: string;\n}\nvar c: C;\nvar r = c.foo;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        let baseline = "//// [tests/cases/conformance/classes/classDeclarations/classHeritageSpecification/classExtendingClass.ts] ////\n\
+            \n\
+            === classExtendingClass.ts ===\n\
+            class C {\n\
+            >C : Symbol(C, Decl(classExtendingClass.ts, 0, 0))\n\
+                foo: string;\n\
+            >foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))\n\
+            }\n\
+            var c: C;\n\
+            >c : Symbol(c, Decl(classExtendingClass.ts, 3, 3))\n\
+            >C : Symbol(C, Decl(classExtendingClass.ts, 0, 0))\n\
+            var r = c.foo;\n\
+            >r : Symbol(r, Decl(classExtendingClass.ts, 4, 3))\n\
+            >c.foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))\n\
+            >c : Symbol(c, Decl(classExtendingClass.ts, 3, 3))\n\
+            >foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))\n";
+        assert_eq!(
+            compare_symbols(baseline, &emitted),
+            FacetVerdict::Pass,
+            "emitted:\n{emitted}"
+        );
+    }
 }
