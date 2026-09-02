@@ -39,7 +39,7 @@ use bamts_compiler::project::resolution::{
 use bamts_compiler::project::resolution_trace::ResolutionTraceLog;
 use bamts_compiler::project::{CompilerOptions, ProjectConfig, ProjectRoot};
 use bamts_compiler::source::SourceText;
-use bamts_compiler::source::{TextRange, Utf16Pos};
+use bamts_compiler::source::{JsxEmit, TextRange, Utf16Pos};
 use bamts_compiler::syntax::{Token, TokenKind};
 
 use crate::catalog::CaseConfiguration;
@@ -454,7 +454,16 @@ pub fn split_case_units(logical_path: &str, text: &str) -> Vec<CaseUnit> {
         match &body_name {
             Some(name) => push_unit(name.clone(), &text[body_start..end], &mut units),
             None => {
-                if end > 0 {
+                // Upstream `ParseTestFilesAndSymlinks` (with
+                // `AllowImplicitFirstFile: false`) panics on real code before
+                // the first `@Filename` and drops comment-only preamble: the
+                // implicit case-named unit exists only when it carries
+                // compiled content. An options/comment-only preamble is
+                // global settings, not a unit, so creating one here echoes a
+                // phantom `//// [<case>.ts]` section and emits a phantom
+                // `//// [<case>.js]`/`.d.ts` output that shifts every
+                // baseline section the emit facets compare.
+                if end > 0 && !strip_directive_lines(&text[..end]).trim().is_empty() {
                     push_unit(case_name.to_owned(), &text[..end], &mut units);
                 }
             }
@@ -791,7 +800,9 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "strictpropertyinitialization"
             | "incremental"
             | "composite"
-            | "emitdeclarationonly" => value.eq_ignore_ascii_case("true").to_string(),
+            | "emitdeclarationonly"
+            | "sourcemap"
+            | "declarationmap" => value.eq_ignore_ascii_case("true").to_string(),
             "lib" => {
                 let items: Vec<String> = values
                     .iter()
@@ -817,6 +828,8 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
             "strictpropertyinitialization" => "strictPropertyInitialization",
             "emitdeclarationonly" => "emitDeclarationOnly",
+            "sourcemap" => "sourceMap",
+            "declarationmap" => "declarationMap",
             "tsbuildinfofile" => "tsBuildInfoFile",
             "outfile" => "outFile",
             "outdir" => "outDir",
@@ -1667,14 +1680,18 @@ pub fn emit_javascript_baseline(
 ) -> std::result::Result<String, String> {
     // Upstream `doJsEmitBaseline` framing: a `//// [<case>] ////` document
     // header, one `//// [<basename>]` echo per compiled unit, a blank-line
-    // block separator, then one `//// [<stem>.js]` section per emitted
-    // output. Comparing the whole document keeps the echo honest alongside
+    // block separator, then the `//// [<output>.js]` sections, then — when the
+    // compile declares — a `\n\n` separator and the `//// [<output>.d.ts]`
+    // sections. Comparing the whole document keeps the echo honest alongside
     // the emit.
     //
     // Every echo is the unit's bytes verbatim: the separator belongs to the
     // block, not to any unit, so it is appended once after the last one. A
     // unit that ends with a newline keeps it, which is what puts the extra
     // blank line before the emit sections in upstream's documents.
+    let options = case.options();
+    let jsx_preserve = options.jsx() == Some(JsxEmit::Preserve);
+    let bundle = bundle_output_name(options)?;
     let mut out = format!("//// [{logical_path}] ////\n\n");
     let units: Vec<_> = case.reached_units().collect();
     for (unit, _) in &units {
@@ -1682,30 +1699,62 @@ pub fn emit_javascript_baseline(
         out.push_str(&unit.text);
     }
     out.push_str("\n\n");
+    // Upstream's `result.JS` is empty for an `emitDeclarationOnly` compile, so
+    // the document carries no `.js` sections at all; its `result.DTS` is empty
+    // unless declaration emit is on. The section set follows those two maps.
     let mut outputs = 0usize;
-    for (unit, output) in &units {
-        let Some(emit) = output.emit() else {
-            return Err(format!(
-                "unit `{}` produced no javascript emit",
-                unit.virtual_path
-            ));
-        };
-        let Some(javascript) = emit.javascript.as_ref() else {
-            return Err(format!(
-                "unit `{}` produced no javascript slot",
-                unit.virtual_path
-            ));
-        };
-        let section = unit_basename(&unit.virtual_path);
-        let js_name = match section.rsplit_once('.') {
-            Some((stem, _)) => format!("{stem}.js"),
-            None => format!("{section}.js"),
-        };
-        out.push_str(&format!("//// [{js_name}]\n{}", javascript.code));
-        if !javascript.code.ends_with('\n') {
-            out.push('\n');
+    if !options.emit_declaration_only() {
+        for (unit, output) in &units {
+            let name = unit_basename(&unit.virtual_path);
+            // A `.d.ts` input is never a JavaScript output: upstream's output
+            // mapping skips declaration files outright.
+            if is_declaration_input_name(&name) {
+                continue;
+            }
+            let Some(emit) = output.emit() else {
+                return Err(format!(
+                    "unit `{}` produced no javascript emit",
+                    unit.virtual_path
+                ));
+            };
+            let Some(javascript) = emit.javascript.as_ref() else {
+                return Err(format!(
+                    "unit `{}` produced no javascript slot",
+                    unit.virtual_path
+                ));
+            };
+            let js_name = output_section_name(&name, bundle.as_deref(), |name| {
+                output_extension(name, jsx_preserve).to_owned()
+            });
+            push_output_section(&mut out, &js_name, &javascript.code);
+            outputs += 1;
         }
-        outputs += 1;
+    }
+    if options.declaration() || options.emit_declaration_only() {
+        let mut declarations = Vec::new();
+        for (unit, output) in &units {
+            let name = unit_basename(&unit.virtual_path);
+            if is_declaration_input_name(&name) {
+                continue;
+            }
+            let section = output_section_name(&name, bundle.as_deref(), declaration_extension);
+            let Some(declaration) = declaration_code(output)
+                .map(str::to_owned)
+                .or_else(|| declaration_text_for(output, &section, &name))
+            else {
+                continue;
+            };
+            declarations.push((section, declaration));
+        }
+        if !declarations.is_empty() {
+            // Upstream writes the `\r\n\r\n` block separator and then the
+            // declaration sections back to back, with no per-file separator.
+            out.push_str("\n\n");
+            for (section, code) in declarations {
+                out.push_str(&format!("//// [{section}]\n{code}"));
+                outputs += 1;
+            }
+        }
     }
     if outputs == 0 {
         return Err("javascript emit reached no case units".to_owned());
@@ -1713,53 +1762,206 @@ pub fn emit_javascript_baseline(
     Ok(out)
 }
 
+/// The bundle output name (`outFile`) upstream gives every unit's JavaScript
+/// output, as a basename. Upstream's per-unit output path is the `outFile`
+/// path itself, and the baseline prints only its basename.
+fn bundle_output_name(options: &CompilerOptions) -> std::result::Result<Option<String>, String> {
+    let Some(path) = options.out_file() else {
+        return Ok(None);
+    };
+    let Some(name) = path.file_name() else {
+        return Ok(None);
+    };
+    let Some(basename) = name.to_str() else {
+        return Err("outFile path is not valid UTF-8".to_owned());
+    };
+    Ok(Some(basename.to_owned()))
+}
+
+/// The `//// [<name>]` section header for one unit's output of a given kind.
+/// A per-file compile names the section after the unit basename; an `outFile`
+/// compile names every output after the bundle. Either way the name is that
+/// file's basename with `extension` swapped in, and a name already carrying
+/// the extension is returned untouched so a `.d.ts` bundle stays `.d.ts`
+/// rather than becoming `.d.d.ts`.
+fn output_section_name(
+    unit_name: &str,
+    bundle: Option<&str>,
+    extension: impl Fn(&str) -> String,
+) -> String {
+    let name = match bundle {
+        Some(bundle) => bundle,
+        None => unit_name,
+    };
+    let extension = extension(name);
+    if name.to_ascii_lowercase().ends_with(&extension) {
+        return name.to_owned();
+    }
+    replace_extension(name, &extension)
+}
+
+/// Whether a unit name is itself a declaration file (`.d.ts`, `.d.mts`,
+/// `.d.cts`). Upstream's output mapping skips declaration inputs entirely:
+/// they produce no JavaScript and no declaration output.
+fn is_declaration_input_name(name: &str) -> bool {
+    is_declaration_section_name(name)
+}
+
+/// The declaration text one unit's frontend output carries, when it carries
+/// one.
+fn declaration_code(output: &FrontendOutput) -> Option<&str> {
+    output
+        .emit()
+        .and_then(|emit| emit.declaration.as_ref())
+        .map(|declaration| declaration.code.as_str())
+}
+
+/// The declaration text for one unit whose frontend output carries only
+/// JavaScript.
+///
+/// The `javascript` lane runs the transform surface, whose `EmitOutput` has no
+/// declaration slot, while upstream's `doJsEmitBaseline` documents the
+/// declaration sections of the same compile. Re-emitting the unit through the
+/// public emitter with declaration emit on produces exactly the text the
+/// `declaration` lane documents: the declaration view of `EmitOptions` carries
+/// only newline, indent, `isolatedDeclarations`, `stripPrivate`, and
+/// `declarationMap`, none of which the lane routing changes.
+/// `emit_declaration_only` keeps the call from re-emitting the JavaScript.
+fn declaration_text_for(
+    output: &FrontendOutput,
+    dts_name: &str,
+    source_name: &str,
+) -> Option<String> {
+    let names = EmitFileNames {
+        source_name: Arc::from(source_name),
+        declaration_file_name: Some(Arc::from(dts_name)),
+        ..EmitFileNames::default()
+    };
+    let options = EmitOptions {
+        declaration: true,
+        emit_declaration_only: true,
+        ..EmitOptions::default()
+    };
+    let emitted = emit_checked(
+        output.source_file(),
+        output.semantic_model(),
+        &options,
+        &names,
+    );
+    emitted.declaration.map(|declaration| declaration.code)
+}
+
+/// Append one `//// [<section>]` output section whose body is newline-terminated.
+fn push_output_section(out: &mut String, section: &str, code: &str) {
+    out.push_str(&format!("//// [{section}]\n{code}"));
+    if !code.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+/// Append one `//// [<section>]` source-map section carrying map JSON.
+fn push_map_section(out: &mut String, section: &str, json: &str) {
+    out.push_str(&format!("//// [{section}]\n{json}"));
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+/// The JavaScript output extension upstream derives for one input name
+/// (`outputpaths.GetOutputExtension`): `.json` stays `.json`; `.tsx`/`.jsx`
+/// become `.jsx` only under `jsx: preserve`; `.mts`/`.mjs` become `.mjs`;
+/// `.cts`/`.cjs` become `.cjs`; everything else becomes `.js`.
+#[must_use]
+pub fn output_extension(file_name: &str, jsx_preserve: bool) -> &'static str {
+    let lower = file_name.to_lowercase();
+    if lower.ends_with(".json") {
+        ".json"
+    } else if jsx_preserve && (lower.ends_with(".tsx") || lower.ends_with(".jsx")) {
+        ".jsx"
+    } else if lower.ends_with(".mts") || lower.ends_with(".mjs") {
+        ".mjs"
+    } else if lower.ends_with(".cts") || lower.ends_with(".cjs") {
+        ".cjs"
+    } else {
+        ".js"
+    }
+}
+
+/// The `//// [<name>]` section header for one unit's JavaScript output. The
+/// baseline prints the output path's basename, so only the extension changes
+/// from the unit name (`a.ts` ⇒ `a.js`, `file.tsx` ⇒ `file.jsx` under
+/// `jsx: preserve`, `m.cts` ⇒ `m.cjs`).
+#[must_use]
+pub fn javascript_section_name(unit_name: &str, jsx_preserve: bool) -> String {
+    replace_extension(unit_name, output_extension(unit_name, jsx_preserve))
+}
+
+/// The declaration-output extension upstream derives for one input name
+/// (`tspath.GetDeclarationEmitExtensionForPath`).
+#[must_use]
+pub fn declaration_extension(file_name: &str) -> String {
+    let lower = file_name.to_lowercase();
+    if lower.ends_with(".mjs") || lower.ends_with(".mts") {
+        ".d.mts".to_owned()
+    } else if lower.ends_with(".cjs") || lower.ends_with(".cts") {
+        ".d.cts".to_owned()
+    } else if lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".js")
+        || lower.ends_with(".jsx")
+    {
+        ".d.ts".to_owned()
+    } else if let Some((_, extension)) = lower.rsplit_once('.') {
+        format!(".d.{extension}.ts")
+    } else {
+        ".d.ts".to_owned()
+    }
+}
+
 /// Swap a unit basename to its declaration-output name (`a.ts` ⇒ `a.d.ts`,
-/// `.mts` ⇒ `.d.mts`, `.cts` ⇒ `.d.cts`), matching upstream's declaration
-/// emit extension rule for per-file output naming.
+/// `.mjs`/`.mts` ⇒ `.d.mts`, `.cjs`/`.cts` ⇒ `.d.cts`), matching upstream's
+/// declaration emit extension rule for per-file output naming.
 #[must_use]
 pub fn declaration_section_name(unit_name: &str) -> String {
-    let lower = unit_name.to_lowercase();
-    let extension = if lower.ends_with(".mts") {
-        ".d.mts"
-    } else if lower.ends_with(".cts") {
-        ".d.cts"
-    } else {
-        ".d.ts"
-    };
-    let stem = unit_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(unit_name);
-    format!("{stem}{extension}")
+    replace_extension(unit_name, &declaration_extension(unit_name))
+}
+
+/// Replaces `file_name`'s extension with `extension`, appending it when the
+/// name has none.
+fn replace_extension(file_name: &str, extension: &str) -> String {
+    match file_name.rsplit_once('.') {
+        Some((stem, _)) => format!("{stem}{extension}"),
+        None => format!("{file_name}{extension}"),
+    }
 }
 
 /// Emit the declaration slice of an upstream `.js` baseline document: one
-/// `//// [<stem>.d.ts]` section per reached unit, framed exactly like
-/// upstream's `doJsEmitBaseline` `fileOutput` sections (header without
-/// trailing slashes, newline-terminated code).
+/// `//// [<output>.d.ts]` section per reached unit that declares, framed
+/// exactly like upstream's `doJsEmitBaseline` `fileOutput` sections (header
+/// without trailing slashes, newline-terminated code, no separator between
+/// declaration sections).
 pub fn emit_declaration_baseline(case: &CheckedCase) -> std::result::Result<String, String> {
+    let options = case.options();
+    let bundle = bundle_output_name(options)?;
     let mut out = String::new();
     for (unit, output) in case.reached_units() {
-        let Some(emit) = output.emit() else {
-            return Err(format!(
-                "unit `{}` produced no declaration emit",
-                unit.virtual_path
-            ));
-        };
-        let Some(declaration) = emit.declaration.as_ref() else {
-            return Err(format!(
-                "unit `{}` produced no declaration slot",
-                unit.virtual_path
-            ));
-        };
-        out.push_str(&format!(
-            "//// [{}]\n",
-            declaration_section_name(&unit_basename(&unit.virtual_path))
-        ));
-        out.push_str(&declaration.code);
-        if !declaration.code.ends_with('\n') {
-            out.push('\n');
+        let name = unit_basename(&unit.virtual_path);
+        // Declaration inputs declare nothing; upstream's output mapping skips
+        // them, so they contribute no section.
+        if is_declaration_input_name(&name) {
+            continue;
         }
+        let section = output_section_name(&name, bundle.as_deref(), declaration_extension);
+        // The declaration lane's frontend output already carries the
+        // declaration; the fallback covers a caller that hands this function a
+        // JavaScript-lane case.
+        let Some(declaration) = declaration_code(output)
+            .map(str::to_owned)
+            .or_else(|| declaration_text_for(output, &section, &name))
+        else {
+            continue;
+        };
+        push_output_section(&mut out, &section, &declaration);
     }
     if out.is_empty() {
         return Err("declaration emit reached no case units".to_owned());
@@ -1906,39 +2108,57 @@ fn inline_source_map_producer_gap() -> String {
     "producer missing: `.sourcemap.txt` sourcemap-record producer (inline source maps are never baselined as `.js.map` upstream)".to_owned()
 }
 
-/// Emit the source-map slice of an upstream `.js.map` baseline document: one
-/// `//// [<stem>.js.map]` section per reached unit carrying the real printer
-/// map as Source Map v3 JSON. Maps are produced through the public emitter
-/// surface with external-map naming (`file`, `sources`, and the
-/// `sourceMappingURL` mirror upstream's per-file baseline shape).
+/// Emit the source-map slice of an upstream `.js.map` baseline document: the
+/// `//// [<output>.js.map]` sections (when `sourceMap` is on) followed by the
+/// `//// [<output>.d.ts.map]` sections (when `declarationMap` is on), each
+/// carrying the real printer map as Source Map v3 JSON. Upstream's
+/// `DoSourcemapBaseline` writes exactly `result.Maps`, whose order is the
+/// program's source order per surface, so JavaScript maps precede declaration
+/// maps. Maps are produced through the public emitter surface with external-map
+/// naming (`file`, `sources`, and the `sourceMappingURL` mirror upstream's
+/// per-file baseline shape).
 pub fn emit_source_map_baseline(
     case: &CheckedCase,
     inline_sources: bool,
 ) -> std::result::Result<String, String> {
+    let program_options = case.options();
     let mut out = String::new();
+    let jsx_preserve = program_options.jsx() == Some(JsxEmit::Preserve);
+    let bundle = bundle_output_name(program_options)?;
+    let source_map = program_options.source_map();
+    let declaration_map = program_options.declaration_map();
+    // An `emitDeclarationOnly` compile produces no JavaScript at all, so its
+    // `.js.map` baseline carries only declaration maps.
+    let want_js_map = source_map && !program_options.emit_declaration_only();
+    let want_dts_map = declaration_map;
+    let mut js_maps: Vec<(String, String)> = Vec::new();
+    let mut dts_maps: Vec<(String, String)> = Vec::new();
     for (unit, output) in case.reached_units() {
-        if output.emit().is_none() {
-            return Err(format!(
-                "unit `{}` produced no javascript emit",
-                unit.virtual_path
-            ));
-        }
         let source_name = unit_basename(&unit.virtual_path);
-        let js_name = match source_name.rsplit_once('.') {
-            Some((stem, _)) => format!("{stem}.js"),
-            None => format!("{source_name}.js"),
-        };
-        let options = EmitOptions {
-            source_map: true,
-            inline_sources,
-            ..EmitOptions::default()
-        };
+        if is_declaration_input_name(&source_name) {
+            continue;
+        }
+        let js_name = output_section_name(&source_name, bundle.as_deref(), |name| {
+            output_extension(name, jsx_preserve).to_owned()
+        });
+        let dts_name = output_section_name(&source_name, bundle.as_deref(), declaration_extension);
         let names = EmitFileNames {
             source_name: Arc::from(source_name.as_str()),
             js_file_name: Some(Arc::from(js_name.as_str())),
             js_source_name: Some(Arc::from(source_name.as_str())),
             js_source_map_url: Some(Arc::from(format!("{js_name}.map").as_str())),
+            declaration_file_name: Some(Arc::from(dts_name.as_str())),
+            declaration_source_name: Some(Arc::from(source_name.as_str())),
+            declaration_source_map_url: Some(Arc::from(format!("{dts_name}.map").as_str())),
             ..EmitFileNames::default()
+        };
+        let options = EmitOptions {
+            source_map: want_js_map,
+            declaration: want_dts_map || program_options.declaration(),
+            emit_declaration_only: program_options.emit_declaration_only(),
+            declaration_map: want_dts_map,
+            inline_sources,
+            ..EmitOptions::default()
         };
         let emitted = emit_checked(
             output.source_file(),
@@ -1946,22 +2166,46 @@ pub fn emit_source_map_baseline(
             &options,
             &names,
         );
-        let Some(map) = emitted
-            .javascript
-            .as_ref()
-            .and_then(|file| file.source_map.as_ref())
-        else {
-            return Err(format!(
-                "unit `{}` produced no source map",
-                unit.virtual_path
-            ));
-        };
-        out.push_str(&format!("//// [{js_name}.map]\n{}", map.to_json()));
-        if !out.ends_with('\n') {
-            out.push('\n');
+        if want_js_map {
+            let Some(map) = emitted
+                .javascript
+                .as_ref()
+                .and_then(|file| file.source_map.as_ref())
+            else {
+                return Err(format!(
+                    "unit `{}` produced no javascript source map",
+                    unit.virtual_path
+                ));
+            };
+            js_maps.push((format!("{js_name}.map"), map.to_json()));
+        }
+        if want_dts_map {
+            let Some(map) = emitted
+                .declaration
+                .as_ref()
+                .and_then(|file| file.source_map.as_ref())
+            else {
+                return Err(format!(
+                    "unit `{}` produced no declaration source map",
+                    unit.virtual_path
+                ));
+            };
+            dts_maps.push((format!("{dts_name}.map"), map.to_json()));
         }
     }
-    if out.is_empty() {
+    // Upstream's `result.Maps` consumes one `.js.map` per source file in
+    // program order, then appends the unhandled declaration maps sorted by
+    // unit name, so JavaScript maps always precede declaration maps.
+    for (section, json) in js_maps {
+        push_map_section(&mut out, &section, &json);
+    }
+    dts_maps.sort_by(|left, right| left.0.cmp(&right.0));
+    for (section, json) in dts_maps {
+        push_map_section(&mut out, &section, &json);
+    }
+    // `emitDeclarationOnly` without `declarationMap` requests no map at all;
+    // only a case with no units is malformed.
+    if out.is_empty() && case.units.is_empty() {
         return Err("source-map emit reached no case units".to_owned());
     }
     Ok(out)
@@ -3317,27 +3561,26 @@ import { everywhere, onlyInA } from \"b.foo\"; // Error
             "tests/cases/conformance/ambient/ambientDeclarationsPatterns_merging1.ts",
             case,
         );
-        assert_eq!(units.len(), 4);
+        // The only line before the first `@filename` is the global
+        // `// @module` directive. Upstream drops an options-only preamble
+        // rather than creating a case-named unit for it, so the first unit is
+        // `types.ts` and the document has no phantom `//// [<case>.ts]` echo.
+        // The authority baseline for this case echoes exactly these three
+        // units and emits exactly `types.js`, `testA.js`, `testB.js`.
+        assert_eq!(units.len(), 3);
         assert_eq!(
             units[0].virtual_path,
-            "tests/cases/conformance/ambient/ambientDeclarationsPatterns_merging1.ts"
-        );
-        // The `// @module` global directive is the only line before the first
-        // `@filename`, so the entry unit's stripped content is empty.
-        assert_eq!(units[0].text, "");
-        assert_eq!(
-            units[1].virtual_path,
             "tests/cases/conformance/ambient/types.ts"
         );
         // The `@filename` directive line is stripped; content begins at the
         // first real source line of the unit.
-        assert!(units[1].text.starts_with("declare module \"*.foo\" {\n"));
+        assert!(units[0].text.starts_with("declare module \"*.foo\" {\n"));
         assert_eq!(
-            units[2].virtual_path,
+            units[1].virtual_path,
             "tests/cases/conformance/ambient/testA.ts"
         );
         assert_eq!(
-            units[3].virtual_path,
+            units[2].virtual_path,
             "tests/cases/conformance/ambient/testB.ts"
         );
     }
@@ -4194,6 +4437,127 @@ export class Model {
     }
 
     #[test]
+    fn javascript_section_name_derives_output_extension_per_upstream() {
+        // `.ts` -> `.js` always; `.tsx`/`.jsx` -> `.jsx` only under
+        // `jsx: preserve`, otherwise `.js`; module-format extensions carry
+        // through. This mirrors `outputpaths.GetOutputExtension`.
+        assert_eq!(javascript_section_name("a.ts", false), "a.js");
+        assert_eq!(javascript_section_name("a.ts", true), "a.js");
+        assert_eq!(javascript_section_name("file.tsx", true), "file.jsx");
+        assert_eq!(javascript_section_name("file.tsx", false), "file.js");
+        assert_eq!(javascript_section_name("view.jsx", true), "view.jsx");
+        assert_eq!(javascript_section_name("view.jsx", false), "view.js");
+        assert_eq!(javascript_section_name("m.mts", false), "m.mjs");
+        assert_eq!(javascript_section_name("c.cts", false), "c.cjs");
+        assert_eq!(javascript_section_name("data.json", false), "data.json");
+        // A name with no recognised extension still gains `.js`.
+        assert_eq!(javascript_section_name("LICENSE", false), "LICENSE.js");
+    }
+
+    #[test]
+    fn output_section_name_uses_bundle_for_outfile_and_unit_for_per_file() {
+        // Per-file compile: the section is the unit's own output name.
+        assert_eq!(
+            output_section_name("a.tsx", None, |name| output_extension(name, true)
+                .to_owned()),
+            "a.jsx"
+        );
+        // `outFile` compile: every unit's JavaScript output is named after the
+        // bundle, keeping the kind's extension.
+        assert_eq!(
+            output_section_name("a.ts", Some("bundle.js"), |name| {
+                output_extension(name, false).to_owned()
+            }),
+            "bundle.js"
+        );
+        // The declaration slice of the same bundle swaps to the declaration
+        // extension.
+        assert_eq!(
+            output_section_name("a.ts", Some("bundle.js"), declaration_extension),
+            "bundle.d.ts"
+        );
+        // A `.d.ts` bundle keeps the compound declaration extension.
+        assert_eq!(
+            output_section_name("a.ts", Some("types.d.ts"), declaration_extension),
+            "types.d.ts"
+        );
+    }
+
+    /// The authority documents order the emit slices as: every input echo in
+    /// unit order, then every `.js` output in unit order, then every `.d.ts`
+    /// output in unit order (`allowSyntheticDefaultImportsCanPaintCrossModule
+    /// Declaration.js` is the reference shape). Declaration inputs echo but
+    /// contribute no output section.
+    #[test]
+    fn javascript_baseline_orders_js_sections_before_dts_sections() {
+        let logical = "tests/cases/compiler/orderPin.ts";
+        let case_text = "\
+// @declaration: true
+// @filename: b.ts
+export const b = 2;
+// @filename: a.ts
+export const a = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                "//// [b.ts]",
+                "//// [a.ts]",
+                "//// [b.js]",
+                "//// [a.js]",
+                "//// [b.d.ts]",
+                "//// [a.d.ts]"
+            ],
+            "{emitted}"
+        );
+    }
+
+    /// A `.d.ts` input unit is echoed but never emitted: upstream's output
+    /// mapping skips declaration files outright, so a document with a
+    /// `module.d.ts` echo carries no `module.js`/`module.d.ts` section.
+    #[test]
+    fn javascript_baseline_skips_declaration_input_outputs() {
+        let logical = "tests/cases/compiler/declInputPin.ts";
+        let case_text = "\
+// @declaration: true
+// @filename: module.d.ts
+declare const m: number;
+// @filename: test.ts
+export const t = 1;
+";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
+        let emitted = emit_javascript_baseline(&case, logical).expect("javascript emit");
+        let heads: Vec<&str> = emitted
+            .lines()
+            .filter(|line| line.starts_with("//// [") && !line.ends_with(" ////"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                "//// [module.d.ts]",
+                "//// [test.ts]",
+                "//// [test.js]",
+                "//// [test.d.ts]"
+            ],
+            "{emitted}"
+        );
+    }
+
+    #[test]
     fn extract_dts_sections_selects_only_declaration_output() {
         // Real upstream shape (argumentsReferenceInConstructor4_Js.js): a
         // document header with trailing ////, an input echo, then the `a.d.ts`
@@ -4311,16 +4675,12 @@ export class Model {
     #[test]
     fn source_map_baseline_frames_real_printer_maps() {
         let logical = "tests/cases/compiler/mapPin.ts";
-        let case_text = "var v = 1;\n";
+        let case_text = "// @sourcemap: true\nvar v = 1;\n";
         let units = split_case_units(logical, case_text);
         let entry = entry_virtual_path(logical, &units);
-        let case = compile_case_frontend(
-            &units,
-            &entry,
-            &CasePragmas::default(),
-            FrontendMode::JavaScript,
-        )
-        .expect("case compiles");
+        let pragmas = parse_case_pragmas(case_text);
+        let case = compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            .expect("case compiles");
         let emitted = emit_source_map_baseline(&case, false).expect("map emit");
         assert!(
             emitted.starts_with("//// [mapPin.js.map]\n{\"version\":3"),
@@ -4328,6 +4688,7 @@ export class Model {
         );
         assert!(emitted.contains("\"file\":\"mapPin.js\""), "{emitted}");
         assert!(emitted.contains("\"sources\":[\"mapPin.ts\"]"), "{emitted}");
+        assert!(emitted.contains("\"sourceRoot\":\"\""), "{emitted}");
         assert_eq!(compare_source_map(&emitted, &emitted), FacetVerdict::Pass);
     }
 

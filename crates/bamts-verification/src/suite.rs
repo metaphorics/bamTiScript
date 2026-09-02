@@ -4704,7 +4704,7 @@ var s: string = \"hi\";\n\
         let case = check_cells::compile_case_frontend(
             &units,
             &entry,
-            &check_cells::CasePragmas::default(),
+            &check_cells::parse_case_pragmas(source),
             bamts_compiler::pipeline::FrontendMode::JavaScript,
         )
         .expect("case compiles");
