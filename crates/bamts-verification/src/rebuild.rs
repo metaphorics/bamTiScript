@@ -1144,7 +1144,7 @@ fn io_path(path: &Path, error: io::Error) -> VerificationError {
 mod tests {
     use super::*;
     use crate::{
-        evidence::{PublishMode, WorkingDirectoryPolicy, publish_evidence},
+        evidence::{PublishMode, ToolchainPin, WorkingDirectoryPolicy, publish_evidence},
         shard::{ExecutionMode, ShardIdentity, ShardSpec},
     };
 
@@ -1183,9 +1183,12 @@ mod tests {
         )
         .expect("obligation key")
     }
+    fn toolchain_pin() -> ToolchainPin {
+        ToolchainPin::new("rustc-1.97.1", DIGEST).expect("toolchain pin")
+    }
 
     fn binding() -> RunBinding {
-        RunBinding::new(DIGEST, DIGEST, DIGEST, DIGEST).expect("binding")
+        RunBinding::new(DIGEST, DIGEST, DIGEST, DIGEST, toolchain_pin()).expect("binding")
     }
 
     fn expected_bindings() -> BTreeMap<String, RunBinding> {
@@ -1230,7 +1233,7 @@ mod tests {
     }
 
     fn run_binding(authority: &str, tree: &str) -> RunBinding {
-        RunBinding::new(authority, tree, DIGEST, DIGEST).expect("run binding")
+        RunBinding::new(authority, tree, DIGEST, DIGEST, toolchain_pin()).expect("run binding")
     }
 
     fn two_catalog_fixture() -> (
@@ -1486,7 +1489,8 @@ mod tests {
         write_receipt(
             &receipt,
             &[pass_row(&declared, "diagnostics")],
-            RunBinding::new(OTHER, DIGEST, DIGEST, DIGEST).expect("stale authority"),
+            RunBinding::new(OTHER, DIGEST, DIGEST, DIGEST, toolchain_pin())
+                .expect("stale authority"),
         );
         let report = project(
             &root,
@@ -1508,15 +1512,15 @@ mod tests {
         for (field, stale) in [
             (
                 "candidate_tree_digest",
-                RunBinding::new(DIGEST, OTHER, DIGEST, DIGEST).expect("tree"),
+                RunBinding::new(DIGEST, OTHER, DIGEST, DIGEST, toolchain_pin()).expect("tree"),
             ),
             (
                 "candidate_binary_digest",
-                RunBinding::new(DIGEST, DIGEST, OTHER, DIGEST).expect("binary"),
+                RunBinding::new(DIGEST, DIGEST, OTHER, DIGEST, toolchain_pin()).expect("binary"),
             ),
             (
                 "harness_digest",
-                RunBinding::new(DIGEST, DIGEST, DIGEST, OTHER).expect("harness"),
+                RunBinding::new(DIGEST, DIGEST, DIGEST, OTHER, toolchain_pin()).expect("harness"),
             ),
         ] {
             write_receipt(&receipt, &[pass_row(&declared, "diagnostics")], stale);
@@ -1549,7 +1553,7 @@ mod tests {
         write_receipt(
             &earlier,
             &[pass_row(&second, "diagnostics")],
-            RunBinding::new(DIGEST, OTHER, OTHER, OTHER).expect("earlier run"),
+            RunBinding::new(DIGEST, OTHER, OTHER, OTHER, toolchain_pin()).expect("earlier run"),
         );
         let report =
             project(&root, &index, &[current, earlier], RebuildMode::Write).expect("mixed runs");

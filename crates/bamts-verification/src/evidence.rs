@@ -88,6 +88,51 @@ pub enum WorkingDirectoryPolicy {
     RepositoryRoot,
 }
 
+/// Toolchain pin bound into every v2 run binding.
+///
+/// Records the exact Rust toolchain that compiled the harness and candidate
+/// binary, so a receipt set is stale when either the `rustc` version or the
+/// `rust-toolchain.toml` content changes — even if the source tree is clean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainPin {
+    rustc_version: String,
+    rust_toolchain_toml_digest: String,
+}
+
+impl ToolchainPin {
+    pub fn new(
+        rustc_version: impl Into<String>,
+        rust_toolchain_toml_digest: impl Into<String>,
+    ) -> Result<Self> {
+        let pin = Self {
+            rustc_version: rustc_version.into(),
+            rust_toolchain_toml_digest: rust_toolchain_toml_digest.into(),
+        };
+        pin.validate()?;
+        Ok(pin)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_token("rustc_version", &self.rustc_version)?;
+        require_sha256(
+            "rust_toolchain_toml_digest",
+            &self.rust_toolchain_toml_digest,
+        )?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn rustc_version(&self) -> &str {
+        &self.rustc_version
+    }
+
+    #[must_use]
+    pub fn rust_toolchain_toml_digest(&self) -> &str {
+        &self.rust_toolchain_toml_digest
+    }
+}
+
 /// Binding shared by every shard of one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,14 +143,15 @@ pub struct RunBinding {
     harness_digest: String,
     environment: Vec<String>,
     runner_version: String,
+    toolchain: ToolchainPin,
 }
-
 impl RunBinding {
     pub fn new(
         authority_digest: impl Into<String>,
         candidate_tree_digest: impl Into<String>,
         candidate_binary_digest: impl Into<String>,
         harness_digest: impl Into<String>,
+        toolchain: ToolchainPin,
     ) -> Result<Self> {
         let binding = Self {
             authority_digest: authority_digest.into(),
@@ -117,6 +163,7 @@ impl RunBinding {
                 .map(|entry| (*entry).to_owned())
                 .collect(),
             runner_version: RUNNER_VERSION.to_owned(),
+            toolchain,
         };
         binding.validate()?;
         Ok(binding)
@@ -138,6 +185,7 @@ impl RunBinding {
         require_sha256("candidate_tree_digest", &self.candidate_tree_digest)?;
         require_sha256("candidate_binary_digest", &self.candidate_binary_digest)?;
         require_sha256("harness_digest", &self.harness_digest)?;
+        self.toolchain.validate()?;
         if self.environment.len() != NORMALIZED_ENV.len()
             || self
                 .environment
@@ -160,6 +208,11 @@ impl RunBinding {
     #[must_use]
     pub fn environment(&self) -> &[String] {
         &self.environment
+    }
+
+    #[must_use]
+    pub fn toolchain(&self) -> &ToolchainPin {
+        &self.toolchain
     }
 
     pub(crate) fn first_mismatch_field(&self, actual: &Self) -> Option<&'static str> {
@@ -185,6 +238,7 @@ impl RunBinding {
                 "runner_version",
                 self.runner_version == actual.runner_version,
             ),
+            ("toolchain", self.toolchain == actual.toolchain),
         ]
         .into_iter()
         .find_map(|(field, matches)| (!matches).then_some(field))
@@ -197,6 +251,7 @@ impl RunBinding {
             && self.harness_digest == other.harness_digest
             && self.environment == other.environment
             && self.runner_version == other.runner_version
+            && self.toolchain == other.toolchain
     }
 }
 /// Exact workflow execution that produced one receipt matrix.
@@ -603,6 +658,7 @@ impl<W: Write> EvidenceWriter<W> {
 }
 
 /// Streaming JSONL reader.  Memory is one line plus running digest state.
+#[derive(Debug)]
 pub struct EvidenceReader<R> {
     reader: R,
     header: EvidenceHeader,
@@ -1124,8 +1180,12 @@ mod tests {
         (0..len).map(key).collect()
     }
 
+    fn toolchain_pin() -> ToolchainPin {
+        ToolchainPin::new("rustc-1.97.1", DIGEST).expect("toolchain pin")
+    }
+
     fn binding() -> RunBinding {
-        RunBinding::new(DIGEST, DIGEST, DIGEST, DIGEST).expect("binding")
+        RunBinding::new(DIGEST, DIGEST, DIGEST, DIGEST, toolchain_pin()).expect("binding")
     }
 
     fn row(index: usize, state: TerminalState) -> EvidenceRow {
@@ -1272,11 +1332,11 @@ mod tests {
         for (label, stale) in [
             (
                 "authority",
-                RunBinding::new(OTHER, DIGEST, DIGEST, DIGEST).expect("authority"),
+                RunBinding::new(OTHER, DIGEST, DIGEST, DIGEST, toolchain_pin()).expect("authority"),
             ),
             (
                 "candidate-tree",
-                RunBinding::new(DIGEST, OTHER, DIGEST, DIGEST).expect("tree"),
+                RunBinding::new(DIGEST, OTHER, DIGEST, DIGEST, toolchain_pin()).expect("tree"),
             ),
         ] {
             let first = scratch.file(&format!("{label}-0.jsonl"));
@@ -1462,5 +1522,76 @@ mod tests {
         let check = publish_evidence(&other, header, &rows, PublishMode::Check).expect_err("check");
         assert_eq!(check.code(), ErrorCode::Digest);
         assert_eq!(fs::read(&other).expect("check dest"), b"not-evidence\n");
+    }
+
+    #[test]
+    fn two_writes_of_same_binding_produce_byte_identical_headers() {
+        let catalog = keys(4);
+        let rows: Vec<EvidenceRow> = (0..4)
+            .map(|index| row(index, TerminalState::Pass))
+            .collect();
+        let scratch = Scratch::new("deterministic-binding");
+        let first = scratch.file("first.jsonl");
+        let second = scratch.file("second.jsonl");
+        write_unsharded(&first, &catalog, &rows);
+        write_unsharded(&second, &catalog, &rows);
+        let first_bytes = fs::read(&first).expect("read first");
+        let second_bytes = fs::read(&second).expect("read second");
+        assert_eq!(first_bytes, second_bytes);
+    }
+    #[test]
+    fn reader_rejects_receipt_with_invalid_candidate_tree_digest() {
+        let catalog = keys(2);
+        let rows: Vec<EvidenceRow> = (0..2)
+            .map(|index| row(index, TerminalState::Pass))
+            .collect();
+        let scratch = Scratch::new("invalid-tree");
+        let dest = scratch.file("evidence.jsonl");
+
+        // Write a valid receipt, then tamper with the candidate_tree_digest
+        // to make it an invalid (non-SHA-256-hex) value.
+        write_unsharded(&dest, &catalog, &rows);
+        let bytes = fs::read_to_string(&dest).expect("read");
+        let tampered = bytes.replace(
+            "\"candidate_tree_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            "\"candidate_tree_digest\":\"not-a-sha256-digest\"",
+        );
+        assert_ne!(bytes, tampered, "tamper must change bytes");
+        fs::write(&dest, &tampered).expect("write tampered");
+
+        let error = EvidenceReader::open(&dest).expect_err("must reject");
+        assert_eq!(
+            error.code(),
+            ErrorCode::Digest,
+            "invalid candidate_tree_digest must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_receipt_missing_toolchain_pin() {
+        let catalog = keys(2);
+        let rows: Vec<EvidenceRow> = (0..2)
+            .map(|index| row(index, TerminalState::Pass))
+            .collect();
+        let scratch = Scratch::new("missing-toolchain");
+        let dest = scratch.file("evidence.jsonl");
+
+        // Write a valid receipt, then remove the toolchain field from the header.
+        write_unsharded(&dest, &catalog, &rows);
+        let bytes = fs::read_to_string(&dest).expect("read");
+        // Remove the toolchain object from the binding.
+        let tampered = bytes.replace(
+            ",\"toolchain\":{\"rustc_version\":\"rustc-1.97.1\",\"rust_toolchain_toml_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+            "",
+        );
+        assert_ne!(bytes, tampered, "tamper must change bytes");
+        fs::write(&dest, &tampered).expect("write tampered");
+
+        let error = EvidenceReader::open(&dest).expect_err("must reject");
+        assert_eq!(
+            error.code(),
+            ErrorCode::Json,
+            "missing toolchain pin must be rejected as a JSON error: {error}"
+        );
     }
 }

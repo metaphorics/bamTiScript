@@ -25,7 +25,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{BufWriter, Read},
+    io::BufWriter,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -39,7 +39,7 @@ use crate::{
     classification::{self, ClassificationState, NonPassState},
     evidence::{
         EvidenceHeader, EvidenceReader, EvidenceRow, EvidenceWriter, ExecutionBinding, PublishMode,
-        RunBinding, TerminalState, WorkingDirectoryPolicy, merge_shards,
+        RunBinding, TerminalState, ToolchainPin, WorkingDirectoryPolicy, merge_shards,
     },
     lane::{
         LaneBinding, LaneExecutor, LaneOutcome, LaneProcessResult, LaneRequest, LaneResponse,
@@ -1117,10 +1117,31 @@ fn authority_digest(root: &Path, catalog: &str) -> Result<String> {
     Ok(schema::sha256_hex(&hasher.finalize()))
 }
 
-/// SHA-256 of one file.
+/// SHA-256 of one file, streamed in 64 KiB chunks.
 fn file_sha256(path: &Path) -> Result<String> {
-    let bytes = schema::read_bytes(path)?;
-    Ok(schema::sha256_hex(&bytes))
+    use std::io::BufReader;
+    let file = File::open(path).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Io,
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut reader, &mut buffer).map_err(|error| {
+            VerificationError::new(
+                ErrorCode::Io,
+                format!("{}: {error}", path.display()),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(schema::sha256_hex(&hasher.finalize()))
 }
 
 /// Runs `git` through the bounded corpus process boundary.
@@ -1156,11 +1177,34 @@ fn git_probe(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(outcome.stdout)
 }
 
-/// Candidate tree identity: the HEAD tree hash, folded with every dirty or
-/// untracked candidate file's current bytes.
+/// Candidate tree identity for a committed tree: the HEAD tree hash.
+///
+/// A v2 receipt is only valid for a clean committed tree.  If the working
+/// tree is dirty (modified, staged, untracked, or deleted files), this
+/// returns an error so the writer never produces a non-deterministic
+/// digest.  Two captures of the same committed tree always produce the
+/// same digest because it is solely `sha256("git-tree\0" + HEAD_tree_hash)`.
 fn candidate_tree_digest(root: &Path) -> Result<String> {
-    let tree = git_probe(root, &["rev-parse", "HEAD^{tree}"])?;
-    let tree = String::from_utf8_lossy(&tree).trim().to_owned();
+    let tree = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD^{tree}"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| {
+            VerificationError::new(
+                ErrorCode::ToolFailed,
+                format!("git rev-parse probe failed: {error}"),
+            )
+        })?;
+    if !tree.status.success() {
+        return Err(VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!("git rev-parse exited {}", tree.status),
+        ));
+    }
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_owned();
     if !matches!(tree.len(), 40 | 64)
         || !tree
             .bytes()
@@ -1171,95 +1215,70 @@ fn candidate_tree_digest(root: &Path) -> Result<String> {
             format!("git reported a malformed tree digest `{tree}`"),
         ));
     }
-    let mut clean_hasher = Sha256::new();
-    clean_hasher.update(b"git-tree\x00");
-    clean_hasher.update(tree.as_bytes());
-    let clean = schema::sha256_hex(&clean_hasher.finalize());
-    let status = git_probe(
-        root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )?;
-    if status.is_empty() {
-        return Ok(clean);
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| {
+            VerificationError::new(
+                ErrorCode::ToolFailed,
+                format!("git status probe failed: {error}"),
+            )
+        })?;
+    if !status.status.success() {
+        return Err(VerificationError::new(
+            ErrorCode::ToolFailed,
+            format!("git status exited {}", status.status),
+        ));
+    }
+    if !status.stdout.is_empty() {
+        return Err(VerificationError::new(
+            ErrorCode::Schema,
+            "candidate tree is dirty; a v2 receipt requires a clean committed tree",
+        ));
     }
     let mut hasher = Sha256::new();
-    hasher.update(b"dirty-tree\x00");
+    hasher.update(b"git-tree\x00");
     hasher.update(tree.as_bytes());
-    hasher.update([0x0a]);
-    let mut fields = status
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty());
-    while let Some(field) = fields.next() {
-        if field.len() < 4 || field[2] != b' ' {
-            return Err(VerificationError::new(
-                ErrorCode::Schema,
-                "git produced malformed porcelain status",
-            ));
-        }
-        let renamed = matches!(field[0], b'R' | b'C') || matches!(field[1], b'R' | b'C');
-        let deleted = field[0] == b'D' || field[1] == b'D';
-        let relative = std::str::from_utf8(&field[3..]).map_err(|_| {
-            VerificationError::new(ErrorCode::Schema, "git status path is not UTF-8")
-        })?;
-        hasher.update(field);
-        hasher.update([0]);
-        if !deleted {
-            hash_candidate_path(root, Path::new(relative), &mut hasher)?;
-        }
-        if renamed {
-            let source = fields.next().ok_or_else(|| {
-                VerificationError::new(ErrorCode::Schema, "git rename status lacks its source path")
-            })?;
-            hasher.update(source);
-            hasher.update([0]);
-        }
-    }
     Ok(schema::sha256_hex(&hasher.finalize()))
 }
 
-fn hash_candidate_path(root: &Path, relative: &Path, hasher: &mut Sha256) -> Result<()> {
-    let path = root.join(relative);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(io_path(&path, error)),
-    };
-    if metadata.file_type().is_symlink() {
-        hasher.update(
-            fs::read_link(&path)
-                .map_err(|error| io_path(&path, error))?
-                .as_os_str()
-                .as_encoded_bytes(),
-        );
-        hasher.update([0x0a]);
-        return Ok(());
-    }
-    // Porcelain already binds the directory path and status; it has no file bytes to hash.
-    if metadata.is_dir() {
-        return Ok(());
-    }
-    if !metadata.is_file() {
+/// Toolchain pin: the `rustc` version string and the SHA-256 of
+/// `rust-toolchain.toml` at the repository root.
+fn toolchain_pin(root: &Path) -> Result<ToolchainPin> {
+    let rustc_version = rustc_version_string()?;
+    let toml_path = root.join("rust-toolchain.toml");
+    let toml_digest = file_sha256(&toml_path)?;
+    ToolchainPin::new(rustc_version, toml_digest)
+}
+
+/// Returns the `rustc --version` output as a trimmed string with spaces
+/// replaced by hyphens, so it is a valid token for [`ToolchainPin`].
+fn rustc_version_string() -> Result<String> {
+    let output = std::process::Command::new("rustc")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| {
+            VerificationError::new(
+                ErrorCode::ToolFailed,
+                format!("rustc --version probe failed: {error}"),
+            )
+        })?;
+    if !output.status.success() {
         return Err(VerificationError::new(
-            ErrorCode::Schema,
-            format!(
-                "dirty candidate path `{}` is not a file",
-                relative.display()
-            ),
+            ErrorCode::ToolFailed,
+            format!("rustc --version exited {}", output.status),
         ));
     }
-    let mut file = File::open(&path).map_err(|error| io_path(&path, error))?;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| io_path(&path, error))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    hasher.update([0x0a]);
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .replace(' ', "-"))
 }
 
 #[derive(Debug)]
@@ -1333,6 +1352,7 @@ fn binding_from_snapshot(root: &Path, catalog: &str, snapshot: &RunSnapshot) -> 
         snapshot.candidate_tree_digest.clone(),
         file_sha256(&candidate_binary(root, catalog)?)?,
         snapshot.harness_digest.clone(),
+        toolchain_pin(root)?,
     )
 }
 
@@ -1480,6 +1500,10 @@ mod tests {
             &manifest_bytes(identifiers, &source_ledger, &digest),
         );
         scratch.write(
+            "rust-toolchain.toml",
+            b"[toolchain]\nchannel = \"1.97.1\"\n",
+        );
+        scratch.write(
             ".gitignore",
             b"receipts/\npartial/\nstale/\nextra/\nwrong-mode/\ntwo/\nduplicate/\n*.jsonl\nout*.jsonl\n",
         );
@@ -1516,6 +1540,24 @@ mod tests {
             "verification/classification/catalog-b.toml",
             b"catalog = \"b\"\n",
         );
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch.root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        run_git(&["add", "."]);
+        run_git(&[
+            "-c",
+            "user.name=bamts-suite-test",
+            "-c",
+            "user.email=suite@example.invalid",
+            "commit",
+            "-qm",
+            "classification fixtures",
+        ]);
         let catalogs = BTreeSet::from(["catalog-b".to_owned(), "catalog-a".to_owned()]);
 
         let bindings = current_run_bindings(&scratch.root, &catalogs).expect("bindings");
@@ -1611,7 +1653,7 @@ mod tests {
                 "-qm",
                 "tracked deletion fixture",
             ]);
-            let clean = candidate_tree_digest(&scratch.root).expect("clean candidate digest");
+            let _ = candidate_tree_digest(&scratch.root).expect("clean candidate digest");
 
             if staged {
                 run_git(&["rm", "-q", "tracked.txt"]);
@@ -1626,19 +1668,16 @@ mod tests {
             .expect("deletion status");
             assert_eq!(status, expected_status.as_slice());
 
-            let dirty = candidate_tree_digest(&scratch.root).expect("deleted candidate digest");
-            assert_ne!(dirty, clean);
-            assert_eq!(
-                candidate_tree_digest(&scratch.root).expect("repeat deleted candidate digest"),
-                dirty
-            );
+            let error = candidate_tree_digest(&scratch.root)
+                .expect_err("dirty tree must be rejected");
+            assert_eq!(error.code(), ErrorCode::Schema);
         }
     }
 
     #[test]
     fn embedded_git_directory_contributes_status_without_file_bytes() {
         let (scratch, _) = manifest_root("embedded-git", &["jit.a"]);
-        let clean = candidate_tree_digest(&scratch.root).expect("clean candidate digest");
+        let _ = candidate_tree_digest(&scratch.root).expect("clean candidate digest");
         let embedded = scratch.root.join(".references/bun");
         fs::create_dir_all(&embedded).expect("create embedded repository");
         let status = std::process::Command::new("git")
@@ -1655,9 +1694,9 @@ mod tests {
         .expect("embedded repository status");
         assert!(String::from_utf8_lossy(&status).contains(".references/bun/"));
 
-        let dirty = candidate_tree_digest(&scratch.root)
-            .expect("embedded repository is a non-file candidate");
-        assert_ne!(dirty, clean);
+        let error = candidate_tree_digest(&scratch.root)
+            .expect_err("dirty tree with embedded git must be rejected");
+        assert_eq!(error.code(), ErrorCode::Schema);
     }
 
     #[test]
@@ -2012,7 +2051,7 @@ mod tests {
                     })
                     .collect();
                 let binding = if index == 2 {
-                    RunBinding::new(hex(9), hex(2), hex(3), hex(4)).expect("binding")
+                    RunBinding::new(hex(9), hex(2), hex(3), hex(4), ToolchainPin::new("rustc-1.97.1", hex(5)).expect("toolchain pin")).expect("binding")
                 } else {
                     binding_for_tests(&root)
                 };
