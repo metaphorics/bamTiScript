@@ -917,6 +917,7 @@ impl LintTsConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompilerOptions {
     target: Option<Arc<str>>,
+    lib: Arc<[Arc<str>]>,
     module: Option<Arc<str>>,
     module_resolution: Option<Arc<str>>,
     jsx: Option<JsxEmit>,
@@ -957,6 +958,11 @@ impl CompilerOptions {
     #[must_use]
     pub fn target(&self) -> Option<&str> {
         self.target.as_deref()
+    }
+
+    #[must_use]
+    pub fn lib(&self) -> &[Arc<str>] {
+        &self.lib
     }
 
     #[must_use]
@@ -1187,6 +1193,7 @@ impl ProjectConfig {
         let strict = optional_bool(compiler, "strict")?.unwrap_or(false);
         let options = CompilerOptions {
             target: optional_nested_string(compiler, "target")?,
+            lib: optional_nested_string_array(compiler, "lib")?,
             module: optional_nested_string(compiler, "module")?,
             module_resolution: optional_nested_string(compiler, "moduleResolution")?,
             jsx: optional_jsx_emit(compiler)?,
@@ -1300,6 +1307,31 @@ fn optional_nested_string(
     key: &'static str,
 ) -> Result<Option<Arc<str>>, ConfigError> {
     object.map_or(Ok(None), |object| optional_string(object, key))
+}
+
+fn optional_nested_string_array(
+    object: Option<&JsonObject>,
+    key: &'static str,
+) -> Result<Arc<[Arc<str>]>, ConfigError> {
+    let Some(object) = object else {
+        return Ok(Arc::from([]));
+    };
+    let Some(value) = object.get(key) else {
+        return Ok(Arc::from([]));
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_field(key, "an array of strings"))?;
+    let parsed: Result<Vec<Arc<str>>, ConfigError> = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(Arc::from)
+                .ok_or_else(|| invalid_field(key, "an array of strings"))
+        })
+        .collect();
+    Ok(Arc::from(parsed?))
 }
 
 fn optional_jsx_emit(object: Option<&JsonObject>) -> Result<Option<JsxEmit>, ConfigError> {

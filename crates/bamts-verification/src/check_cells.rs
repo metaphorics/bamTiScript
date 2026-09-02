@@ -792,6 +792,16 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "incremental"
             | "composite"
             | "emitdeclarationonly" => value.eq_ignore_ascii_case("true").to_string(),
+            "lib" => {
+                let items: Vec<String> = values
+                    .iter()
+                    .flat_map(|v| v.split(','))
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
             _ => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
         };
         let key = match name.as_str() {

@@ -76,6 +76,7 @@ pub enum ScriptTarget {
     Es2022,
     Es2023,
     Es2024,
+    Es2025,
     #[default]
     EsNext,
 }

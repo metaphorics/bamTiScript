@@ -220,7 +220,8 @@ pub struct ResolvedProgram {
     strict_null_checks: bool,
     strict_property_initialization: bool,
     always_strict: bool,
-    es5: bool,
+    target: crate::emitter::ScriptTarget,
+    libs: crate::checker::intrinsic_environment::LibSet,
     check_js: bool,
     jsx: Option<JsxEmit>,
     jsx_factory: Option<Arc<str>>,
@@ -328,7 +329,8 @@ impl ResolvedProgram {
         .with_strict_null_checks(self.strict_null_checks)
         .with_strict_property_initialization(self.strict_property_initialization)
         .with_always_strict(self.always_strict)
-        .with_es5(self.es5)
+        .with_script_target(self.target)
+        .with_libs(self.libs)
         .with_check_js(self.check_js)
     }
 
@@ -684,6 +686,16 @@ impl ProgramLoader {
             .enumerate()
             .map(|(index, module)| (module.source_id(), index))
             .collect();
+        let target = self
+            .options
+            .target()
+            .and_then(crate::emitter::parse_target)
+            .unwrap_or_default();
+        let libs = if self.options.lib().is_empty() {
+            crate::checker::intrinsic_environment::LibSet::default_for_target(target)
+        } else {
+            crate::checker::intrinsic_environment::LibSet::from_lib_names(self.options.lib())
+        };
         Ok(ResolvedProgram {
             root: self.root.clone(),
             roots: Arc::from(root_ids),
@@ -694,9 +706,8 @@ impl ProgramLoader {
             strict_null_checks: self.options.strict_null_checks(),
             strict_property_initialization: self.options.strict_property_initialization(),
             always_strict: self.options.always_strict(),
-            es5: self.options.target().is_some_and(|target| {
-                target.eq_ignore_ascii_case("es5") || target.eq_ignore_ascii_case("es3")
-            }),
+            target,
+            libs,
             check_js: self.options.check_js(),
             jsx: self.options.jsx(),
             jsx_factory: self.options.jsx_factory().map(Arc::from),

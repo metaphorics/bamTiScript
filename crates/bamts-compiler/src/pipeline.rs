@@ -208,11 +208,7 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
     // (CLI) path uses — ensures the lane and the CLI cannot diverge on
     // downleveling or the strict-mode prologue.
     let check = program.check_options();
-    let target = if check.es5() {
-        emitter::ScriptTarget::Es5
-    } else {
-        emitter::ScriptTarget::EsNext
-    };
+    let target = check.target();
     let always_strict = check.always_strict();
     let module = program.is_commonjs().then_some(ModuleKind::CommonJs);
     options.apply_emit_fields(target, always_strict, module);

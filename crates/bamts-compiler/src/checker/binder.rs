@@ -5280,7 +5280,7 @@ impl<'src> Binder<'src> {
             .intrinsics
             .values()
             .iter()
-            .chain(self.intrinsics.module_values())
+            .chain(self.intrinsics.module_values().iter())
         {
             let id = self.declare(
                 name,
@@ -5318,7 +5318,7 @@ impl<'src> Binder<'src> {
                 self.class_instance_types.insert(id, applied);
             }
         }
-        for name in self.intrinsics.types() {
+        for name in self.intrinsics.types().iter() {
             let id = self.declare(
                 name,
                 SymbolKind::IntrinsicType,
@@ -17761,7 +17761,7 @@ pub(crate) fn bind_source_with_cancel(
 ) -> Result<(SemanticModel, Vec<Diagnostic>), super::CheckCancelled> {
     let mut binder = Binder::with_environment_and_cancel(
         source,
-        GlobalEnvironment::standard(),
+        GlobalEnvironment::standard(crate::checker::intrinsic_environment::LibSet::ALL),
         source_is_module(source),
         ProgramCheckOptions::standard(),
         cancel,
@@ -18520,7 +18520,9 @@ mod tests {
         ));
         super::bind_source_with_environment(
             parsed.product(),
-            super::super::intrinsic_environment::GlobalEnvironment::standard(),
+            super::super::intrinsic_environment::GlobalEnvironment::standard(
+                crate::checker::intrinsic_environment::LibSet::ALL,
+            ),
             super::source_is_module(parsed.product()),
             options,
         )

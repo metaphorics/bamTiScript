@@ -79,7 +79,7 @@ use crate::syntax::{
     IdentifierNode, ImportBinding, ModuleExportName, NodeId, SourceFile, Statement, TokenKind,
 };
 use crate::warning::analyze_warnings;
-use intrinsic_environment::GlobalEnvironment;
+use intrinsic_environment::{GlobalEnvironment, LibSet};
 
 /// Diagnostic emitted when a block-scoped name redeclares an existing binding.
 pub const DUPLICATE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C001");
@@ -557,9 +557,12 @@ pub struct ProgramCheckOptions {
     /// Whether `alwaysStrict` is enabled: every source file is treated as if
     /// it begins with the "use strict" directive.
     always_strict: bool,
-    /// Whether the compilation target is ES5 or earlier, which forbids function
-    /// declarations inside blocks in strict mode.
-    es5: bool,
+    /// ECMAScript target — drives lib derivation and downleveling decisions.
+    target: crate::emitter::ScriptTarget,
+    /// Active lib set — controls which intrinsic globals are installed.
+    /// When empty (no explicit lib and no target), all globals are installed
+    /// to preserve the pre-lib-scoping behavior.
+    libs: LibSet,
     check_js: bool,
 }
 
@@ -572,7 +575,8 @@ impl ProgramCheckOptions {
             no_implicit_any: false,
             strict_property_initialization: false,
             always_strict: false,
-            es5: false,
+            target: crate::emitter::ScriptTarget::EsNext,
+            libs: LibSet::ALL,
             check_js: false,
         }
     }
@@ -585,7 +589,8 @@ impl ProgramCheckOptions {
             no_implicit_any: false,
             strict_property_initialization: false,
             always_strict: false,
-            es5: false,
+            target: crate::emitter::ScriptTarget::EsNext,
+            libs: LibSet::ALL,
             check_js: false,
         }
     }
@@ -626,20 +631,34 @@ impl ProgramCheckOptions {
         self
     }
 
+    /// Sets the target from a string (e.g. `"es5"`, `"es2020"`) and derives
+    /// its default lib set. `None` selects the default target; an
+    /// unrecognized name leaves the options unchanged.
     #[must_use]
-    pub const fn with_es5(mut self, value: bool) -> Self {
-        self.es5 = value;
+    pub fn with_target(self, target: Option<&str>) -> Self {
+        let parsed = match target {
+            Some(name) => crate::emitter::parse_target(name),
+            None => Some(crate::emitter::ScriptTarget::default()),
+        };
+        match parsed {
+            Some(target) => self.with_script_target(target),
+            None => self,
+        }
+    }
+
+    /// Sets the target directly from a [`ScriptTarget`] and derives the
+    /// default lib set.
+    #[must_use]
+    pub const fn with_script_target(mut self, target: crate::emitter::ScriptTarget) -> Self {
+        self.target = target;
+        self.libs = LibSet::default_for_target(target);
         self
     }
 
+    /// Sets an explicit lib set, overriding any target-derived default.
     #[must_use]
-    pub fn with_target(mut self, target: Option<&str>) -> Self {
-        self.es5 = match target {
-            Some(target) => {
-                target.eq_ignore_ascii_case("es5") || target.eq_ignore_ascii_case("es3")
-            }
-            None => false,
-        };
+    pub(crate) const fn with_libs(mut self, libs: LibSet) -> Self {
+        self.libs = libs;
         self
     }
 
@@ -674,9 +693,16 @@ impl ProgramCheckOptions {
         self.commonjs
     }
 
+    /// Whether the compilation target is ES5 or earlier, which forbids
+    /// function declarations inside blocks in strict mode.
     #[must_use]
     pub const fn es5(&self) -> bool {
-        self.es5
+        (self.target as u8) <= (crate::emitter::ScriptTarget::Es5 as u8)
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> crate::emitter::ScriptTarget {
+        self.target
     }
 
     #[must_use]
@@ -686,9 +712,9 @@ impl ProgramCheckOptions {
 
     const fn environment(self) -> GlobalEnvironment {
         if self.commonjs {
-            GlobalEnvironment::commonjs()
+            GlobalEnvironment::commonjs(self.libs)
         } else {
-            GlobalEnvironment::standard()
+            GlobalEnvironment::standard(self.libs)
         }
     }
 }
@@ -2891,6 +2917,137 @@ mod tests {
             !checker_codes(&result).contains(&CANNOT_FIND_TYPE.as_str()),
             "type-only library names must remain available: {:?}",
             result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn default_target_admits_every_lib() {
+        // `with_target(None)` relies on the default target's lib set being
+        // the full set, so unscoped checks see every global.
+        assert_eq!(
+            ProgramCheckOptions::standard().with_target(None).libs,
+            super::intrinsic_environment::LibSet::ALL
+        );
+    }
+
+    #[test]
+    fn lib_es5_scopes_out_es2015_and_dom_values() {
+        // With @lib: es5, Proxy (es2015) and document (dom) are TS2304.
+        let result = check_text_with(
+            "Proxy; document;",
+            ProgramCheckOptions::standard()
+                .with_script_target(crate::emitter::ScriptTarget::Es5)
+                .with_libs(super::intrinsic_environment::LibSet::from_lib_names(&[
+                    "es5",
+                ])),
+        );
+        let codes = checker_codes(&result);
+        assert!(
+            codes.contains(&CANNOT_FIND_NAME.as_str()),
+            "es5 lib must not resolve Proxy or document: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn target_es5_default_lib_resolves_dom_but_not_es2015() {
+        // At @target: es5 with default lib, document (dom) resolves but
+        // Proxy (es2015) does not.
+        let result = check_text_with(
+            "document;",
+            ProgramCheckOptions::standard().with_script_target(crate::emitter::ScriptTarget::Es5),
+        );
+        let codes = checker_codes(&result);
+        assert!(
+            !codes.contains(&CANNOT_FIND_NAME.as_str()),
+            "dom global must resolve at es5 default lib: {:?}",
+            result.diagnostics()
+        );
+
+        let result_proxy = check_text_with(
+            "Proxy;",
+            ProgramCheckOptions::standard().with_script_target(crate::emitter::ScriptTarget::Es5),
+        );
+        let codes_proxy = checker_codes(&result_proxy);
+        assert!(
+            codes_proxy.contains(&CANNOT_FIND_NAME.as_str()),
+            "Proxy must not resolve at es5 default lib: {:?}",
+            result_proxy.diagnostics()
+        );
+    }
+
+    #[test]
+    fn target_es2015_default_lib_resolves_proxy() {
+        // At @target: es2015 with default lib, Proxy resolves.
+        let result = check_text_with(
+            "Proxy;",
+            ProgramCheckOptions::standard()
+                .with_script_target(crate::emitter::ScriptTarget::Es2015),
+        );
+        let codes = checker_codes(&result);
+        assert!(
+            !codes.contains(&CANNOT_FIND_NAME.as_str()),
+            "Proxy must resolve at es2015 default lib: {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn lib_es2015_without_dom_scopes_out_document() {
+        // With @lib: es2015 (no dom), document is TS2304 but Proxy resolves.
+        let result = check_text_with(
+            "document;",
+            ProgramCheckOptions::standard().with_libs(
+                super::intrinsic_environment::LibSet::from_lib_names(&["es2015"]),
+            ),
+        );
+        let codes = checker_codes(&result);
+        assert!(
+            codes.contains(&CANNOT_FIND_NAME.as_str()),
+            "document must not resolve with es2015-only lib: {:?}",
+            result.diagnostics()
+        );
+
+        let result_proxy = check_text_with(
+            "Proxy;",
+            ProgramCheckOptions::standard().with_libs(
+                super::intrinsic_environment::LibSet::from_lib_names(&["es2015"]),
+            ),
+        );
+        let codes_proxy = checker_codes(&result_proxy);
+        assert!(
+            !codes_proxy.contains(&CANNOT_FIND_NAME.as_str()),
+            "Proxy must resolve with es2015 lib: {:?}",
+            result_proxy.diagnostics()
+        );
+    }
+
+    #[test]
+    fn float16_array_only_available_with_esnext() {
+        // Float16Array is only in es2025.float16, which is included by
+        // esnext but not by es2021.
+        let esnext = check_text_with(
+            "Float16Array;",
+            ProgramCheckOptions::standard()
+                .with_script_target(crate::emitter::ScriptTarget::EsNext),
+        );
+        let esnext_codes = checker_codes(&esnext);
+        assert!(
+            !esnext_codes.contains(&CANNOT_FIND_NAME.as_str()),
+            "Float16Array must resolve at esnext default lib: {:?}",
+            esnext.diagnostics()
+        );
+
+        let es2021 = check_text_with(
+            "Float16Array;",
+            ProgramCheckOptions::standard()
+                .with_script_target(crate::emitter::ScriptTarget::Es2021),
+        );
+        let es2021_codes = checker_codes(&es2021);
+        assert!(
+            es2021_codes.contains(&CANNOT_FIND_NAME.as_str()),
+            "Float16Array must not resolve at es2021 default lib: {:?}",
+            es2021.diagnostics()
         );
     }
 
@@ -11541,7 +11698,9 @@ function check(options: Options = {}) {
         };
         let strict = super::binder::bind_source_with_environment(
             parsed_js("with ({}) {}").product(),
-            super::intrinsic_environment::GlobalEnvironment::standard(),
+            super::intrinsic_environment::GlobalEnvironment::standard(
+                super::intrinsic_environment::LibSet::ALL,
+            ),
             false,
             ProgramCheckOptions::standard().with_always_strict(true),
         );
@@ -11556,7 +11715,9 @@ function check(options: Options = {}) {
 
         let sloppy = super::binder::bind_source_with_environment(
             parsed_js("with ({}) {}").product(),
-            super::intrinsic_environment::GlobalEnvironment::standard(),
+            super::intrinsic_environment::GlobalEnvironment::standard(
+                super::intrinsic_environment::LibSet::ALL,
+            ),
             false,
             ProgramCheckOptions::standard(),
         );

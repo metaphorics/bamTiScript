@@ -654,6 +654,7 @@ pub(crate) fn parse_target(value: &str) -> Option<ScriptTarget> {
         "es2022" => Some(ScriptTarget::Es2022),
         "es2023" => Some(ScriptTarget::Es2023),
         "es2024" => Some(ScriptTarget::Es2024),
+        "es2025" => Some(ScriptTarget::Es2025),
         "esnext" | "latest" => Some(ScriptTarget::EsNext),
         _ => None,
     }
