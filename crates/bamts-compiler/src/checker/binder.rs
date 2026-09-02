@@ -43,7 +43,7 @@ use super::{
     SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
     TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
     USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
-    USING_DECLARATION_MISSING_INITIALIZER, WITH_STATEMENT_NOT_ALLOWED,
+    USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
     ABSTRACT_CONSTRUCTOR_MESSAGE, ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
@@ -71,7 +71,8 @@ use super::{
     TYPE_NESTING_TOO_DEEP_MESSAGE, TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
     UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
     USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
-    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, VALUE_CANNOT_BE_USED_HERE_MESSAGE,
+    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -79,16 +80,16 @@ use crate::literal::{number_value, string_value};
 use crate::namespace_plan::{self, NamespaceDeclarationBinding, NamespaceFacts};
 use crate::source::{ScriptKind, TextRange};
 use crate::syntax::{
-    Accessibility, ArrayElement, ArrowFunction, AssignmentOperator, AssignmentTarget,
-    BinaryOperator, BindingPattern, CallArgument, CallExpression, ClassDeclaration, ClassMember,
-    ConditionalExpression, DeclarationModifiers, EntityName, Expr, Expression, ForBinding,
-    ForInitializer, ForOfMode, FunctionBody, FunctionLike, FunctionType, IdentifierNode,
-    ImportBinding, InterfaceDeclaration, JsxAttributeInitializer, JsxAttributeItem, JsxChild,
-    KeywordType, Literal, LogicalOperator, MemberProperty, MetaProperty, NamespaceName,
-    NewExpression, NodeId, ObjectLiteral, ObjectMember, ParameterNode, PropertyModifier,
-    PropertyName, SourceFile, Statement, Stmt, Token, TokenKind, Ty, TypeAliasDeclaration,
-    TypeAnnotationNode, TypeLiteral, TypeMember, TypeNode, TypeOperator, TypeReference,
-    UnaryOperator, VariableDeclaration, VariableKind,
+    Accessibility, ArrayElement, ArrowFunction, AssignmentExpression, AssignmentOperator,
+    AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, CallArgument,
+    CallExpression, ClassDeclaration, ClassMember, ConditionalExpression, DeclarationModifiers,
+    EntityName, Expr, Expression, ForBinding, ForInitializer, ForOfMode, FunctionBody,
+    FunctionLike, FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration,
+    JsxAttributeInitializer, JsxAttributeItem, JsxChild, KeywordType, Literal, LogicalOperator,
+    MemberProperty, MetaProperty, NamespaceName, NewExpression, NodeId, ObjectLiteral,
+    ObjectMember, ParameterNode, PropertyModifier, PropertyName, SourceFile, Statement, Stmt,
+    Token, TokenKind, Ty, TypeAliasDeclaration, TypeAnnotationNode, TypeLiteral, TypeMember,
+    TypeNode, TypeOperator, TypeReference, UnaryOperator, VariableDeclaration, VariableKind,
 };
 
 /// Maximum depth of recursive type resolution before the checker emits
@@ -3509,6 +3510,18 @@ impl TypeTable {
                 self.union(&members)
             }
             _ => type_id,
+        }
+    }
+
+    /// Whether `null` or `undefined` is one of the type's own constituents.
+    ///
+    /// This is the constituent test upstream's nullable-operand check uses, so
+    /// a union reports when any member is nullable.
+    pub fn is_nullable(&self, type_id: TypeId) -> bool {
+        match self.get(type_id) {
+            Type::Null | Type::Undefined => true,
+            Type::Union(members) => members.iter().any(|member| self.is_nullable(*member)),
+            _ => false,
         }
     }
     fn optional_access_view(&mut self, type_id: TypeId) -> TypeId {
@@ -8539,6 +8552,10 @@ impl<'src> Binder<'src> {
             Statement::ForOf(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
                 self.resolve_expr(&for_statement.iterable, child);
+                // `for-of` reads the iterator protocol off the iterable, so a
+                // nullable iterable is rejected before the element type is
+                // even computed.
+                self.check_non_null_operand(&for_statement.iterable, child);
                 let iterable_type = self.type_of_expr(&for_statement.iterable, child);
                 let element_type =
                     match self.iteration_element_type(iterable_type, for_statement.mode) {
@@ -11510,6 +11527,12 @@ impl<'src> Binder<'src> {
                     self.check_super_member_access(member.object.range(), member.optional);
                 } else {
                     self.resolve_expr(&member.object, scope);
+                    // A property read dereferences its object, so a nullable
+                    // object is rejected. Optional chaining tests for null
+                    // rather than dereferencing, so it accepts one.
+                    if !member.optional {
+                        self.check_non_null_operand(&member.object, scope);
+                    }
                 }
                 let object_symbol = self.resolved_expression_reference(&member.object);
                 if let MemberProperty::Computed(inner) = &member.property {
@@ -11626,7 +11649,18 @@ impl<'src> Binder<'src> {
                         .push(yield_type);
                 }
             }
-            Expression::Unary(unary) => self.resolve_expr(&unary.argument, scope),
+            Expression::Unary(unary) => {
+                self.resolve_expr(&unary.argument, scope);
+                // `-x`, `+x`, and `~x` coerce to a number and so reject a
+                // nullable operand. `!x`, `typeof x`, `void x`, and `delete x`
+                // all accept one.
+                if matches!(
+                    unary.operator,
+                    UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitNot
+                ) {
+                    self.check_non_null_operand(&unary.argument, scope);
+                }
+            }
             Expression::Update(update) => {
                 self.inventory_assignment_target_writes_in_scope(&update.argument, scope);
                 self.resolve_assignment_target(&update.argument, scope);
@@ -11635,6 +11669,7 @@ impl<'src> Binder<'src> {
             Expression::Binary(binary) => {
                 self.resolve_expr(&binary.left, scope);
                 self.resolve_expr(&binary.right, scope);
+                self.check_nullable_operands(binary, scope);
             }
             Expression::Logical(logical) => {
                 self.resolve_expr(&logical.left, scope);
@@ -11693,6 +11728,7 @@ impl<'src> Binder<'src> {
                 self.inventory_assignment_target_writes_in_scope(&assignment.left, scope);
                 self.resolve_assignment_target(&assignment.left, scope);
                 self.resolve_expr(&assignment.right, scope);
+                self.check_nullable_compound_operand(assignment, scope);
                 if assignment.operator == AssignmentOperator::Assign && !self.is_typescript() {
                     self.extend_javascript_object_assignment(
                         &assignment.left,
@@ -16620,6 +16656,131 @@ impl<'src> Binder<'src> {
         match self.types.get(type_id) {
             Type::String | Type::StringLiteral(_) => true,
             Type::Union(members) => members.iter().any(|member| self.is_string_like(*member)),
+            _ => false,
+        }
+    }
+
+    /// Reports the `null` literal and the `undefined` identifier in an operand
+    /// position that rejects a nullable value.
+    ///
+    /// Grounded on the TypeScript 7.0.2 authority baselines. The arithmetic,
+    /// bitwise, relational, and `in` operators check both operands
+    /// unconditionally. `+` checks only when neither operand is assignable to
+    /// a string-like type, one condition covering three observed behaviors:
+    /// `"test" + null` stays clean, `null + anyValue` stays clean, and with
+    /// `strictNullChecks` off nothing reports because `null` is then itself
+    /// string-assignable (`plusOperatorWithAnyOtherType` gets TS2365 for the
+    /// operator instead, with its operand types still printed unnarrowed).
+    /// Equality and `instanceof` accept a nullable operand.
+    fn check_nullable_operands(&mut self, binary: &'src BinaryExpression, scope: ScopeId) {
+        let checks_operands = match binary.operator {
+            BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Remainder
+            | BinaryOperator::Exponentiate
+            | BinaryOperator::LeftShift
+            | BinaryOperator::SignedRightShift
+            | BinaryOperator::UnsignedRightShift
+            | BinaryOperator::BitAnd
+            | BinaryOperator::BitXor
+            | BinaryOperator::BitOr
+            | BinaryOperator::LessThan
+            | BinaryOperator::LessThanOrEqual
+            | BinaryOperator::GreaterThan
+            | BinaryOperator::GreaterThanOrEqual
+            | BinaryOperator::In => true,
+            BinaryOperator::Add => {
+                let left = self.type_of_expr(&binary.left, scope);
+                let right = self.type_of_expr(&binary.right, scope);
+                !self.is_assignable_to_string_like(left)
+                    && !self.is_assignable_to_string_like(right)
+            }
+            BinaryOperator::Instanceof
+            | BinaryOperator::Equal
+            | BinaryOperator::NotEqual
+            | BinaryOperator::StrictEqual
+            | BinaryOperator::StrictNotEqual => false,
+        };
+        if !checks_operands {
+            return;
+        }
+        self.check_non_null_operand(&binary.left, scope);
+        self.check_non_null_operand(&binary.right, scope);
+    }
+
+    /// Reports one operand of an operator that rejects a nullable value.
+    fn check_non_null_operand(&mut self, operand: &'src Expr, scope: ScopeId) {
+        if !self.is_nullable_value_word(operand) {
+            return;
+        }
+        let operand_type = self.type_of_expr(operand, scope);
+        if !self.types.is_nullable(operand_type) {
+            return;
+        }
+        self.emit(
+            VALUE_CANNOT_BE_USED_HERE,
+            operand.range(),
+            VALUE_CANNOT_BE_USED_HERE_MESSAGE,
+        );
+    }
+
+    /// Reports a nullable right operand of a compound assignment.
+    ///
+    /// A compound assignment applies its underlying operator, so it inherits
+    /// that operator's operand rule: `+=` skips the check when either side is
+    /// string-assignable, the arithmetic and bitwise forms always check, and
+    /// the logical forms (`&&=`, `||=`, `??=`) accept a nullable value.
+    fn check_nullable_compound_operand(
+        &mut self,
+        assignment: &'src AssignmentExpression,
+        scope: ScopeId,
+    ) {
+        let checks_operand = match assignment.operator {
+            AssignmentOperator::SubtractAssign
+            | AssignmentOperator::MultiplyAssign
+            | AssignmentOperator::DivideAssign
+            | AssignmentOperator::RemainderAssign
+            | AssignmentOperator::ExponentiateAssign
+            | AssignmentOperator::LeftShiftAssign
+            | AssignmentOperator::SignedRightShiftAssign
+            | AssignmentOperator::UnsignedRightShiftAssign
+            | AssignmentOperator::BitAndAssign
+            | AssignmentOperator::BitXorAssign
+            | AssignmentOperator::BitOrAssign => true,
+            AssignmentOperator::AddAssign => {
+                let left = self.type_of_assignment_target(&assignment.left, scope);
+                let right = self.type_of_expr(&assignment.right, scope);
+                !self.is_assignable_to_string_like(left)
+                    && !self.is_assignable_to_string_like(right)
+            }
+            AssignmentOperator::Assign
+            | AssignmentOperator::LogicalAndAssign
+            | AssignmentOperator::LogicalOrAssign
+            | AssignmentOperator::NullishAssign => false,
+        };
+        if checks_operand {
+            self.check_non_null_operand(&assignment.right, scope);
+        }
+    }
+
+    /// Whether a value of this type can be assigned to a string. `any` and
+    /// `null`/`undefined` without `strictNullChecks` both qualify, which is
+    /// what suppresses the `+` operand check for them.
+    fn is_assignable_to_string_like(&self, type_id: TypeId) -> bool {
+        self.is_string_like(type_id)
+            || matches!(self.types.get(type_id), Type::Any)
+            || (!self.strict_null_checks && self.types.is_nullable(type_id))
+    }
+
+    /// Whether the expression spells a nullable value directly: the `null`
+    /// literal or an identifier reading `undefined`. Upstream reports these two
+    /// through TS18050 and every other nullable operand through a different
+    /// code, so the spelling decides the diagnostic identity.
+    fn is_nullable_value_word(&self, operand: &'src Expr) -> bool {
+        match operand.data() {
+            Expression::Literal(Literal::Null(_)) => true,
+            Expression::Identifier(identifier) => self.identifier_text(identifier) == "undefined",
             _ => false,
         }
     }

@@ -178,6 +178,11 @@ pub const STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT: DiagnosticCode =
 /// Diagnostic emitted when a function call argument is not assignable to the
 /// declared parameter type.
 pub const ARGUMENT_NOT_ASSIGNABLE: DiagnosticCode = DiagnosticCode::new("BAMTS-C053");
+/// Diagnostic emitted when the `null` literal or the `undefined` identifier is
+/// used as an operand of an operator that rejects a nullable operand: the
+/// arithmetic, bitwise, and relational operators, and `+` unless one side is
+/// string-like. Corresponds to TypeScript's TS18050.
+pub const VALUE_CANNOT_BE_USED_HERE: DiagnosticCode = DiagnosticCode::new("BAMTS-C086");
 /// Diagnostic emitted when the number of arguments in a call does not match
 /// the callable's parameter count.
 pub const ARGUMENT_COUNT_MISMATCH: DiagnosticCode = DiagnosticCode::new("BAMTS-C054");
@@ -289,6 +294,7 @@ const DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE: &str =
 const ABSTRACT_CONSTRUCTOR_MESSAGE: &str = "Cannot create an instance of an abstract class.";
 const EXCESS_PROPERTY_MESSAGE: &str = "Object literal may only specify known properties.";
 const ARGUMENT_NOT_ASSIGNABLE_MESSAGE: &str = "Argument type is not assignable to parameter type.";
+pub(crate) const VALUE_CANNOT_BE_USED_HERE_MESSAGE: &str = "The value cannot be used here.";
 const ARGUMENT_COUNT_MISMATCH_MESSAGE: &str =
     "Supplied arguments do not match the expected parameter count.";
 const PROPERTY_DOES_NOT_EXIST_MESSAGE: &str = "Property does not exist on this type.";
@@ -2091,7 +2097,8 @@ mod tests {
         ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
         SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
         TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
-        TypeTable, WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
+        TypeTable, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -11546,5 +11553,139 @@ function check(options: Options = {}) {
             "{:?}",
             sloppy.1
         );
+    }
+
+    // ---- nullable operands (BAMTS-C086 / TS18050) ------------------------------
+
+    /// Counts the nullable-operand reports, which is what the authority
+    /// baselines pin: one per rejected operand, not one per expression.
+    fn nullable_operand_reports(text: &str) -> usize {
+        checker_codes_of(&check_text_strict_null(text))
+            .iter()
+            .filter(|code| code.as_str() == VALUE_CANNOT_BE_USED_HERE.as_str())
+            .count()
+    }
+
+    #[test]
+    fn arithmetic_and_bitwise_operators_reject_a_nullable_operand() {
+        // Every operand is reported, so `null * null` reports twice. Grounded on
+        // `arithmeticOperatorWithNullValueAndValidOperands` and `binaryArithmatic3`.
+        assert_eq!(nullable_operand_reports("var a = null * 1;"), 1);
+        assert_eq!(nullable_operand_reports("var a = 1 - undefined;"), 1);
+        assert_eq!(nullable_operand_reports("var a = null / null;"), 2);
+        assert_eq!(nullable_operand_reports("var a = undefined | 1;"), 1);
+        assert_eq!(nullable_operand_reports("var a = 1 ^ null;"), 1);
+        assert_eq!(nullable_operand_reports("var a = null << undefined;"), 2);
+    }
+
+    #[test]
+    fn relational_and_in_operators_reject_a_nullable_operand() {
+        // `comparisonOperatorWithOneOperandIsNull` reports on relational
+        // operators and `inOperatorWithInvalidOperands` on both `in` operands,
+        // while equality accepts a nullable operand everywhere.
+        assert_eq!(nullable_operand_reports("var a = 1 < null;"), 1);
+        assert_eq!(nullable_operand_reports("var a = undefined >= 1;"), 1);
+        assert_eq!(
+            nullable_operand_reports("var o = {}; var a = null in o;"),
+            1
+        );
+        assert_eq!(
+            nullable_operand_reports("var o = {}; var a = \"k\" in undefined;"),
+            1
+        );
+        assert_eq!(nullable_operand_reports("var a = 1 == null;"), 0);
+        assert_eq!(nullable_operand_reports("var a = undefined !== 1;"), 0);
+    }
+
+    #[test]
+    fn concatenation_keeps_a_nullable_operand_only_beside_a_string() {
+        // `operatorAddNullUndefined` reports both operands of `null + null` and
+        // leaves exactly its four `"test" + null`-shaped lines clean, because a
+        // string-assignable partner makes `+` concatenate rather than coerce.
+        assert_eq!(nullable_operand_reports("var a = null + null;"), 2);
+        assert_eq!(nullable_operand_reports("var a = 1 + undefined;"), 1);
+        assert_eq!(nullable_operand_reports("var a = \"t\" + null;"), 0);
+        assert_eq!(nullable_operand_reports("var a = undefined + \"t\";"), 0);
+        // An `any` partner is string-assignable too, so it suppresses `+` but
+        // never the arithmetic operators.
+        assert_eq!(
+            nullable_operand_reports("declare var x: any; var a = null + x;"),
+            0
+        );
+        assert_eq!(
+            nullable_operand_reports("declare var x: any; var a = null * x;"),
+            1
+        );
+    }
+
+    #[test]
+    fn unary_coercions_reject_a_nullable_operand_but_tests_accept_one() {
+        // `bitwiseNotOperatorWithAnyOtherType` and its plus/negate siblings
+        // report; `!x`, `typeof x`, and `void x` never coerce, so they accept.
+        assert_eq!(nullable_operand_reports("var a = ~undefined;"), 1);
+        assert_eq!(nullable_operand_reports("var a = -null;"), 1);
+        assert_eq!(nullable_operand_reports("var a = +undefined;"), 1);
+        assert_eq!(nullable_operand_reports("var a = !null;"), 0);
+        assert_eq!(nullable_operand_reports("var a = typeof undefined;"), 0);
+        assert_eq!(nullable_operand_reports("var a = void null;"), 0);
+    }
+
+    #[test]
+    fn compound_assignment_inherits_its_operator_s_operand_rule() {
+        // `compoundAdditionAssignmentWithInvalidOperands` reports the right
+        // operand; the logical forms short-circuit and accept one.
+        assert_eq!(
+            nullable_operand_reports("declare var x: number; x -= null;"),
+            1
+        );
+        assert_eq!(
+            nullable_operand_reports("declare var x: number; x **= undefined;"),
+            1
+        );
+        assert_eq!(
+            nullable_operand_reports("declare var x: boolean; x += null;"),
+            1
+        );
+        assert_eq!(
+            nullable_operand_reports("declare var x: string; x += null;"),
+            0
+        );
+        assert_eq!(
+            nullable_operand_reports("declare var x: number; x ||= null;"),
+            0
+        );
+        assert_eq!(
+            nullable_operand_reports("declare var x: number; x ??= undefined;"),
+            0
+        );
+    }
+
+    #[test]
+    fn dereferencing_a_nullable_value_is_rejected_unless_it_is_optional() {
+        // `nullKeyword`, `propertyAccess4`, and `moduleVariableArrayIndexer`
+        // report the dereferenced object; optional chaining tests instead.
+        assert_eq!(nullable_operand_reports("var a = null.foo;"), 1);
+        assert_eq!(nullable_operand_reports("var a = undefined[0];"), 1);
+        assert_eq!(nullable_operand_reports("var a = null?.foo;"), 0);
+        // `omittedExpressionForOfLoop` reports the iterable.
+        assert_eq!(
+            nullable_operand_reports("for (const x of undefined) { }"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_nullable_operand_is_reported_at_the_operand_not_the_expression() {
+        // The authority ranges name the operand, so a two-operand expression
+        // yields two distinct spans rather than one expression-wide span.
+        let checked = check_text_strict_null("var a = null / undefined;");
+        let spans: Vec<_> = checked
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code().as_str() == VALUE_CANNOT_BE_USED_HERE.as_str())
+            .map(|diagnostic| diagnostic.range())
+            .collect();
+        assert_eq!(spans.len(), 2);
+        assert_ne!(spans[0], spans[1]);
     }
 }

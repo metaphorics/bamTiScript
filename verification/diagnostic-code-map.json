@@ -116,138 +116,6 @@
       "tsCode": 1206
     },
     {
-      "bamtsCode": "BAMTS-L001",
-      "evidence": "Unterminated string literal -> TS1002 via tsc --noEmit on \"\\n.",
-      "status": "mapped",
-      "tsCode": 1002
-    },
-    {
-      "bamtsCode": "BAMTS-L002",
-      "evidence": "Unterminated block comment -> TS1010 via tsc --noEmit on /* nope.",
-      "status": "mapped",
-      "tsCode": 1010
-    },
-    {
-      "bamtsCode": "BAMTS-L003",
-      "evidence": "Unterminated template literal -> TS1160 via tsc --noEmit on `open.",
-      "status": "mapped",
-      "tsCode": 1160
-    },
-    {
-      "bamtsCode": "BAMTS-L004",
-      "evidence": "Unterminated regular expression literal -> TS1161 via tsc --noEmit on /open.",
-      "status": "mapped",
-      "tsCode": 1161
-    },
-    {
-      "bamtsCode": "BAMTS-L005",
-      "evidence": "Unexpected / invalid character -> TS1127 via tsc --noEmit on \\u0007a.",
-      "status": "mapped",
-      "tsCode": 1127
-    },
-    {
-      "bamtsCode": "BAMTS-L006",
-      "evidence": "Invalid escape sequence -> TS1488 via tsc --noEmit on \"\\8\".",
-      "status": "mapped",
-      "tsCode": 1488
-    },
-    {
-      "bamtsCode": "BAMTS-L007",
-      "evidence": "Invalid unicode escape -> TS1125 via tsc --noEmit on \"\\u{G}\".",
-      "status": "mapped",
-      "tsCode": 1125
-    },
-    {
-      "bamtsCode": "BAMTS-L008",
-      "evidence": "Multiple consecutive numeric separators -> TS6189 via tsc --noEmit on 1__2.",
-      "status": "mapped",
-      "tsCode": 6189
-    },
-    {
-      "bamtsCode": "BAMTS-L009",
-      "evidence": "Numeric literal missing digits (exponent) -> TS1124 via tsc --noEmit on 1e.",
-      "status": "mapped",
-      "tsCode": 1124
-    },
-    {
-      "bamtsCode": "BAMTS-L010",
-      "evidence": "BigInt literal must be integer -> TS1353 via tsc --noEmit on 1.5n.",
-      "status": "mapped",
-      "tsCode": 1353
-    },
-    {
-      "bamtsCode": "BAMTS-L011",
-      "evidence": "Invalid private identifier / hash not followed by identifier -> TS1127 via tsc --noEmit on \"# \".",
-      "status": "mapped",
-      "tsCode": 1127
-    },
-    {
-      "bamtsCode": "BAMTS-P001",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P002",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P003",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P004",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P005",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P006",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P007",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P009",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P010",
-      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P011",
-      "evidence": "Reserved for parser-side `using` declaration grammar recovery.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
-      "bamtsCode": "BAMTS-P012",
-      "evidence": "Reserved for parser-side `using` declaration grammar recovery.",
-      "status": "unmapped",
-      "tsCode": null
-    },
-    {
       "bamtsCode": "BAMTS-C020",
       "evidence": "Intrinsic JSX tag absent from JSX.IntrinsicElements -> TS2339 via tsc --noEmit --jsx preserve on \"<bar />\" in a .tsx file where IntrinsicElements declares only foo.",
       "status": "mapped",
@@ -380,12 +248,6 @@
       "tsCode": 2440
     },
     {
-      "bamtsCode": "BAMTS-C044",
-      "evidence": "new.target outside function/constructor body -> TS17013 via tsc --noEmit on \"new.target\".",
-      "status": "mapped",
-      "tsCode": 17013
-    },
-    {
       "bamtsCode": "BAMTS-C042",
       "evidence": "The left-hand side of an arithmetic operation must be numeric -> TS2362 via tsc --noEmit on \"enum E { a = `1` - `1` }\".",
       "status": "mapped",
@@ -396,6 +258,12 @@
       "evidence": "The right-hand side of an arithmetic operation must be numeric -> TS2363 via tsc --noEmit on \"enum E { a = `1` - `1` }\".",
       "status": "mapped",
       "tsCode": 2363
+    },
+    {
+      "bamtsCode": "BAMTS-C044",
+      "evidence": "new.target outside function/constructor body -> TS17013 via tsc --noEmit on \"new.target\".",
+      "status": "mapped",
+      "tsCode": 17013
     },
     {
       "bamtsCode": "BAMTS-C045",
@@ -516,6 +384,144 @@
       "evidence": "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value (empty or fall-through body) -> TS2355 via tsc --noEmit on the upstream ParameterList5 reference case (row 1,15).",
       "status": "mapped",
       "tsCode": 2355
+    },
+    {
+      "bamtsCode": "BAMTS-C086",
+      "evidence": "The `null` literal or the `undefined` identifier as an operand of an operator that rejects a nullable value -> TS18050 in the TypeScript 7.0.2 authority baselines: operatorAddNullUndefined (16 sites, and exactly the four string-operand lines clean), comparisonOperatorWithOneOperandIsNull (64 sites), inOperatorWithInvalidOperands (4 sites), and bitwiseNotOperatorWithAnyOtherType for the unary form.",
+      "status": "mapped",
+      "tsCode": 18050
+    },
+    {
+      "bamtsCode": "BAMTS-L001",
+      "evidence": "Unterminated string literal -> TS1002 via tsc --noEmit on \"\\n.",
+      "status": "mapped",
+      "tsCode": 1002
+    },
+    {
+      "bamtsCode": "BAMTS-L002",
+      "evidence": "Unterminated block comment -> TS1010 via tsc --noEmit on /* nope.",
+      "status": "mapped",
+      "tsCode": 1010
+    },
+    {
+      "bamtsCode": "BAMTS-L003",
+      "evidence": "Unterminated template literal -> TS1160 via tsc --noEmit on `open.",
+      "status": "mapped",
+      "tsCode": 1160
+    },
+    {
+      "bamtsCode": "BAMTS-L004",
+      "evidence": "Unterminated regular expression literal -> TS1161 via tsc --noEmit on /open.",
+      "status": "mapped",
+      "tsCode": 1161
+    },
+    {
+      "bamtsCode": "BAMTS-L005",
+      "evidence": "Unexpected / invalid character -> TS1127 via tsc --noEmit on \\u0007a.",
+      "status": "mapped",
+      "tsCode": 1127
+    },
+    {
+      "bamtsCode": "BAMTS-L006",
+      "evidence": "Invalid escape sequence -> TS1488 via tsc --noEmit on \"\\8\".",
+      "status": "mapped",
+      "tsCode": 1488
+    },
+    {
+      "bamtsCode": "BAMTS-L007",
+      "evidence": "Invalid unicode escape -> TS1125 via tsc --noEmit on \"\\u{G}\".",
+      "status": "mapped",
+      "tsCode": 1125
+    },
+    {
+      "bamtsCode": "BAMTS-L008",
+      "evidence": "Multiple consecutive numeric separators -> TS6189 via tsc --noEmit on 1__2.",
+      "status": "mapped",
+      "tsCode": 6189
+    },
+    {
+      "bamtsCode": "BAMTS-L009",
+      "evidence": "Numeric literal missing digits (exponent) -> TS1124 via tsc --noEmit on 1e.",
+      "status": "mapped",
+      "tsCode": 1124
+    },
+    {
+      "bamtsCode": "BAMTS-L010",
+      "evidence": "BigInt literal must be integer -> TS1353 via tsc --noEmit on 1.5n.",
+      "status": "mapped",
+      "tsCode": 1353
+    },
+    {
+      "bamtsCode": "BAMTS-L011",
+      "evidence": "Invalid private identifier / hash not followed by identifier -> TS1127 via tsc --noEmit on \"# \".",
+      "status": "mapped",
+      "tsCode": 1127
+    },
+    {
+      "bamtsCode": "BAMTS-P001",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P002",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P003",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P004",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P005",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P006",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P007",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P009",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P010",
+      "evidence": "No repository or TypeScript 7.0.2 evidence establishes a one-to-one diagnostic correspondence yet.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P011",
+      "evidence": "Reserved for parser-side `using` declaration grammar recovery.",
+      "status": "unmapped",
+      "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-P012",
+      "evidence": "Reserved for parser-side `using` declaration grammar recovery.",
+      "status": "unmapped",
+      "tsCode": null
     }
   ]
 }
