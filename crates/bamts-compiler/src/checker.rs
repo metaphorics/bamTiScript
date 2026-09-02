@@ -188,6 +188,10 @@ pub const VALUE_CANNOT_BE_USED_HERE: DiagnosticCode = DiagnosticCode::new("BAMTS
 /// TypeScript's TS2397.
 pub const DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL: DiagnosticCode =
     DiagnosticCode::new("BAMTS-C087");
+/// Diagnostic emitted when a qualified name references a member that exists in
+/// a namespace's local scope but is not exported. Corresponds to TypeScript's
+/// TS2694.
+pub const NAMESPACE_NO_EXPORTED_MEMBER: DiagnosticCode = DiagnosticCode::new("BAMTS-C088");
 /// Diagnostic emitted when the number of arguments in a call does not match
 /// the callable's parameter count.
 pub const ARGUMENT_COUNT_MISMATCH: DiagnosticCode = DiagnosticCode::new("BAMTS-C054");
@@ -2133,12 +2137,13 @@ mod tests {
         CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
         DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
         IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, INVALID_ASSIGNMENT_TARGET,
-        MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, PARAMETER_DECORATOR_NOT_SUPPORTED,
-        PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
-        ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
-        SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind,
-        TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
-        TypeTable, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
+        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
+        PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
+        ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
+        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
+        VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
         check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
@@ -4994,7 +4999,10 @@ function check(options: Options = {}) {
     #[test]
     fn qualified_namespace_type_requires_an_exported_member() {
         let hidden = check_text("namespace N { interface T {} } type Alias = N.T;");
-        assert_eq!(checker_codes(&hidden), [CANNOT_FIND_TYPE.as_str()]);
+        assert_eq!(
+            checker_codes(&hidden),
+            [NAMESPACE_NO_EXPORTED_MEMBER.as_str()]
+        );
 
         let ambient = check_text("declare namespace N { interface T {} } type Alias = N.T;");
         assert!(checker_codes(&ambient).is_empty());
@@ -5053,7 +5061,10 @@ function check(options: Options = {}) {
         let hidden = check_text(
             "namespace N { export interface Visible {} } namespace N { interface Hidden {} } type Alias = N.Hidden;",
         );
-        assert_eq!(checker_codes(&hidden), [CANNOT_FIND_TYPE.as_str()]);
+        assert_eq!(
+            checker_codes(&hidden),
+            [NAMESPACE_NO_EXPORTED_MEMBER.as_str()]
+        );
     }
 
     #[test]

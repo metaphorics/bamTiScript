@@ -36,8 +36,8 @@ use super::{
     FUNCTION_IMPLEMENTATION_WRONG_NAME, FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION,
     GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS, IMPORT_CONFLICTS_WITH_LOCAL,
     INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY, MEMBER_NOT_ACCESSIBLE,
-    MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NEW_TARGET_OUTSIDE_FUNCTION,
-    NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
+    MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
+    NEW_TARGET_OUTSIDE_FUNCTION, NON_VOID_FUNCTION_MUST_RETURN, PARAMETER_DECORATOR_NOT_SUPPORTED,
     PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED,
     SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
     STRICT_NULL_MEMBER_ACCESS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
@@ -4875,6 +4875,9 @@ pub(crate) struct Binder<'src> {
     pub(crate) namespace_declarations: Vec<NamespaceDeclarationBinding<'src>>,
     pub(crate) namespace_export_scopes: HashMap<SymbolId, ScopeId>,
     pub(crate) namespace_local_scopes: HashMap<NodeId, ScopeId>,
+    /// Maps a namespace symbol to its companion local (Function) scope,
+    /// used for qualified lookup of non-exported members from the same file.
+    pub(crate) namespace_local_of_symbol: HashMap<SymbolId, ScopeId>,
     pub(crate) active_namespace_declarations: Vec<NodeId>,
     pub(crate) namespace_reference_blocks: HashMap<NodeId, NodeId>,
     pub(crate) namespace_qualified_type_paths: HashMap<NodeId, Box<[SymbolId]>>,
@@ -5080,6 +5083,7 @@ impl<'src> Binder<'src> {
             namespace_declarations: Vec::new(),
             namespace_export_scopes: HashMap::new(),
             namespace_local_scopes: HashMap::new(),
+            namespace_local_of_symbol: HashMap::new(),
             active_namespace_declarations: Vec::new(),
             namespace_reference_blocks: HashMap::new(),
             namespace_qualified_type_paths: HashMap::new(),
@@ -7065,7 +7069,7 @@ impl<'src> Binder<'src> {
                 self.bind_enum(declaration_node, declaration, scope, false)
             }
             Statement::Namespace(namespace) => {
-                self.bind_namespace(namespace, declaration, scope, false, None);
+                self.bind_namespace(namespace, declaration, scope, scope, false, None);
             }
             Statement::Import(import) => self.bind_import(import, scope, declaration),
             Statement::ImportEquals(import) => {
@@ -7089,7 +7093,7 @@ impl<'src> Binder<'src> {
                 {
                     self.bind_enum(declaration, declaration_id, scope, true);
                 } else if let Statement::Namespace(namespace) = inner.data() {
-                    self.bind_namespace(namespace, inner.id(), scope, true, None);
+                    self.bind_namespace(namespace, inner.id(), scope, scope, true, None);
                 } else {
                     self.bind_statement(inner, scope);
                 }
@@ -7216,6 +7220,7 @@ impl<'src> Binder<'src> {
         declaration: &'src crate::syntax::NamespaceDeclaration,
         declaration_id: NodeId,
         scope: ScopeId,
+        scope_parent: ScopeId,
         ambient: bool,
         parent: Option<SymbolId>,
     ) {
@@ -7236,7 +7241,7 @@ impl<'src> Binder<'src> {
                     .get(&symbol)
                     .copied()
                     .unwrap_or_else(|| {
-                        let export_scope = self.new_scope(ScopeKind::Namespace, Some(scope));
+                        let export_scope = self.new_scope(ScopeKind::Namespace, Some(scope_parent));
                         self.namespace_export_scopes.insert(symbol, export_scope);
                         export_scope
                     });
@@ -7263,7 +7268,7 @@ impl<'src> Binder<'src> {
                     .get(&symbol)
                     .copied()
                     .unwrap_or_else(|| {
-                        let export_scope = self.new_scope(ScopeKind::Namespace, Some(scope));
+                        let export_scope = self.new_scope(ScopeKind::Namespace, Some(scope_parent));
                         self.namespace_export_scopes.insert(symbol, export_scope);
                         export_scope
                     });
@@ -7286,6 +7291,7 @@ impl<'src> Binder<'src> {
         let local_scope = self.new_scope(ScopeKind::Function, Some(export_scope));
         self.namespace_local_scopes
             .insert(declaration_id, local_scope);
+        self.namespace_local_of_symbol.insert(symbol, local_scope);
         self.namespace_declarations
             .push(NamespaceDeclarationBinding {
                 declaration,
@@ -7297,10 +7303,16 @@ impl<'src> Binder<'src> {
             });
 
         for statement in &declaration.body.data().statements {
-            let target =
+            let _target =
                 self.bind_namespace_member(statement, local_scope, export_scope, symbol, ambient);
             if let Some(class) = Self::statement_class(statement) {
-                self.predeclare_class_header(class, target);
+                // Always predeclare the class header with `local_scope` as
+                // parent so that both class bounds resolution and class body
+                // resolution can see non-exported namespace siblings.  The
+                // exported name itself is declared in `export_scope` by
+                // `bind_namespace_member`; only the class body's lexical
+                // parent must be `local_scope`.
+                self.predeclare_class_header(class, local_scope);
             }
         }
         for statement in &declaration.body.data().statements {
@@ -7352,20 +7364,37 @@ impl<'src> Binder<'src> {
             Statement::Export(crate::syntax::ExportDeclaration::Named(
                 crate::syntax::ExportNamedDeclaration::Declaration(inner),
             )) => match inner.data() {
-                Statement::Namespace(namespace) => {
-                    self.bind_namespace(namespace, inner.id(), target, ambient, Some(container))
-                }
+                Statement::Namespace(namespace) => self.bind_namespace(
+                    namespace,
+                    inner.id(),
+                    target,
+                    local_scope,
+                    ambient,
+                    Some(container),
+                ),
                 _ => self.bind_statement(inner, target),
             },
             Statement::Namespace(namespace)
                 if ambient || self.is_dotted_namespace_tail(statement) =>
             {
-                self.bind_namespace(namespace, statement.id(), target, ambient, Some(container));
+                self.bind_namespace(
+                    namespace,
+                    statement.id(),
+                    target,
+                    local_scope,
+                    ambient,
+                    Some(container),
+                );
             }
             Statement::Declare(inner) => match inner.data() {
-                Statement::Namespace(namespace) => {
-                    self.bind_namespace(namespace, inner.id(), target, true, Some(container))
-                }
+                Statement::Namespace(namespace) => self.bind_namespace(
+                    namespace,
+                    inner.id(),
+                    target,
+                    local_scope,
+                    true,
+                    Some(container),
+                ),
                 _ => self.bind_statement(statement, target),
             },
             _ => self.bind_statement(statement, target),
@@ -14634,7 +14663,24 @@ impl<'src> Binder<'src> {
                 };
                 let name = self.identifier_text(right);
                 let Some(symbol) = self.scopes[member_scope.0 as usize].type_binding(&name) else {
-                    self.emit(CANNOT_FIND_TYPE, right.range(), CANNOT_FIND_TYPE_MESSAGE);
+                    if let Some(&local_scope) = path
+                        .last()
+                        .and_then(|ns| self.namespace_local_of_symbol.get(ns))
+                        && self.scopes[local_scope.0 as usize]
+                            .type_binding(&name)
+                            .is_some()
+                    {
+                        let ns_name = self.symbols[path.last().unwrap().get() as usize]
+                            .name()
+                            .to_owned();
+                        self.emit_with_message(
+                            NAMESPACE_NO_EXPORTED_MEMBER,
+                            right.range(),
+                            format!("Namespace '{ns_name}' has no exported member '{name}'."),
+                        );
+                    } else {
+                        self.emit(CANNOT_FIND_TYPE, right.range(), CANNOT_FIND_TYPE_MESSAGE);
+                    }
                     return self.types.error_type();
                 };
                 path.push(symbol);
@@ -17837,12 +17883,12 @@ pub(crate) fn bind_source_with_environment_and_imports_with_cancel(
 mod tests {
     use super::{
         ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
-        ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION,
-        CONSTRUCTOR_TYPE_PARAMETERS, DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
+        ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_READONLY, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
+        CANNOT_FIND_TYPE, CONSTRUCTOR_TYPE_PARAMETERS, DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL,
         DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, FUNCTION_IMPLEMENTATION_WRONG_NAME,
         FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
-        MISSING_METHOD_RETURN_TYPE, PROPERTY_NOT_INITIALIZED, PropertyType,
-        SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+        MISSING_METHOD_RETURN_TYPE, NAMESPACE_NO_EXPORTED_MEMBER, PROPERTY_NOT_INITIALIZED,
+        PropertyType, SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
         SUPER_REFERENCE_NON_DERIVED, ScopeId, ScopeKind, SymbolId, SymbolKind, TYPE_NOT_ASSIGNABLE,
         TupleShape, Type, TypeParameterBounds, TypeTable, bind_source,
     };
@@ -20060,6 +20106,182 @@ namespace undefined { export var x = 42; }",
                 .iter()
                 .any(|d| d.code() == DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL),
             "interface globalThis in a script should report TS2397: {diagnostics:?}"
+        );
+    }
+    // ── Namespace scope resolution tests (TS2304 over-fire fixes) ──
+
+    fn has_cannot_find_name(diagnostics: &[Diagnostic]) -> bool {
+        diagnostics.iter().any(|d| d.code() == CANNOT_FIND_NAME)
+    }
+
+    fn has_cannot_find_type(diagnostics: &[Diagnostic]) -> bool {
+        diagnostics.iter().any(|d| d.code() == CANNOT_FIND_TYPE)
+    }
+
+    fn has_namespace_no_exported_member(diagnostics: &[Diagnostic]) -> bool {
+        diagnostics
+            .iter()
+            .any(|d| d.code() == NAMESPACE_NO_EXPORTED_MEMBER)
+    }
+
+    #[test]
+    fn namespace_private_class_visible_from_exported_class_type_position() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                class C2_private {}
+                export class C3_public {
+                    private v: C2_private;
+                }
+            }",
+        );
+        assert!(
+            !has_cannot_find_type(&diagnostics),
+            "C2_private should resolve from C3_public's type annotation: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_private_class_visible_from_exported_class_value_position() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                class C2_private {}
+                export class C3_public {
+                    public f() { return new C2_private(); }
+                }
+            }",
+        );
+        assert!(
+            !has_cannot_find_name(&diagnostics),
+            "C2_private should resolve from C3_public's method body: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_private_interface_visible_from_exported_class() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                interface I2_private {}
+                export class C3_public {
+                    private v: I2_private;
+                }
+            }",
+        );
+        assert!(
+            !has_cannot_find_type(&diagnostics),
+            "I2_private should resolve from C3_public: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_private_var_visible_from_exported_class_method() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                var v_private = 42;
+                export class C3_public {
+                    public f() { return v_private; }
+                }
+            }",
+        );
+        assert!(
+            !has_cannot_find_name(&diagnostics),
+            "v_private should resolve from C3_public's method: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_private_function_visible_from_exported_class_method() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                function f_private() {}
+                export class C3_public {
+                    public f() { return f_private(); }
+                }
+            }",
+        );
+        assert!(
+            !has_cannot_find_name(&diagnostics),
+            "f_private should resolve from C3_public's method: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn nested_namespace_sees_parent_private_class_type_position() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                export namespace m2 {
+                    export function f1(c1: C1) {}
+                }
+                class C1 {}
+            }",
+        );
+        assert!(
+            !has_cannot_find_type(&diagnostics),
+            "C1 should resolve from nested namespace m2: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn nested_namespace_sees_parent_private_class_value_position() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                export namespace m2 {
+                    export function f1() { return new C1(); }
+                }
+                class C1 {}
+            }",
+        );
+        assert!(
+            !has_cannot_find_name(&diagnostics),
+            "C1 should resolve from nested namespace m2 value position: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_forward_reference_to_private_class_resolves() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                export class C3_public {
+                    private v: C2_private;
+                }
+                class C2_private {}
+            }",
+        );
+        assert!(
+            !has_cannot_find_type(&diagnostics),
+            "C2_private forward reference should resolve: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn genuinely_undeclared_name_in_namespace_still_reports_ts2304() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                export class C3_public {
+                    private v: NonExistent;
+                }
+            }",
+        );
+        assert!(
+            has_cannot_find_type(&diagnostics),
+            "NonExistent should produce TS2304: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_private_member_not_visible_from_outside_qualified() {
+        let (_model, diagnostics) = bound(
+            "namespace m1 {
+                class C2_private {}
+            }
+            let x: m1.C2_private;",
+        );
+        assert!(
+            has_namespace_no_exported_member(&diagnostics),
+            "m1.C2_private should report TS2694 (no exported member): {diagnostics:?}"
+        );
+        assert!(
+            !has_cannot_find_type(&diagnostics),
+            "m1.C2_private should NOT report TS2304: {diagnostics:?}"
         );
     }
 }

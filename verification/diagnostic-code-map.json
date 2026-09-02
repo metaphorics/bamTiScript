@@ -398,6 +398,12 @@
       "tsCode": 2397
     },
     {
+      "bamtsCode": "BAMTS-C088",
+      "evidence": "Qualified name references a namespace member that exists in the local scope but is not exported -> TS2694 in the TypeScript 7.0.2 authority baselines: complicatedPrivacy (mglo5.i6 at line 73).",
+      "status": "mapped",
+      "tsCode": 2694
+    },
+    {
       "bamtsCode": "BAMTS-L001",
       "evidence": "Unterminated string literal -> TS1002 via tsc --noEmit on \"\\n.",
       "status": "mapped",
