@@ -462,10 +462,20 @@ pub fn split_case_units(logical_path: &str, text: &str) -> Vec<CaseUnit> {
 }
 
 /// Map a `@filename:` name onto a root-relative virtual path: relative names
-/// join under the case's directory; absolute virtual names (`/ref.d.ts`) are
-/// remapped to the root so `ProgramLoader` can confine them.
+/// join under the case's directory; absolute virtual names (`/ref.d.ts`) and
+/// Windows-style drive-letter paths (`c:/root/...`) are remapped to the root
+/// so `ProgramLoader` can confine them. The drive letter is a virtual root
+/// marker in upstream test cases, not a real directory component; stripping it
+/// prevents paths like `/tmp/x/c:/root/...` on Unix hosts.
 fn virtual_unit_path(case_dir: &str, name: &str) -> String {
     let name = name.replace('\\', "/");
+    // Strip a Windows-style drive-letter prefix (`c:/…`, `D:\…` after
+    // backslash→slash normalization). The remainder is a root-relative
+    // virtual path (like `/`-prefixed absolute names), NOT joined under the
+    // case directory — the drive letter marks an absolute virtual root.
+    if name.len() >= 3 && name.as_bytes()[1] == b':' && name.as_bytes()[2] == b'/' {
+        return name[3..].to_owned();
+    }
     if let Some(rest) = name.strip_prefix('/') {
         return rest.to_owned();
     }
@@ -515,6 +525,7 @@ pub fn baseline_groups(index: &SuiteIndex) -> BaselineGroups {
 fn split_baseline_file_name(file_name: &str) -> Option<(&str, &str, &str)> {
     let extensions = [
         ".errors.txt",
+        ".trace.json",
         ".types",
         ".symbols",
         ".jsx",
@@ -2123,8 +2134,8 @@ pub(crate) fn observe_trace(
     };
     let Some(baseline_path) = baseline_path else {
         return CompilerCheckObservation {
-            class: FailureClass::HarnessError,
-            detail: "classification/execution drift: no owned `.trace.json` baseline".to_owned(),
+            class: FailureClass::Inapplicable,
+            detail: "trace observable inapplicable: no owned `.trace.json` baseline for this case/configuration".to_owned(),
             artifact: None,
         };
     };
@@ -3057,6 +3068,38 @@ r.toFixed();
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].virtual_path, "ref.d.ts");
         assert_eq!(units[1].virtual_path, "tests/cases/compiler/main.ts");
+    }
+
+    #[test]
+    fn split_case_units_drive_letter_paths_remap_to_root() {
+        // Upstream test cases use Windows-style drive-letter paths as virtual
+        // roots (e.g. `c:/root/folder1/file1.ts`). The drive letter must be
+        // stripped so the path maps into the virtual root with no `c:/`
+        // residue, preventing paths like `/tmp/x/c:/root/...` on Unix.
+        let case = "\
+// @filename: c:/root/folder1/file1.ts
+export const a = 1;
+// @filename: c:/root/folder2/file2.ts
+export const b = 2;
+// @filename: c:/file3.ts
+export const c = 3;
+";
+        let units = split_case_units(
+            "tests/cases/compiler/pathMappingBasedModuleResolution4_node.ts",
+            case,
+        );
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0].virtual_path, "root/folder1/file1.ts");
+        assert_eq!(units[1].virtual_path, "root/folder2/file2.ts");
+        assert_eq!(units[2].virtual_path, "file3.ts");
+        // No `c:/` residue in any virtual path.
+        for unit in &units {
+            assert!(
+                !unit.virtual_path.contains("c:/"),
+                "drive-letter residue in `{}`",
+                unit.virtual_path
+            );
+        }
     }
 
     #[test]

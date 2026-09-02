@@ -99,6 +99,12 @@ pub enum FailureClass {
     SkipDeferred,
     SkipExcluded,
     HarnessError,
+    /// The observable does not apply to this cell: the catalog generated an
+    /// obligation but the upstream baseline has no corresponding artifact.
+    /// Maps to [`LaneOutcome::InapplicableCatalogError`] so the row is
+    /// non-blocking and completion-ineligible (a catalog error to fix, not a
+    /// compiler defect to burn down).
+    Inapplicable,
 }
 
 impl FailureClass {
@@ -117,6 +123,7 @@ impl FailureClass {
             Self::SkipDeferred => "SKIP_DEFERRED",
             Self::SkipExcluded => "SKIP_EXCLUDED",
             Self::HarnessError => "HARNESS_ERROR",
+            Self::Inapplicable => "INAPPLICABLE",
         }
     }
 }
@@ -2642,6 +2649,10 @@ impl CompilerLaneObservation {
             LaneOutcome::Completed {
                 artifacts: self.artifacts.clone(),
             }
+        } else if self.class == FailureClass::Inapplicable {
+            LaneOutcome::InapplicableCatalogError {
+                detail: self.detail.clone(),
+            }
         } else {
             LaneOutcome::BlockingFail {
                 detail: self.detail.clone(),
@@ -2940,6 +2951,7 @@ fn project_trace_lane(
 #[serde(rename_all = "camelCase")]
 struct ProjectTraceCase {
     project_root: String,
+    #[serde(default)]
     input_files: Vec<String>,
 }
 
@@ -2958,15 +2970,14 @@ fn observe_project_trace(
         Ok((produced, expected, baseline_path)) => check_cells::CompilerCheckObservation {
             class: FailureClass::FailBehavior,
             detail: format!(
-                "trace mismatch against `{baseline_path}`: produced {} bytes, expected {} bytes; [DEBUG-a19f] produced={:?}",
+                "trace mismatch against `{baseline_path}`: produced {} bytes, expected {} bytes",
                 produced.len(),
                 expected.len(),
-                String::from_utf8_lossy(&produced)
             ),
             artifact: Some(produced),
         },
         Err(detail) => check_cells::CompilerCheckObservation {
-            class: FailureClass::HarnessError,
+            class: FailureClass::Inapplicable,
             detail,
             artifact: None,
         },
@@ -2989,13 +3000,21 @@ fn produce_project_trace(
             fixture.project_root
         ));
     }
-    if fixture.input_files.is_empty()
-        || fixture
-            .input_files
-            .iter()
-            .any(|path| !is_safe_logical_path(path))
+    // A project fixture without `inputFiles` is a project compilation test,
+    // not a trace test: the trace observable is inapplicable. Upstream project
+    // fixtures use `projectRoot` + directory scanning, not an explicit file
+    // list; only fixtures that declare `inputFiles` carry trace obligations.
+    if fixture.input_files.is_empty() {
+        return Err(
+            "project trace fixture has no inputFiles: trace observable inapplicable".to_owned(),
+        );
+    }
+    if fixture
+        .input_files
+        .iter()
+        .any(|path| !is_safe_logical_path(path))
     {
-        return Err("project trace fixture has no safe inputFiles".to_owned());
+        return Err("project trace fixture has unsafe inputFiles".to_owned());
     }
 
     let relative_case = index_entry
@@ -4701,8 +4720,9 @@ var s: string = \"hi\";\n\
 
     /// The `trace` observable compiles the case and re-resolves imports
     /// through `resolve_module_name_with_trace`. A case with no owned
-    /// `.trace.json` baseline is a classification/execution drift, not a
-    /// synthesized pass.
+    /// `.trace.json` baseline is inapplicable: the catalog generated a trace
+    /// obligation, but the upstream baseline has no trace artifact for this
+    /// case/configuration, so the observable does not apply.
     #[test]
     fn compiler_observation_trace_without_baseline_is_drift() {
         let fixture = compiler_lane_fixture(
@@ -4719,7 +4739,7 @@ var s: string = \"hi\";\n\
             &["trace"],
         );
         let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
-        assert_eq!(observation.class, FailureClass::HarnessError);
+        assert_eq!(observation.class, FailureClass::Inapplicable);
         assert!(
             observation
                 .detail
@@ -4821,8 +4841,9 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
         );
     }
 
-    /// A project fixture with no owned `.trace.json` baseline is missing
-    /// evidence, not a producer-missing gap: the traced loader ran.
+    /// A project fixture with no owned `.trace.json` baseline is
+    /// inapplicable: the trace observable does not apply when the upstream
+    /// baseline has no trace artifact for this project.
     #[test]
     fn project_trace_without_baseline_names_missing_evidence() {
         let fixture = project_trace_fixture("project-trace-missing", None);
@@ -4836,7 +4857,7 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
         let observation = observe_compiler_lane(&fixture.snapshot, &fixture.ctx, &request);
         assert_eq!(
             observation.class,
-            FailureClass::HarnessError,
+            FailureClass::Inapplicable,
             "{}",
             observation.detail
         );
@@ -4875,6 +4896,58 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
             observation.detail.starts_with(
                 "trace mismatch against `tests/baselines/reference/project/traceFix.trace.json`"
             ),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// A project fixture without `inputFiles` is a project compilation test,
+    /// not a trace test. The trace observable is inapplicable: the catalog
+    /// generates a trace obligation for every project case, but fixtures
+    /// without `inputFiles` don't carry trace obligations. Per the catalog
+    /// rule, this is `Inapplicable` (non-blocking, completion-ineligible),
+    /// not `HarnessError` / `BLOCKING_FAIL`.
+    #[test]
+    fn project_trace_without_input_files_is_inapplicable() {
+        let extracted = TestDir::new("project-trace-no-inputfiles-src");
+        let case = extracted
+            .path()
+            .join("tests/cases/project/noInputFiles.json");
+        fs::create_dir_all(case.parent().unwrap()).unwrap();
+        // No `inputFiles` field — this is a project compilation fixture.
+        fs::write(
+            &case,
+            r#"{"scenario":"trace","projectRoot":"tests/cases/projects/trace"}"#,
+        )
+        .unwrap();
+        let project = extracted.path().join("tests/cases/projects/trace");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("main.ts"), "void 0;\n").unwrap();
+        fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
+        let snap = TestDir::new("project-trace-no-inputfiles-snap");
+        materialize_from_extracted(snap.path(), extracted.path()).unwrap();
+        let verified = verify_snapshot(snap.path()).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ctx = CheckContext {
+            code_map: crate::facets::load_diagnostic_code_map(&repo).expect("code map"),
+            baseline_groups: crate::check_cells::baseline_groups(&verified.snapshot.index),
+        };
+        let request = compiler_lane_request(
+            &verified.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/noInputFiles.json",
+            "default#trace",
+            &["trace"],
+        );
+        let observation = observe_compiler_lane(&verified.snapshot, &ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::Inapplicable,
+            "{}",
+            observation.detail
+        );
+        assert!(
+            observation.detail.contains("no inputFiles"),
             "{}",
             observation.detail
         );
