@@ -18,8 +18,18 @@ use crate::{
 };
 
 mod emission;
+// Mapping a linked image into executable memory is the `host-jit` tier's
+// capability; `aot` alone only emits objects for an external linker.
+#[cfg(feature = "host-jit")]
+#[allow(unsafe_code)]
+mod in_process_link;
 mod linking;
 mod reproducible;
+
+#[cfg(feature = "host-jit")]
+pub use in_process_link::{
+    HostTargetError, LinkedAotProgram, NativeExecutionReport, host_target, link_aot_in_process,
+};
 
 pub use emission::{
     EmissionError, EmittedObject, SUPPORTED_TARGET_TRIPLES, TargetDescriptor, content_digest,

@@ -210,6 +210,10 @@ pub use aot::{
     emit_for_targets, emit_reproducible, plan_link, require_matching_target, resolve_symbols,
     validate_linked_image,
 };
+#[cfg(all(feature = "aot", feature = "host-jit"))]
+pub use aot::{
+    HostTargetError, LinkedAotProgram, NativeExecutionReport, host_target, link_aot_in_process,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;

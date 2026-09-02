@@ -3,13 +3,14 @@
 //! Three execution backends run in-process through the public `bamts` facade:
 //! the register **interpreter** (`bamts_runtime::run`), the **JIT** backend
 //! (`bamts_codegen::compile_jit` + `run_linked_program`), and the **AOT**
-//! reference driver (`NativeEngine::run`, which exercises the native ABI
-//! dispatch without object linking). Process-spawning backends stay outside.
+//! backend (`bamts_codegen::compile_aot` + `link_aot_in_process` +
+//! `run_linked_program`, which executes real compiled native code in-process).
+//! Process-spawning backends stay outside.
 //! Callers may also supply typed runner outcomes of their own.
 
 use bamts_bytecode::EcmaString;
 use bamts_compiler::diagnostic::Diagnostic;
-use bamts_runtime::{NativeEngine, RuntimeErrorKind, ThrowOrigin, run_linked_program};
+use bamts_runtime::{RuntimeErrorKind, ThrowOrigin, run_linked_program};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -700,11 +701,11 @@ pub fn evaluate_in_all_modes<R: Test262Runner>(
 }
 
 /// Returns the production runner for `mode`.
-///
 /// All three execution modes run in-process: the interpreter through
 /// `bamts_runtime::run`, JIT through `compile_jit` + `run_linked_program`,
-/// and AOT through the `NativeEngine` reference driver. The runner dispatches
-/// internally on `request.mode`, so one runner serves every mode.
+/// and AOT through `compile_aot` + `link_aot_in_process` +
+/// `run_linked_program`. The runner dispatches internally on `request.mode`,
+/// so one runner serves every mode.
 pub fn backend_runner(
     _mode: ExecutionMode,
     scratch: impl Into<PathBuf>,
@@ -755,10 +756,10 @@ pub fn evaluate_in_mode<R: Test262Runner>(
 /// - **JIT** — `bamts_codegen::compile_jit` finalizes native entries, then
 ///   `bamts_runtime::run_linked_program` executes them through the shared
 ///   `NativeOps` dispatch.
-/// - **AOT** — `NativeEngine::run` (the reference native driver). It walks
-///   verified bytecode and routes every value/heap/host operation through
-///   `NativeOps::dispatch` — the same seam AOT-compiled code would use —
-///   without requiring object emission or linking.
+/// - **AOT** — `bamts_codegen::compile_aot` emits a relocatable object,
+///   `link_aot_in_process` maps it into W^X memory and resolves helper
+///   relocations against live `bamts_*` exports, then
+///   `run_linked_program` executes the real compiled native entries.
 ///
 /// Fuel is derived from the request deadline for all modes.
 ///
@@ -787,27 +788,6 @@ struct MaterializedScript(PathBuf);
 impl Drop for MaterializedScript {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// A dummy entry table for the AOT reference driver. The reference backend
-/// recurses internally and never invokes the entry table; this satisfies the
-/// `NativeEngine::new` constructor without pulling in a native-code backend.
-struct NoEntries;
-
-impl bamts_native::NativeEntryTable for NoEntries {
-    fn program_bytes(&self) -> &[u8] {
-        &[]
-    }
-
-    fn invoke(
-        &self,
-        _module: u32,
-        _function: u32,
-        _frame: &mut bamts_native::ShadowFrame,
-        _out: &mut bamts_native::Completion,
-    ) -> std::result::Result<bamts_native::CompletionTag, bamts_native::AbiError> {
-        Ok(bamts_native::CompletionTag::FatalTrap)
     }
 }
 
@@ -884,9 +864,40 @@ impl Test262Runner for InterpreterRunner {
                     })
             }
             ExecutionMode::Aot => {
-                let entries = NoEntries;
-                let engine = NativeEngine::new(executable.wire(), &entries, &mut host, limits);
-                engine.run().map(|_| ())
+                // Compile to a relocatable object for the host target.
+                let target = match bamts_codegen::host_target() {
+                    Ok(t) => t,
+                    Err(error) => {
+                        return RunOutcome::Blocked {
+                            detail: format!("aot: unsupported host target: {error}"),
+                        };
+                    }
+                };
+                let aot_object = match bamts_codegen::compile_aot(executable.wire(), target) {
+                    Ok(obj) => obj,
+                    Err(error) => {
+                        return RunOutcome::Blocked {
+                            detail: format!("aot: unsupported {error}"),
+                        };
+                    }
+                };
+                // Link the object in-process: parse ELF, map W^X memory,
+                // resolve helper relocations, produce a real NativeEntryTable.
+                let linked =
+                    match bamts_codegen::link_aot_in_process(&aot_object, executable.wire()) {
+                        Ok(prog) => prog,
+                        Err(error) => {
+                            return RunOutcome::Blocked {
+                                detail: format!("aot: load failed: {error}"),
+                            };
+                        }
+                    };
+                run_linked_program(executable.wire(), &linked, &mut host, &limits)
+                    .map(|_| ())
+                    .map_err(|native_error| match native_error {
+                        bamts_runtime::NativeError::Runtime(runtime_error) => runtime_error,
+                        other => synthetic_runtime_error(other),
+                    })
             }
         };
         let elapsed = started.elapsed();
@@ -971,7 +982,10 @@ fn parse_phase_outcome(diagnostics: &[Diagnostic]) -> RunOutcome {
 /// user-defined class name. Per the test262 INTERPRETING.md rule, the
 /// negative `type` must match the constructor's name exactly.
 #[must_use]
-fn classify_thrown(origin: ThrowOrigin, constructor_name: Option<&EcmaString>) -> Option<NegativeType> {
+fn classify_thrown(
+    origin: ThrowOrigin,
+    constructor_name: Option<&EcmaString>,
+) -> Option<NegativeType> {
     match origin {
         ThrowOrigin::TypeError { .. } => Some(NegativeType::TypeError),
         ThrowOrigin::RangeError { .. } => Some(NegativeType::RangeError),
@@ -987,33 +1001,35 @@ fn classify_thrown(origin: ThrowOrigin, constructor_name: Option<&EcmaString>) -
 /// Classifies an engine failure into a thrown runtime error or a block.
 fn observed_failure(error: &bamts_runtime::RuntimeError, deadline: Duration) -> RunOutcome {
     match &error.kind {
-        RuntimeErrorKind::UncaughtThrow { origin, constructor_name, .. } => {
-            match classify_thrown(*origin, constructor_name.as_ref()) {
-                Some(error_type) => RunOutcome::Completed {
-                    thrown: Some(ThrownError {
-                        phase: NegativePhase::Runtime,
-                        error_type,
-                    }),
-                },
-                None => {
-                    let site = error
-                        .source
-                        .function_name
-                        .as_ref()
-                        .map_or_else(|| "<anonymous>".to_owned(), |name| name.to_utf8_lossy());
-                    let constructor = constructor_name
-                        .as_ref()
-                        .map(|name| format!(" (constructor: {})", name.to_utf8_lossy()))
-                        .unwrap_or_default();
-                    RunOutcome::Blocked {
-                        detail: format!(
-                            "guest threw a value whose constructor does not \
+        RuntimeErrorKind::UncaughtThrow {
+            origin,
+            constructor_name,
+            ..
+        } => match classify_thrown(*origin, constructor_name.as_ref()) {
+            Some(error_type) => RunOutcome::Completed {
+                thrown: Some(ThrownError {
+                    phase: NegativePhase::Runtime,
+                    error_type,
+                }),
+            },
+            None => {
+                let site = error
+                    .source
+                    .function_name
+                    .as_ref()
+                    .map_or_else(|| "<anonymous>".to_owned(), |name| name.to_utf8_lossy());
+                let constructor = constructor_name
+                    .as_ref()
+                    .map(|name| format!(" (constructor: {})", name.to_utf8_lossy()))
+                    .unwrap_or_default();
+                RunOutcome::Blocked {
+                    detail: format!(
+                        "guest threw a value whose constructor does not \
                              map to a Test262 negative type{constructor} (throw site: {site})"
-                        ),
-                    }
+                    ),
                 }
             }
-        }
+        },
         RuntimeErrorKind::FuelExhausted { .. } => RunOutcome::Blocked {
             detail: format!("fuel exhausted within the {deadline:?} deadline"),
         },
@@ -1059,17 +1075,11 @@ fn observed_done_trace(
     for stream in [stdout, stderr] {
         let mut cursor = 0;
         loop {
-            let (at, kind) = if let Some(found) =
-                find_marker(&stream[cursor..], COMPLETE_MARKER)
-            {
+            let (at, kind) = if let Some(found) = find_marker(&stream[cursor..], COMPLETE_MARKER) {
                 (cursor + found, DoneEventKind::Success)
-            } else if let Some(found) =
-                find_marker(&stream[cursor..], FAILURE_MARKER)
-            {
+            } else if let Some(found) = find_marker(&stream[cursor..], FAILURE_MARKER) {
                 (cursor + found, DoneEventKind::Error)
-            } else if let Some(found) =
-                find_marker(&stream[cursor..], MARKER_OPEN)
-            {
+            } else if let Some(found) = find_marker(&stream[cursor..], MARKER_OPEN) {
                 let at = cursor + found;
                 let kind = if stream.get(at + MARKER_OPEN.len()) == Some(&b')') {
                     DoneEventKind::Success
