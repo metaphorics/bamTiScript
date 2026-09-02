@@ -40,7 +40,7 @@ use bamts_compiler::project::resolution_trace::ResolutionTraceLog;
 use bamts_compiler::project::{CompilerOptions, ProjectConfig, ProjectRoot};
 use bamts_compiler::source::SourceText;
 use bamts_compiler::source::{TextRange, Utf16Pos};
-use bamts_compiler::syntax::{NodeId, Token, TokenKind};
+use bamts_compiler::syntax::{Token, TokenKind};
 
 use crate::catalog::CaseConfiguration;
 use crate::facets::{
@@ -302,6 +302,10 @@ pub fn parse_case_pragmas(text: &str) -> CasePragmas {
 /// Returns the body of a whole-line `// @name: …` directive, if the line is one.
 fn directive_body(line: &str) -> Option<&str> {
     let trimmed = line.trim();
+    // A leading U+FEFF (BOM) may precede the `//` in files saved with a
+    // byte-order mark; strip it before the directive test so coordinates
+    // are not shifted by the invisible character.
+    let trimmed = trimmed.strip_prefix('\u{feff}').unwrap_or(trimmed);
     let rest = trimmed.strip_prefix("//")?;
     let rest = rest.trim_start_matches('/').trim_start();
     rest.strip_prefix('@')
@@ -346,6 +350,9 @@ fn strip_directive_lines(text: &str) -> String {
 /// name, then a colon. This is the exact set upstream strips from unit content;
 /// `///` reference directives and `@word` lines without a colon are kept.
 fn is_option_directive_line(line: &str) -> bool {
+    // A leading U+FEFF (BOM) may precede the `//` in files saved with a
+    // byte-order mark; strip it before the directive test.
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
     let Some(rest) = line.strip_prefix("//") else {
         return false;
     };
@@ -1314,11 +1321,8 @@ pub fn emit_types_baseline(case: &CheckedCase, logical_path: &str) -> String {
 fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, out: &mut String) {
     let mut records: Vec<TypeAnnotation> = Vec::new();
     // Declaration-name records come from source-declared symbols (intrinsics
-    // carry the default declaration node and an empty range).
+    // carry an empty range, which the range check below filters out).
     for (index, symbol) in model.symbols().iter().enumerate() {
-        if symbol.declaration() == NodeId::default() {
-            continue;
-        }
         if symbol.kind() == bamts_compiler::checker::SymbolKind::TypeParameter {
             continue;
         }
@@ -2401,6 +2405,13 @@ pub fn emit_symbols_baseline(case: &CheckedCase, logical_path: &str) -> String {
         let section = unit_basename(&unit.virtual_path);
         let source_file = output.source_file();
         for (symbol_index, symbol) in output.semantic_model().symbols().iter().enumerate() {
+            // Only mergeable kinds participate in the cross-unit overlay;
+            // non-mergeable kinds (type parameters, `let`/`const` locals,
+            // parameters, …) use their own per-unit anchor via the
+            // `local_decl_positions` fallback in `emit_unit_symbols`.
+            if !kind_is_mergeable(symbol.kind()) {
+                continue;
+            }
             let Some((line, character)) =
                 symbol_decl_position(source_file.tokens(), source_file.source_text(), symbol)
             else {
@@ -2487,11 +2498,27 @@ fn emit_unit_symbols(
         let index = symbol_id.get() as usize;
         let symbol = model.symbols().get(index)?;
         let name = model.qualified_name(symbol_id);
-        let anchors = declaration_anchors
-            .get(&(name.clone(), symbol.kind()))
-            .or_else(|| declaration_anchors.get(&(symbol.name().to_owned(), symbol.kind())))
-            .cloned()
-            .or_else(|| {
+        let anchors =
+            if kind_is_mergeable(symbol.kind()) {
+                declaration_anchors
+                    .get(&(name.clone(), symbol.kind()))
+                    .or_else(|| declaration_anchors.get(&(symbol.name().to_owned(), symbol.kind())))
+                    .cloned()
+                    .or_else(|| {
+                        local_decl_positions.get(index).copied().flatten().map(
+                            |(line, character)| {
+                                vec![SymbolDeclAnchor {
+                                    section: section.to_owned(),
+                                    line,
+                                    character,
+                                }]
+                            },
+                        )
+                    })?
+            } else {
+                // Non-mergeable kinds use their own per-unit anchor only,
+                // preventing same-named distinct symbols (e.g. type parameters
+                // `T` in different scopes) from collapsing into one Decl list.
                 local_decl_positions
                     .get(index)
                     .copied()
@@ -2502,8 +2529,8 @@ fn emit_unit_symbols(
                             line,
                             character,
                         }]
-                    })
-            })?;
+                    })?
+            };
         let declarations = anchors
             .iter()
             .map(|anchor| {
@@ -2520,7 +2547,7 @@ fn emit_unit_symbols(
     let mut records: Vec<SymbolRecord> = Vec::new();
     // Declaration-name records: each source-declared symbol at its identifier.
     for (index, symbol) in model.symbols().iter().enumerate() {
-        if symbol.declaration() == NodeId::default() || symbol.range().is_empty() {
+        if symbol.range().is_empty() {
             continue;
         }
         let symbol_id = SymbolId::new(index as u32);
@@ -2606,7 +2633,7 @@ fn symbol_decl_position(
     source: &SourceText,
     symbol: &bamts_compiler::checker::Symbol,
 ) -> Option<(usize, usize)> {
-    if symbol.declaration() == NodeId::default() || symbol.range().is_empty() {
+    if symbol.range().is_empty() {
         return None;
     }
     let id_start = symbol.range().start();
@@ -2624,6 +2651,67 @@ fn symbol_decl_position(
             } else {
                 break;
             }
+        }
+    }
+    // Decorator walk: scan left over accessor keywords and decorator
+    // expression tokens so a decorated member anchors at the decorator's
+    // `@` token, not the declaration name. Runs for all symbol kinds
+    // since decorators can appear on non-keyword-led members (e.g.
+    // `@dec get accessor()` where `accessor` binds as `Variable(Let)`).
+    let mut found_at = false;
+    while let Some(prev) = prev_significant_token(tokens, node_index) {
+        match tokens[prev].kind() {
+            TokenKind::At => {
+                found_at = true;
+                node_index = prev;
+            }
+            TokenKind::Identifier | TokenKind::Dot => {
+                if found_at {
+                    // After finding `@`, only step over an identifier that
+                    // is itself preceded by `@` (stacked decorators like
+                    // `@first @second`). Otherwise stop — the identifier is
+                    // an unrelated preceding token, not a decorator name.
+                    if let Some(prev2) = prev_significant_token(tokens, prev)
+                        && tokens[prev2].kind() == TokenKind::At
+                    {
+                        node_index = prev2;
+                        continue;
+                    }
+                    break;
+                }
+                node_index = prev;
+            }
+            TokenKind::RParen => {
+                // Skip balanced `(args)` for `@decorator(args)`.
+                let mut depth = 1;
+                let mut scan = prev;
+                while scan > 0 {
+                    scan -= 1;
+                    let token = &tokens[scan];
+                    if token.is_missing() || is_trivia_token(token.kind()) {
+                        continue;
+                    }
+                    match token.kind() {
+                        TokenKind::RParen => depth += 1,
+                        TokenKind::LParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if depth == 0 {
+                    node_index = scan;
+                } else {
+                    break;
+                }
+            }
+            TokenKind::KwGet | TokenKind::KwSet | TokenKind::KwAccessor => {
+                node_index = prev;
+            }
+            _ => break,
         }
     }
     // The declaration's full start is the end of the significant token that
@@ -2661,6 +2749,23 @@ const fn kind_is_keyword_led(kind: SymbolKind) -> bool {
             | SymbolKind::Function
             | SymbolKind::Interface
             | SymbolKind::TypeAlias
+            | SymbolKind::Enum
+            | SymbolKind::Namespace
+    )
+}
+
+/// Symbol kinds that can merge across compilation units when they share a
+/// name: namespaces, interfaces, enums, functions, and `var` redeclarations.
+/// Only these participate in the cross-unit `declaration_anchors` overlay;
+/// all other kinds (type parameters, parameters, `let`/`const` locals, …)
+/// use their own per-unit anchor so same-named distinct symbols do not
+/// collapse into one `Decl` list.
+const fn kind_is_mergeable(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Variable(bamts_compiler::syntax::VariableKind::Var)
+            | SymbolKind::Function
+            | SymbolKind::Interface
             | SymbolKind::Enum
             | SymbolKind::Namespace
     )
@@ -4610,5 +4715,125 @@ export class Model {
             report.push_str(sample);
         }
         write_facet_report("member-records", &report);
+    }
+    // ---- Fix 1: first-declaration NodeId(0) not skipped ------------------
+
+    /// The very first declaration in a unit receives `NodeId::default()`
+    /// (NodeId(0)). The old `declaration() == NodeId::default()` guard
+    /// skipped it, dropping the first symbol's `.symbols` and `.types`
+    /// records. Gating on `range().is_empty()` alone keeps it.
+    #[test]
+    fn first_declaration_with_node_id_zero_is_emitted() {
+        let source = "function foo() {}\n";
+        let logical = "tests/cases/compiler/firstDecl.ts";
+        let units = split_case_units(logical, source);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        assert!(
+            emitted.contains(">foo : Symbol(foo, Decl("),
+            "first declaration must appear in symbols output:\n{emitted}"
+        );
+        // Also verify the .types baseline emits the first symbol.
+        let types = emit_types_baseline(&case, logical);
+        assert!(
+            types.contains("foo"),
+            "first declaration must appear in types output:\n{types}"
+        );
+    }
+
+    // ---- Fix 2: same-named type parameters keep separate Decl lists -------
+
+    /// Two type parameters named `T` in different scopes must not share
+    /// `Decl` entries. The old `(String, SymbolKind)` keying collapsed
+    /// them because both mapped to `("T", TypeParameter)`. Restricting
+    /// the cross-unit overlay to mergeable kinds gives each its own anchor.
+    #[test]
+    fn same_named_type_parameters_keep_separate_decl_lists() {
+        let source = "\
+function identity<T>(x: T): T { return x; }\n\
+function wrap<U, T>(x: T): T { return x; }\n\
+";
+        let logical = "tests/cases/compiler/dupTypeParam.ts";
+        let units = split_case_units(logical, source);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        // Each `T` must have exactly one Decl entry (its own), not two.
+        let t_lines: Vec<&str> = emitted
+            .lines()
+            .filter(|l| l.starts_with(">T :") && l.contains("Symbol(T,"))
+            .collect();
+        assert!(
+            !t_lines.is_empty(),
+            "must have at least one T symbol line:\n{emitted}"
+        );
+        for line in &t_lines {
+            let decl_count = line.matches("Decl(").count();
+            assert_eq!(
+                decl_count, 1,
+                "each T must have exactly one Decl entry, got {decl_count}:\n{line}\n{emitted}"
+            );
+        }
+    }
+
+    // ---- Fix 3: BOM-prefixed directive lines are stripped -----------------
+
+    /// A source file whose first line carries a U+FEFF BOM before the `//`
+    /// directive must still have the directive stripped and coordinates
+    /// numbered from the first surviving line.
+    #[test]
+    fn bom_prefixed_directive_is_stripped() {
+        let source = "\u{feff}// @target: es2015\nvar x = 1;";
+        // is_option_directive_line must recognise the BOM-prefixed line.
+        assert!(
+            is_option_directive_line("\u{feff}// @target: es2015"),
+            "BOM-prefixed directive line must be recognised"
+        );
+        // strip_directive_lines must remove it, leaving `var x = 1;`.
+        let stripped = strip_directive_lines(source);
+        assert_eq!(
+            stripped, "var x = 1;",
+            "BOM-prefixed directive must be stripped, got: {stripped:?}"
+        );
+        // directive_body must also recognise the BOM-prefixed line.
+        assert_eq!(
+            directive_body("\u{feff}// @target: es2015"),
+            Some("target: es2015"),
+            "directive_body must strip BOM"
+        );
+    }
+
+    // ---- Fix 4: decorated member anchors at decorator, not name ----------
+
+    /// A decorated class property `@dec x` must anchor its `Decl` at the
+    /// decorator's full start (right after `{`), not at the property name.
+    /// The decorator walk scans left over `@dec` to reach the position
+    /// TypeScript's `node.pos` would report. (Get/set accessors are not
+    /// yet bound as symbols by the binder, so we test with a property.)
+    #[test]
+    fn decorated_member_anchors_at_decorator() {
+        let source = "\
+declare function dec(target: any, propertyKey: string): any;\n\
+\n\
+class C {\n\
+    @dec x: number = 1;\n\
+}\n\
+";
+        let logical = "tests/cases/compiler/decoratorProp.ts";
+        let units = split_case_units(logical, source);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_symbols_baseline(&case, logical);
+        // The property's Decl must be at line 2 (the `class C {` line),
+        // column 9 (right after `{` — the full start including decorator).
+        let x_line = emitted
+            .lines()
+            .find(|l| l.starts_with(">x :"))
+            .unwrap_or_else(|| panic!("missing x symbol line:\n{emitted}"));
+        assert!(
+            x_line.contains("Decl(decoratorProp.ts, 2, 9)"),
+            "decorated property must anchor at Decl(decoratorProp.ts, 2, 9), got:\n{x_line}\n{emitted}"
+        );
     }
 }

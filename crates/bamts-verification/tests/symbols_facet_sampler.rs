@@ -358,12 +358,16 @@ fn classify_diff(
                 if exp_decl_count != act_decl_count {
                     "wrong-decl-count".to_owned()
                 } else {
-                    // Check if it's just ordering of Decl entries
-                    let exp_decls: Vec<&str> = exp_decl.matches("Decl(").collect();
-                    let act_decls: Vec<&str> = act_decl.matches("Decl(").collect();
-                    if exp_decls.len() == act_decls.len() {
-                        let mut exp_sorted = exp_decls.to_vec();
-                        let mut act_sorted = act_decls.to_vec();
+                    // Check if it's just ordering of Decl entries.
+                    // Use extract_decl_coords to compare actual coordinate
+                    // strings, not literal "Decl(" substrings (which are
+                    // always identical and make the sort+compare trivially
+                    // equal, misclassifying coordinate errors as order diffs).
+                    let exp_coords = extract_decl_coords(exp_line);
+                    let act_coords = extract_decl_coords(act_line);
+                    if exp_coords.len() == act_coords.len() {
+                        let mut exp_sorted = exp_coords.clone();
+                        let mut act_sorted = act_coords.clone();
                         exp_sorted.sort();
                         act_sorted.sort();
                         if exp_sorted == act_sorted {
