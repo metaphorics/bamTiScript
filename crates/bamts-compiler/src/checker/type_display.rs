@@ -140,6 +140,15 @@ fn render_type_grouped(
             render_type_grouped(model, *value, false, visiting_aliases)
         ),
         Type::This { .. } => "this".to_owned(),
+        Type::EnumMember {
+            enum_symbol,
+            member_symbol,
+            ..
+        } => {
+            let enum_name = model.symbol(*enum_symbol).name();
+            let member_name = model.symbol(*member_symbol).name();
+            format!("{enum_name}.{member_name}")
+        }
         Type::Named(symbol) | Type::NumericEnum(symbol) => model.symbol(*symbol).name().to_owned(),
     }
 }

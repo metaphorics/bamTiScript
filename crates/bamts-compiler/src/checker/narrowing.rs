@@ -749,6 +749,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::Named(_)
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. } => self.table.never(),
@@ -806,6 +807,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. } => None,
@@ -890,6 +892,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. } => None,
@@ -947,6 +950,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
@@ -1100,6 +1104,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::Named(_)
             | Type::AppliedClass { .. }
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. } => match decide(self.table, self.table.get(ty)) {
@@ -1201,6 +1206,7 @@ impl<'a> NarrowingContext<'a> {
                 | Type::AppliedClass { .. }
                 | Type::AppliedAlias { .. }
                 | Type::NumericEnum(_)
+                | Type::EnumMember { .. }
                 | Type::Keyof(_)
                 | Type::IndexedAccess { .. }
                 | Type::Record { .. }
@@ -1260,6 +1266,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
@@ -1300,6 +1307,7 @@ impl<'a> NarrowingContext<'a> {
             | Type::AppliedClass { .. }
             | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
@@ -1531,11 +1539,25 @@ fn typeof_matches(table: &TypeTable, ty: &Type, name: TypeofName) -> bool {
             .any(|member| typeof_matches(table, table.get(*member), name));
     }
     match name {
-        TypeofName::String => matches!(ty, Type::String | Type::StringLiteral(_)),
+        TypeofName::String => matches!(
+            ty,
+            Type::String
+                | Type::StringLiteral(_)
+                | Type::EnumMember {
+                    string_value: Some(_),
+                    ..
+                }
+        ),
         TypeofName::Number => {
             matches!(
                 ty,
-                Type::Number | Type::NumberLiteral(_) | Type::NumericEnum(_)
+                Type::Number
+                    | Type::NumberLiteral(_)
+                    | Type::NumericEnum(_)
+                    | Type::EnumMember {
+                        string_value: None,
+                        ..
+                    }
             )
         }
         TypeofName::BigInt => matches!(ty, Type::BigInt | Type::BigIntLiteral(_)),
@@ -1562,6 +1584,10 @@ fn definitely_falsy(ty: &Type) -> bool {
         Type::BooleanLiteral(value) => !value,
         Type::NumberLiteral(text) => number_value(text) == Some(0.0),
         Type::StringLiteral(text) => text.is_empty(),
+        Type::EnumMember {
+            string_value: Some(value),
+            ..
+        } => value.is_empty(),
         Type::BigIntLiteral(text) => bigint_literal_is_zero(text),
         _ => false,
     }
@@ -1580,6 +1606,9 @@ fn possibly_falsy(ty: &Type) -> bool {
         | Type::String
         | Type::BigInt
         | Type::NumericEnum(_)
+        | Type::EnumMember {
+            string_value: None, ..
+        }
         | Type::Named(_)
         | Type::AppliedClass { .. } => true,
         _ => definitely_falsy(ty),

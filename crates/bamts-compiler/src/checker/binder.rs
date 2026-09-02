@@ -1252,6 +1252,16 @@ pub enum Type {
     },
     /// A numeric enum value, distinct from both its runtime enum object and number.
     NumericEnum(SymbolId),
+    /// A literal enum member type like `E.A`. The enum symbol identifies the
+    /// widened enum type; the member symbol identifies the member for display.
+    /// `string_value` is `Some` for string enum members, carrying the cooked
+    /// string literal value for assignability with `string` and the specific
+    /// literal; `None` for numeric enum members.
+    EnumMember {
+        enum_symbol: SymbolId,
+        member_symbol: SymbolId,
+        string_value: Option<EcmaString>,
+    },
     /// A deferred `keyof T` type, reduced when the operand becomes concrete.
     Keyof(TypeId),
     /// A deferred indexed access type `T[K]`, reduced when the object and key
@@ -3168,6 +3178,20 @@ impl TypeTable {
         self.intern(Type::NumericEnum(symbol))
     }
 
+    /// Interns a literal enum member type like `E.A`.
+    pub fn enum_member(
+        &mut self,
+        enum_symbol: SymbolId,
+        member_symbol: SymbolId,
+        string_value: Option<EcmaString>,
+    ) -> TypeId {
+        self.intern(Type::EnumMember {
+            enum_symbol,
+            member_symbol,
+            string_value,
+        })
+    }
+
     /// Interns an array type over `element`.
     pub fn array(&mut self, element: TypeId) -> TypeId {
         let array = self.intern(Type::Array(element));
@@ -3554,6 +3578,10 @@ impl TypeTable {
             Type::Null | Type::Undefined | Type::Void | Type::BooleanLiteral(false) => self.never,
             Type::NumberLiteral(text) if number_value(&text) == Some(0.0) => self.never,
             Type::StringLiteral(text) if text.is_empty() => self.never,
+            Type::EnumMember {
+                string_value: Some(value),
+                ..
+            } if value.is_empty() => self.never,
             Type::Union(members) => {
                 let members: Vec<_> = members
                     .into_iter()
@@ -3661,6 +3689,16 @@ impl TypeTable {
             Type::NumberLiteral(_) if !keep_primitive_literals => self.number(),
             Type::BooleanLiteral(_) if !keep_primitive_literals => self.boolean(),
             Type::BigIntLiteral(_) if !keep_primitive_literals => self.bigint(),
+            Type::EnumMember {
+                enum_symbol,
+                string_value: None,
+                ..
+            } if !keep_primitive_literals => self.numeric_enum(enum_symbol),
+            Type::EnumMember {
+                enum_symbol,
+                string_value: Some(_),
+                ..
+            } if !keep_primitive_literals => self.named(enum_symbol),
             Type::Union(members) if !keep_primitive_literals => {
                 let widened = members
                     .into_iter()
@@ -3966,6 +4004,17 @@ impl TypeTable {
                 Type::NumericEnum(symbol) => {
                     let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
                     target.numeric_enum(symbol)
+                }
+                Type::EnumMember {
+                    enum_symbol,
+                    member_symbol,
+                    string_value,
+                } => {
+                    let enum_symbol =
+                        remap_symbol(target, source, enum_symbol, imported, next_symbol);
+                    let member_symbol =
+                        remap_symbol(target, source, member_symbol, imported, next_symbol);
+                    target.enum_member(enum_symbol, member_symbol, string_value)
                 }
                 Type::Keyof(operand) => {
                     let operand = copy(target, source, operand, imported, next_symbol);
@@ -7066,6 +7115,15 @@ impl<'src> Binder<'src> {
                 .entry(name.clone())
                 .or_insert(member_symbol);
             self.enum_member_names.insert(member.id(), name);
+            let string_value = member
+                .data()
+                .initializer
+                .as_deref()
+                .and_then(|init| self.enum_member_string_value(init));
+            self.symbol_types[member_symbol.get() as usize] =
+                self.types.enum_member(symbol, member_symbol, string_value);
+            self.type_state[member_symbol.get() as usize] =
+                TypeState::Done(self.symbol_types[member_symbol.get() as usize]);
         }
         let numeric = declaration.members.iter().all(|member| {
             member
@@ -13604,6 +13662,7 @@ impl<'src> Binder<'src> {
             | Type::Function(_)
             | Type::AppliedAlias { .. }
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. } => None,
         }
@@ -16748,6 +16807,10 @@ impl<'src> Binder<'src> {
     fn is_string_like(&self, type_id: TypeId) -> bool {
         match self.types.get(type_id) {
             Type::String | Type::StringLiteral(_) => true,
+            Type::EnumMember {
+                string_value: Some(_),
+                ..
+            } => true,
             Type::Union(members) => members.iter().any(|member| self.is_string_like(*member)),
             _ => false,
         }
@@ -16873,6 +16936,10 @@ impl<'src> Binder<'src> {
     fn is_assignable_to_string_like(&self, type_id: TypeId) -> bool {
         match self.types.get(type_id) {
             Type::Any | Type::String | Type::StringLiteral(_) => true,
+            Type::EnumMember {
+                string_value: Some(_),
+                ..
+            } => true,
             // Without `strictNullChecks` a nullable value is string-assignable,
             // so `+` concatenates and no operand is rejected.
             Type::Null | Type::Undefined => !self.strict_null_checks,
@@ -17517,6 +17584,18 @@ impl<'src> Binder<'src> {
             Literal::Regex(_) => self
                 .reg_exp_instance_type
                 .expect("RegExp intrinsic installed before expression resolution"),
+        }
+    }
+
+    /// Extracts the cooked string value from a string-literal enum member
+    /// initializer, returning `None` for numeric or computed initializers.
+    fn enum_member_string_value(&self, expression: &Expr) -> Option<EcmaString> {
+        match expression.data() {
+            Expression::Literal(Literal::String(token)) => {
+                let lexeme = self.text(token.data().token());
+                crate::literal::string_value(lexeme)
+            }
+            _ => None,
         }
     }
 }

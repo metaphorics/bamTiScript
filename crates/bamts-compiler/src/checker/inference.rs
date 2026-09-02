@@ -482,7 +482,8 @@ impl InferredTypeArguments {
             | Type::NumberLiteral(_)
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
-            | Type::NumericEnum(_) => ty,
+            | Type::NumericEnum(_)
+            | Type::EnumMember { .. } => ty,
         }
     }
 

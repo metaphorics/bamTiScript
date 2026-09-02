@@ -4254,4 +4254,192 @@ export class Model {
             "all 10 cells must be exercised\n{report}"
         );
     }
+
+    /// Measures the `.types` facet on a 60-cell sample of authority cases
+    /// whose names start with `enum`.  This is a measurement test, not a
+    /// pass/fail gate: it prints the exact-match count so the EnumMemberAny
+    /// node can report before/after numbers.
+    #[test]
+    fn enum_types_facet_sample_60_cells() {
+        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT")
+            .unwrap_or_else(|_| {
+                "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests"
+                    .to_owned()
+            });
+        let cases_dir = format!("{authority_root}/tests/cases/compiler");
+        let conformance_dir = format!("{authority_root}/tests/cases/conformance/enums");
+        let baseline_dir = format!("{authority_root}/tests/baselines/reference");
+
+        // Collect enum-named .ts case files from both directories.
+        let mut case_paths: Vec<(String, String)> = Vec::new();
+        for dir in [&cases_dir, &conformance_dir] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap().to_string_lossy().to_owned();
+                if !name.starts_with("enum") || !name.ends_with(".ts") {
+                    continue;
+                }
+                let stem = name.trim_end_matches(".ts");
+                let baseline = format!("{baseline_dir}/{stem}.types");
+                if !std::path::Path::new(&baseline).exists() {
+                    continue;
+                }
+                let logical = if *dir == cases_dir {
+                    format!("tests/cases/compiler/{name}")
+                } else {
+                    format!("tests/cases/conformance/enums/{name}")
+                };
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                };
+                case_paths.push((logical, text));
+            }
+        }
+        case_paths.sort_by(|a, b| a.0.cmp(&b.0));
+        let sample: Vec<_> = case_paths.into_iter().take(60).collect();
+        let total = sample.len();
+        assert!(total >= 60, "expected at least 60 enum cases with .types baselines, found {total}");
+
+        let mut exact_matches = 0usize;
+        let mut mismatches = 0usize;
+        let mut compile_failures = 0usize;
+        let mut missing_baselines = 0usize;
+
+        for (logical, text) in &sample {
+            let stem = logical.rsplit('/').next().unwrap().trim_end_matches(".ts");
+            let baseline_path = format!("{baseline_dir}/{stem}.types");
+            let units = split_case_units(logical, text);
+            let entry = entry_virtual_path(logical, &units);
+            let case = match compile_case(&units, &entry) {
+                Ok(case) => case,
+                Err(_) => {
+                    compile_failures += 1;
+                    continue;
+                }
+            };
+            let emitted = emit_types_baseline(&case, logical);
+            let expected = match std::fs::read_to_string(&baseline_path) {
+                Ok(text) => text,
+                Err(_) => {
+                    missing_baselines += 1;
+                    continue;
+                }
+            };
+            let verdict = compare_types(&expected, &emitted);
+            if matches!(verdict, FacetVerdict::Pass) {
+                exact_matches += 1;
+            } else {
+                mismatches += 1;
+            }
+        }
+
+        let report = format!(
+            "enum_types_facet_sample: total={total} exact_matches={exact_matches} \
+             mismatches={mismatches} compile_failures={compile_failures} \
+             missing_baselines={missing_baselines}"
+        );
+        write_facet_report("types-60", &report);
+    }
+
+    /// Writes a facet measurement report under the session scratch root so the
+    /// orchestrator can read the numbers without library-path printing.
+    fn write_facet_report(name: &str, text: &str) {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("manifest sits in crates/<name>");
+        let dir = workspace.join("target/tmp/enum-member-any");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let _ = std::fs::write(dir.join(format!("{name}.txt")), text);
+    }
+
+    /// Per-record parity: re-checks every member-access record line
+    /// (`>E.A : T`, `>E["A"] : T`, `>E[\`A\`] : T`) in the authority `.types`
+    /// baselines of the 60-case enum sample against the compiler's emitted
+    /// records, counting verbatim line matches.
+    #[test]
+    fn enum_member_access_records_parity() {
+        let authority_root = std::env::var("BAMTS_AUTHORITY_ROOT")
+            .unwrap_or_else(|_| {
+                "/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests"
+                    .to_owned()
+            });
+        let baseline_dir = format!("{authority_root}/tests/baselines/reference");
+        let mut case_paths: Vec<(String, String)> = Vec::new();
+        for (rel_dir, dir) in [
+            ("tests/cases/compiler", "tests/cases/compiler"),
+            ("tests/cases/conformance/enums", "tests/cases/conformance/enums"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(format!("{authority_root}/{dir}")) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap().to_string_lossy().to_owned();
+                if !name.starts_with("enum") || !name.ends_with(".ts") {
+                    continue;
+                }
+                let stem = name.trim_end_matches(".ts");
+                if !std::path::Path::new(&format!("{baseline_dir}/{stem}.types")).exists() {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                case_paths.push((format!("{rel_dir}/{name}"), text));
+            }
+        }
+        case_paths.sort_by(|a, b| a.0.cmp(&b.0));
+        let sample: Vec<_> = case_paths.into_iter().take(60).collect();
+
+        let mut member_records = 0usize;
+        let mut matched_records = 0usize;
+        let mut unmatched_samples: Vec<String> = Vec::new();
+        for (logical, text) in &sample {
+            let stem = logical.rsplit('/').next().unwrap().trim_end_matches(".ts");
+            let Ok(expected) = std::fs::read_to_string(format!("{baseline_dir}/{stem}.types"))
+            else {
+                continue;
+            };
+            let units = split_case_units(logical, text);
+            let entry = entry_virtual_path(logical, &units);
+            let Ok(case) = compile_case(&units, &entry) else {
+                continue;
+            };
+            let emitted = emit_types_baseline(&case, logical);
+            let emitted_lines: std::collections::HashSet<&str> =
+                emitted.lines().collect();
+            let mut per_case = (0usize, 0usize);
+            for line in expected.lines().filter(|line| {
+                line.starts_with('>')
+                    && line.contains(" : ")
+                    && (line.contains('.') || line.contains('['))
+            }) {
+                member_records += 1;
+                per_case.0 += 1;
+                if emitted_lines.contains(line) {
+                    matched_records += 1;
+                    per_case.1 += 1;
+                } else if unmatched_samples.len() < 40 {
+                    unmatched_samples.push(format!("{stem}: {line}"));
+                }
+            }
+            let _ = per_case;
+        }
+        let mut report = format!(
+            "enum_member_access_records: total={member_records} matched={matched_records}"
+        );
+        for sample in &unmatched_samples {
+            report.push('\n');
+            report.push_str(sample);
+        }
+        write_facet_report("member-records", &report);
+    }
 }

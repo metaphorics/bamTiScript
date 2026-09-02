@@ -11810,4 +11810,143 @@ function check(options: Options = {}) {
         assert_eq!(c036_count, 1, "expected exactly 1 C036, got {codes:?}");
         assert_eq!(c086_count, 1, "expected exactly 1 C086, got {codes:?}");
     }
+
+    // ---- enum member literal types -------------------------------------------
+
+    #[test]
+    fn null_plus_numeric_enum_member_reports_c086() {
+        // `null + E.A` must report TS18050 (BAMTS-C086) because a numeric enum
+        // member is not string-assignable, so `+` coerces rather than
+        // concatenates.  Grounded on `additionOperatorWithNumberAndEnum`.
+        assert_eq!(
+            nullable_operand_reports("enum E { A } var a = null + E.A;"),
+            1
+        );
+    }
+
+    #[test]
+    fn null_plus_string_enum_member_does_not_report_c086() {
+        // A string enum member IS string-assignable, so `+` concatenates and
+        // the nullable-operand rule does not fire.
+        assert_eq!(
+            nullable_operand_reports("enum E { A = \"a\" } var a = null + E.A;"),
+            0
+        );
+    }
+
+    #[test]
+    fn numeric_enum_member_types_as_enum_dot_member() {
+        // `E.A` must render as `E.A`, not `any` or `number`.
+        let result = check_text("enum E { A, B } E.A;");
+        let model = result.product();
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("enum E { A, B } E.A;"),
+        ));
+        let Statement::Expression(stmt) = parsed.product().statements()[1].data() else {
+            panic!("second statement is the expression statement");
+        };
+        let type_id = model.node_type(stmt.expression.id()).expect("E.A is typed");
+        assert_eq!(
+            super::render_type(model, type_id),
+            "E.A",
+            "numeric enum member should render as E.A"
+        );
+    }
+
+    #[test]
+    fn numeric_enum_member_plus_one_types_as_number() {
+        // `E.A + 1` must type as `number`, not `any`.
+        let result = check_text("enum E { A } E.A + 1;");
+        let model = result.product();
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("enum E { A } E.A + 1;"),
+        ));
+        let Statement::Expression(stmt) = parsed.product().statements()[1].data() else {
+            panic!("second statement is the expression statement");
+        };
+        let type_id = model
+            .node_type(stmt.expression.id())
+            .expect("E.A + 1 is typed");
+        assert_eq!(
+            super::render_type(model, type_id),
+            "number",
+            "E.A + 1 should render as number"
+        );
+    }
+
+    #[test]
+    fn string_enum_member_types_as_enum_dot_member() {
+        // `E.A` for a string enum must render as `E.A`, not `any` or `string`.
+        let result = check_text("enum E { A = \"hello\", B = \"world\" } E.A;");
+        let model = result.product();
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("enum E { A = \"hello\", B = \"world\" } E.A;"),
+        ));
+        let Statement::Expression(stmt) = parsed.product().statements()[1].data() else {
+            panic!("second statement is the expression statement");
+        };
+        let type_id = model.node_type(stmt.expression.id()).expect("E.A is typed");
+        assert_eq!(
+            super::render_type(model, type_id),
+            "E.A",
+            "string enum member should render as E.A"
+        );
+    }
+
+    #[test]
+    fn string_enum_member_is_assignable_to_string() {
+        // A string enum member is assignable to `string` but a numeric enum
+        // member is not assignable to `string`.
+        let result = check_text(
+            "enum N { A } enum S { A = \"x\" } \
+             var ns: string = S.A; \
+             var nn: string = N.A;",
+        );
+        let codes = checker_codes(&result);
+        // S.A → string is fine; N.A → string should error.
+        assert!(
+            codes.iter().any(|c| *c == TYPE_NOT_ASSIGNABLE.as_str()),
+            "numeric enum member should not be assignable to string: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_enum_member_is_assignable_to_number() {
+        // A numeric enum member is assignable to `number`.
+        let result = check_text("enum N { A } var nn: number = N.A;");
+        let codes = checker_codes(&result);
+        assert!(
+            codes.iter().all(|c| *c != TYPE_NOT_ASSIGNABLE.as_str()),
+            "numeric enum member should be assignable to number: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn element_access_enum_member_types_as_enum_dot_member() {
+        // `E["A"]` resolves to the same member literal type as `E.A`.
+        let result = check_text("enum E { A, B } E[\"A\"];");
+        let model = result.product();
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            source("enum E { A, B } E[\"A\"];"),
+        ));
+        let Statement::Expression(stmt) = parsed.product().statements()[1].data() else {
+            panic!("second statement is the expression statement");
+        };
+        let type_id = model
+            .node_type(stmt.expression.id())
+            .expect("E[\"A\"] is typed");
+        assert_eq!(
+            super::render_type(model, type_id),
+            "E.A",
+            "element access enum member should render as E.A"
+        );
+    }
 }

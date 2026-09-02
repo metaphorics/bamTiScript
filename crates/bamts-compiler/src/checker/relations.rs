@@ -767,7 +767,8 @@ impl<'table> TypeRelations<'table> {
             | Type::NumberLiteral(_)
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
-            | Type::NumericEnum(_) => Some(false),
+            | Type::NumericEnum(_)
+            | Type::EnumMember { .. } => Some(false),
         }
     }
 
@@ -1129,6 +1130,57 @@ impl<'table> TypeRelations<'table> {
                     Strictness::Assignable | Strictness::StrictNull | Strictness::Comparable
                 )
             }
+            // A numeric enum member literal is a subtype of `number` and of
+            // its enum type, exactly like `NumericEnum` itself.
+            (
+                Type::EnumMember {
+                    string_value: None, ..
+                },
+                Type::Number,
+            ) => true,
+            (
+                Type::Number,
+                Type::EnumMember {
+                    string_value: None, ..
+                },
+            ) => {
+                matches!(
+                    strictness,
+                    Strictness::Assignable | Strictness::StrictNull | Strictness::Comparable
+                )
+            }
+            // A string enum member literal is a subtype of `string`, like a
+            // string literal.
+            (
+                Type::EnumMember {
+                    string_value: Some(_),
+                    ..
+                },
+                Type::String,
+            ) => true,
+            // An enum member literal is assignable to its own enum type.
+            (Type::EnumMember { enum_symbol, .. }, Type::NumericEnum(target_symbol))
+                if enum_symbol == target_symbol =>
+            {
+                true
+            }
+            (
+                Type::EnumMember {
+                    enum_symbol,
+                    string_value: Some(_),
+                    ..
+                },
+                Type::Named(target_symbol),
+            ) if enum_symbol == target_symbol => true,
+            // A string enum member with a specific value is assignable to the
+            // matching string literal type.
+            (
+                Type::EnumMember {
+                    string_value: Some(value),
+                    ..
+                },
+                Type::StringLiteral(target_value),
+            ) if value == target_value => true,
             // Null/undefined are assignable to any type in non-strict mode,
             // but not to `never`. Under strict null checks they only flow to
             // types that explicitly include them.
@@ -1208,6 +1260,7 @@ impl<'table> TypeRelations<'table> {
                 | Type::BooleanLiteral(_)
                 | Type::BigIntLiteral(_)
                 | Type::NumericEnum(_)
+                | Type::EnumMember { .. }
                 | Type::AppliedClass { .. },
                 Type::Named(symbol),
             ) if self.is_object_symbol(*symbol) => true,
@@ -1238,6 +1291,7 @@ impl<'table> TypeRelations<'table> {
                 | Type::AppliedClass { .. }
                 | Type::AppliedAlias { .. }
                 | Type::NumericEnum(_)
+                | Type::EnumMember { .. }
                 | Type::Keyof(_),
                 _,
             ) => false,
@@ -1445,6 +1499,7 @@ impl<'table> TypeRelations<'table> {
             | Type::Function(_)
             | Type::Named(_)
             | Type::NumericEnum(_)
+            | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
@@ -1913,11 +1968,19 @@ impl<'table> TypeRelations<'table> {
             Type::Null => Some(PrimitiveDomain::Null),
             Type::Undefined => Some(PrimitiveDomain::Undefined),
             Type::Boolean | Type::BooleanLiteral(_) => Some(PrimitiveDomain::Boolean),
-            Type::Number | Type::NumberLiteral(_) | Type::NumericEnum(_) => {
-                Some(PrimitiveDomain::Number)
-            }
+            Type::Number
+            | Type::NumberLiteral(_)
+            | Type::NumericEnum(_)
+            | Type::EnumMember {
+                string_value: None, ..
+            } => Some(PrimitiveDomain::Number),
             Type::BigInt | Type::BigIntLiteral(_) => Some(PrimitiveDomain::BigInt),
-            Type::String | Type::StringLiteral(_) => Some(PrimitiveDomain::String),
+            Type::String
+            | Type::StringLiteral(_)
+            | Type::EnumMember {
+                string_value: Some(_),
+                ..
+            } => Some(PrimitiveDomain::String),
             Type::Symbol => Some(PrimitiveDomain::Symbol),
             _ => None,
         }

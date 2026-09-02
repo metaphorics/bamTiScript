@@ -328,7 +328,8 @@ impl<'src> Binder<'src> {
                         | Type::Array(_)
                         | Type::Tuple(_)
                         | Type::ObjectType(_)
-                        | Type::NumericEnum(_) => {
+                        | Type::NumericEnum(_)
+                        | Type::EnumMember { .. } => {
                             self.emit(
                                 JSX_ELEMENT_TYPE_NOT_CALLABLE,
                                 range,
@@ -375,7 +376,8 @@ impl<'src> Binder<'src> {
             | Type::Array(_)
             | Type::Tuple(_)
             | Type::ObjectType(_)
-            | Type::NumericEnum(_) => {
+            | Type::NumericEnum(_)
+            | Type::EnumMember { .. } => {
                 self.emit(
                     JSX_ELEMENT_TYPE_NOT_CALLABLE,
                     range,

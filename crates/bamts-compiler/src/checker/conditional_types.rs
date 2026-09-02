@@ -592,7 +592,8 @@ impl<'table> ConditionalTypeEvaluator<'table> {
             | Type::StringLiteral(_)
             | Type::BigIntLiteral(_)
             | Type::Named(_)
-            | Type::NumericEnum(_) => Ok(()),
+            | Type::NumericEnum(_)
+            | Type::EnumMember { .. } => Ok(()),
         };
         visiting.remove(&type_id);
         result
