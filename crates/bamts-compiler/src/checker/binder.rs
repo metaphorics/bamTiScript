@@ -3513,31 +3513,31 @@ impl TypeTable {
         }
     }
 
-    /// Whether `null` or `undefined` is one of the type's own constituents, so
-    /// a union answers true when any member is nullable.
+    /// Whether the type is exactly `null` or exactly `undefined`, rather than a
+    /// type that merely carries one as a constituent.
     ///
-    /// The union arm is unreachable in legal TypeScript, and not because of the
-    /// caller's spelling gate. `is_nullable_value_word` matches `undefined` by
-    /// identifier text, so a local shadow does spell the word while carrying a
-    /// declared union type. The authority forecloses that program one step
-    /// earlier: all three cases declaring a local `undefined`
-    /// (`undefinedTypeAssignment2`, `undefinedTypeAssignment3`,
-    /// `reExportUndefined2`) are rejected at the declaration with TS2397,
-    /// `Declaration name conflicts with built-in global identifier`, and none
-    /// carries a TS18050 anywhere in its baseline.
+    /// The exactness is what keeps this rule inside its own diagnostic family.
+    /// The authority table splits the two ideas: TS18047 through TS18049 read
+    /// `'{0}' is possibly 'null'`, `'possibly 'undefined'`, and `'possibly
+    /// 'null' or 'undefined'` and own a value whose type contains a nullable
+    /// constituent, while TS18050 reads `The value '{0}' cannot be used here.`
+    /// and owns the value being null or undefined. This predicate serves the
+    /// TS18050 correspondent, so a union answering true here would emit our
+    /// code for a case the authority gives to the possibly-null family.
     ///
-    /// So both an any-member and an exact `Null | Undefined` body behave
-    /// identically on every legal program, and no baseline can distinguish
-    /// them. This keeps the any-member form because it is the constituent test
-    /// the name promises, not because the corner was measured: we do not
-    /// implement TS2397 yet, so we accept the shadow this rule then reports on.
-    /// Whichever body sits here, that acceptance is the defect to fix.
-    pub fn is_nullable(&self, type_id: TypeId) -> bool {
-        match self.get(type_id) {
-            Type::Null | Type::Undefined => true,
-            Type::Union(members) => members.iter().any(|member| self.is_nullable(*member)),
-            _ => false,
-        }
+    /// The caller's spelling gate does not make that unreachable on its own.
+    /// `is_nullable_value_word` matches `undefined` by identifier text, so a
+    /// local shadow spells the word while carrying a declared union type. Two
+    /// measurements bound how far the corpus speaks. The three cases declaring
+    /// a local `undefined` (`undefinedTypeAssignment2`,
+    /// `undefinedTypeAssignment3`, `reExportUndefined2`) are all global-scope
+    /// `var`, are rejected at the declaration with TS2397, and carry no
+    /// TS18050. No case shadows either value word in function scope, so no
+    /// baseline exercises a shadowed operand and none can settle the corner by
+    /// observation. The choice rests on the family split above, and it is
+    /// recorded here as reasoned rather than measured.
+    pub fn is_exactly_nullish(&self, type_id: TypeId) -> bool {
+        matches!(self.get(type_id), Type::Null | Type::Undefined)
     }
     fn optional_access_view(&mut self, type_id: TypeId) -> TypeId {
         let non_nullable = self.non_nullable(type_id);
@@ -16730,7 +16730,7 @@ impl<'src> Binder<'src> {
             return;
         }
         let operand_type = self.type_of_expr(operand, scope);
-        if !self.types.is_nullable(operand_type) {
+        if !self.types.is_exactly_nullish(operand_type) {
             return;
         }
         self.emit(
