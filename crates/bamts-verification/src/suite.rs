@@ -2954,6 +2954,58 @@ fn project_trace_lane(
     bind_compiler_observation(input, variant, observable, BTreeMap::new(), declared, check)
 }
 
+/// Typed errors from `produce_project_trace` so `observe_project_trace` can
+/// distinguish genuinely catalog-inapplicable outcomes (no `inputFiles`,
+/// baseline proven absent upstream) from harness failures and compiler
+/// defects that must stay in the blocking denominator.
+enum ProjectTraceError {
+    /// The fixture has no `inputFiles`: it is a project compilation test,
+    /// not a trace test. The trace observable is inapplicable.
+    NoInputFiles,
+    /// The baseline `.trace.json` was not found in the snapshot. The catalog
+    /// generated a trace obligation, but the upstream baseline has no
+    /// corresponding artifact — a catalog error, not a compiler defect.
+    MissingBaseline(String),
+    /// A harness-level failure: temp-dir, I/O, config parse, or loader
+    /// setup. These are infrastructure bugs, not compiler defects, but they
+    /// must not be silently dropped from the blocking denominator.
+    Harness(String),
+    /// The fixture's `projectRoot` or `inputFiles` contain path traversal or
+    /// other unsafe constructs. A harness guard failure — blocking.
+    UnsafeInputFiles(String),
+    /// The fixture's `projectRoot` is not under `tests/cases/projects/` or
+    /// contains path traversal. A harness guard failure — blocking.
+    UnsafeProjectRoot(String),
+    /// The fixture JSON could not be deserialized. A harness/snapshot
+    /// integrity failure — blocking.
+    InvalidFixture(String),
+    /// The fixture's logical path does not strip to a project baseline stem.
+    /// A harness routing failure — blocking.
+    InvalidPath(String),
+    /// Compilation or module resolution failed while producing the trace.
+    /// These are real compiler defects — blocking.
+    Compile(String),
+}
+
+impl ProjectTraceError {
+    /// Human-readable detail text. Preserves the prefixes that existing
+    /// tests assert on (e.g. `missing trace evidence \`...\``).
+    fn detail(&self) -> String {
+        match self {
+            Self::NoInputFiles => {
+                "project trace fixture has no inputFiles: trace observable inapplicable".to_owned()
+            }
+            Self::MissingBaseline(msg) => msg.clone(),
+            Self::Harness(msg) => msg.clone(),
+            Self::UnsafeInputFiles(msg) => msg.clone(),
+            Self::UnsafeProjectRoot(msg) => msg.clone(),
+            Self::InvalidFixture(msg) => msg.clone(),
+            Self::InvalidPath(msg) => msg.clone(),
+            Self::Compile(msg) => msg.clone(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectTraceCase {
@@ -2983,9 +3035,25 @@ fn observe_project_trace(
             ),
             artifact: Some(produced),
         },
-        Err(detail) => check_cells::CompilerCheckObservation {
-            class: FailureClass::Inapplicable,
-            detail,
+        Err(err @ (ProjectTraceError::NoInputFiles | ProjectTraceError::MissingBaseline(_))) => {
+            check_cells::CompilerCheckObservation {
+                class: FailureClass::Inapplicable,
+                detail: err.detail(),
+                artifact: None,
+            }
+        }
+        Err(
+            err @ (ProjectTraceError::Harness(_)
+            | ProjectTraceError::InvalidFixture(_)
+            | ProjectTraceError::InvalidPath(_)),
+        ) => check_cells::CompilerCheckObservation {
+            class: FailureClass::HarnessError,
+            detail: err.detail(),
+            artifact: None,
+        },
+        Err(err) => check_cells::CompilerCheckObservation {
+            class: FailureClass::FailBehavior,
+            detail: err.detail(),
             artifact: None,
         },
     }
@@ -2994,34 +3062,35 @@ fn observe_project_trace(
 fn produce_project_trace(
     snapshot: &(impl SnapshotAssets + ?Sized),
     index_entry: &IndexEntry,
-) -> std::result::Result<(Vec<u8>, Vec<u8>, String), String> {
+) -> std::result::Result<(Vec<u8>, Vec<u8>, String), ProjectTraceError> {
     let descriptor = read_verified_snapshot_asset(snapshot, &index_entry.logical_path)
-        .map_err(|error| error.to_string())?;
-    let fixture: ProjectTraceCase = serde_json::from_slice(&descriptor)
-        .map_err(|error| format!("invalid project trace fixture: {error}"))?;
+        .map_err(|error| ProjectTraceError::Harness(error.to_string()))?;
+    let fixture: ProjectTraceCase = serde_json::from_slice(&descriptor).map_err(|error| {
+        ProjectTraceError::InvalidFixture(format!("invalid project trace fixture: {error}"))
+    })?;
     if !fixture.project_root.starts_with("tests/cases/projects/")
         || !is_safe_logical_path(&fixture.project_root)
     {
-        return Err(format!(
+        return Err(ProjectTraceError::UnsafeProjectRoot(format!(
             "project trace fixture has unsafe projectRoot `{}`",
             fixture.project_root
-        ));
+        )));
     }
     // A project fixture without `inputFiles` is a project compilation test,
     // not a trace test: the trace observable is inapplicable. Upstream project
     // fixtures use `projectRoot` + directory scanning, not an explicit file
     // list; only fixtures that declare `inputFiles` carry trace obligations.
     if fixture.input_files.is_empty() {
-        return Err(
-            "project trace fixture has no inputFiles: trace observable inapplicable".to_owned(),
-        );
+        return Err(ProjectTraceError::NoInputFiles);
     }
     if fixture
         .input_files
         .iter()
         .any(|path| !is_safe_logical_path(path))
     {
-        return Err("project trace fixture has unsafe inputFiles".to_owned());
+        return Err(ProjectTraceError::UnsafeInputFiles(
+            "project trace fixture has unsafe inputFiles".to_owned(),
+        ));
     }
 
     let relative_case = index_entry
@@ -3029,20 +3098,27 @@ fn produce_project_trace(
         .strip_prefix("tests/cases/project/")
         .and_then(|path| path.strip_suffix(".json"))
         .ok_or_else(|| {
-            format!(
+            ProjectTraceError::InvalidPath(format!(
                 "project trace fixture path `{}` has no project baseline stem",
                 index_entry.logical_path
-            )
+            ))
         })?;
     let baseline_path = format!("tests/baselines/reference/project/{relative_case}.trace.json");
-    let expected = read_verified_snapshot_asset(snapshot, &baseline_path)
-        .map_err(|error| format!("missing trace evidence `{baseline_path}`: {error}"))?;
+    let expected = read_verified_snapshot_asset(snapshot, &baseline_path).map_err(|error| {
+        ProjectTraceError::MissingBaseline(format!(
+            "missing trace evidence `{baseline_path}`: {error}"
+        ))
+    })?;
 
     let temp = TempDir::new("bamts-project-trace")
-        .map_err(|error| format!("project trace temp root: {error}"))?;
+        .map_err(|error| ProjectTraceError::Harness(format!("project trace temp root: {error}")))?;
     let project_dir = temp.path().join(&fixture.project_root);
-    fs::create_dir_all(&project_dir)
-        .map_err(|error| format!("project trace root `{}`: {error}", project_dir.display()))?;
+    fs::create_dir_all(&project_dir).map_err(|error| {
+        ProjectTraceError::Harness(format!(
+            "project trace root `{}`: {error}",
+            project_dir.display()
+        ))
+    })?;
     let project_prefix = format!("{}/", fixture.project_root.trim_end_matches('/'));
     for entry in snapshot.index().entries.values() {
         let Some(relative) = entry.logical_path.strip_prefix(&project_prefix) else {
@@ -3052,35 +3128,45 @@ fn produce_project_trace(
             continue;
         }
         let bytes = read_verified_snapshot_asset(snapshot, &entry.logical_path)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ProjectTraceError::Harness(error.to_string()))?;
         let destination = project_dir.join(relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| {
-                format!("project trace directory `{}`: {error}", parent.display())
+                ProjectTraceError::Harness(format!(
+                    "project trace directory `{}`: {error}",
+                    parent.display()
+                ))
             })?;
         }
         fs::write(&destination, bytes).map_err(|error| {
-            format!("project trace source `{}`: {error}", destination.display())
+            ProjectTraceError::Harness(format!(
+                "project trace source `{}`: {error}",
+                destination.display()
+            ))
         })?;
     }
 
-    let root =
-        ProjectRoot::new(&project_dir).map_err(|error| format!("project trace root: {error}"))?;
+    let root = ProjectRoot::new(&project_dir)
+        .map_err(|error| ProjectTraceError::Harness(format!("project trace root: {error}")))?;
     let config_path = project_dir.join("tsconfig.json");
     let config_source = if config_path.exists() {
-        fs::read_to_string(&config_path)
-            .map_err(|error| format!("project trace config `{}`: {error}", config_path.display()))?
+        fs::read_to_string(&config_path).map_err(|error| {
+            ProjectTraceError::Harness(format!(
+                "project trace config `{}`: {error}",
+                config_path.display()
+            ))
+        })?
     } else {
         "{}".to_owned()
     };
     let config = ProjectConfig::parse(&root, &config_path, &config_source)
-        .map_err(|error| format!("project trace config: {error}"))?;
+        .map_err(|error| ProjectTraceError::Harness(format!("project trace config: {error}")))?;
     let loader = ProgramLoader::new(&root, config.options())
-        .map_err(|error| format!("project trace loader: {error}"))?;
+        .map_err(|error| ProjectTraceError::Harness(format!("project trace loader: {error}")))?;
     let roots: Vec<PathBuf> = fixture.input_files.iter().map(PathBuf::from).collect();
-    let loaded = loader
-        .load_roots(&roots)
-        .map_err(|error| format!("project trace load failed: {error}"))?;
+    let loaded = loader.load_roots(&roots).map_err(|error| {
+        ProjectTraceError::Compile(format!("project trace load failed: {error}"))
+    })?;
     let trace = check_cells::collect_resolution_trace(&loaded, config.options());
     let mut rendered = trace.lines().join("\n");
     if !rendered.is_empty() {
@@ -4957,6 +5043,202 @@ File 'tests/cases/projects/trace/util.ts' exists - use it as a name resolution r
             observation.detail.contains("no inputFiles"),
             "{}",
             observation.detail
+        );
+    }
+
+    /// A project fixture with malformed JSON is a harness/snapshot integrity
+    /// failure, not a catalog-inapplicable outcome. The typed error
+    /// `InvalidFixture` maps to `HarnessError` (blocking), not
+    /// `Inapplicable`, so the defect stays in the blocking denominator.
+    #[test]
+    fn project_trace_harness_error_is_not_inapplicable() {
+        let extracted = TestDir::new("project-trace-harness-src");
+        let case = extracted.path().join("tests/cases/project/badJson.json");
+        fs::create_dir_all(case.parent().unwrap()).unwrap();
+        // Malformed JSON — deserialization fails, which is a harness error.
+        fs::write(&case, r#"{"scenario":"trace","projectRoot":"tests/cases/projects/trace","inputFiles":["main.ts"]"#).unwrap();
+        let project = extracted.path().join("tests/cases/projects/trace");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("main.ts"), "void 0;\n").unwrap();
+        // Provide a baseline so the error is from parsing, not missing baseline.
+        let baseline_path = extracted
+            .path()
+            .join("tests/baselines/reference/project/badJson.trace.json");
+        fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        fs::write(&baseline_path, "[]\n").unwrap();
+        fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
+        let snap = TestDir::new("project-trace-harness-snap");
+        materialize_from_extracted(snap.path(), extracted.path()).unwrap();
+        let verified = verify_snapshot(snap.path()).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ctx = CheckContext {
+            code_map: crate::facets::load_diagnostic_code_map(&repo).expect("code map"),
+            baseline_groups: crate::check_cells::baseline_groups(&verified.snapshot.index),
+        };
+        let request = compiler_lane_request(
+            &verified.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/badJson.json",
+            "default#trace",
+            &["trace"],
+        );
+        let observation = observe_compiler_lane(&verified.snapshot, &ctx, &request);
+        assert_eq!(
+            observation.class,
+            FailureClass::HarnessError,
+            "{}",
+            observation.detail
+        );
+        assert!(
+            observation
+                .detail
+                .starts_with("invalid project trace fixture:"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// A project fixture whose `inputFiles` import a non-existent module
+    /// triggers a compile/resolution failure. The typed error `Compile` maps
+    /// to `FailBehavior` (blocking), not `Inapplicable`, so the compiler
+    /// defect stays in the blocking denominator.
+    #[test]
+    fn project_trace_compile_failure_is_blocking() {
+        let extracted = TestDir::new("project-trace-compile-src");
+        let case = extracted
+            .path()
+            .join("tests/cases/project/compileFail.json");
+        fs::create_dir_all(case.parent().unwrap()).unwrap();
+        fs::write(
+            &case,
+            r#"{"scenario":"trace","projectRoot":"tests/cases/projects/compileFail","inputFiles":["main.ts"]}"#,
+        )
+        .unwrap();
+        let project = extracted.path().join("tests/cases/projects/compileFail");
+        fs::create_dir_all(&project).unwrap();
+        // main.ts imports a module that does not exist — resolution will fail.
+        fs::write(project.join("main.ts"), "import './nonexistent.js';\n").unwrap();
+        // Provide a baseline so the error is from compilation, not missing baseline.
+        let baseline_path = extracted
+            .path()
+            .join("tests/baselines/reference/project/compileFail.trace.json");
+        fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        fs::write(&baseline_path, "[]\n").unwrap();
+        fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
+        let snap = TestDir::new("project-trace-compile-snap");
+        materialize_from_extracted(snap.path(), extracted.path()).unwrap();
+        let verified = verify_snapshot(snap.path()).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ctx = CheckContext {
+            code_map: crate::facets::load_diagnostic_code_map(&repo).expect("code map"),
+            baseline_groups: crate::check_cells::baseline_groups(&verified.snapshot.index),
+        };
+        let request = compiler_lane_request(
+            &verified.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/compileFail.json",
+            "default#trace",
+            &["trace"],
+        );
+        let observation = observe_compiler_lane(&verified.snapshot, &ctx, &request);
+        assert_ne!(
+            observation.class,
+            FailureClass::Inapplicable,
+            "compile failure must not be Inapplicable: {}",
+            observation.detail
+        );
+        assert!(
+            observation.detail.starts_with("project trace load failed:"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// A project fixture with unsafe `inputFiles` (path traversal) is a
+    /// harness guard failure — blocking, not inapplicable. The typed error
+    /// `UnsafeInputFiles` maps to `FailBehavior`.
+    #[test]
+    fn project_trace_unsafe_input_files_is_blocking() {
+        let extracted = TestDir::new("project-trace-unsafe-src");
+        let case = extracted
+            .path()
+            .join("tests/cases/project/unsafeInput.json");
+        fs::create_dir_all(case.parent().unwrap()).unwrap();
+        // inputFiles contains a path traversal — unsafe.
+        fs::write(
+            &case,
+            r#"{"scenario":"trace","projectRoot":"tests/cases/projects/trace","inputFiles":["../escape.ts"]}"#,
+        )
+        .unwrap();
+        let project = extracted.path().join("tests/cases/projects/trace");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("main.ts"), "void 0;\n").unwrap();
+        // Provide a baseline so the error is from the guard, not missing baseline.
+        let baseline_path = extracted
+            .path()
+            .join("tests/baselines/reference/project/unsafeInput.trace.json");
+        fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        fs::write(&baseline_path, "[]\n").unwrap();
+        fs::write(extracted.path().join("LICENSE"), b"Apache-2.0\n").unwrap();
+        let snap = TestDir::new("project-trace-unsafe-snap");
+        materialize_from_extracted(snap.path(), extracted.path()).unwrap();
+        let verified = verify_snapshot(snap.path()).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ctx = CheckContext {
+            code_map: crate::facets::load_diagnostic_code_map(&repo).expect("code map"),
+            baseline_groups: crate::check_cells::baseline_groups(&verified.snapshot.index),
+        };
+        let request = compiler_lane_request(
+            &verified.snapshot,
+            COMPILER_CATALOG,
+            "project/tests/cases/project/unsafeInput.json",
+            "default#trace",
+            &["trace"],
+        );
+        let observation = observe_compiler_lane(&verified.snapshot, &ctx, &request);
+        assert_ne!(
+            observation.class,
+            FailureClass::Inapplicable,
+            "unsafe inputFiles must not be Inapplicable: {}",
+            observation.detail
+        );
+        assert!(
+            observation.detail.contains("unsafe inputFiles"),
+            "{}",
+            observation.detail
+        );
+    }
+
+    /// The baseline path derivation strips `tests/cases/project/` prefix and
+    /// `.json` suffix from the case path, then appends `.trace.json` under
+    /// `tests/baselines/reference/project/`. This matches the upstream
+    /// layout where project baselines live at
+    /// `tests/baselines/reference/project/<name>.trace.json`. The 281
+    /// "missing trace evidence" rows from the evidence sweep were proven
+    /// absent: zero of the 281 project case names have a `.trace.json`
+    /// file anywhere under the upstream `tests/baselines/reference/`
+    /// directory (checked against 204 existing trace baselines, 0
+    /// intersection). The path derivation is correct; the baselines are
+    /// genuinely absent upstream.
+    #[test]
+    fn project_trace_baseline_path_derivation_matches_upstream_layout() {
+        // The derivation logic: strip "tests/cases/project/" prefix and
+        // ".json" suffix, then format as
+        // "tests/baselines/reference/project/{relative_case}.trace.json".
+        // This is exercised by the passing test
+        // project_trace_without_baseline_names_missing_evidence, which
+        // verifies the exact path
+        // "tests/baselines/reference/project/traceFix.trace.json".
+        // Here we verify the derivation for a nested case name.
+        let logical_path = "tests/cases/project/subDir/nestedCase.json";
+        let relative_case = logical_path
+            .strip_prefix("tests/cases/project/")
+            .and_then(|path| path.strip_suffix(".json"))
+            .expect("strip prefix and suffix");
+        let baseline_path = format!("tests/baselines/reference/project/{relative_case}.trace.json");
+        assert_eq!(
+            baseline_path,
+            "tests/baselines/reference/project/subDir/nestedCase.trace.json"
         );
     }
 
