@@ -201,9 +201,25 @@ impl FrontendMode {
 
 fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option<EmitOptions> {
     let mut options = mode.emit_options()?;
-    if program.is_commonjs() {
-        options.module = Some(ModuleKind::CommonJs);
-    }
+
+    // Shared mapping: target, always_strict, module. The program carries the
+    // resolved strict-family and es5 flags through `check_options()`; mapping
+    // them here through `apply_emit_fields` — the same method the project
+    // (CLI) path uses — ensures the lane and the CLI cannot diverge on
+    // downleveling or the strict-mode prologue.
+    let check = program.check_options();
+    let target = if check.es5() {
+        emitter::ScriptTarget::Es5
+    } else {
+        emitter::ScriptTarget::EsNext
+    };
+    let always_strict = check.always_strict();
+    let module = program.is_commonjs().then_some(ModuleKind::CommonJs);
+    options.apply_emit_fields(target, always_strict, module);
+
+    // JSX routing is JavaScript-specific and already shared with the CLI path,
+    // which applies the same overrides from `program.jsx()` after its base
+    // `emit_options` call.
     if mode == FrontendMode::JavaScript {
         match program.jsx_routing_decision(ProgramOutputKind::JavaScript) {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
@@ -607,8 +623,9 @@ fn canonicalize(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrontendMode, FrontendRequest, canonicalize, compile_frontend, compile_program_frontend,
-        compile_program_frontend_with_cancel, resolved_checker_edges_with_cancel,
+        FrontendMode, FrontendRequest, ProgramFrontendOutput, canonicalize, compile_frontend,
+        compile_program_frontend, compile_program_frontend_with_cancel,
+        resolved_checker_edges_with_cancel,
     };
     use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticSeverity};
     use crate::lint::{LintProfile, LintTable};
@@ -641,6 +658,40 @@ mod tests {
             no_emit,
             no_emit_on_error,
         }
+    }
+
+    fn program_fixture_with_config(
+        source: &str,
+        config_source: &str,
+    ) -> (PathBuf, ResolvedProgram) {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root_path = std::env::temp_dir().join(format!(
+            "bamts-pipeline-emit-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root_path).expect("create pipeline fixture");
+        std::fs::write(root_path.join("main.ts"), source).expect("write pipeline fixture");
+        let root = ProjectRoot::new(std::fs::canonicalize(&root_path).expect("canonical fixture"))
+            .expect("valid project root");
+        let config = ProjectConfig::parse(&root, root_path.join("tsconfig.json"), config_source)
+            .expect("valid project config");
+        let program = ProgramLoader::new(&root, config.options())
+            .expect("construct program loader")
+            .load("main.ts")
+            .expect("load fixture program");
+        (root_path, program)
+    }
+
+    fn entrypoint_javascript(output: &ProgramFrontendOutput) -> String {
+        let module = output
+            .modules()
+            .iter()
+            .find(|m| m.source_file().source_id() == output.entrypoint_id())
+            .expect("entrypoint module present");
+        let emit = module.emit().expect("javascript mode emits");
+        let js = emit.javascript.as_ref().expect("javascript slot present");
+        js.code.clone()
     }
     fn program_fixture(source: &str) -> (PathBuf, ResolvedProgram) {
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -1059,6 +1110,62 @@ mod tests {
             assert_eq!(legacy.diagnostics(), canonical.diagnostics());
             assert_eq!(legacy.emit().is_some(), canonical.emit().is_some());
         }
+        std::fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn es5_always_strict_emits_var_lowering_and_prologue_through_pipeline() {
+        // A script (no imports/exports) compiled with target: es5 and
+        // alwaysStrict: true must emit `var` (not `let`) and a "use strict"
+        // prologue. Before the fix, program_emit_options used
+        // EmitOptions::default() (target EsNext, always_strict false) so the
+        // lane never downleveled and never wrote the prologue.
+        let source = "let value = 1;";
+        let config = r#"{"compilerOptions":{"target":"es5","alwaysStrict":true}}"#;
+        let (root_path, program) = program_fixture_with_config(source, config);
+
+        assert!(program.check_options().es5(), "fixture should carry es5");
+        assert!(
+            program.check_options().always_strict(),
+            "fixture should carry always_strict"
+        );
+
+        let output = compile_program_frontend(&program, FrontendMode::JavaScript);
+        let js = entrypoint_javascript(&output);
+
+        assert!(
+            js.starts_with("\"use strict\";\n"),
+            "expected strict prologue, got: {js:?}"
+        );
+        assert!(
+            js.contains("var "),
+            "expected var lowering for es5, got: {js:?}"
+        );
+        assert!(
+            !js.contains("let "),
+            "let should not appear in es5 output, got: {js:?}"
+        );
+        std::fs::remove_dir_all(root_path).unwrap();
+    }
+
+    #[test]
+    fn es2015_module_emits_no_strict_prologue_through_pipeline() {
+        // An external module (has import/export) compiled with module: es2015
+        // must NOT receive a "use strict" prologue, even when alwaysStrict is
+        // true. The strict_prelude rule suppresses the prologue for ES module
+        // output; this test proves the module option reaches emit through the
+        // pipeline path.
+        let source = "export const value = 1;";
+        let config = r#"{"compilerOptions":{"module":"es2015","alwaysStrict":true}}"#;
+        let (root_path, program) = program_fixture_with_config(source, config);
+
+        let output = compile_program_frontend(&program, FrontendMode::JavaScript);
+        let js = entrypoint_javascript(&output);
+
+        assert!(
+            !js.starts_with("\"use strict\";\n"),
+            "ES module output should not have strict prologue, got: {js:?}"
+        );
         std::fs::remove_dir_all(root_path).unwrap();
     }
 }

@@ -681,6 +681,11 @@ fn source_map_names(
 }
 
 fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions, Vec<Diagnostic>) {
+    // All fields go through the directive parser so invalid-value diagnostics
+    // are produced exactly as before. The shared fields (target, always_strict,
+    // module) are then re-applied through `apply_emit_fields` — the single
+    // mapping point the project (CLI) and program (lane) paths share — so the
+    // two paths cannot diverge on downleveling or the strict-mode prologue.
     let mut directives = BTreeMap::new();
     for (name, value) in [
         ("target", options.target()),
@@ -703,7 +708,18 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
             directives.insert(name.to_owned(), String::from("true"));
         }
     }
-    EmitOptions::from_directives(&directives, source_id)
+    let (mut emit_options, diagnostics) = EmitOptions::from_directives(&directives, source_id);
+
+    // Re-apply the shared fields through the single mapping point.
+    let target = options
+        .target()
+        .and_then(emitter::parse_target)
+        .unwrap_or(emitter::ScriptTarget::EsNext);
+    let always_strict = options.always_strict();
+    let module = options.module().and_then(emitter::parse_module);
+    emit_options.apply_emit_fields(target, always_strict, module);
+
+    (emit_options, diagnostics)
 }
 
 fn single_project_graph(project: &EffectiveProject) -> Result<ReferenceGraph, ProjectCompileError> {

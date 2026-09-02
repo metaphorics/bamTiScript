@@ -34,7 +34,8 @@ use crate::syntax::*;
 use declarations::DeclarationOptions;
 use helpers::{HelperOptions, HelperStyle};
 use sourcemap::{LineColumn, SourceMap, SourceMapBuilder};
-use transforms::{LanguageFeature, ScriptTarget, TransformOptions};
+pub use transforms::ScriptTarget;
+use transforms::{LanguageFeature, TransformOptions};
 
 /// Stable diagnostic identifiers produced by the emitter.
 pub mod codes {
@@ -186,6 +187,23 @@ impl EmitOptions {
         diagnostics.sort();
         diagnostics.dedup();
         (options, diagnostics)
+    }
+
+    /// Applies the emit-relevant fields that the project (CLI) and program
+    /// (lane) paths must agree on: `target`, `always_strict`, and `module`.
+    /// This is the single mapping point so the two paths cannot diverge on
+    /// downleveling or the strict-mode prologue.
+    pub fn apply_emit_fields(
+        &mut self,
+        target: ScriptTarget,
+        always_strict: bool,
+        module: Option<ModuleKind>,
+    ) {
+        self.target = target;
+        self.always_strict = always_strict;
+        if let Some(module) = module {
+            self.module = Some(module);
+        }
     }
 
     /// Applies one compiler directive, returning a typed diagnostic on failure.
@@ -622,7 +640,7 @@ pub(crate) fn print_with_jsx_plan(
     }
 }
 
-fn parse_target(value: &str) -> Option<ScriptTarget> {
+pub(crate) fn parse_target(value: &str) -> Option<ScriptTarget> {
     match value.trim().to_ascii_lowercase().as_str() {
         "es3" => Some(ScriptTarget::Es3),
         "es5" => Some(ScriptTarget::Es5),
@@ -641,7 +659,7 @@ fn parse_target(value: &str) -> Option<ScriptTarget> {
     }
 }
 
-fn parse_module(value: &str) -> Option<ModuleKind> {
+pub(crate) fn parse_module(value: &str) -> Option<ModuleKind> {
     match value.trim().to_ascii_lowercase().as_str() {
         "commonjs" => Some(ModuleKind::CommonJs),
         "amd" => Some(ModuleKind::Amd),
@@ -3220,10 +3238,10 @@ impl<'a> Emitter<'a> {
 
     /// Returns `true` if `expression` is a bare `Symbol()` call.
     fn is_symbol_call(&self, expression: &crate::syntax::Expression) -> bool {
-        if let crate::syntax::Expression::Call(call) = expression {
-            if let crate::syntax::Expression::Identifier(ident) = call.callee.data() {
-                return self.text(ident.data().token()) == Some("Symbol");
-            }
+        if let crate::syntax::Expression::Call(call) = expression
+            && let crate::syntax::Expression::Identifier(ident) = call.callee.data()
+        {
+            return self.text(ident.data().token()) == Some("Symbol");
         }
         false
     }
@@ -3416,13 +3434,13 @@ impl<'a> Emitter<'a> {
                 if let Some(annotation) = &property.type_annotation {
                     self.raw(": ");
                     self.emit_type(&annotation.data().type_node);
-                } else if let Some(initializer) = &property.initializer {
-                    if let Some(type_id) = self.model.node_type(initializer.id()) {
-                        let rendered = render_type(self.model, type_id);
-                        if !rendered.is_empty() {
-                            self.raw(": ");
-                            self.raw(&rendered);
-                        }
+                } else if let Some(initializer) = &property.initializer
+                    && let Some(type_id) = self.model.node_type(initializer.id())
+                {
+                    let rendered = render_type(self.model, type_id);
+                    if !rendered.is_empty() {
+                        self.raw(": ");
+                        self.raw(&rendered);
                     }
                 }
                 self.raw(";");
