@@ -201,8 +201,15 @@ pub struct TypeRelations<'table> {
     /// Number of directed pairs introduced by each active signature frame.
     parameter_alias_frames: RefCell<Vec<usize>>,
     /// Signature type parameters erased to `any` for the comparable relation.
-    /// Non-empty only while one signature comparison is active.
     erased_parameters: RefCell<Vec<SymbolId>>,
+    /// Type parameters inferred from the non-generic signature during a
+    /// generic-to-non-generic function comparison, mapped to their inferred
+    /// concrete types. Non-empty only inside such a comparison.
+    inferred_type_arguments: RefCell<HashMap<SymbolId, TypeId>>,
+    /// All type-parameter symbols declared by the signatures currently being
+    /// compared, so unconstrained parameters can be treated as `unknown`
+    /// (their implicit constraint) without consulting the symbol table.
+    known_type_parameters: RefCell<HashSet<SymbolId>>,
     /// Cooperative cancellation signal. `None` for the non-cancellable path.
     cancel: Option<bamts_cancel::CancellationToken>,
     #[cfg(test)]
@@ -234,6 +241,8 @@ impl<'table> TypeRelations<'table> {
             parameter_aliases: RefCell::new(Vec::new()),
             parameter_alias_frames: RefCell::new(Vec::new()),
             erased_parameters: RefCell::new(Vec::new()),
+            inferred_type_arguments: RefCell::new(HashMap::new()),
+            known_type_parameters: RefCell::new(HashSet::new()),
             cancel,
             #[cfg(test)]
             computed_relations: Cell::new(0),
@@ -750,7 +759,11 @@ impl<'table> TypeRelations<'table> {
             Type::This { constraint, .. } => {
                 self.type_reaches_free_symbol(*constraint, symbol, search)
             }
-            Type::ConstructorType { arguments, structural, .. } => {
+            Type::ConstructorType {
+                arguments,
+                structural,
+                ..
+            } => {
                 let arguments_reach =
                     self.any_types_reach_free_symbol(arguments.iter().copied(), symbol, search);
                 if arguments_reach == Some(true) {
@@ -1004,6 +1017,46 @@ impl<'table> TypeRelations<'table> {
             (Type::This { constraint, .. }, _) => self.relates(*constraint, target, strictness),
             (Type::Never, Type::This { .. }) => true,
             (_, Type::This { .. }) => false,
+            // Inferred type argument: a generic signature's type parameter
+            // that was positionally inferred from the non-generic counterpart.
+            // Substitute the inferred concrete type and continue.
+            (Type::Named(symbol), _)
+                if let Some(&inferred) = self.inferred_type_arguments.borrow().get(symbol) =>
+            {
+                inferred != source && self.relates(inferred, target, strictness)
+            }
+            (_, Type::Named(symbol))
+                if let Some(&inferred) = self.inferred_type_arguments.borrow().get(symbol) =>
+            {
+                inferred != target && self.relates(source, inferred, strictness)
+            }
+            // Generic signatures compare their type parameters by position.
+            // Resolve that temporary identity before consulting constraints;
+            // otherwise two renamed constrained parameters decay to their
+            // bounds and can never match each other.
+            (Type::Named(source_symbol), Type::Named(target_symbol))
+                if self
+                    .parameter_aliases
+                    .borrow()
+                    .contains(&(*source_symbol, *target_symbol)) =>
+            {
+                true
+            }
+            // A known type parameter without a declared constraint has an
+            // implicit constraint of `unknown`: everything flows in, nothing
+            // flows out — exactly the `unknown` arms below.
+            (Type::Named(symbol), _)
+                if self.known_type_parameters.borrow().contains(symbol)
+                    && self.table.type_parameter_constraint(*symbol).is_none() =>
+            {
+                false
+            }
+            (_, Type::Named(symbol))
+                if self.known_type_parameters.borrow().contains(symbol)
+                    && self.table.type_parameter_constraint(*symbol).is_none() =>
+            {
+                true
+            }
             (Type::Named(symbol), _)
                 if strictness == Strictness::Comparable && self.is_erased_parameter(*symbol) =>
             {
@@ -1028,7 +1081,7 @@ impl<'table> TypeRelations<'table> {
                 true
             }
             (_, Type::Named(symbol))
-                if strictness == Strictness::Comparable
+                if matches!(strictness, Strictness::Assignable | Strictness::StrictNull)
                     && self.table.type_parameter_constraint(*symbol).is_some() =>
             {
                 let constraint = self
@@ -1040,18 +1093,6 @@ impl<'table> TypeRelations<'table> {
             // `unknown` is the top type: everything flows in, nothing flows out.
             (_, Type::Unknown) => true,
             (Type::Unknown, _) => false,
-            // Generic signatures compare their type parameters by position.
-            // Resolve that temporary identity before consulting constraints;
-            // otherwise two renamed constrained parameters decay to their
-            // bounds and can never match each other.
-            (Type::Named(source_symbol), Type::Named(target_symbol))
-                if self
-                    .parameter_aliases
-                    .borrow()
-                    .contains(&(*source_symbol, *target_symbol)) =>
-            {
-                true
-            }
             // A value whose type is a type parameter carries at least its
             // declared constraint. Class and interface names are absent from
             // this table and keep their nominal handling below.
@@ -1243,6 +1284,30 @@ impl<'table> TypeRelations<'table> {
             (Type::Function(source_sig), Type::Function(target_sig)) => {
                 self.function_relates(source_sig, target_sig, strictness)
             }
+            // A function is assignable to an object type with call signatures
+            // when the object type has no required members beyond those
+            // signatures and the function satisfies at least one call signature.
+            (Type::Function(source_sig), Type::ObjectType(target_object)) => {
+                target_object.properties.iter().all(|p| p.optional())
+                    && target_object.construct_signatures.is_empty()
+                    && target_object.index_signatures.is_empty()
+                    && target_object.iterator_property.is_none()
+                    && target_object.async_iterator_property.is_none()
+                    && target_object.generator_return.is_none()
+                    && self.signature_sets_relate(
+                        std::slice::from_ref(source_sig),
+                        &target_object.call_signatures,
+                        strictness,
+                    )
+            }
+            // An object type with call signatures is assignable to a function
+            // when at least one call signature satisfies the target function.
+            (Type::ObjectType(source_object), Type::Function(target_sig)) => self
+                .signature_sets_relate(
+                    &source_object.call_signatures,
+                    std::slice::from_ref(target_sig),
+                    strictness,
+                ),
             // `object` is the non-primitive type: object literals, arrays,
             // functions, and class instances all flow into it.
             (
@@ -1332,7 +1397,25 @@ impl<'table> TypeRelations<'table> {
         }
         let (source_parameters, target_parameters) =
             (source.type_parameters(), target.type_parameters());
-        if source_parameters.is_empty() || source_parameters.len() != target_parameters.len() {
+        if source_parameters.is_empty() && target_parameters.is_empty() {
+            return compare();
+        }
+        // When one side is generic and the other is not, TypeScript
+        // instantiates the generic side. For assignability we approximate
+        // this with positional inference from the non-generic side's
+        // parameter types, falling back to the constraint (or `unknown` for
+        // unconstrained parameters) for type parameters that cannot be
+        // inferred. Strict subtype keeps the nominal comparison.
+        if source_parameters.len() != target_parameters.len() {
+            if matches!(strictness, Strictness::Assignable | Strictness::StrictNull) {
+                return self.with_inferred_parameters(
+                    source,
+                    target,
+                    source_parameters,
+                    target_parameters,
+                    compare,
+                );
+            }
             return compare();
         }
         let same_declaration = source_parameters == target_parameters;
@@ -1380,6 +1463,237 @@ impl<'table> TypeRelations<'table> {
         drop(aliases);
         self.active_context.set(previous_context);
         result
+    }
+
+    /// Relates a generic signature to a non-generic one (or two generics
+    /// with different arities) by inferring the generic side's type
+    /// parameters from the non-generic counterpart's parameter types.
+    ///
+    /// Positional inference matches each source parameter type against the
+    /// corresponding target parameter type. When the source parameter is a
+    /// bare type parameter `T`, it is inferred as the target parameter type.
+    /// When the source parameter is a structural type containing `T` (e.g.
+    /// `T[]`, `(arg: T) => U`), inference recurses into the structure. Type
+    /// parameters that cannot be inferred from any parameter position keep
+    /// their declared constraint (or the implicit `unknown` when
+    /// unconstrained), which is handled by the `known_type_parameters` arms
+    /// in `relates_uncached`.
+    fn with_inferred_parameters(
+        &self,
+        source: &FunctionSignature,
+        target: &FunctionSignature,
+        source_parameters: &[SymbolId],
+        target_parameters: &[SymbolId],
+        compare: impl FnOnce() -> bool,
+    ) -> bool {
+        let previous_context = self.active_context.get();
+
+        // Register source type parameters as known so unconstrained ones
+        // are treated as `unknown` (their implicit constraint). Target TPs
+        // are only registered when the source is also generic — otherwise
+        // the target's unconstrained TPs should go through the normal
+        // constraint arms, not be collapsed to `unknown` (which would make
+        // everything assignable to them).
+        let mut known = self.known_type_parameters.borrow_mut();
+        known.extend(source_parameters.iter().copied());
+        if !source_parameters.is_empty() {
+            known.extend(target_parameters.iter().copied());
+        }
+        drop(known);
+
+        // Infer source type parameters from target parameter types.
+        let mut inferred = self.inferred_type_arguments.borrow_mut();
+        let inferred_added: Vec<SymbolId>;
+        if !source_parameters.is_empty() && target_parameters.is_empty() {
+            // Source is generic, target is not: infer source TPs from target params.
+            inferred_added = source_parameters.to_vec();
+            for &tp in source_parameters {
+                inferred
+                    .entry(tp)
+                    .or_insert_with(|| self.infer_type_argument(tp, source, target));
+            }
+        } else if source_parameters.is_empty() && !target_parameters.is_empty() {
+            // Target is generic, source is not: infer target TPs from
+            // source parameter types so the comparison uses the concrete
+            // instantiations. Only infer when a real match is found —
+            // falling back to `unknown` would make everything assignable
+            // to the target, which is wrong.
+            let mut added: Vec<SymbolId> = Vec::new();
+            let target_params = target.parameters();
+            let source_params = source.parameters();
+            for &tp in target_parameters {
+                for (tp_param, src_param) in target_params.iter().zip(source_params.iter()) {
+                    if let Some(inferred_type) =
+                        self.infer_from_type(tp, tp_param.type_id(), src_param.type_id())
+                    {
+                        inferred.entry(tp).or_insert(inferred_type);
+                        added.push(tp);
+                        break;
+                    }
+                }
+            }
+            inferred_added = added;
+        } else {
+            // Both generic with different arities: infer source TPs from
+            // target params (with `unknown` fallback for unconstrained),
+            // and target TPs from source params (only on real match —
+            // `unknown` fallback would make everything assignable).
+            let mut added: Vec<SymbolId> = source_parameters.to_vec();
+            for &tp in source_parameters {
+                inferred
+                    .entry(tp)
+                    .or_insert_with(|| self.infer_type_argument(tp, source, target));
+            }
+            let target_params = target.parameters();
+            let source_params = source.parameters();
+            for &tp in target_parameters {
+                for (tp_param, src_param) in target_params.iter().zip(source_params.iter()) {
+                    if let Some(inferred_type) =
+                        self.infer_from_type(tp, tp_param.type_id(), src_param.type_id())
+                    {
+                        inferred.entry(tp).or_insert(inferred_type);
+                        added.push(tp);
+                        break;
+                    }
+                }
+            }
+            inferred_added = added;
+        }
+        drop(inferred);
+
+        self.refresh_context();
+        let result = compare();
+
+        // Clean up.
+        let mut inferred = self.inferred_type_arguments.borrow_mut();
+        for tp in &inferred_added {
+            inferred.remove(tp);
+        }
+        drop(inferred);
+
+        let mut known = self.known_type_parameters.borrow_mut();
+        // Remove only the ones we added (they were not present before).
+        for tp in source_parameters.iter().chain(target_parameters.iter()) {
+            known.remove(tp);
+        }
+        drop(known);
+
+        self.active_context.set(previous_context);
+        result
+    }
+
+    /// Attempts to infer a single type parameter `tp` by matching the
+    /// parameter types of `generic` against those of `concrete`.
+    fn infer_type_argument(
+        &self,
+        tp: SymbolId,
+        generic: &FunctionSignature,
+        concrete: &FunctionSignature,
+    ) -> TypeId {
+        let generic_params = generic.parameters();
+        let concrete_params = concrete.parameters();
+        for (generic_param, concrete_param) in generic_params.iter().zip(concrete_params.iter()) {
+            if let Some(inferred) =
+                self.infer_from_type(tp, generic_param.type_id(), concrete_param.type_id())
+            {
+                return inferred;
+            }
+        }
+        // Could not infer from parameters: use the constraint, or `unknown`.
+        self.table
+            .type_parameter_constraint(tp)
+            .unwrap_or_else(|| self.table.unknown())
+    }
+
+    /// Recursively matches `pattern` (which may contain the type parameter
+    /// `tp`) against `concrete` to infer `tp`'s type.
+    fn infer_from_type(&self, tp: SymbolId, pattern: TypeId, concrete: TypeId) -> Option<TypeId> {
+        match self.table.get(pattern) {
+            Type::Named(symbol) if *symbol == tp => Some(concrete),
+            Type::Array(element) => {
+                if let Type::Array(concrete_element) = self.table.get(concrete) {
+                    self.infer_from_type(tp, *element, *concrete_element)
+                } else if let Type::Tuple(concrete_shape) = self.table.get(concrete) {
+                    // T[] matches a tuple if all elements are the same type.
+                    let mut inferred = None;
+                    for &elem in concrete_shape.all_element_types().iter() {
+                        if let Some(elem_inferred) = self.infer_from_type(tp, *element, elem) {
+                            if let Some(existing) = inferred {
+                                if existing != elem_inferred {
+                                    return None;
+                                }
+                            } else {
+                                inferred = Some(elem_inferred);
+                            }
+                        }
+                    }
+                    inferred
+                } else {
+                    None
+                }
+            }
+            Type::Tuple(shape) => {
+                if let Type::Tuple(concrete_shape) = self.table.get(concrete) {
+                    for (pattern_elem, concrete_elem) in shape
+                        .all_element_types()
+                        .iter()
+                        .zip(concrete_shape.all_element_types().iter())
+                    {
+                        if let Some(inferred) =
+                            self.infer_from_type(tp, *pattern_elem, *concrete_elem)
+                        {
+                            return Some(inferred);
+                        }
+                    }
+                }
+                None
+            }
+            Type::Function(sig) => {
+                if let Type::Function(concrete_sig) = self.table.get(concrete) {
+                    for (pattern_param, concrete_param) in sig
+                        .parameters()
+                        .iter()
+                        .zip(concrete_sig.parameters().iter())
+                    {
+                        // Parameters are contravariant: match pattern param
+                        // against concrete param in reverse.
+                        if let Some(inferred) = self.infer_from_type(
+                            tp,
+                            concrete_param.type_id(),
+                            pattern_param.type_id(),
+                        ) {
+                            return Some(inferred);
+                        }
+                    }
+                    if let Some(inferred) =
+                        self.infer_from_type(tp, sig.return_type(), concrete_sig.return_type())
+                    {
+                        return Some(inferred);
+                    }
+                }
+                None
+            }
+            Type::ObjectType(obj) => {
+                if let Type::ObjectType(concrete_obj) = self.table.get(concrete) {
+                    for pattern_prop in &obj.properties {
+                        if let Some(concrete_prop) = concrete_obj
+                            .properties
+                            .iter()
+                            .find(|p| p.name() == pattern_prop.name())
+                            && let Some(inferred) = self.infer_from_type(
+                                tp,
+                                pattern_prop.type_id(),
+                                concrete_prop.type_id(),
+                            )
+                        {
+                            return Some(inferred);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
     fn with_erased_parameters(
         &self,
@@ -3776,5 +4090,193 @@ mod tests {
         assert!(relations.assignable(parent_source, parent_target));
         relations.dependency_stack.borrow_mut().pop();
         relations.visiting.borrow_mut().remove(&child_relation);
+    }
+
+    // --- Generic function inference tests ---
+
+    /// `<T>(x: T) => T[]` is assignable to `(x: number) => number[]` because
+    /// TypeScript infers `T = number` from the parameter and the instantiated
+    /// return type matches. Without inference the unconstrained `T` would
+    /// fall to `unknown` and the return check would fail.
+    #[test]
+    fn generic_function_infers_type_arguments_from_non_generic_target() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let t = SymbolId::new(600);
+        let named_t = table.named(t);
+        let number_array = table.array(number);
+        let t_array = table.array(named_t);
+        let source = table.function_with_parameter_bounds(
+            vec![t],
+            vec![TypeParameterBounds::NONE],
+            vec![FunctionParameter::new(
+                "x".to_string(),
+                named_t,
+                false,
+                false,
+            )],
+            t_array,
+            false,
+        );
+        let target = table.function(vec![number], number_array);
+        let relations = TypeRelations::new(&table);
+        assert!(
+            relations.assignable(source, target),
+            "generic <T>(x: T) => T[] should be assignable to (x: number) => number[]"
+        );
+    }
+
+    /// `<T>(x: T) => T` is NOT assignable to `(x: number) => string` because
+    /// after inferring `T = number`, the return type `number` is not
+    /// assignable to `string`. This guards against the erasure-as-any
+    /// over-approximation.
+    #[test]
+    fn generic_function_inference_catches_return_type_mismatch() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let t = SymbolId::new(610);
+        let named_t = table.named(t);
+        let source = table.function_with_parameter_bounds(
+            vec![t],
+            vec![TypeParameterBounds::NONE],
+            vec![FunctionParameter::new(
+                "x".to_string(),
+                named_t,
+                false,
+                false,
+            )],
+            named_t,
+            false,
+        );
+        let target = table.function(vec![number], string);
+        let relations = TypeRelations::new(&table);
+        assert!(
+            !relations.assignable(source, target),
+            "generic <T>(x: T) => T should NOT be assignable to (x: number) => string"
+        );
+    }
+
+    /// A non-generic function is assignable to a generic target when the
+    /// source satisfies the type parameter's constraint. `(x: number) => number`
+    /// is assignable to `<T>(x: T) => T` because `number` is assignable to
+    /// the implicit `unknown` constraint.
+    #[test]
+    fn non_generic_function_assignable_to_generic_target() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let t = SymbolId::new(620);
+        let named_t = table.named(t);
+        let source = table.function(vec![number], number);
+        let target = table.function_with_parameter_bounds(
+            vec![t],
+            vec![TypeParameterBounds::NONE],
+            vec![FunctionParameter::new(
+                "x".to_string(),
+                named_t,
+                false,
+                false,
+            )],
+            named_t,
+            false,
+        );
+        let relations = TypeRelations::new(&table);
+        assert!(
+            relations.assignable(source, target),
+            "(x: number) => number should be assignable to <T>(x: T) => T"
+        );
+    }
+
+    // --- Function vs ObjectType with call signatures ---
+
+    /// A function `() => number` is assignable to an object type with a
+    /// call signature `(x: number): void` because void return absorption
+    /// and fewer parameters are genuine subtyping concessions.
+    #[test]
+    fn function_assignable_to_object_type_with_call_signature() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let void = table.void();
+        let source = table.function(Vec::new(), number);
+        let call_sig_fn = table.function(vec![number], void);
+        let call_sig = match table.get(call_sig_fn) {
+            Type::Function(sig) => sig.clone(),
+            _ => unreachable!(),
+        };
+        let target = table.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: vec![call_sig],
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let relations = TypeRelations::new(&table);
+        assert!(
+            relations.assignable(source, target),
+            "() => number should be assignable to {{ (x: number): void }}"
+        );
+    }
+
+    /// An object type with a call signature `(x: number): string` is
+    /// assignable to a function `(x: number): void` because void return
+    /// absorption.
+    #[test]
+    fn object_type_with_call_signature_assignable_to_function() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let string = table.string();
+        let void = table.void();
+        let call_sig_fn = table.function(vec![number], string);
+        let call_sig = match table.get(call_sig_fn) {
+            Type::Function(sig) => sig.clone(),
+            _ => unreachable!(),
+        };
+        let source = table.object_type_with_members(ObjectType {
+            properties: Vec::new(),
+            call_signatures: vec![call_sig],
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let target = table.function(vec![number], void);
+        let relations = TypeRelations::new(&table);
+        assert!(
+            relations.assignable(source, target),
+            "{{ (x: number): string }} should be assignable to (x: number) => void"
+        );
+    }
+
+    /// A function is NOT assignable to an object type with a required
+    /// property beyond the call signature.
+    #[test]
+    fn function_not_assignable_to_object_type_with_required_property() {
+        let mut table = TypeTable::new();
+        let number = table.number();
+        let void = table.void();
+        let string = table.string();
+        let source = table.function(Vec::new(), number);
+        let call_sig_fn = table.function(vec![number], void);
+        let call_sig = match table.get(call_sig_fn) {
+            Type::Function(sig) => sig.clone(),
+            _ => unreachable!(),
+        };
+        let target = table.object_type_with_members(ObjectType {
+            properties: vec![PropertyType::new("extra", false, string)],
+            call_signatures: vec![call_sig],
+            construct_signatures: Vec::new(),
+            index_signatures: Vec::new(),
+            generator_return: None,
+            iterator_property: None,
+            async_iterator_property: None,
+        });
+        let relations = TypeRelations::new(&table);
+        assert!(
+            !relations.assignable(source, target),
+            "() => number should NOT be assignable to {{ extra: string; (x: number): void }}"
+        );
     }
 }
