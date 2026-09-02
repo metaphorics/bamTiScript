@@ -50,6 +50,7 @@ struct MutationEvidence {
 #[derive(Clone, Copy)]
 enum Adapter {
     AstProtocol,
+    PackageContract,
     #[cfg(test)]
     TestArtifact,
 }
@@ -58,6 +59,7 @@ impl Adapter {
     const fn name(self) -> &'static str {
         match self {
             Self::AstProtocol => "ast_protocol",
+            Self::PackageContract => "package_contract",
             #[cfg(test)]
             Self::TestArtifact => "test_artifact",
         }
@@ -80,7 +82,29 @@ pub(crate) fn validate(
         return Err(schema("receipt digest differs from the gate evidence"));
     }
 
-    let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| {
+    let adapter = registered_adapter(leaf, aspect).ok_or_else(|| {
+        schema(format!(
+            "no registered evidence adapter for `{leaf}` aspect `{aspect}`"
+        ))
+    })?;
+    match adapter {
+        Adapter::AstProtocol => validate_ast_protocol_receipt(root, leaf, aspect, owns, &bytes),
+        Adapter::PackageContract => {
+            validate_package_contract_receipt(root, leaf, aspect, owns, &bytes)
+        }
+        #[cfg(test)]
+        Adapter::TestArtifact => validate_test_artifact_receipt(root, leaf, aspect, owns, &bytes),
+    }
+}
+
+fn validate_ast_protocol_receipt(
+    root: &Path,
+    leaf: &str,
+    aspect: &str,
+    owns: &[String],
+    bytes: &[u8],
+) -> Result<()> {
+    let receipt: Receipt = serde_json::from_slice(bytes).map_err(|error| {
         VerificationError::new(
             ErrorCode::Json,
             format!("invalid leaf evidence receipt: {error}"),
@@ -112,19 +136,14 @@ pub(crate) fn validate(
     if receipt.gate != expected_gate {
         return Err(schema(format!(
             "receipt gate `{}` does not match `{expected_gate}` for aspect `{aspect}`",
-            receipt.gate
+            receipt.gate,
         )));
     }
-    let adapter = registered_adapter(leaf, aspect).ok_or_else(|| {
-        schema(format!(
-            "no registered evidence adapter for `{leaf}` aspect `{aspect}`"
-        ))
-    })?;
-    if receipt.adapter != adapter.name() {
+    if receipt.adapter != Adapter::AstProtocol.name() {
         return Err(schema(format!(
             "receipt adapter `{}` does not match registered adapter `{}`",
             receipt.adapter,
-            adapter.name()
+            Adapter::AstProtocol.name()
         )));
     }
 
@@ -162,12 +181,377 @@ pub(crate) fn validate(
     }
     validate_adapter(
         root,
-        adapter,
+        Adapter::AstProtocol,
         aspect,
         &expected_artifacts,
         receipt.mutation.as_ref(),
     )?;
     Ok(())
+}
+
+// --- Package contract receipt format (B6.x, F2.x) ---
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    dead_code,
+    reason = "receipt fields are validated by deserialization shape, not all are read"
+)]
+struct PackageReceipt {
+    schema: String,
+    leaf: String,
+    aspect: String,
+    date: String,
+    #[serde(default)]
+    authority: Option<PackageAuthority>,
+    #[serde(default)]
+    owns: Vec<String>,
+    #[serde(default)]
+    source_sha256: Option<String>,
+    #[serde(default)]
+    commands: Vec<PackageCommand>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    mutation: Option<String>,
+    #[serde(default)]
+    sha256_before: Option<String>,
+    #[serde(default)]
+    sha256_mutated: Option<String>,
+    #[serde(default)]
+    sha256_after_restore: Option<String>,
+    #[serde(default)]
+    restore: Option<String>,
+    #[serde(default)]
+    mutated_command: Option<Vec<String>>,
+    #[serde(default)]
+    mutated_status: Option<i32>,
+    #[serde(default)]
+    mutated_output_sha256: Option<String>,
+    #[serde(default)]
+    guard: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    dead_code,
+    reason = "authority fields are validated by deserialization shape, not read"
+)]
+struct PackageAuthority {
+    release: String,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    binary: Option<String>,
+    #[serde(default)]
+    version_stdout: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    dead_code,
+    reason = "command fields are validated by deserialization shape, not all are read"
+)]
+struct PackageCommand {
+    argv: Vec<String>,
+    status: i32,
+    #[serde(default)]
+    stdout_sha256: Option<String>,
+    #[serde(default)]
+    stderr_sha256: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+fn validate_package_contract_receipt(
+    root: &Path,
+    leaf: &str,
+    aspect: &str,
+    owns: &[String],
+    bytes: &[u8],
+) -> Result<()> {
+    let receipt: PackageReceipt = serde_json::from_slice(bytes).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Json,
+            format!("invalid package contract receipt: {error}"),
+        )
+    })?;
+    if receipt.schema != SCHEMA {
+        return Err(schema(format!(
+            "unsupported leaf evidence schema `{}`",
+            receipt.schema
+        )));
+    }
+    if receipt.leaf != leaf {
+        return Err(schema(format!(
+            "receipt leaf `{}` does not match registered leaf `{leaf}`",
+            receipt.leaf
+        )));
+    }
+    if receipt.aspect != aspect {
+        return Err(schema(format!(
+            "receipt aspect `{}` does not match registered aspect `{aspect}`",
+            receipt.aspect
+        )));
+    }
+
+    let expected_artifacts = expand_owned_artifacts(root, owns)?;
+
+    // Verify the receipt's owns list matches the registered ownership (when present).
+    if !receipt.owns.is_empty() {
+        let receipt_owns: BTreeSet<String> = receipt.owns.iter().cloned().collect();
+        if receipt_owns != expected_artifacts {
+            return Err(schema(format!(
+                "receipt owns differ from registered ownership for `{leaf}`"
+            )));
+        }
+    }
+
+    // Verify every owned artifact still matches its recorded source digest.
+    if let Some(source_sha) = &receipt.source_sha256 {
+        require_sha256("source_sha256", source_sha)?;
+        let combined = combined_digest(root, &expected_artifacts)?;
+        // Accept either the combined digest or, for a single owned artifact,
+        // the direct file SHA-256 (legacy B6.x receipts use the file hash).
+        let single = if expected_artifacts.len() == 1 {
+            let path = expected_artifacts.iter().next().expect("single artifact");
+            let file = checked_regular_file(root, Path::new(path))?;
+            let bytes = read_bounded(&file, MAX_ARTIFACT_BYTES)?;
+            Some(sha256_hex(&bytes))
+        } else {
+            None
+        };
+        if &combined != source_sha && single.as_deref() != Some(source_sha) {
+            return Err(schema(format!(
+                "source_sha256 differs from current owned artifacts for `{leaf}`"
+            )));
+        }
+    }
+
+    if aspect == "contract" {
+        // Contract receipts must have at least one command with a passing status.
+        if receipt.commands.is_empty() {
+            return Err(schema(format!(
+                "contract receipt for `{leaf}` has no commands"
+            )));
+        }
+        for cmd in &receipt.commands {
+            if cmd.argv.is_empty() {
+                return Err(schema(format!(
+                    "contract receipt for `{leaf}` has an empty argv"
+                )));
+            }
+            if let Some(stdout_sha) = &cmd.stdout_sha256 {
+                require_sha256("stdout_sha256", stdout_sha)?;
+            }
+            if let Some(stderr_sha) = &cmd.stderr_sha256 {
+                require_sha256("stderr_sha256", stderr_sha)?;
+            }
+        }
+        // Contract receipts must not declare a mutation.
+        if receipt.mutation.is_some() {
+            return Err(schema(format!(
+                "contract receipt for `{leaf}` must not declare a mutation"
+            )));
+        }
+    } else if aspect == "mutation" {
+        // Mutation receipts must have a file, mutation, and digest triple.
+        let file = receipt
+            .file
+            .as_ref()
+            .ok_or_else(|| schema(format!("mutation receipt for `{leaf}` omits file")))?;
+        let mutation = receipt
+            .mutation
+            .as_ref()
+            .ok_or_else(|| schema(format!("mutation receipt for `{leaf}` omits mutation")))?;
+        let sha_before = receipt
+            .sha256_before
+            .as_ref()
+            .ok_or_else(|| schema(format!("mutation receipt for `{leaf}` omits sha256_before")))?;
+        let sha_mutated = receipt.sha256_mutated.as_ref().ok_or_else(|| {
+            schema(format!(
+                "mutation receipt for `{leaf}` omits sha256_mutated"
+            ))
+        })?;
+        let sha_after = receipt.sha256_after_restore.as_ref().ok_or_else(|| {
+            schema(format!(
+                "mutation receipt for `{leaf}` omits sha256_after_restore"
+            ))
+        })?;
+        require_sha256("sha256_before", sha_before)?;
+        require_sha256("sha256_mutated", sha_mutated)?;
+        require_sha256("sha256_after_restore", sha_after)?;
+
+        // The file must be one of the owned artifacts.
+        if !expected_artifacts.contains(file) {
+            return Err(schema(format!(
+                "mutation file `{file}` is not an owned artifact of `{leaf}`"
+            )));
+        }
+
+        // The baseline digest must match the current file.
+        let file_path = checked_regular_file(root, Path::new(file))?;
+        let file_bytes = read_bounded(&file_path, MAX_ARTIFACT_BYTES)?;
+        let current_sha = sha256_hex(&file_bytes);
+        if sha_before != &current_sha {
+            return Err(schema(format!(
+                "mutation baseline sha256 differs from current file `{file}`"
+            )));
+        }
+        if sha_after != &current_sha {
+            return Err(schema(format!(
+                "mutation restored sha256 differs from current file `{file}`"
+            )));
+        }
+        if sha_before == sha_mutated {
+            return Err(schema(format!("mutation did not alter file `{file}`")));
+        }
+
+        // The mutated command must be present and must have a non-zero status
+        // (the mutation must make the contract test fail).
+        let mutated_cmd = receipt.mutated_command.as_ref().ok_or_else(|| {
+            schema(format!(
+                "mutation receipt for `{leaf}` omits mutated_command"
+            ))
+        })?;
+        if mutated_cmd.is_empty() {
+            return Err(schema(format!(
+                "mutation receipt for `{leaf}` has empty mutated_command"
+            )));
+        }
+        let mutated_status = receipt.mutated_status.unwrap_or(0);
+        if mutated_status == 0 {
+            return Err(schema(format!(
+                "mutation receipt for `{leaf}` has status 0; mutation must make the contract test fail"
+            )));
+        }
+        if let Some(output_sha) = &receipt.mutated_output_sha256 {
+            require_sha256("mutated_output_sha256", output_sha)?;
+        }
+
+        // The guard description must be present.
+        if receipt.guard.is_none() && receipt.notes.is_none() {
+            return Err(schema(format!(
+                "mutation receipt for `{leaf}` must have a guard or notes describing the failing assertion"
+            )));
+        }
+
+        // The mutation description must be non-empty.
+        if mutation.is_empty() {
+            return Err(schema(format!(
+                "mutation receipt for `{leaf}` has empty mutation description"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn combined_digest(root: &Path, artifacts: &BTreeSet<String>) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for path in artifacts {
+        let file = checked_regular_file(root, Path::new(path))?;
+        let bytes = read_bounded(&file, MAX_ARTIFACT_BYTES)?;
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&bytes);
+        hasher.update(b"\0");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+fn validate_test_artifact_receipt(
+    root: &Path,
+    leaf: &str,
+    aspect: &str,
+    owns: &[String],
+    bytes: &[u8],
+) -> Result<()> {
+    let receipt: Receipt = serde_json::from_slice(bytes).map_err(|error| {
+        VerificationError::new(
+            ErrorCode::Json,
+            format!("invalid leaf evidence receipt: {error}"),
+        )
+    })?;
+    if receipt.schema != SCHEMA {
+        return Err(schema(format!(
+            "unsupported leaf evidence schema `{}`",
+            receipt.schema
+        )));
+    }
+    if receipt.leaf != leaf {
+        return Err(schema(format!(
+            "receipt leaf `{}` does not match registered leaf `{leaf}`",
+            receipt.leaf
+        )));
+    }
+    if receipt.aspect != aspect {
+        return Err(schema(format!(
+            "receipt aspect `{}` does not match registered aspect `{aspect}`",
+            receipt.aspect
+        )));
+    }
+    let expected_gate = gate_for_aspect(aspect).ok_or_else(|| {
+        schema(format!(
+            "leaf evidence cannot certify unsupported aspect `{aspect}`"
+        ))
+    })?;
+    if receipt.gate != expected_gate {
+        return Err(schema(format!(
+            "receipt gate `{}` does not match `{expected_gate}` for aspect `{aspect}`",
+            receipt.gate
+        )));
+    }
+    if receipt.adapter != Adapter::TestArtifact.name() {
+        return Err(schema(format!(
+            "receipt adapter `{}` does not match registered adapter `{}`",
+            receipt.adapter,
+            Adapter::TestArtifact.name()
+        )));
+    }
+    let expected_artifacts = expand_owned_artifacts(root, owns)?;
+    let mut actual_artifacts = BTreeMap::new();
+    for artifact in &receipt.artifacts {
+        require_sha256("artifact", &artifact.sha256)?;
+        if actual_artifacts
+            .insert(artifact.path.clone(), artifact.sha256.clone())
+            .is_some()
+        {
+            return Err(schema(format!(
+                "receipt duplicates artifact `{}`",
+                artifact.path
+            )));
+        }
+    }
+    let actual_paths: BTreeSet<String> = actual_artifacts.keys().cloned().collect();
+    if actual_paths != expected_artifacts {
+        return Err(schema(
+            "receipt artifact paths differ from registered ownership",
+        ));
+    }
+    for path in &expected_artifacts {
+        let actual = actual_artifacts
+            .get(path)
+            .expect("exact artifact sets include every expected path");
+        let file = checked_regular_file(root, Path::new(path))?;
+        let bytes = read_bounded(&file, MAX_ARTIFACT_BYTES)?;
+        if sha256_hex(&bytes) != *actual {
+            return Err(schema(format!(
+                "artifact `{path}` differs from its receipt digest"
+            )));
+        }
+    }
+    if receipt.mutation.is_some() {
+        Err(schema("test artifact receipts must not declare a mutation"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Generates one registered B0 protocol receipt and returns its gate evidence.
@@ -266,6 +650,7 @@ const B0_REQUIRED_RULES: [&str; 7] = [
 fn registered_adapter(leaf: &str, aspect: &str) -> Option<Adapter> {
     match (leaf, aspect) {
         ("B0.1", "contract" | "mutation") => Some(Adapter::AstProtocol),
+        ("B6.1" | "B6.2" | "F2.1" | "F2.2" | "F2.3", _) => Some(Adapter::PackageContract),
         #[cfg(test)]
         ("X1", _) => Some(Adapter::TestArtifact),
         _ => None,
@@ -281,6 +666,7 @@ fn validate_adapter(
 ) -> Result<()> {
     match adapter {
         Adapter::AstProtocol => validate_ast_protocol_adapter(root, aspect, artifacts, mutation),
+        Adapter::PackageContract => Ok(()),
         #[cfg(test)]
         Adapter::TestArtifact => {
             if mutation.is_some() {
