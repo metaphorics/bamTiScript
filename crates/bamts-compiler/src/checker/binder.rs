@@ -4213,14 +4213,21 @@ enum TypeDef<'src> {
 }
 
 /// Whether the file is an external module: it carries a top-level `import` or
-/// `export` that names a module.
+/// `export` that names a module, or an `import =` whose reference is an
+/// external module reference (`import I = require("m")`). A qualified alias
+/// (`import I = A.B.C`) leaves the file a script.
 pub(crate) fn source_is_module(source: &SourceFile) -> bool {
-    source.statements().iter().any(|statement| {
-        matches!(
-            statement.data(),
-            Statement::Import(_) | Statement::Export(_) | Statement::ImportEquals(_)
-        )
-    })
+    source
+        .statements()
+        .iter()
+        .any(|statement| match statement.data() {
+            Statement::Import(_) | Statement::Export(_) => true,
+            Statement::ImportEquals(import) => matches!(
+                import.reference,
+                crate::syntax::ExternalModuleReference::Require(_)
+            ),
+            _ => false,
+        })
 }
 
 /// Returns whether the directive prologue of a statement list contains

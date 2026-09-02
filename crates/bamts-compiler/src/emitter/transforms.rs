@@ -766,7 +766,8 @@ impl<'a> Rewriter<'a> {
                     }
                 }
                 Statement::ImportEquals(import) => {
-                    plan.is_module |= !import.is_type_only;
+                    plan.is_module |= !import.is_type_only
+                        && matches!(import.reference, ExternalModuleReference::Require(_));
                 }
                 Statement::Export(export) => {
                     plan.is_module = true;
@@ -6446,6 +6447,75 @@ console.log(JSON.stringify([bar, bar4, log]));
             String::from_utf8_lossy(&result.stdout),
             "4:4:25\n",
             "{code}"
+        );
+    }
+
+    #[test]
+    fn import_equals_qualified_alias_is_not_a_module_and_gets_use_strict() {
+        let source = "import I = A.B.C;\n";
+        let file = parse(source);
+        assert!(
+            !crate::checker::source_is_module(&file),
+            "import I = A.B.C (qualified alias) must not make the file a module"
+        );
+        let output = emit_with_options(
+            source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.starts_with("\"use strict\";\n"),
+            "a script with alwaysStrict must start with use strict: {code}"
+        );
+    }
+
+    #[test]
+    fn import_equals_require_is_a_module_and_takes_no_prologue_under_es2015() {
+        let source = "import I = require(\"m\");\n";
+        let file = parse(source);
+        assert!(
+            crate::checker::source_is_module(&file),
+            "import I = require(\"m\") must make the file a module"
+        );
+        let output = emit_with_options(
+            source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::Es2015),
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            !code.starts_with("\"use strict\";\n"),
+            "an ES2015 module takes no strict prologue even under alwaysStrict: {code}"
+        );
+    }
+
+    #[test]
+    fn cjs_plan_for_qualified_alias_emits_no_require_or_esmodule_marker() {
+        let source = "import I = A.B.C;\n";
+        let output = emit_with_options(
+            source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                module: Some(crate::emitter::ModuleKind::CommonJs),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            !code.contains("__esModule"),
+            "a qualified alias must not trigger the __esModule marker: {code}"
+        );
+        assert!(
+            !code.contains("require("),
+            "a qualified alias must not emit a require call: {code}"
         );
     }
 }

@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 
 use crate::diagnostic::Diagnostic;
 use crate::source::{SourceId, TextRange, Utf16Pos};
-use crate::syntax::{SourceFile, Statement};
+use crate::syntax::SourceFile;
 
 /// Stable diagnostic identifiers produced by helper policy.
 pub mod codes {
@@ -333,17 +333,6 @@ pub fn emit_helpers_named(
     emit_closed(helpers, options, file, diagnostics)
 }
 
-/// Returns whether `file` contains an import or export and so is an external module.
-#[must_use]
-pub fn is_external_module(file: &SourceFile) -> bool {
-    file.statements().iter().any(|statement| {
-        matches!(
-            statement.data(),
-            Statement::Import(_) | Statement::ImportEquals(_) | Statement::Export(_)
-        )
-    })
-}
-
 fn close_helpers(requested: &[HelperKind]) -> Vec<HelperKind> {
     let mut set = BTreeSet::new();
     let mut stack: Vec<HelperKind> = requested.to_vec();
@@ -381,7 +370,7 @@ fn emit_closed(
     };
     if !imported.is_empty()
         && options.style == HelperStyle::EsModule
-        && !file.is_some_and(is_external_module)
+        && !file.is_some_and(crate::checker::source_is_module)
     {
         let (source_id, range) = file.map_or((SourceId::new(0), empty_range()), |file| {
             (file.source_id(), file.range())
@@ -492,10 +481,7 @@ fn empty_range() -> TextRange {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HelperKind, HelperOptions, HelperStyle, codes, emit_helpers, emit_helpers_named,
-        is_external_module,
-    };
+    use super::{HelperKind, HelperOptions, HelperStyle, codes, emit_helpers, emit_helpers_named};
     use crate::parser;
     use crate::scanner;
     use crate::source::{ScriptKind, SourceId, SourceText, TextRange, Utf16Pos};
@@ -597,7 +583,7 @@ mod tests {
     #[test]
     fn esm_import_helpers_on_a_script_is_an_error_and_emits_nothing() {
         let file = parse("const x = 1;\n");
-        assert!(!is_external_module(&file));
+        assert!(!crate::checker::source_is_module(&file));
         let emitted = emit_helpers(
             &[HelperKind::Awaiter],
             &HelperOptions::es_module(),
