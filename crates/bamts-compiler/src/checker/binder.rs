@@ -1282,6 +1282,16 @@ pub enum Type {
         owner: SymbolId,
         constraint: TypeId,
     },
+    /// The constructor (static) side of a class — `typeof C`. Carries the
+    /// class symbol for nominal display, the type arguments for generic
+    /// classes (`typeof C<T>`), and the structural `ObjectType` view built
+    /// by `class_static_type` so property/construct lookup can delegate
+    /// without pattern-detecting a shape in the display layer.
+    ConstructorType {
+        symbol: SymbolId,
+        arguments: Vec<TypeId>,
+        structural: TypeId,
+    },
 }
 
 #[derive(Debug)]
@@ -1620,6 +1630,9 @@ impl TypeTable {
                 ForOfMode::Sync => object.iterator_property,
                 ForOfMode::Async => object.async_iterator_property,
             },
+            Type::ConstructorType { structural, .. } => {
+                self.iterator_property_of(structural, protocol)
+            }
             Type::AppliedClass { .. } => self
                 .prepare_applied_class_view(ty)
                 .and_then(|view| self.iterator_property_of(view, protocol)),
@@ -2218,6 +2231,18 @@ impl TypeTable {
         let type_id = self.intern(Type::AppliedClass { symbol, arguments });
         self.materialize_applied_class_view(type_id);
         type_id
+    }
+
+    /// Interns a `typeof C` constructor (static-side) type. The structural
+    /// view is the `ObjectType` built by `class_static_type`; property and
+    /// construct-signature lookup delegate to it.
+    pub fn constructor_type(
+        &mut self,
+        symbol: SymbolId,
+        arguments: Vec<TypeId>,
+        structural: TypeId,
+    ) -> TypeId {
+        self.intern(Type::ConstructorType { symbol, arguments, structural })
     }
 
     /// Returns the parameter-relative self head used inside a class declaration.
@@ -4035,6 +4060,15 @@ impl TypeTable {
                     let constraint = copy(target, source, constraint, imported, next_symbol);
                     target.this_type(owner, constraint)
                 }
+                Type::ConstructorType { symbol, arguments, structural } => {
+                    let symbol = remap_symbol(target, source, symbol, imported, next_symbol);
+                    let arguments = arguments
+                        .iter()
+                        .map(|&arg| copy(target, source, arg, imported, next_symbol))
+                        .collect();
+                    let structural = copy(target, source, structural, imported, next_symbol);
+                    target.constructor_type(symbol, arguments, structural)
+                }
             };
             imported.types.insert(source_id, type_id);
             type_id
@@ -4463,6 +4497,11 @@ pub struct SemanticModel {
     pub(crate) enum_facts: EnumFacts,
     namespace_facts: NamespaceFacts,
     ambient_modules: HashMap<String, SymbolId>,
+    /// Constructor (static) types for class symbols, keyed by the class
+    /// declaration symbol. `symbol_types` stores the instance type for
+    /// class declarations; this map holds the `typeof C` constructor type
+    /// needed for value references and `typeof` queries.
+    class_constructor_types: HashMap<SymbolId, TypeId>,
 }
 
 impl SemanticModel {
@@ -4523,6 +4562,16 @@ impl SemanticModel {
     #[must_use]
     pub fn symbol_type(&self, id: SymbolId) -> TypeId {
         self.symbol_types[id.0 as usize]
+    }
+
+    /// Returns the constructor (static) type for a class symbol, or the
+    /// symbol's declared type if no constructor type was recorded.
+    #[must_use]
+    pub fn constructor_type(&self, id: SymbolId) -> TypeId {
+        self.class_constructor_types
+            .get(&id)
+            .copied()
+            .unwrap_or(self.symbol_types[id.0 as usize])
     }
 
     #[cfg(test)]
@@ -4857,6 +4906,10 @@ pub(crate) struct Binder<'src> {
     /// during class-body resolution so `new C()` and member access on class-typed
     /// values can resolve declared instance members.
     pub(crate) class_instance_types: HashMap<SymbolId, TypeId>,
+    /// Constructor (static-side) types keyed by the class symbol. For class
+ /// declarations, `symbol_types[owner]` stores the instance type and this
+ /// map holds the `typeof C` constructor type for value-position references.
+ pub(crate) class_constructor_types: HashMap<SymbolId, TypeId>,
     reg_exp_instance_type: Option<TypeId>,
     /// Shared by provisional and final class-shape passes so a generic method's
     /// type parameters keep one semantic identity.
@@ -5034,6 +5087,7 @@ impl<'src> Binder<'src> {
             import_equals_symbols: HashMap::new(),
             qualified_import_paths: HashMap::new(),
             import_equals_targets: HashMap::new(),
+            class_constructor_types: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             imported_type_planes: HashMap::new(),
             hoisted_declaration_symbols: HashMap::new(),
@@ -5920,6 +5974,7 @@ impl<'src> Binder<'src> {
             enum_facts: EnumFacts::unchecked(),
             namespace_facts: NamespaceFacts::unchecked(),
             ambient_modules: std::mem::take(&mut self.ambient_modules),
+            class_constructor_types: std::mem::take(&mut self.class_constructor_types),
         };
         let (enum_facts, diagnostics) = enum_plan::build(
             &model,
@@ -9982,7 +10037,8 @@ impl<'src> Binder<'src> {
             self.class_instance_types
                 .insert(owner, preliminary_instance);
             let static_type = self.class_static_type(class, scope, preliminary_instance);
-            self.symbol_types[owner.get() as usize] = static_type;
+            self.class_constructor_types.insert(owner, static_type);
+            self.symbol_types[owner.get() as usize] = preliminary_instance;
         }
     }
     fn resolve_class_body(
@@ -10100,7 +10156,15 @@ impl<'src> Binder<'src> {
         let static_type = self.class_static_type(class, scope, instance_type);
         if let Some(owner) = owner {
             self.class_instance_types.insert(owner, instance_type);
-            self.symbol_types[owner.get() as usize] = static_type;
+            self.class_constructor_types.insert(owner, static_type);
+            // Class declarations: the symbol's declared type is the instance
+            // type (`>C : C` in .types baselines). Class expressions: the
+            // symbol's type is the constructor type (`>C : typeof C`).
+            self.symbol_types[owner.get() as usize] = if bind_internal_name {
+                static_type
+            } else {
+                instance_type
+            };
         }
         for (implemented_type, range) in implemented_types {
             if !self.types_assignable(instance_type, implemented_type) {
@@ -10665,8 +10729,18 @@ impl<'src> Binder<'src> {
             if let Type::AppliedClass { arguments, .. } = self.types.get(base_instance).clone() {
                 base_arguments = arguments;
             }
-            let type_id = self.symbol_types[base_symbol.get() as usize];
-            match self.types.get(type_id).clone() {
+            let static_id = self
+                .class_constructor_types
+                .get(&base_symbol)
+                .copied()
+                .unwrap_or(self.symbol_types[base_symbol.get() as usize]);
+            match self.types.get(static_id).clone() {
+                Type::ConstructorType { structural, .. } => {
+                    match self.types.get(structural).clone() {
+                        Type::ObjectType(object) => Some(object),
+                        _ => None,
+                    }
+                }
                 Type::ObjectType(object) => Some(object),
                 _ => None,
             }
@@ -10699,7 +10773,7 @@ impl<'src> Binder<'src> {
             base_static.as_ref(),
             &base_arguments,
         );
-        self.types.object_type_with_members(ObjectType {
+        let structural = self.types.object_type_with_members(ObjectType {
             properties,
             call_signatures: Vec::new(),
             construct_signatures,
@@ -10707,7 +10781,15 @@ impl<'src> Binder<'src> {
             generator_return: None,
             iterator_property,
             async_iterator_property,
-        })
+        });
+        let owner = self.scopes[scope.0 as usize].owner;
+        match owner {
+            // tsc renders `typeof C` without type arguments for user-defined
+            // generic classes; the type parameters are carried by the
+            // structural construct signatures.
+            Some(symbol) => self.types.constructor_type(symbol, Vec::new(), structural),
+            None => structural,
+        }
     }
 
     fn class_construct_signatures(
@@ -11311,7 +11393,10 @@ impl<'src> Binder<'src> {
             return self.types.any();
         };
         if is_static {
-            self.symbol_types[owner.get() as usize]
+            self.class_constructor_types
+                .get(&owner)
+                .copied()
+                .unwrap_or(self.symbol_types[owner.get() as usize])
         } else {
             let instance = self
                 .class_instance_types
@@ -11550,14 +11635,20 @@ impl<'src> Binder<'src> {
                     self.resolve_object_member(member.data(), scope);
                 }
             }
-            Expression::Function(function) => self.resolve_function(
-                &function.function,
-                scope,
-                true,
-                false,
-                self.types.any(),
-                SuperMemberHome::NonMemberFunction,
-            ),
+            Expression::Function(function) => {
+                self.resolve_function(
+                    &function.function,
+                    scope,
+                    true,
+                    false,
+                    self.types.any(),
+                    SuperMemberHome::NonMemberFunction,
+                );
+                let type_id = self.type_of_function_like(&function.function, scope);
+                if self.node_types.insert(expression.id(), type_id).is_none() {
+                    self.typed_expressions.push((expression.range(), type_id));
+                }
+            }
             Expression::Class(class) => {
                 let type_id = self.resolve_class_expression(&class.class, scope);
                 if self.node_types.insert(expression.id(), type_id).is_none() {
@@ -11647,6 +11738,10 @@ impl<'src> Binder<'src> {
                 self.return_contexts.pop();
                 let popped_context = self.super_call_contexts.pop();
                 debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
+                let type_id = self.type_of_arrow(arrow, scope);
+                if self.node_types.insert(expression.id(), type_id).is_none() {
+                    self.typed_expressions.push((expression.range(), type_id));
+                }
             }
             Expression::Call(call) => {
                 if matches!(call.callee.data(), Expression::Super) {
@@ -12684,6 +12779,9 @@ impl<'src> Binder<'src> {
             return self.construct_signature_groups_for_type_raw(view, receiver);
         }
         match self.types.get(type_id).clone() {
+            Type::ConstructorType { structural, .. } => {
+                self.construct_signature_groups_for_type_raw(structural, receiver)
+            }
             Type::ObjectType(object) if !object.construct_signatures.is_empty() => {
                 let signatures = object
                     .construct_signatures
@@ -13103,6 +13201,9 @@ impl<'src> Binder<'src> {
                 (view != iterable)
                     .then(|| self.iteration_element_type_inner(view, mode, receiver))
                     .flatten()
+            }
+            Type::ConstructorType { structural, .. } => {
+                self.iteration_element_type_inner(structural, mode, receiver)
             }
             _ => None,
         }
@@ -13628,6 +13729,16 @@ impl<'src> Binder<'src> {
                 }
                 None
             }
+            Type::ConstructorType { structural, .. } => {
+                self.property_type_for_member_raw(
+                    structural,
+                    name,
+                    range,
+                    read,
+                    receiver,
+                    owner_hint,
+                )
+            }
             Type::This {
                 owner, constraint, ..
             } => self.property_type_for_member_raw(
@@ -13701,6 +13812,9 @@ impl<'src> Binder<'src> {
                     return self.property_is_readonly(view, name);
                 }
                 false
+            }
+            Type::ConstructorType { structural, .. } => {
+                self.property_is_readonly(structural, name)
             }
             Type::AppliedAlias { .. } => {
                 if let Some(view) = self.types.prepare_applied_alias_view(object_type) {
@@ -14232,7 +14346,14 @@ impl<'src> Binder<'src> {
                     );
                     return self.types.any();
                 };
-                self.symbol_types[symbol.get() as usize]
+                match self.symbols[symbol.get() as usize].kind {
+                    SymbolKind::Class => self
+                        .class_constructor_types
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
+                    _ => self.symbol_types[symbol.get() as usize],
+                }
             }
             EntityName::Qualified { left, right } => {
                 // A qualified `typeof A.B` can be a namespace path (the prefix
@@ -14245,7 +14366,14 @@ impl<'src> Binder<'src> {
                     Ok((member_scope, _path)) => {
                         let name = self.identifier_text(right);
                         match self.scopes[member_scope.0 as usize].value(&name) {
-                            Some(symbol) => self.symbol_types[symbol.get() as usize],
+                            Some(symbol) => match self.symbols[symbol.get() as usize].kind {
+                                SymbolKind::Class => self
+                                    .class_constructor_types
+                                    .get(&symbol)
+                                    .copied()
+                                    .unwrap_or(self.symbol_types[symbol.get() as usize]),
+                                _ => self.symbol_types[symbol.get() as usize],
+                            },
                             None => {
                                 self.emit(
                                     CANNOT_FIND_NAME,
@@ -16590,7 +16718,14 @@ impl<'src> Binder<'src> {
                 let Some(&symbol) = self.references.get(&identifier.id()) else {
                     return self.types.any();
                 };
-                let declared = self.symbol_types[symbol.get() as usize];
+                let declared = match self.symbols[symbol.get() as usize].kind {
+                    SymbolKind::Class => self
+                        .class_constructor_types
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or(self.symbol_types[symbol.get() as usize]),
+                    _ => self.symbol_types[symbol.get() as usize],
+                };
                 self.narrowed_type(symbol, declared)
             }
             Expression::Literal(literal) => self.type_of_literal(literal),

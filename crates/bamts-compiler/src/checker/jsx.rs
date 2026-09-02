@@ -354,6 +354,7 @@ impl<'src> Binder<'src> {
             | Type::Unknown
             | Type::Named(_)
             | Type::AppliedClass { .. }
+            | Type::ConstructorType { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }

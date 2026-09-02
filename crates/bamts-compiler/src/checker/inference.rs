@@ -444,6 +444,18 @@ impl InferredTypeArguments {
                     .collect();
                 table.applied_class(symbol, arguments)
             }
+            Type::ConstructorType {
+                symbol,
+                arguments,
+                structural,
+            } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|&argument| self.instantiate_inner(table, argument))
+                    .collect();
+                let structural = self.instantiate_inner(table, structural);
+                table.constructor_type(symbol, arguments, structural)
+            }
             Type::AppliedAlias { symbol, arguments } => {
                 let arguments = arguments
                     .iter()

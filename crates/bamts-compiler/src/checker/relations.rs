@@ -750,6 +750,15 @@ impl<'table> TypeRelations<'table> {
             Type::This { constraint, .. } => {
                 self.type_reaches_free_symbol(*constraint, symbol, search)
             }
+            Type::ConstructorType { arguments, structural, .. } => {
+                let arguments_reach =
+                    self.any_types_reach_free_symbol(arguments.iter().copied(), symbol, search);
+                if arguments_reach == Some(true) {
+                    return Some(true);
+                }
+                let structural_reach = self.type_reaches_free_symbol(*structural, symbol, search);
+                Self::combine_reachability(arguments_reach, structural_reach)
+            }
             Type::Error
             | Type::Any
             | Type::Unknown
@@ -1269,6 +1278,12 @@ impl<'table> TypeRelations<'table> {
             (Type::Object, Type::ObjectType(target)) => {
                 target.properties.iter().all(|property| property.optional())
             }
+            (Type::ConstructorType { structural, .. }, _) => {
+                self.relates(*structural, target, strictness)
+            }
+            (_, Type::ConstructorType { structural, .. }) => {
+                self.relates(source, *structural, strictness)
+            }
             (
                 Type::Void
                 | Type::Null
@@ -1477,6 +1492,9 @@ impl<'table> TypeRelations<'table> {
                     .applied_alias_view(type_id)
                     .map(|view| self.contains_undefined_inner(view, visiting_aliases))
                     .unwrap_or(false)
+            }
+            Type::ConstructorType { structural, .. } => {
+                self.contains_undefined_inner(*structural, visiting_aliases)
             }
             Type::Error
             | Type::Intersection(_)

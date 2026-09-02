@@ -150,6 +150,21 @@ fn render_type_grouped(
             format!("{enum_name}.{member_name}")
         }
         Type::Named(symbol) | Type::NumericEnum(symbol) => model.symbol(*symbol).name().to_owned(),
+        Type::ConstructorType {
+            symbol, arguments, ..
+        } => {
+            let name = model.symbol(*symbol).name();
+            if arguments.is_empty() {
+                format!("typeof {name}")
+            } else {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| render_type_grouped(model, *argument, false, visiting_aliases))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("typeof {name}<{arguments}>")
+            }
+        }
     }
 }
 

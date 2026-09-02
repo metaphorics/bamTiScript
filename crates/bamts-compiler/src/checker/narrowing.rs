@@ -752,7 +752,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
-            | Type::Record { .. } => self.table.never(),
+            | Type::Record { .. }
+            | Type::ConstructorType { .. } => self.table.never(),
         }
     }
 
@@ -810,7 +811,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
-            | Type::Record { .. } => None,
+            | Type::Record { .. }
+            | Type::ConstructorType { .. } => None,
         };
         let parameters: Vec<FunctionParameter> = parameters
             .iter()
@@ -895,7 +897,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
-            | Type::Record { .. } => None,
+            | Type::Record { .. }
+            | Type::ConstructorType { .. } => None,
         }
     }
 
@@ -954,7 +957,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
-            | Type::This { .. } => ty,
+            | Type::This { .. }
+            | Type::ConstructorType { .. } => ty,
         }
     }
 
@@ -1107,7 +1111,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
-            | Type::Record { .. } => match decide(self.table, self.table.get(ty)) {
+            | Type::Record { .. }
+            | Type::ConstructorType { .. } => match decide(self.table, self.table.get(ty)) {
                 Narrow::Keep => ty,
                 Narrow::Drop => self.table.never(),
                 Narrow::Replace(replacement) => replacement,
@@ -1210,7 +1215,8 @@ impl<'a> NarrowingContext<'a> {
                 | Type::Keyof(_)
                 | Type::IndexedAccess { .. }
                 | Type::Record { .. }
-                | Type::This { .. },
+                | Type::This { .. }
+                | Type::ConstructorType { .. },
                 _,
             ) => self.table.never(),
         }
@@ -1270,7 +1276,8 @@ impl<'a> NarrowingContext<'a> {
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
             | Type::Record { .. }
-            | Type::This { .. } => {}
+            | Type::This { .. }
+            | Type::ConstructorType { .. } => {}
         }
         match self.table.get(ty).clone() {
             Type::Error | Type::Intersection(_) | Type::Any | Type::Unknown | Type::Never => ty,
@@ -1310,8 +1317,9 @@ impl<'a> NarrowingContext<'a> {
             | Type::EnumMember { .. }
             | Type::Keyof(_)
             | Type::IndexedAccess { .. }
+            | Type::This { .. }
             | Type::Record { .. }
-            | Type::This { .. } => ty,
+            | Type::ConstructorType { .. } => ty,
         }
     }
 
