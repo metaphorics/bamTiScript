@@ -3513,13 +3513,31 @@ impl TypeTable {
         }
     }
 
-    /// Whether the type is exactly `null` or exactly `undefined`.
+    /// Whether `null` or `undefined` is one of the type's own constituents, so
+    /// a union answers true when any member is nullable.
     ///
-    /// Deliberately not a union test. Upstream reports a nullable operand only
-    /// where the operand spells one of those two values, so a union that merely
-    /// contains them is not reported and must not answer true here.
-    pub fn is_nullish(&self, type_id: TypeId) -> bool {
-        matches!(self.get(type_id), Type::Null | Type::Undefined)
+    /// The union arm is unreachable in legal TypeScript, and not because of the
+    /// caller's spelling gate. `is_nullable_value_word` matches `undefined` by
+    /// identifier text, so a local shadow does spell the word while carrying a
+    /// declared union type. The authority forecloses that program one step
+    /// earlier: all three cases declaring a local `undefined`
+    /// (`undefinedTypeAssignment2`, `undefinedTypeAssignment3`,
+    /// `reExportUndefined2`) are rejected at the declaration with TS2397,
+    /// `Declaration name conflicts with built-in global identifier`, and none
+    /// carries a TS18050 anywhere in its baseline.
+    ///
+    /// So both an any-member and an exact `Null | Undefined` body behave
+    /// identically on every legal program, and no baseline can distinguish
+    /// them. This keeps the any-member form because it is the constituent test
+    /// the name promises, not because the corner was measured: we do not
+    /// implement TS2397 yet, so we accept the shadow this rule then reports on.
+    /// Whichever body sits here, that acceptance is the defect to fix.
+    pub fn is_nullable(&self, type_id: TypeId) -> bool {
+        match self.get(type_id) {
+            Type::Null | Type::Undefined => true,
+            Type::Union(members) => members.iter().any(|member| self.is_nullable(*member)),
+            _ => false,
+        }
     }
     fn optional_access_view(&mut self, type_id: TypeId) -> TypeId {
         let non_nullable = self.non_nullable(type_id);
@@ -16712,7 +16730,7 @@ impl<'src> Binder<'src> {
             return;
         }
         let operand_type = self.type_of_expr(operand, scope);
-        if !self.types.is_nullish(operand_type) {
+        if !self.types.is_nullable(operand_type) {
             return;
         }
         self.emit(
