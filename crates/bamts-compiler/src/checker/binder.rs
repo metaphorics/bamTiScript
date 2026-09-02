@@ -84,8 +84,8 @@ use crate::syntax::{
     Accessibility, ArrayElement, ArrowFunction, AssignmentExpression, AssignmentOperator,
     AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, CallArgument,
     CallExpression, ClassDeclaration, ClassMember, ConditionalExpression, DeclarationModifiers,
-    EntityName, Expr, Expression, ExternalModuleReference, ForBinding, ForInitializer, ForOfMode,
-    FunctionBody, FunctionLike, FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration,
+    EntityName, Expr, Expression, ForBinding, ForInitializer, ForOfMode, FunctionBody,
+    FunctionLike, FunctionType, IdentifierNode, ImportBinding, InterfaceDeclaration,
     JsxAttributeInitializer, JsxAttributeItem, JsxChild, KeywordType, Literal, LogicalOperator,
     MemberProperty, MetaProperty, NamespaceName, NewExpression, NodeId, ObjectLiteral,
     ObjectMember, ParameterNode, PropertyModifier, PropertyName, SourceFile, Statement, Stmt,
@@ -4214,24 +4214,13 @@ enum TypeDef<'src> {
 
 /// Whether the file is an external module: it carries a top-level `import` or
 /// `export` that names a module.
-///
-/// `import I = A.B.C` aliases a namespace and leaves the file a script, while
-/// `import I = require("m")` references a module, so only the `Require` form
-/// counts. `ExternalModuleReference` already separates them. Counting the alias
-/// form makes a script look like a module, which flips its implicit strictness
-/// in the checker and suppresses the emitter's `"use strict"` prologue;
-/// `constEnums` is the baseline that proves it.
 pub(crate) fn source_is_module(source: &SourceFile) -> bool {
-    source
-        .statements()
-        .iter()
-        .any(|statement| match statement.data() {
-            Statement::Import(_) | Statement::Export(_) => true,
-            Statement::ImportEquals(import) => {
-                matches!(import.reference, ExternalModuleReference::Require(_))
-            }
-            _ => false,
-        })
+    source.statements().iter().any(|statement| {
+        matches!(
+            statement.data(),
+            Statement::Import(_) | Statement::Export(_) | Statement::ImportEquals(_)
+        )
+    })
 }
 
 /// Returns whether the directive prologue of a statement list contains
