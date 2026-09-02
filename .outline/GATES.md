@@ -16,6 +16,7 @@ Scope: Complete the clean-room Rust compiler, TypeScript-compatible Node 24 API 
   CHECK: cargo run -p bamts-verification -- completion verify --root compiler
   EXPECT: COMPILER COMPLETE release=typescript-7.0.2 blocking=0 external_blocked=0
   EVIDENCE: 2026-08-28 `completion verify --root compiler` exit 1: unproven B0.1, B1.1 through B1.4, B2.1, B2.2, B3.1 through B3.3, and 19515 more. Ledger n=78498 PASS=0 BLOCKING_FAIL=71750
+  BASELINE: 2026-09-02 `bamts-verification suite run --catalog typescript-7.0.2 --shard i/64` with `BAMTS_SUITE_COMPILER_ADAPTER` set, receipts under `target/evidence-sweep/typescript-7.0.2/`. This is a shard sweep, not the CHECK above. 66786 rows: PASS 8951 (13.4%), BLOCKING_FAIL 51141 (76.6%), INAPPLICABLE_LANGUAGE_SERVICE 6693, TIMEOUT 1. Per-facet PASS: diagnostics 6525/15484, symbols 1846/14621, source-map 8/237, types 440/15918, declaration 61/2215, javascript 71/14096, parse 0/3718, trace 0/487, build-info 0/10. The 2026-08-28 line above reads PASS=0 because no adapter was registered, so every cell recorded `no registered adapter` and nothing was measured. These receipts pre-date 979b78c and 6d1ecc3, so they are a baseline for ranking work, never publishable completion evidence.
 
 - [ ] G4: The bamti Node 24 package implements tsc and all thirteen stable native-preview export subpaths, including API-reachable language-service behavior
   CHECK: cargo run -p bamts-verification -- completion verify --root package
