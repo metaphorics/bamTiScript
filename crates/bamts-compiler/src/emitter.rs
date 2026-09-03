@@ -5859,6 +5859,7 @@ export default answer;
         ));
         assert!(parsed.diagnostics().is_empty());
         let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
         assert_eq!(
             javascript(&output).code,
             "class C {\n    constructor(x) {\n        this.x = x;\n    }\n}\n"
