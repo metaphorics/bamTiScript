@@ -2047,7 +2047,7 @@ impl<'a> Emitter<'a> {
             }
             if !first {
                 let limit = parameter.binding.range().start();
-                cursor = self.mapped_list_separator_from(cursor, limit);
+                self.mapped_list_separator_from(cursor, limit);
             }
             first = false;
             self.emit_decorators_inline(&parameter.decorators);
@@ -2126,7 +2126,7 @@ impl<'a> Emitter<'a> {
         self.emit_class_body_js(&class.members, range);
     }
 
-    fn emit_class_body_js(&mut self, members: &[ClassMemberNode], range: TextRange) {
+    fn emit_class_body_js(&mut self, members: &[ClassMemberNode], _range: TextRange) {
         self.raw("{");
         let has = members
             .iter()
@@ -4668,14 +4668,6 @@ fn array_element_range(element: &ArrayElement) -> Option<TextRange> {
 fn array_binding_element_range(element: &ArrayBindingElement) -> Option<TextRange> {
     match element {
         ArrayBindingElement::Binding(binding) => Some(binding.range()),
-        _ => None,
-    }
-}
-
-/// Source range of an assignment-target array-pattern element.
-fn assignment_array_element_range(element: &AssignmentArrayElement) -> Option<TextRange> {
-    match element {
-        AssignmentArrayElement::Target(target) => Some(target.range()),
         _ => None,
     }
 }

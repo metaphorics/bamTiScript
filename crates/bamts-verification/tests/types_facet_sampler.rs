@@ -831,76 +831,76 @@ fn types_facet_wrong_expr_diagnostic() {
             Err(_) => continue,
         };
         let verdict = compare_types(&expected, &emitted);
-        if verdict != FacetVerdict::Pass {
-            if let Some((_, exp_line, _, act_line)) = first_diff(&expected, &emitted) {
-                let family = classify_diff(&expected, &emitted, &exp_line, &act_line, "");
-                if family != "wrong-expression-typed" {
-                    continue;
-                }
-                // Extract record lines (only `>display : type` lines, not
-                // caret lines), using the same predicate as `first_diff`.
-                let exp_records: Vec<&str> = expected
-                    .lines()
-                    .filter(|l| l.starts_with('>') && !is_caret_line(l))
-                    .collect();
-                let act_records: Vec<&str> = emitted
-                    .lines()
-                    .filter(|l| l.starts_with('>') && !is_caret_line(l))
-                    .collect();
+        if verdict != FacetVerdict::Pass
+            && let Some((_, exp_line, _, act_line)) = first_diff(&expected, &emitted)
+        {
+            let family = classify_diff(&expected, &emitted, &exp_line, &act_line, "");
+            if family != "wrong-expression-typed" {
+                continue;
+            }
+            // Extract record lines (only `>display : type` lines, not
+            // caret lines), using the same predicate as `first_diff`.
+            let exp_records: Vec<&str> = expected
+                .lines()
+                .filter(|l| l.starts_with('>') && !is_caret_line(l))
+                .collect();
+            let act_records: Vec<&str> = emitted
+                .lines()
+                .filter(|l| l.starts_with('>') && !is_caret_line(l))
+                .collect();
 
-                // LCS alignment on display names
-                let exp_displays: Vec<String> =
-                    exp_records.iter().map(|l| extract_display(l)).collect();
-                let act_displays: Vec<String> =
-                    act_records.iter().map(|l| extract_display(l)).collect();
+            // LCS alignment on display names
+            let exp_displays: Vec<String> =
+                exp_records.iter().map(|l| extract_display(l)).collect();
+            let act_displays: Vec<String> =
+                act_records.iter().map(|l| extract_display(l)).collect();
 
-                // Simple LCS on display names
-                let m = exp_displays.len();
-                let n = act_displays.len();
-                let mut dp = vec![vec![0usize; n + 1]; m + 1];
-                for i in 1..=m {
-                    for j in 1..=n {
-                        if exp_displays[i - 1] == act_displays[j - 1] {
-                            dp[i][j] = dp[i - 1][j - 1] + 1;
-                        } else {
-                            dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
-                        }
+            // Simple LCS on display names
+            let m = exp_displays.len();
+            let n = act_displays.len();
+            let mut dp = vec![vec![0usize; n + 1]; m + 1];
+            for i in 1..=m {
+                for j in 1..=n {
+                    if exp_displays[i - 1] == act_displays[j - 1] {
+                        dp[i][j] = dp[i - 1][j - 1] + 1;
+                    } else {
+                        dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
                     }
                 }
-                let lcs_len = dp[m][n];
-                let match_ratio = if m > 0 {
-                    lcs_len as f64 / m as f64
-                } else {
-                    0.0
-                };
+            }
+            let lcs_len = dp[m][n];
+            let match_ratio = if m > 0 {
+                lcs_len as f64 / m as f64
+            } else {
+                0.0
+            };
 
-                // If most expected displays match actual displays, the diff is
-                // at a specific position — likely (a) observer emitting wrong
-                // node at that position. If many expected displays are missing,
-                // it's (b) compiler not recording type_of_expr for those nodes.
-                let exp_only = m.saturating_sub(lcs_len);
-                let act_only = n.saturating_sub(lcs_len);
+            // If most expected displays match actual displays, the diff is
+            // at a specific position — likely (a) observer emitting wrong
+            // node at that position. If many expected displays are missing,
+            // it's (b) compiler not recording type_of_expr for those nodes.
+            let exp_only = m.saturating_sub(lcs_len);
+            let act_only = n.saturating_sub(lcs_len);
 
-                let label = format!(
-                    "{} | exp_records={} act_records={} lcs={} exp_only={} act_only={} match_ratio={:.2} | EXP:{} | ACT:{}",
-                    case.logical_path,
-                    m,
-                    n,
-                    lcs_len,
-                    exp_only,
-                    act_only,
-                    match_ratio,
-                    exp_line,
-                    act_line
-                );
+            let label = format!(
+                "{} | exp_records={} act_records={} lcs={} exp_only={} act_only={} match_ratio={:.2} | EXP:{} | ACT:{}",
+                case.logical_path,
+                m,
+                n,
+                lcs_len,
+                exp_only,
+                act_only,
+                match_ratio,
+                exp_line,
+                act_line
+            );
 
-                if exp_only > 3 && match_ratio < 0.5 {
-                    compiler_side.push(label);
-                } else if exp_only <= 2 && act_only <= 2 {
-                    observer_side.push(label);
-                } else {
-                    ambiguous.push(label);
-                }
+            if exp_only > 3 && match_ratio < 0.5 {
+                compiler_side.push(label);
+            } else if exp_only <= 2 && act_only <= 2 {
+                observer_side.push(label);
+            } else {
+                ambiguous.push(label);
             }
         }
     }

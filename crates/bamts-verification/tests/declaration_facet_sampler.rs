@@ -382,11 +382,11 @@ fn extract_js_sections(baseline: &str) -> String {
     let mut out = String::new();
     let mut in_js_section = false;
     for line in baseline.lines() {
-        if line.starts_with("//// [") {
-            if let Some(end) = line.find(']') {
-                let name = &line[6..end];
-                in_js_section = name.ends_with(".js");
-            }
+        if line.starts_with("//// [")
+            && let Some(end) = line.find(']')
+        {
+            let name = &line[6..end];
+            in_js_section = name.ends_with(".js");
         }
         if in_js_section {
             out.push_str(line);
