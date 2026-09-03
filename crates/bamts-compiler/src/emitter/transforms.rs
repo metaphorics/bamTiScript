@@ -565,12 +565,15 @@ enum ExportWrapper {
 }
 
 /// First [`NodeId`](crate::syntax::NodeId) the [`Rewriter`] may mint. The
-/// parser assigns dense ids from zero, so ids at or above this floor are
-/// known rewriter-minted and the printer's mint-gate assert leans on that
-/// split. Taint itself is set membership and the authored-length gate
-/// decides out-of-text ranges, so even a pathological file whose parser
-/// arena crossed the floor would only waive the assert, never misclassify
-/// a node. Change the value in one place only.
+/// parser assigns dense ids from zero, so on ordinary files ids at or above
+/// this floor are rewriter-minted and the printer's mint-gate assert leans
+/// on that split. Taint itself is set membership, so a pathological file
+/// (multi-MB dense nodes, parser ids past the floor) can alias
+/// rewriter-minted values into the set and wrongly expand an authored
+/// single-line body; bytes stay valid, preservation just loses. Deriving
+/// the seed from the file's real high-water id (including JSX-desugar
+/// consumption) is the exact fix, queued for phase 2. Change the value in
+/// one place only.
 pub(crate) const SYNTHESIZED_ID_FLOOR: u32 = 1_000_000;
 
 struct Rewriter<'a> {
