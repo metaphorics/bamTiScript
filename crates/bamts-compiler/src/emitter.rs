@@ -1295,9 +1295,11 @@ impl<'a> Emitter<'a> {
 
     fn emit_expression_statement(&mut self, statement: &ExpressionStatement) {
         let expression = &statement.expression;
-        // A parenthesized node prints its own parens, so manual wrapping would double them.
-        let wrap = !matches!(expression.data(), Expression::Parenthesized(_))
-            && self.leads_with_bad_token(expression, false);
+        // Manual wrapping is only needed when emission would otherwise start
+        // with a bare `{`, `function`, or `class`: a printed `(` anywhere on
+        // the left edge already protects the statement position.
+        let wrap =
+            !self.starts_parenthesized(expression) && self.leads_with_bad_token(expression, false);
         if wrap {
             self.raw("(");
             self.emit_expression_prec(expression, 0);
@@ -1982,7 +1984,7 @@ impl<'a> Emitter<'a> {
                 self.emit_block_with_braces(block.data(), block.range(), false);
             }
             FunctionBody::Expression(expression) => {
-                if !matches!(expression.data(), Expression::Parenthesized(_))
+                if !self.starts_parenthesized(expression)
                     && self.leads_with_bad_token(expression, true)
                 {
                     self.raw("(");
@@ -2839,7 +2841,7 @@ impl<'a> Emitter<'a> {
                 self.unwrap_expression(&member.object).data(),
                 Expression::Literal(Literal::Number(_))
             );
-        if numeric_object && !matches!(member.object.data(), Expression::Parenthesized(_)) {
+        if numeric_object && !self.starts_parenthesized(&member.object) {
             self.raw("(");
             self.emit_expression_prec(&member.object, 0);
             self.raw(")");
@@ -3033,9 +3035,7 @@ impl<'a> Emitter<'a> {
         prec: u8,
         is_left: bool,
     ) {
-        if self.coalesce_mix(parent, operand)
-            && !matches!(operand.data(), Expression::Parenthesized(_))
-        {
+        if self.coalesce_mix(parent, operand) && !self.starts_parenthesized(operand) {
             self.raw("(");
             self.emit_expression_prec(operand, 0);
             self.raw(")");
@@ -3130,7 +3130,7 @@ impl<'a> Emitter<'a> {
                         self.unwrap_expression(&member.object).data(),
                         Expression::Literal(Literal::Number(_))
                     );
-                if numeric_object && !matches!(member.object.data(), Expression::Parenthesized(_)) {
+                if numeric_object && !self.starts_parenthesized(&member.object) {
                     self.raw("(");
                     self.emit_expression_prec(&member.object, 0);
                     self.raw(")");
@@ -3453,6 +3453,47 @@ impl<'a> Emitter<'a> {
         match target.data() {
             AssignmentTarget::Object(_) => true,
             AssignmentTarget::Member(member) => self.leads_with_bad_token(&member.object, false),
+            _ => false,
+        }
+    }
+    /// Whether emission of this expression starts with a printed `(`.
+    /// Walks only the left edge through nodes whose emission forwards to
+    /// it, stopping at parenthesized nodes (which print their own parens)
+    /// instead of seeing through them like [`Self::leads_with_bad_token`]
+    /// does. Naming the upstream query: this is the `GetLeftmostExpression`
+    /// stop-at-parens half of the statement-position decision.
+    fn starts_parenthesized(&self, expression: &Expr) -> bool {
+        match expression.data() {
+            Expression::Parenthesized(_) => true,
+            Expression::As(as_expr) => self.starts_parenthesized(&as_expr.expression),
+            Expression::Satisfies(satisfies) => self.starts_parenthesized(&satisfies.expression),
+            Expression::TypeAssertion(assertion) => {
+                self.starts_parenthesized(&assertion.expression)
+            }
+            Expression::NonNull(non_null) => self.starts_parenthesized(&non_null.expression),
+            Expression::Binary(binary) => self.starts_parenthesized(&binary.left),
+            Expression::Logical(logical) => self.starts_parenthesized(&logical.left),
+            Expression::Conditional(conditional) => self.starts_parenthesized(&conditional.test),
+            Expression::Sequence(sequence) => sequence
+                .expressions
+                .first()
+                .is_some_and(|first| self.starts_parenthesized(first)),
+            Expression::Call(call) => self.starts_parenthesized(&call.callee),
+            Expression::Member(member) => self.starts_parenthesized(&member.object),
+            Expression::TaggedTemplate(tagged) => self.starts_parenthesized(&tagged.tag),
+            Expression::Update(update) if !update.prefix => {
+                self.target_starts_parenthesized(&update.argument)
+            }
+            Expression::Assignment(assignment) => {
+                self.target_starts_parenthesized(&assignment.left)
+            }
+            _ => false,
+        }
+    }
+
+    fn target_starts_parenthesized(&self, target: &AssignmentTargetNode) -> bool {
+        match target.data() {
+            AssignmentTarget::Member(member) => self.starts_parenthesized(&member.object),
             _ => false,
         }
     }
