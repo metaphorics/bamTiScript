@@ -514,7 +514,7 @@ fn declaration_facet_sample() {
 
         // For declaration, extract only the .d.ts sections from the .js baseline
         let expected = if facet == "declaration" {
-            extract_dts_sections(&raw_baseline)
+            extract_dts_sections(&raw_baseline, units.len())
         } else {
             raw_baseline
         };

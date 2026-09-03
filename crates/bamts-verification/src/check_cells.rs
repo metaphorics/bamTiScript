@@ -24,11 +24,13 @@ use std::{
 use bamts_compiler::checker::Type;
 use bamts_compiler::checker::{SemanticModel, SymbolId, SymbolKind, render_type};
 use bamts_compiler::diagnostic::DiagnosticSeverity;
-use bamts_compiler::emitter::{EmitFileNames, EmitOptions, emit_checked};
+use bamts_compiler::emitter::{EmitFileNames, EmitOptions, ModuleKind, emit_checked};
 use bamts_compiler::pipeline::{
     FrontendMode, FrontendOutput, ProgramFrontendOutput, compile_program_frontend,
 };
-use bamts_compiler::program::{ModuleEdgeKind, ProgramLoader, ResolvedProgram};
+use bamts_compiler::program::{
+    JsxRoutingDecision, ModuleEdgeKind, ProgramLoader, ProgramOutputKind, ResolvedProgram,
+};
 use bamts_compiler::project::build_mode::{
     BUILD_INFO_SCHEMA, BuildInfo, canonical_json, source_signature,
 };
@@ -208,6 +210,26 @@ impl CheckedCase {
         self.units
             .iter()
             .filter_map(|(unit, index)| index.map(|index| (unit, &self.output.modules()[index])))
+    }
+
+    /// `(unit, output)` pairs for every reached unit, sorted by ascending
+    /// module index. `ProgramFrontendOutput::modules()` is dependency-first
+    /// (dependencies before dependents), matching upstream's output section
+    /// order. `reached_units()` iterates split order instead, which is the
+    /// `// @filename:` directive order and not the emit order.
+    pub fn reached_units_in_module_order(&self) -> Vec<(&CaseUnit, &FrontendOutput)> {
+        let mut triples: Vec<(usize, &CaseUnit, &FrontendOutput)> = self
+            .units
+            .iter()
+            .filter_map(|(unit, index)| {
+                index.map(|index| (index, unit, &self.output.modules()[index]))
+            })
+            .collect();
+        triples.sort_by_key(|(index, _, _)| *index);
+        triples
+            .into_iter()
+            .map(|(_, unit, output)| (unit, output))
+            .collect()
     }
 
     /// The resolved module graph, for the trace comparator.
@@ -1807,6 +1829,14 @@ fn is_declaration_input_name(name: &str) -> bool {
     is_declaration_section_name(name)
 }
 
+/// Whether a unit name is a JSON file (`.json`). Upstream's declaration emit
+/// never produces a `.d.ts` for JSON inputs: `resolveJsonModule` lets a JSON
+/// file be imported as a typed value, but the output mapping skips it for
+/// declaration purposes.
+fn is_json_input_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".json")
+}
+
 /// The declaration text one unit's frontend output carries, when it carries
 /// one.
 fn declaration_code(output: &FrontendOutput) -> Option<&str> {
@@ -1944,11 +1974,11 @@ pub fn emit_declaration_baseline(case: &CheckedCase) -> std::result::Result<Stri
     let options = case.options();
     let bundle = bundle_output_name(options)?;
     let mut out = String::new();
-    for (unit, output) in case.reached_units() {
+    for (unit, output) in case.reached_units_in_module_order() {
         let name = unit_basename(&unit.virtual_path);
-        // Declaration inputs declare nothing; upstream's output mapping skips
-        // them, so they contribute no section.
-        if is_declaration_input_name(&name) {
+        // Declaration inputs and JSON inputs produce no declaration output;
+        // upstream's output mapping skips them entirely.
+        if is_declaration_input_name(&name) || is_json_input_name(&name) {
             continue;
         }
         let section = output_section_name(&name, bundle.as_deref(), declaration_extension);
@@ -1988,14 +2018,24 @@ fn is_declaration_section_name(name: &str) -> bool {
 /// `.js` baseline document. The `declaration` observable speaks only about
 /// this slice; input echoes, `.js` outputs, and `[DtsFileErrors]` markers stay
 /// out of the comparison.
+///
+/// `echo_count` is the number of input-file echo sections at the top of the
+/// document (one per `// @filename:` unit). Upstream's `doJsEmitBaseline`
+/// writes all input echoes first, then generated outputs; a `.d.ts`-named
+/// section in the echo zone is an input echo, not a generated declaration.
+/// Skipping `echo_count` sections before extracting prevents echo
+/// contamination when a case has `.d.ts` inputs alongside generated
+/// declarations of the same basename.
 #[must_use]
-pub fn extract_dts_sections(baseline: &str) -> String {
+pub fn extract_dts_sections(baseline: &str, echo_count: usize) -> String {
     let mut out = String::new();
     let mut in_section = false;
+    let mut sections_seen = 0usize;
     for line in baseline.lines() {
         match section_header_name(line) {
             Some(name) => {
-                in_section = is_declaration_section_name(name);
+                sections_seen += 1;
+                in_section = sections_seen > echo_count && is_declaration_section_name(name);
                 if in_section {
                     out.push_str(line.trim_end());
                     out.push('\n');
@@ -2071,7 +2111,7 @@ pub(crate) fn observe_declaration(
                     };
                 }
             };
-            let expected = extract_dts_sections(&String::from_utf8_lossy(&bytes));
+            let expected = extract_dts_sections(&String::from_utf8_lossy(&bytes), units.len());
             match compare_js_emit(&expected, &emitted) {
                 FacetVerdict::Pass => CompilerCheckObservation {
                     class: FailureClass::Pass,
@@ -2133,9 +2173,9 @@ pub fn emit_source_map_baseline(
     let want_dts_map = declaration_map;
     let mut js_maps: Vec<(String, String)> = Vec::new();
     let mut dts_maps: Vec<(String, String)> = Vec::new();
-    for (unit, output) in case.reached_units() {
+    for (unit, output) in case.reached_units_in_module_order() {
         let source_name = unit_basename(&unit.virtual_path);
-        if is_declaration_input_name(&source_name) {
+        if is_declaration_input_name(&source_name) || is_json_input_name(&source_name) {
             continue;
         }
         let js_name = output_section_name(&source_name, bundle.as_deref(), |name| {
@@ -2152,7 +2192,7 @@ pub fn emit_source_map_baseline(
             declaration_source_map_url: Some(Arc::from(format!("{dts_name}.map").as_str())),
             ..EmitFileNames::default()
         };
-        let options = EmitOptions {
+        let mut options = EmitOptions {
             source_map: want_js_map,
             declaration: want_dts_map || program_options.declaration(),
             emit_declaration_only: program_options.emit_declaration_only(),
@@ -2160,6 +2200,28 @@ pub fn emit_source_map_baseline(
             inline_sources,
             ..EmitOptions::default()
         };
+        // Forward the resolved program's emit fields (target, always_strict,
+        // module, jsx) the same way pipeline.rs does, so the verification
+        // lane and the CLI cannot diverge on downleveling, the strict-mode
+        // prologue, or module-wrapper structure.
+        let prog = case.program();
+        let check = prog.check_options();
+        options.apply_emit_fields(
+            check.target(),
+            check.always_strict(),
+            prog.is_commonjs().then_some(ModuleKind::CommonJs),
+        );
+        match prog.jsx_routing_decision(ProgramOutputKind::JavaScript) {
+            JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
+                options.jsx = prog.jsx();
+                options.jsx_factory = prog.jsx_factory().map(Arc::from);
+                options.jsx_fragment_factory = prog.jsx_fragment_factory().map(Arc::from);
+                options.jsx_import_source = prog.jsx_import_source().map(Arc::from);
+            }
+            JsxRoutingDecision::Lower | JsxRoutingDecision::RejectPreservedNative => {
+                unreachable!("JavaScript output never selects a native JSX route");
+            }
+        }
         let emitted = emit_checked(
             output.source_file(),
             output.semantic_model(),
@@ -4568,7 +4630,7 @@ export const t = 1;
             \n\
             //// [a.d.ts]\ndeclare class A {}\n";
         assert_eq!(
-            extract_dts_sections(doc),
+            extract_dts_sections(doc, 1),
             "//// [a.d.ts]\ndeclare class A {}\n"
         );
     }
@@ -4594,12 +4656,12 @@ export const t = 1;
             \n\
             //// [declPin.d.ts]\ndeclare var x: number;\n";
         assert_eq!(
-            compare_js_emit(&extract_dts_sections(baseline_doc), &emitted),
+            compare_js_emit(&extract_dts_sections(baseline_doc, 1), &emitted),
             FacetVerdict::Pass
         );
         let semantic = baseline_doc.replace("number", "string");
         assert!(matches!(
-            compare_js_emit(&extract_dts_sections(&semantic), &emitted),
+            compare_js_emit(&extract_dts_sections(&semantic, 1), &emitted),
             FacetVerdict::Fail { .. }
         ));
     }
@@ -5331,4 +5393,178 @@ class C {\n\
             "emitted:\n{emitted}"
         );
     }
+
+    // ---- Section-header-diff fixes (wave 4) -----------------------------
+
+    /// `extract_dts_sections` must skip input-echo sections: a `.d.ts`-named
+    /// section in the echo zone is an input file, not a generated declaration.
+    /// The `echo_count` parameter tells the extractor how many leading
+    /// sections are echoes (one per `// @filename:` unit).
+    #[test]
+    fn extract_dts_sections_skips_echo_dts_inputs() {
+        // Mirrors `exportSpecifierForAGlobal.js`: `a.d.ts` is an input echo,
+        // `b.d.ts` is the generated output. With `echo_count = 2` (a.d.ts +
+        // b.ts), only the output `b.d.ts` section survives.
+        let doc = "\
+//// [tests/cases/compiler/exportSpecifierForAGlobal.ts] ////\n\
+\n\
+//// [a.d.ts]\ndeclare const g: number;\n\
+\n\
+//// [b.ts]\nexport { g };\n\
+\n\
+//// [b.js]\n\"use strict\";\nexport { g };\n\
+\n\
+//// [b.d.ts]\ndeclare const g: number;\n";
+        assert_eq!(
+            extract_dts_sections(doc, 2),
+            "//// [b.d.ts]\ndeclare const g: number;\n"
+        );
+    }
+
+    /// JSON inputs must not produce declaration sections. Upstream's output
+    /// mapping skips `.json` files for declaration emit entirely.
+    #[test]
+    fn declaration_baseline_skips_json_input_units() {
+        let source = "\
+// @declaration: true\n\
+// @resolveJsonModule: true\n\
+// @module: nodenext\n\
+\n\
+// @filename: package.json\n\
+{\"name\": \"pkg\", \"type\": \"module\"}\n\
+\n\
+// @filename: index.ts\n\
+export const x: number = 1;\n";
+        let logical = "tests/cases/compiler/jsonSkipTest.ts";
+        let units = split_case_units(logical, source);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_declaration_baseline(&case).expect("declaration emit");
+        // Must contain index.d.ts but NOT package.d.json.ts or any JSON-derived section
+        assert!(
+            emitted.contains("//// [index.d.ts]"),
+            "expected index.d.ts section, got:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("package"),
+            "JSON input must not produce a declaration section, got:\n{emitted}"
+        );
+    }
+
+    /// Declaration output sections must follow module-index order
+    /// (dependency-first), not split order (`// @filename:` directive order).
+    /// `exportSpecifiers` has split [imports.ts, exports.ts] but modules()
+    /// is [exports.ts, imports.ts], and the baseline emits exports.d.ts
+    /// before imports.d.ts.
+    #[test]
+    fn declaration_baseline_emits_in_module_index_order() {
+        let source = "\
+// @module: esnext\n\
+// @declaration: true\n\
+\n\
+// @filename: imports.ts\n\
+import { foo } from \"./exports\";\n\
+export { foo };\n\
+\n\
+// @filename: exports.ts\n\
+export const foo = 1;\n";
+        let logical = "tests/cases/compiler/exportSpecifiers.ts";
+        let units = split_case_units(logical, source);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_declaration_baseline(&case).expect("declaration emit");
+        let exports_pos = emitted.find("//// [exports.d.ts]").unwrap_or(usize::MAX);
+        let imports_pos = emitted.find("//// [imports.d.ts]").unwrap_or(usize::MAX);
+        assert!(
+            exports_pos < imports_pos,
+            "exports.d.ts must precede imports.d.ts (module-index order), got:\n{emitted}"
+        );
+    }
+}
+
+// ---- Section-header-diff fixes (wave 4) -----------------------------
+
+/// `extract_dts_sections` must skip input-echo sections: a `.d.ts`-named
+/// section in the echo zone is an input file, not a generated declaration.
+/// The `echo_count` parameter tells the extractor how many leading
+/// sections are echoes (one per `// @filename:` unit).
+#[test]
+fn extract_dts_sections_skips_echo_dts_inputs() {
+    // Mirrors `exportSpecifierForAGlobal.js`: `a.d.ts` is an input echo,
+    // `b.d.ts` is the generated output. With `echo_count = 2` (a.d.ts +
+    // b.ts), only the output `b.d.ts` section survives.
+    let doc = "\
+//// [tests/cases/compiler/exportSpecifierForAGlobal.ts] ////\n\
+\n\
+//// [a.d.ts]\ndeclare const g: number;\n\
+\n\
+//// [b.ts]\nexport { g };\n\
+\n\
+//// [b.js]\n\"use strict\";\nexport { g };\n\
+\n\
+//// [b.d.ts]\ndeclare const g: number;\n";
+    assert_eq!(
+        extract_dts_sections(doc, 2),
+        "//// [b.d.ts]\ndeclare const g: number;\n"
+    );
+}
+
+/// JSON inputs must not produce declaration sections. Upstream's output
+/// mapping skips `.json` files for declaration emit entirely.
+#[test]
+fn declaration_baseline_skips_json_input_units() {
+    let source = "\
+// @declaration: true\n\
+// @resolveJsonModule: true\n\
+// @module: nodenext\n\
+\n\
+// @filename: package.json\n\
+{\"name\": \"pkg\", \"type\": \"module\"}\n\
+\n\
+// @filename: index.ts\n\
+export const x: number = 1;\n";
+    let logical = "tests/cases/compiler/jsonSkipTest.ts";
+    let units = split_case_units(logical, source);
+    let entry = entry_virtual_path(logical, &units);
+    let case = compile_case(&units, &entry).expect("case compiles");
+    let emitted = emit_declaration_baseline(&case).expect("declaration emit");
+    // Must contain index.d.ts but NOT package.d.json.ts or any JSON-derived section
+    assert!(
+        emitted.contains("//// [index.d.ts]"),
+        "expected index.d.ts section, got:\n{emitted}"
+    );
+    assert!(
+        !emitted.contains("package"),
+        "JSON input must not produce a declaration section, got:\n{emitted}"
+    );
+}
+
+/// Declaration output sections must follow module-index order
+/// (dependency-first), not split order (`// @filename:` directive order).
+/// `exportSpecifiers` has split [imports.ts, exports.ts] but modules()
+/// is [exports.ts, imports.ts], and the baseline emits exports.d.ts
+/// before imports.d.ts.
+#[test]
+fn declaration_baseline_emits_in_module_index_order() {
+    let source = "\
+// @module: esnext\n\
+// @declaration: true\n\
+\n\
+// @filename: imports.ts\n\
+import { foo } from \"./exports\";\n\
+export { foo };\n\
+\n\
+// @filename: exports.ts\n\
+export const foo = 1;\n";
+    let logical = "tests/cases/compiler/exportSpecifiers.ts";
+    let units = split_case_units(logical, source);
+    let entry = entry_virtual_path(logical, &units);
+    let case = compile_case(&units, &entry).expect("case compiles");
+    let emitted = emit_declaration_baseline(&case).expect("declaration emit");
+    let exports_pos = emitted.find("//// [exports.d.ts]").unwrap_or(usize::MAX);
+    let imports_pos = emitted.find("//// [imports.d.ts]").unwrap_or(usize::MAX);
+    assert!(
+        exports_pos < imports_pos,
+        "exports.d.ts must precede imports.d.ts (module-index order), got:\n{emitted}"
+    );
 }
