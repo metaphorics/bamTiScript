@@ -2272,6 +2272,17 @@ impl<'a> Rewriter<'a> {
                     }
                     let name =
                         self.lower_class_member_name(&property.name, &mut prelude, member.range());
+                    // Assignment semantics define nothing for a declaration
+                    // without an initializer: tsc emits no assignment and no
+                    // constructor for it (baseline
+                    // computedPropertyNames36_ES5(target=es2015).js keeps
+                    // `class Foo {\n}`). Define mode still materializes the
+                    // `void 0` default through defineProperty below, so only
+                    // Assign drops the entry. Computed-key side effects already
+                    // live in `prelude`, independent of this push.
+                    if property.initializer.is_none() && matches!(mode, FieldMode::Assign) {
+                        continue;
+                    }
                     let init = property
                         .initializer
                         .as_deref()
@@ -5791,12 +5802,32 @@ mod tests {
         );
     }
     #[test]
-    fn uninitialized_public_fields_create_own_undefined_properties() {
+    fn uninitialized_fields_emit_nothing_under_assignment_semantics() {
+        // Baseline computedPropertyNames36_ES5(target=es2015).js keeps
+        // `class Foo {\n}` for `class Foo { x }`: assignment semantics
+        // define nothing for a declaration without an initializer.
         let output = emit_at("class C { x; static y; }\n", ScriptTarget::Es2015);
         let code = javascript(&output);
-        assert!(code.contains("this.x = void 0"), "{code}");
-        assert!(code.contains("C.y = void 0"), "{code}");
-        assert!(!code.lines().any(|line| line.trim() == "x;"), "{code}");
+        assert!(!code.contains("constructor"), "{code}");
+        assert!(!code.contains("void 0"), "{code}");
+        assert!(code.contains("class C {"), "{code}");
+    }
+
+    #[test]
+    fn uninitialized_fields_define_void_0_under_define_semantics() {
+        let output = emit_with_options(
+            "class C { x; static y; }\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                use_define_for_class_fields: Some(true),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(code.contains("Object.defineProperty(this, \"x\""), "{code}");
+        assert!(code.contains("Object.defineProperty(C, \"y\""), "{code}");
+        assert!(code.contains("void 0"), "{code}");
+        assert!(!code.contains("this.x ="), "{code}");
     }
 
     #[test]
