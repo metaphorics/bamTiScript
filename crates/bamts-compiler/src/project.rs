@@ -929,6 +929,7 @@ pub struct CompilerOptions {
     strict_null_checks: bool,
     strict_property_initialization: bool,
     always_strict: bool,
+    use_define_for_class_fields: Option<bool>,
     allow_js: bool,
     check_js: bool,
     resolve_json_module: bool,
@@ -1018,6 +1019,10 @@ impl CompilerOptions {
     #[must_use]
     pub const fn always_strict(&self) -> bool {
         self.always_strict
+    }
+    #[must_use]
+    pub const fn use_define_for_class_fields(&self) -> Option<bool> {
+        self.use_define_for_class_fields
     }
 
     #[must_use]
@@ -1209,6 +1214,7 @@ impl ProjectConfig {
             )?
             .unwrap_or(strict),
             always_strict: optional_bool(compiler, "alwaysStrict")?.unwrap_or(strict),
+            use_define_for_class_fields: optional_bool(compiler, "useDefineForClassFields")?,
             allow_js: optional_bool(compiler, "allowJs")?.unwrap_or(false),
             check_js: optional_bool(compiler, "checkJs")?.unwrap_or(false),
             resolve_json_module: optional_bool(compiler, "resolveJsonModule")?.unwrap_or(false),
@@ -2497,6 +2503,37 @@ mod tests {
         assert!(!config.options().strict_null_checks());
         assert!(!config.options().strict_property_initialization());
         assert!(!config.options().always_strict());
+    }
+
+    #[test]
+    fn project_config_parses_use_define_for_class_fields_as_tri_state() {
+        let pinned_true = ProjectConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{"compilerOptions":{"useDefineForClassFields":true}}"#,
+        )
+        .expect("pinned true");
+        assert_eq!(
+            pinned_true.options().use_define_for_class_fields(),
+            Some(true)
+        );
+        let pinned_false = ProjectConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{"compilerOptions":{"useDefineForClassFields":false}}"#,
+        )
+        .expect("pinned false");
+        assert_eq!(
+            pinned_false.options().use_define_for_class_fields(),
+            Some(false)
+        );
+        let silent = ProjectConfig::parse(
+            &root(),
+            "/workspace/corpus/tsconfig.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        )
+        .expect("silent key");
+        assert_eq!(silent.options().use_define_for_class_fields(), None);
     }
 
     #[test]

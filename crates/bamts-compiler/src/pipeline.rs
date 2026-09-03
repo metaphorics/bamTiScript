@@ -211,7 +211,12 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
     let target = check.target();
     let always_strict = check.always_strict();
     let module = program.is_commonjs().then_some(ModuleKind::CommonJs);
-    options.apply_emit_fields(target, always_strict, module);
+    options.apply_emit_fields(
+        target,
+        always_strict,
+        module,
+        program.use_define_for_class_fields(),
+    );
 
     // JSX routing is JavaScript-specific and already shared with the CLI path,
     // which applies the same overrides from `program.jsx()` after its base

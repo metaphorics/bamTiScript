@@ -717,7 +717,12 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
         .unwrap_or(emitter::ScriptTarget::EsNext);
     let always_strict = options.always_strict();
     let module = options.module().and_then(emitter::parse_module);
-    emit_options.apply_emit_fields(target, always_strict, module);
+    emit_options.apply_emit_fields(
+        target,
+        always_strict,
+        module,
+        options.use_define_for_class_fields(),
+    );
 
     (emit_options, diagnostics)
 }

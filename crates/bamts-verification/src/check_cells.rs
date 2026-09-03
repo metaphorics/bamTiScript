@@ -836,7 +836,8 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "composite"
             | "emitdeclarationonly"
             | "sourcemap"
-            | "declarationmap" => value.eq_ignore_ascii_case("true").to_string(),
+            | "declarationmap"
+            | "usedefineforclassfields" => value.eq_ignore_ascii_case("true").to_string(),
             "lib" => {
                 let items: Vec<String> = values
                     .iter()
@@ -858,6 +859,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "moduleresolution" => "moduleResolution",
             "noemit" => "noEmit",
             "alwaysstrict" => "alwaysStrict",
+            "usedefineforclassfields" => "useDefineForClassFields",
             "exactoptionalpropertytypes" => "exactOptionalPropertyTypes",
             "nouncheckedindexedaccess" => "noUncheckedIndexedAccess",
             "strictpropertyinitialization" => "strictPropertyInitialization",
@@ -2285,6 +2287,7 @@ pub fn emit_source_map_baseline(
             check.target(),
             check.always_strict(),
             prog.is_commonjs().then_some(ModuleKind::CommonJs),
+            prog.use_define_for_class_fields(),
         );
         match prog.jsx_routing_decision(ProgramOutputKind::JavaScript) {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {

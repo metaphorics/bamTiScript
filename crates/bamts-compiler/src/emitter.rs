@@ -191,19 +191,25 @@ impl EmitOptions {
     }
 
     /// Applies the emit-relevant fields that the project (CLI) and program
-    /// (lane) paths must agree on: `target`, `always_strict`, and `module`.
-    /// This is the single mapping point so the two paths cannot diverge on
-    /// downleveling or the strict-mode prologue.
+    /// (lane) paths must agree on: `target`, `always_strict`, `module`, and
+    /// the `useDefineForClassFields` pin. This is the single mapping point so
+    /// the two paths cannot diverge on downleveling or the strict-mode
+    /// prologue. The pin is `Option` so an unset key keeps the
+    /// target-derived default instead of forcing false.
     pub fn apply_emit_fields(
         &mut self,
         target: ScriptTarget,
         always_strict: bool,
         module: Option<ModuleKind>,
+        use_define_for_class_fields: Option<bool>,
     ) {
         self.target = target;
         self.always_strict = always_strict;
         if let Some(module) = module {
             self.module = Some(module);
+        }
+        if let Some(use_define) = use_define_for_class_fields {
+            self.use_define_for_class_fields = Some(use_define);
         }
     }
 

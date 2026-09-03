@@ -220,6 +220,7 @@ pub struct ResolvedProgram {
     strict_null_checks: bool,
     strict_property_initialization: bool,
     always_strict: bool,
+    use_define_for_class_fields: Option<bool>,
     target: crate::emitter::ScriptTarget,
     libs: crate::checker::intrinsic_environment::LibSet,
     check_js: bool,
@@ -233,6 +234,11 @@ impl ResolvedProgram {
     #[must_use]
     pub const fn root(&self) -> &ProjectRoot {
         &self.root
+    }
+
+    #[must_use]
+    pub const fn use_define_for_class_fields(&self) -> Option<bool> {
+        self.use_define_for_class_fields
     }
 
     #[must_use]
@@ -706,6 +712,7 @@ impl ProgramLoader {
             strict_null_checks: self.options.strict_null_checks(),
             strict_property_initialization: self.options.strict_property_initialization(),
             always_strict: self.options.always_strict(),
+            use_define_for_class_fields: self.options.use_define_for_class_fields(),
             target,
             libs,
             check_js: self.options.check_js(),
