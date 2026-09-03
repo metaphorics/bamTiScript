@@ -877,6 +877,21 @@ impl<'a> Emitter<'a> {
         self.raw_mapped_token(text, pos, 1);
     }
 
+    /// Writes `text` without a glyph segment, then sets `last_mapped_end` to
+    /// the source position just past the last `ch` in `range`. The next
+    /// `newline()` emits an EOL segment at that position — matching tsc's
+    /// convention for class-body close braces, which get an EOL segment but no
+    /// glyph segment.
+    fn raw_mapped_eol(&mut self, text: &str, range: TextRange, ch: char) {
+        self.raw(text);
+        let pos = self
+            .source_pos_of_last(range, ch)
+            .unwrap_or_else(|| Utf16Pos::new(range.end().get().saturating_sub(1)));
+        if let Ok(end) = TextRange::new(pos, Utf16Pos::new(pos.get() + 1)) {
+            self.last_mapped_end = Some(end);
+        }
+    }
+
     /// Maps the `, ` separator to the comma between two list elements.
     fn raw_mapped_list_separator(&mut self, previous_end: Utf16Pos, next: TextRange) {
         if let Some(window) = TextRange::new(previous_end, next.start())
@@ -1358,19 +1373,21 @@ impl<'a> Emitter<'a> {
         self.emit_block_with_braces(block, range, true);
     }
 
-    /// `map_braces` mirrors tsc: statement-level blocks (try bodies, catch and
-    /// finally arms, standalone blocks) map `{`/`}` to their source tokens,
-    /// while function, arrow, and class bodies keep their braces unmapped.
-    fn emit_block_with_braces(&mut self, block: &Block, range: TextRange, map_braces: bool) {
+    /// `map_open_brace` mirrors tsc: statement-level blocks (try bodies,
+    /// catch and finally arms, standalone blocks) map the opening `{` to its
+    /// source token, while function, arrow, and class bodies leave it
+    /// unmapped. The closing `}` is always mapped to its source token — tsc
+    /// emits a segment for every block close brace regardless of context.
+    fn emit_block_with_braces(&mut self, block: &Block, range: TextRange, map_open_brace: bool) {
         if block.statements.is_empty() {
-            if map_braces {
+            if map_open_brace {
                 self.raw_mapped_char_end("{}", range, '{');
             } else {
-                self.raw("{}");
+                self.raw_mapped_char_end("{}", range, '}');
             }
             return;
         }
-        if map_braces {
+        if map_open_brace {
             self.raw_mapped_char("{", range, '{', 1);
         } else {
             self.raw("{");
@@ -1383,21 +1400,18 @@ impl<'a> Emitter<'a> {
             }
         }
         self.indent -= 1;
-        if map_braces {
-            self.raw_mapped_char_end("}", range, '}');
-        } else {
-            self.raw("}");
-        }
+        self.raw_mapped_char_end("}", range, '}');
     }
     fn emit_switch(&mut self, switch: &SwitchStatement) {
-        self.raw_mapped("switch (", self.anchor);
+        let range = self.anchor;
+        self.raw_mapped("switch (", range);
         self.emit_expression(&switch.discriminant);
         self.raw_mapped_pos(") ", switch.discriminant.range().end());
         if switch.cases.is_empty() {
-            self.raw("{}");
+            self.raw_mapped_char_end("{}", range, '{');
             return;
         }
-        self.raw("{");
+        self.raw_mapped_char("{", range, '{', 1);
         self.newline();
         self.indent += 1;
         for case_node in &switch.cases {
@@ -1423,7 +1437,7 @@ impl<'a> Emitter<'a> {
             }
         }
         self.indent -= 1;
-        self.raw("}");
+        self.raw_mapped_char_end("}", range, '}');
     }
 
     fn emit_for(&mut self, statement: &ForStatement) {
@@ -2126,7 +2140,7 @@ impl<'a> Emitter<'a> {
         self.emit_class_body_js(&class.members, range);
     }
 
-    fn emit_class_body_js(&mut self, members: &[ClassMemberNode], _range: TextRange) {
+    fn emit_class_body_js(&mut self, members: &[ClassMemberNode], range: TextRange) {
         self.raw("{");
         let has = members
             .iter()
@@ -2143,7 +2157,7 @@ impl<'a> Emitter<'a> {
         if has {
             self.indent -= 1;
         }
-        self.raw("}");
+        self.raw_mapped_eol("}", range, '}');
     }
 
     fn class_member_emits_js(&self, member: &ClassMember) -> bool {
@@ -3927,6 +3941,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_class_core_decl(&mut self, class: &ClassDeclaration) {
+        let range = self.anchor;
         if class.modifiers.is_abstract {
             self.raw("abstract ");
         }
@@ -3951,10 +3966,9 @@ impl<'a> Emitter<'a> {
             }
         }
         self.raw(" ");
-        self.emit_class_body_decl(&class.members);
+        self.emit_class_body_decl(&class.members, range);
     }
-
-    fn emit_class_body_decl(&mut self, members: &[ClassMemberNode]) {
+    fn emit_class_body_decl(&mut self, members: &[ClassMemberNode], range: TextRange) {
         self.raw("{");
         let has = members
             .iter()
@@ -3976,7 +3990,7 @@ impl<'a> Emitter<'a> {
         } else {
             self.newline();
         }
-        self.raw("}");
+        self.raw_mapped_eol("}", range, '}');
     }
 
     fn class_member_emits_decl(&self, member: &ClassMember) -> bool {

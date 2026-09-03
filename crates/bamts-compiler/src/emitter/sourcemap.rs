@@ -1326,6 +1326,106 @@ mod tests {
     }
 
     #[test]
+    fn token_level_mappings_class_body_close_brace() {
+        // Authority: sourceMapValidationClass(target=es2015) — tsc emits an
+        // EOL segment for the class-body closing `}` (Emitted(19,2)
+        // Source(18,2), 1-based = gen col 1, src col 1) but NO glyph segment
+        // for the `}` itself. The opening `{` is also unmapped.
+        let source = "class Greeter {\n    greet() { return 1; }\n}\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        // Generated: "use strict";\nclass Greeter {\n    greet() {\n        return 1;\n    }\n}\n
+        // Line 5 (class close `}`): EOL segment at gen col 1 -> src col 1
+        // (one past the `}` on source line 2). No glyph segment at col 0.
+        let segments = mappings.split(';').collect::<Vec<_>>();
+        assert!(segments.len() >= 6, "expected >= 6 lines, got {}\n  {mappings}", segments.len());
+        let class_close = segments[5];
+        assert!(
+            !class_close.is_empty(),
+            "class close brace line must have an EOL segment\n  {mappings}"
+        );
+        // The EOL segment lands at gen col 1 (after the `}` glyph).
+        let (gen_col, _) = decode_vlq(class_close.split(',').next().unwrap()).unwrap();
+        assert_eq!(gen_col, 1, "class close brace EOL at column 1\n  {mappings}");
+    }
+
+    #[test]
+    fn token_level_mappings_function_body_close_brace() {
+        // Authority: sourceMapValidationClass(target=es2015) constructor close
+        // (Emitted(6,5) Source(3,5) + Emitted(6,6) Source(3,6)) — tsc maps the
+        // function-body closing `}` but not the opening `{`.
+        let source = "function foo() {\n    return 1;\n}\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        // Generated: "use strict";\nfunction foo() {\n    return 1;\n}\n
+        // Line 0: "use strict";
+        // Line 1: function foo() { -> function(0), foo(9), ()(12), EOL(15)
+        // Line 2: return 1; -> return(4), 1(11), ;(12), EOL(13)
+        // Line 3: } -> }(0), EOL(1)  [function close brace mapped]
+        let segments = mappings.split(';').collect::<Vec<_>>();
+        assert!(segments.len() >= 4, "expected >= 4 lines, got {}\n  {mappings}", segments.len());
+        // Line 3 (function close): must have a segment at column 0.
+        let func_close = segments[3];
+        assert!(
+            !func_close.is_empty(),
+            "function close brace line must have a mapping segment\n  {mappings}"
+        );
+        let (gen_col, _) = decode_vlq(func_close.split(',').next().unwrap()).unwrap();
+        assert_eq!(gen_col, 0, "function close brace at column 0\n  {mappings}");
+    }
+
+    #[test]
+    fn token_level_mappings_switch_block_braces() {
+        // Authority: sourceMapValidationSwitch — tsc maps both the switch
+        // block opening `{` and closing `}` to their source tokens.
+        let source = "var x = 10;\nswitch (x) {\ncase 5: x++; break;\ndefault: x = 0;\n}\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        // The switch close brace must have a mapping segment.
+        let segments = mappings.split(';').collect::<Vec<_>>();
+        // Find the line containing the switch close brace (last non-empty line
+        // before the sourceMappingURL comment).
+        let last_mapped = segments.iter().rev().find(|s| !s.is_empty()).unwrap();
+        assert!(
+            !last_mapped.is_empty(),
+            "switch close brace must have a mapping\n  {mappings}"
+        );
+    }
+
+    #[test]
     fn inline_sources_requires_a_javascript_source_map() {
         let output = emit(
             "const value = 1;",
