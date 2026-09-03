@@ -771,6 +771,9 @@ struct FunctionContext<'a> {
     top_level: bool,
     /// Whether this activation is an `async` function (not top-level await).
     is_async: bool,
+    /// Whether this activation is an `async generator`: `yield*` delegates
+    /// through the async iterator protocol only inside one.
+    is_async_generator: bool,
     goal: LoweringGoal,
     completion: Option<Register>,
     completion_pool: Vec<Register>,
@@ -816,6 +819,7 @@ impl<'a> FunctionContext<'a> {
             disposal_stack: Vec::new(),
             top_level: true,
             is_async: false,
+            is_async_generator: false,
             goal,
             completion: None,
             completion_pool: Vec::new(),
@@ -4340,6 +4344,9 @@ impl<'a> FunctionContext<'a> {
             Some(expression) => self.lower_expression(builder, expression)?,
             None => self.undefined(builder, range)?,
         };
+        if self.is_async_generator {
+            return self.lower_yield_delegate_async(builder, range, subject);
+        }
         let iterator = self.alloc_register(range)?;
         self.emit(
             range,
@@ -4377,6 +4384,351 @@ impl<'a> FunctionContext<'a> {
         self.patch_jump(exit_jump, exit);
         self.move_to(range, result, value)?;
         Ok(result)
+    }
+    /// Lowering for `yield*` inside an async generator (ECMA-262 27.5.3.7).
+    ///
+    /// Acquires the delegated iterator through `Symbol.asyncIterator`
+    /// (falling back to `Symbol.iterator` inside `GetIterator`), awaits every
+    /// raw `next()` result before unpacking it, and forwards abrupt `throw` /
+    /// `return` requests to the delegated iterator's own methods. The single
+    /// `Suspend` re-enters at a mode dispatch: `next` resumes the loop with the
+    /// resumed value, while `throw`/`return` arms forward `received` (written
+    /// before the dispatch) and their inner completion is awaited before it
+    /// settles the generator.
+    fn lower_yield_delegate_async(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        subject: Register,
+    ) -> Result<Register, LowerError> {
+        let iterator = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::GetIterator {
+                dst: iterator,
+                src: subject,
+                kind: IteratorKind::Async,
+            },
+        )?;
+        let undefined = self.undefined(builder, range)?;
+        let received = self.alloc_register(range)?;
+        self.move_to(range, received, undefined)?;
+        let value = self.alloc_register(range)?;
+
+        // Delegated next(): acquire the raw (possibly promised) result, settle
+        // it, then unpack done/value; IteratorResult rejects non-objects.
+        let head = self.next_pc();
+        let step = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::IteratorStep {
+                dst: step,
+                iterator,
+            },
+        )?;
+        let settled = self.emit_await(range, step)?;
+        let done = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::IteratorResult {
+                done,
+                value,
+                result: settled,
+            },
+        )?;
+        let done_exit = self.emit(
+            range,
+            Instruction::JumpIfTrue {
+                condition: done,
+                target: Pc::new(0),
+            },
+        )?;
+        self.move_to(range, received, value)?;
+        let to_yield = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
+
+        let do_return = self.next_pc();
+        let return_to_yield = self.lower_delegate_return_arm(
+            builder,
+            range,
+            iterator,
+            received,
+            value,
+        )?;
+        let do_throw = self.next_pc();
+        let throw_to_yield = self.lower_delegate_throw_arm(
+            builder,
+            range,
+            iterator,
+            received,
+            value,
+        )?;
+
+        // Yield the delegated value and re-enter on the resume edge, where the
+        // engine-written mode selects the next arm.
+        let yield_point = self.next_pc();
+        self.patch_jump(to_yield, yield_point);
+        self.patch_jump(return_to_yield, yield_point);
+        self.patch_jump(throw_to_yield, yield_point);
+        let resumed = self.alloc_register(range)?;
+        let mode = self.alloc_register(range)?;
+        let resume = Pc::new(self.code.len() as u32 + 1);
+        self.emit(
+            range,
+            Instruction::Suspend {
+                dst: resumed,
+                src: received,
+                resume,
+                mode,
+            },
+        )?;
+        self.move_to(range, received, resumed)?;
+        let skip_throw = self.emit_int32_guard(builder, range, mode, RESUME_THROW)?;
+        self.emit(range, Instruction::Jump { target: do_throw })?;
+        let after_throw = self.next_pc();
+        self.patch_jump(skip_throw, after_throw);
+        let skip_return = self.emit_int32_guard(builder, range, mode, RESUME_RETURN)?;
+        self.emit(range, Instruction::Jump { target: do_return })?;
+        let after_return = self.next_pc();
+        self.patch_jump(skip_return, after_return);
+        self.emit(range, Instruction::Jump { target: head })?;
+
+        // The delegated iterator finished: its awaited value is the value of
+        // the whole `yield*` expression.
+        let done_target = self.next_pc();
+        self.patch_jump(done_exit, done_target);
+        let final_value = self.emit_await(range, value)?;
+        let result = self.alloc_register(range)?;
+        self.move_to(range, result, final_value)?;
+        let exit_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
+
+
+        let exit = self.next_pc();
+        self.patch_jump(exit_jump, exit);
+        Ok(result)
+    }
+    /// Emits one inner-completion return: await the settled inner value and
+    /// route it through any enclosing `finally` before completing.
+    fn lower_delegate_done_return(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        value: Register,
+    ) -> Result<(), LowerError> {
+        let final_value = self.emit_await(range, value)?;
+        if !self.route_through_finally(
+            builder,
+            range,
+            COMPLETION_RETURN,
+            Some(final_value),
+            None,
+        )? {
+            self.emit_function_return(builder, range, final_value)?;
+        }
+        Ok(())
+    }
+    /// Emits the `received.[[Type]] is return` arm of the async `yield*` loop.
+    ///
+    /// With a callable `return` method the received value is forwarded and the
+    /// awaited result is yielded back into the loop; without one the received
+    /// value completes the generator after an await. Returns the jump that
+    /// re-enters the yield point after a non-done forwarded result.
+    fn lower_delegate_return_arm(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        iterator: Register,
+        received: Register,
+        value: Register,
+    ) -> Result<Pc, LowerError> {
+        let method = self.alloc_register(range)?;
+        let return_key = self.string_reg(builder, EcmaString::encode("return"), range)?;
+        self.emit(
+            range,
+            Instruction::GetProperty {
+                dst: method,
+                object: iterator,
+                key: return_key,
+            },
+        )?;
+        let undefined = self.undefined(builder, range)?;
+        let is_undefined = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Binary {
+                dst: is_undefined,
+                op: BinaryOp::StrictEqual,
+                left: method,
+                right: undefined,
+            },
+        )?;
+        let no_method = self.emit(
+            range,
+            Instruction::JumpIfTrue {
+                condition: is_undefined,
+                target: Pc::new(0),
+            },
+        )?;
+        let arguments = self.alloc_register(range)?;
+        self.emit(range, Instruction::CreateArray { dst: arguments })?;
+        self.emit(
+            range,
+            Instruction::ArrayPush {
+                array: arguments,
+                value: received,
+            },
+        )?;
+        let raw = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Call {
+                dst: raw,
+                callee: method,
+                this_value: iterator,
+                arguments,
+            },
+        )?;
+        let settled = self.emit_await(range, raw)?;
+        let done = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::IteratorResult {
+                done,
+                value,
+                result: settled,
+            },
+        )?;
+        let inner_done = self.emit(
+            range,
+            Instruction::JumpIfTrue {
+                condition: done,
+                target: Pc::new(0),
+            },
+        )?;
+        self.move_to(range, received, value)?;
+        let to_yield = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
+
+        // No `return` method: the received value itself completes the
+        // generator once awaited.
+        let no_method_target = self.next_pc();
+        self.patch_jump(no_method, no_method_target);
+        self.lower_delegate_done_return(builder, range, received)?;
+
+        let inner_done_target = self.next_pc();
+        self.patch_jump(inner_done, inner_done_target);
+        self.lower_delegate_done_return(builder, range, value)?;
+        Ok(to_yield)
+    }
+    /// Emits the `received.[[Type]] is throw` arm of the async `yield*` loop.
+    ///
+    /// With a callable `throw` method the thrown value is forwarded and a
+    /// non-done result is yielded back into the loop; without one the
+    /// iterator is closed (close failures win over the pending throw) and the
+    /// thrown value re-raises into the generator body. Returns the jump that
+    /// re-enters the yield point after a non-done forwarded result.
+    fn lower_delegate_throw_arm(
+        &mut self,
+        builder: &mut ModuleBuilder,
+        range: TextRange,
+        iterator: Register,
+        received: Register,
+        value: Register,
+    ) -> Result<Pc, LowerError> {
+        let method = self.alloc_register(range)?;
+        let throw_key = self.string_reg(builder, EcmaString::encode("throw"), range)?;
+        self.emit(
+            range,
+            Instruction::GetProperty {
+                dst: method,
+                object: iterator,
+                key: throw_key,
+            },
+        )?;
+        let undefined = self.undefined(builder, range)?;
+        let is_undefined = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Binary {
+                dst: is_undefined,
+                op: BinaryOp::StrictEqual,
+                left: method,
+                right: undefined,
+            },
+        )?;
+        let no_method = self.emit(
+            range,
+            Instruction::JumpIfTrue {
+                condition: is_undefined,
+                target: Pc::new(0),
+            },
+        )?;
+        let arguments = self.alloc_register(range)?;
+        self.emit(range, Instruction::CreateArray { dst: arguments })?;
+        self.emit(
+            range,
+            Instruction::ArrayPush {
+                array: arguments,
+                value: received,
+            },
+        )?;
+        let raw = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::Call {
+                dst: raw,
+                callee: method,
+                this_value: iterator,
+                arguments,
+            },
+        )?;
+        let settled = self.emit_await(range, raw)?;
+        let done = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::IteratorResult {
+                done,
+                value,
+                result: settled,
+            },
+        )?;
+        let inner_done = self.emit(
+            range,
+            Instruction::JumpIfTrue {
+                condition: done,
+                target: Pc::new(0),
+            },
+        )?;
+        self.move_to(range, received, value)?;
+        let to_yield = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
+
+        // No `throw` method: close the iterator (awaiting its close result and
+        // rejecting non-object close results) and re-raise the pending throw.
+        let close_target = self.next_pc();
+        self.patch_jump(no_method, close_target);
+        let close_result = self.alloc_register(range)?;
+        let close_called = self.alloc_register(range)?;
+        self.emit(
+            range,
+            Instruction::IteratorClose {
+                result: close_result,
+                called: close_called,
+                iterator,
+                mode: IteratorCloseMode::Propagate,
+            },
+        )?;
+        let settled_close = self.emit_await(range, close_result)?;
+        self.emit(
+            range,
+            Instruction::RequireCloseResult {
+                result: settled_close,
+                called: close_called,
+            },
+        )?;
+        self.emit(range, Instruction::Throw { value: received })?;
+
+        let inner_done_target = self.next_pc();
+        self.patch_jump(inner_done, inner_done_target);
+        self.lower_delegate_done_return(builder, range, value)?;
+        Ok(to_yield)
     }
     fn emit_suspend(
         &mut self,
@@ -6521,6 +6873,7 @@ impl<'a> FunctionContext<'a> {
             disposal_stack: Vec::new(),
             top_level: false,
             is_async: flags.is_async,
+            is_async_generator: flags.is_async && flags.is_generator,
             goal: self.goal,
             completion: None,
             completion_pool: Vec::new(),
@@ -6655,6 +7008,7 @@ impl<'a> FunctionContext<'a> {
             disposal_stack: Vec::new(),
             top_level: false,
             is_async: false,
+            is_async_generator: false,
             goal: self.goal,
             completion: None,
             completion_pool: Vec::new(),
@@ -8137,6 +8491,7 @@ impl<'a> FunctionContext<'a> {
             disposal_stack: Vec::new(),
             top_level: false,
             is_async: false,
+            is_async_generator: false,
             goal: self.goal,
             completion: None,
             completion_pool: Vec::new(),
@@ -10402,8 +10757,8 @@ mod tests {
         );
     }
     use bamts_bytecode::{
-        BinaryOp, Constant, DecodeLimits, Function, Instruction, Module, Pc, RESUME_RETURN,
-        RESUME_THROW, Register, UnaryOp, Verified, decode_verified,
+        BinaryOp, Constant, DecodeLimits, Function, Instruction, IteratorKind, Module, Pc,
+        RESUME_RETURN, RESUME_THROW, Register, UnaryOp, Verified, decode_verified,
     };
     fn lower_js_result(src: &str) -> Result<Module<Verified>, LowerError> {
         let source = Arc::new(
@@ -14579,6 +14934,87 @@ mod tests {
         assert!(
             !any_instruction(&module, |i| matches!(i, Instruction::IteratorNext { .. })),
             "async loops never use the fused sync step"
+        );
+        assert_round_trips(&module);
+    }
+    #[test]
+    fn async_generator_yield_star_delegates_through_the_async_protocol() {
+        let module = lower_js("async function* g(xs: any) { yield* xs; }");
+        assert!(
+            any_instruction(&module, |i| matches!(
+                i,
+                Instruction::GetIterator {
+                    kind: IteratorKind::Async,
+                    ..
+                }
+            )),
+            "the delegated iterator is acquired through Symbol.asyncIterator"
+        );
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::IteratorStep { .. })),
+            "each delegated step is acquired as a raw result"
+        );
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::Await { .. })),
+            "raw delegated results are awaited before unpacking"
+        );
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::Suspend { .. })),
+            "delegated values yield through the generator suspension"
+        );
+        assert!(
+            any_instruction(&module, |i| matches!(i, Instruction::Call { .. })),
+            "abrupt completions forward through delegated iterator methods"
+        );
+        assert_round_trips(&module);
+    }
+    #[test]
+    fn sync_generator_inside_async_function_keeps_sync_yield_star() {
+        let module = lower_js(
+            "async function f() { const g = function* (xs: any) { yield* xs; }; return g; }",
+        );
+        let generator = module
+            .functions()
+            .iter()
+            .find(|function| function.flags().is_generator)
+            .expect("nested generator lowers");
+        assert!(
+            generator.code().iter().any(|instruction| matches!(
+                instruction,
+                Instruction::GetIterator {
+                    kind: IteratorKind::Sync,
+                    ..
+                }
+            )),
+            "a sync generator's yield* stays on Symbol.iterator"
+        );
+        assert!(
+            !generator
+                .code()
+                .iter()
+                .any(|instruction| matches!(
+                    instruction,
+                    Instruction::GetIterator {
+                        kind: IteratorKind::Async,
+                        ..
+                    }
+                )),
+            "the enclosing async function must not leak into the nested generator"
+        );
+        assert_round_trips(&module);
+    }
+    #[test]
+    fn yield_star_allows_a_newline_before_the_delegated_operand() {
+        let module = lower_js("async function* g(f: any) { yield*\n f(); }");
+        assert!(
+            any_instruction(&module, |i| matches!(
+                i,
+                Instruction::GetIterator {
+                    kind: IteratorKind::Async,
+                    ..
+                }
+            )),
+            "the newline form still lowers as async delegation"
         );
         assert_round_trips(&module);
     }
