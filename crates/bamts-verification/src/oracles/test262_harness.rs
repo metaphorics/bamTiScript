@@ -165,9 +165,17 @@ impl DoneRecorder {
     }
 
     /// The observed calls as a shared-oracle trace.
+    ///
+    /// The first failure's stringified argument rides on the trace so
+    /// [`judge_run`] can match it against a negative expectation.
     #[must_use]
     pub fn trace(&self) -> AsyncTrace {
         AsyncTrace {
+            failure_value: self
+                .first
+                .as_ref()
+                .filter(|call| call.kind == DoneEventKind::Error)
+                .and_then(|call| call.value.clone()),
             events: self.events.clone(),
             exited_at: self.exited_at,
             deadline: self.deadline,
@@ -536,6 +544,22 @@ mod tests {
                 value: "Test262Error: expected 1".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn a_recorded_failure_trace_carries_the_value_for_negative_matching() {
+        let mut recorder = DoneRecorder::new(DEADLINE);
+        recorder
+            .call(DoneArgument::Value("TypeError: nope"), at(10))
+            .unwrap();
+        assert_eq!(
+            recorder.trace().failure_value,
+            Some("TypeError: nope".to_owned())
+        );
+
+        let mut recorder = DoneRecorder::new(DEADLINE);
+        recorder.call(DoneArgument::None, at(10)).unwrap();
+        assert_eq!(recorder.trace().failure_value, None);
     }
 
     #[test]

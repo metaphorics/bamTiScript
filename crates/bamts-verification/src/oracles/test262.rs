@@ -304,6 +304,11 @@ pub struct DoneEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncTrace {
     pub events: Vec<DoneEvent>,
+    /// The stringified `$DONE` argument of the first Error event, when one
+    /// was observed. [`judge_run`] matches its leading constructor name
+    /// against a negative expectation's `type`, mirroring the completed-run
+    /// comparison.
+    pub failure_value: Option<String>,
     pub exited_at: Option<Duration>,
     pub deadline: Duration,
 }
@@ -633,7 +638,50 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
                     actual: "async".to_owned(),
                 });
             }
-            judge_done(trace).map_err(OracleError::Done)
+            match judge_done(trace) {
+                Ok(()) => match &request.negative {
+                    None => Ok(()),
+                    Some(expected) => Err(OracleError::ExpectationMismatch {
+                        expected: format!("{:?}/{}", expected.phase, expected.error_type.as_str()),
+                        actual: "async completion".to_owned(),
+                    }),
+                },
+                Err(DoneFailure::Error) => match &request.negative {
+                    None => Err(OracleError::Done(DoneFailure::Error)),
+                    Some(expected) => {
+                        // The failure surfaced through the async completion
+                        // callback after the body ran, so it is a runtime
+                        // throw by construction. Per the Test262
+                        // INTERPRETING rule the negative `type` must match
+                        // the constructor named by the stringified argument
+                        // exactly.
+                        let actual_type = async_failure_type(trace);
+                        if expected.phase == NegativePhase::Runtime
+                            && actual_type == Some(expected.error_type)
+                        {
+                            Ok(())
+                        } else {
+                            Err(OracleError::ExpectationMismatch {
+                                expected: format!(
+                                    "{:?}/{}",
+                                    expected.phase,
+                                    expected.error_type.as_str()
+                                ),
+                                actual: match actual_type {
+                                    Some(actual_type) => {
+                                        format!("Runtime/{}", actual_type.as_str())
+                                    }
+                                    None => format!(
+                                        "Runtime/{}",
+                                        trace.failure_value.as_deref().unwrap_or_default()
+                                    ),
+                                },
+                            })
+                        }
+                    }
+                },
+                Err(other) => Err(OracleError::Done(other)),
+            }
         }
         RunOutcome::Completed { thrown } => match (&request.negative, thrown) {
             (None, None) => {
@@ -666,6 +714,18 @@ pub fn judge_run(request: &RunRequest, outcome: &RunOutcome) -> Result<(), Oracl
             detail: detail.clone(),
         }),
     }
+}
+
+/// Resolves the negative type named by the first async-failure value.
+///
+/// The harnesses stringify a `$DONE` argument as `<Constructor>: <message>`;
+/// per the Test262 INTERPRETING rule the negative `type` names the throw's
+/// constructor exactly. A value with no leading known constructor names no
+/// negative type and can never satisfy an expectation.
+#[must_use]
+fn async_failure_type(trace: &AsyncTrace) -> Option<NegativeType> {
+    let value = trace.failure_value.as_deref()?;
+    NegativeType::parse(value.split(':').next()?.trim()).ok()
 }
 
 pub fn evaluate_in_all_modes<R: Test262Runner>(
@@ -1067,6 +1127,8 @@ fn interpreter_fuel(deadline: Duration) -> bamts_runtime::Limits {
 /// additionally emits `$DONE()` / `$DONE(…)` through `console.log`.
 /// Both marker families are recognised so production and fixture flows
 /// share the same judge path.
+/// The stringified argument of the first failure marker is captured on the
+/// trace so `judge_run` can match it against a negative expectation.
 #[must_use]
 fn observed_done_trace(
     stdout: &[u8],
@@ -1075,30 +1137,39 @@ fn observed_done_trace(
     deadline: Duration,
 ) -> AsyncTrace {
     let mut events = Vec::new();
+    let mut failure_value = None;
     for stream in [stdout, stderr] {
         let mut cursor = 0;
         loop {
-            let (at, kind) = if let Some(found) = find_marker(&stream[cursor..], COMPLETE_MARKER) {
-                (cursor + found, DoneEventKind::Success)
-            } else if let Some(found) = find_marker(&stream[cursor..], FAILURE_MARKER) {
-                (cursor + found, DoneEventKind::Error)
-            } else if let Some(found) = find_marker(&stream[cursor..], MARKER_OPEN) {
-                let at = cursor + found;
-                let kind = if stream.get(at + MARKER_OPEN.len()) == Some(&b')') {
-                    DoneEventKind::Success
+            let (at, kind, value) =
+                if let Some(found) = find_marker(&stream[cursor..], COMPLETE_MARKER) {
+                    (cursor + found, DoneEventKind::Success, None)
+                } else if let Some(found) = find_marker(&stream[cursor..], FAILURE_MARKER) {
+                    let at = cursor + found;
+                    let rest = failure_marker_value(&stream[at + FAILURE_MARKER.len()..]);
+                    (at, DoneEventKind::Error, Some(rest))
+                } else if let Some(found) = find_marker(&stream[cursor..], MARKER_OPEN) {
+                    let at = cursor + found;
+                    let after = at + MARKER_OPEN.len();
+                    if stream.get(after) == Some(&b')') {
+                        (at, DoneEventKind::Success, None)
+                    } else {
+                        let rest = failure_marker_value(&stream[after..]);
+                        (at, DoneEventKind::Error, Some(rest))
+                    }
                 } else {
-                    DoneEventKind::Error
+                    break;
                 };
-                (at, kind)
-            } else {
-                break;
-            };
+            if kind == DoneEventKind::Error && failure_value.is_none() {
+                failure_value = value;
+            }
             events.push(DoneEvent { kind, at: elapsed });
             cursor = at + 1;
         }
     }
     AsyncTrace {
         events,
+        failure_value,
         exited_at: Some(elapsed),
         deadline,
     }
@@ -1117,6 +1188,27 @@ fn find_marker(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// The stringified `$DONE` argument captured after a failure marker.
+///
+/// The canonical harness prints `Test262:AsyncTestFailure:` immediately
+/// followed by the stringified argument, and the internal harness prints
+/// `$DONE(` + argument + `)`; both occupy one line. The optional leading
+/// `:`, the trailing `)`, and surrounding whitespace belong to the harness
+/// shapes, not the argument, so they are stripped. Type resolution reads
+/// only the leading constructor name, so an argument whose message itself
+/// contains those characters is still classified correctly.
+fn failure_marker_value(rest: &[u8]) -> String {
+    let mut end = rest
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(rest.len());
+    let start = usize::from(rest.first() == Some(&b':'));
+    if end > start && rest[end - 1] == b')' {
+        end -= 1;
+    }
+    String::from_utf8_lossy(&rest[start..end]).trim().to_owned()
 }
 
 #[cfg(test)]
@@ -1236,6 +1328,7 @@ function $ERROR(message) {\n\
                         kind: DoneEventKind::Success,
                         at: Duration::from_millis(1),
                     }],
+                    failure_value: None,
                     exited_at: None,
                     deadline: request.deadline,
                 })
@@ -1484,6 +1577,7 @@ function $ERROR(message) {\n\
                 kind: DoneEventKind::Success,
                 at: Duration::from_millis(1),
             }],
+            failure_value: None,
             exited_at: None,
             deadline,
         };
@@ -1494,6 +1588,7 @@ function $ERROR(message) {\n\
                 kind: DoneEventKind::Error,
                 at: Duration::from_millis(1),
             }],
+            failure_value: None,
             exited_at: None,
             deadline,
         };
@@ -1510,6 +1605,7 @@ function $ERROR(message) {\n\
                     at: Duration::from_millis(2),
                 },
             ],
+            failure_value: None,
             exited_at: None,
             deadline,
         };
@@ -1517,6 +1613,7 @@ function $ERROR(message) {\n\
 
         let missing = AsyncTrace {
             events: vec![],
+            failure_value: None,
             exited_at: None,
             deadline,
         };
@@ -1527,6 +1624,7 @@ function $ERROR(message) {\n\
                 kind: DoneEventKind::Success,
                 at: Duration::from_millis(11),
             }],
+            failure_value: None,
             exited_at: None,
             deadline,
         };
@@ -1534,6 +1632,7 @@ function $ERROR(message) {\n\
 
         let early = AsyncTrace {
             events: vec![],
+            failure_value: None,
             exited_at: Some(Duration::from_millis(1)),
             deadline,
         };
@@ -1722,6 +1821,228 @@ function $ERROR(message) {\n\
         let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
         for variant in &plan.variants {
             run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
+        }
+    }
+
+    /// An async request expecting `negative`, with the deadline the trace
+    /// helpers below share.
+    fn negative_async_request(negative: Option<Negative>) -> RunRequest {
+        RunRequest {
+            mode: ExecutionMode::Interpreter,
+            variant: ExecutionVariant {
+                kind: SourceKind::ScriptNonStrict,
+            },
+            script: ComposedScript {
+                bytes: Vec::new(),
+                test_offset: 0,
+                kind: SourceKind::ScriptNonStrict,
+                untouched: false,
+            },
+            negative,
+            async_done: true,
+            deadline: Duration::from_millis(100),
+        }
+    }
+
+    /// An async outcome whose single `$DONE` event carries `failure_value`.
+    fn async_done_outcome(kind: DoneEventKind, failure_value: Option<&str>) -> RunOutcome {
+        RunOutcome::Async(AsyncTrace {
+            events: vec![DoneEvent {
+                kind,
+                at: Duration::from_millis(1),
+            }],
+            failure_value: failure_value.map(str::to_owned),
+            exited_at: None,
+            deadline: Duration::from_millis(100),
+        })
+    }
+
+    #[test]
+    fn an_async_done_failure_satisfies_a_matching_runtime_negative() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::Test262Error,
+        }));
+        let outcome =
+            async_done_outcome(DoneEventKind::Error, Some("Test262Error: expected failure"));
+
+        assert_eq!(judge_run(&request, &outcome), Ok(()));
+    }
+
+    #[test]
+    fn an_async_done_failure_with_the_wrong_type_is_a_mismatch() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::TypeError,
+        }));
+        let outcome = async_done_outcome(
+            DoneEventKind::Error,
+            Some("Test262Error: a different class"),
+        );
+
+        assert!(matches!(
+            judge_run(&request, &outcome),
+            Err(OracleError::ExpectationMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_async_done_failure_demands_the_runtime_phase() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Parse,
+            error_type: NegativeType::Test262Error,
+        }));
+        let outcome = async_done_outcome(
+            DoneEventKind::Error,
+            Some("Test262Error: not a parse error"),
+        );
+
+        assert!(matches!(
+            judge_run(&request, &outcome),
+            Err(OracleError::ExpectationMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_async_done_failure_still_fails_a_positive_request() {
+        let request = negative_async_request(None);
+        let outcome = async_done_outcome(DoneEventKind::Error, Some("Test262Error: unexpected"));
+
+        assert_eq!(
+            judge_run(&request, &outcome),
+            Err(OracleError::Done(DoneFailure::Error))
+        );
+    }
+
+    #[test]
+    fn an_async_completion_cannot_satisfy_a_negative() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::Test262Error,
+        }));
+        let outcome = async_done_outcome(DoneEventKind::Success, None);
+
+        assert!(matches!(
+            judge_run(&request, &outcome),
+            Err(OracleError::ExpectationMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_async_trace_stays_blocking_under_a_negative() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::Test262Error,
+        }));
+        let duplicate = RunOutcome::Async(AsyncTrace {
+            events: vec![
+                DoneEvent {
+                    kind: DoneEventKind::Error,
+                    at: Duration::from_millis(1),
+                },
+                DoneEvent {
+                    kind: DoneEventKind::Success,
+                    at: Duration::from_millis(2),
+                },
+            ],
+            failure_value: Some("Test262Error: first".to_owned()),
+            exited_at: None,
+            deadline: Duration::from_millis(100),
+        });
+
+        assert_eq!(
+            judge_run(&request, &duplicate),
+            Err(OracleError::Done(DoneFailure::Duplicate))
+        );
+    }
+
+    #[test]
+    fn the_internal_marker_captures_the_done_argument_for_negative_matching() {
+        let trace = observed_done_trace(
+            b"$DONE(Test262Error: expected failure)\n",
+            &[],
+            Duration::from_millis(1),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            trace.failure_value.as_deref(),
+            Some("Test262Error: expected failure")
+        );
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::Test262Error,
+        }));
+
+        assert_eq!(judge_run(&request, &RunOutcome::Async(trace)), Ok(()));
+    }
+
+    #[test]
+    fn the_canonical_failure_marker_captures_the_thrown_type() {
+        let trace = observed_done_trace(
+            b"Test262:AsyncTestFailure: TypeError: nope\n",
+            &[],
+            Duration::from_millis(1),
+            Duration::from_millis(100),
+        );
+        assert_eq!(trace.failure_value.as_deref(), Some("TypeError: nope"));
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::TypeError,
+        }));
+
+        assert_eq!(judge_run(&request, &RunOutcome::Async(trace)), Ok(()));
+    }
+
+    #[test]
+    fn interpreter_runner_judges_async_negative_done_fixture() {
+        let harness = runner_scratch("async-negative-harness");
+        let scratch = runner_scratch("async-negative-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        write_harness(&harness, "doneprintHandle.js", DONEPRINT_JS);
+        let source = wrap(
+            "description: an async negative test fails through $DONE\n\
+             flags: [async]\n\
+             negative:\n  phase: runtime\n  type: TypeError",
+            "$DONE(new TypeError('expected failure'));",
+        );
+        let parsed = parse_test(&source).unwrap();
+        assert_eq!(
+            parsed.frontmatter.negative,
+            Some(Negative {
+                phase: NegativePhase::Runtime,
+                error_type: NegativeType::TypeError,
+            })
+        );
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            run_variant(&runner, &parsed, &plan, &sources, variant).unwrap();
+        }
+    }
+
+    #[test]
+    fn interpreter_runner_fails_a_positive_async_done_error_fixture() {
+        let harness = runner_scratch("async-positive-error-harness");
+        let scratch = runner_scratch("async-positive-error-scratch");
+        write_harness(&harness, "assert.js", ASSERT_JS);
+        write_harness(&harness, "sta.js", STA_JS);
+        write_harness(&harness, "doneprintHandle.js", DONEPRINT_JS);
+        let source = wrap(
+            "description: an async test fails through $DONE\nflags: [async]",
+            "$DONE(new Test262Error('unexpected failure'));",
+        );
+        let parsed = parse_test(&source).unwrap();
+        assert!(parsed.frontmatter.negative.is_none());
+        let plan = plan_execution(&parsed.frontmatter, &harness).unwrap();
+        let sources = load_harness_sources(&plan, &FileHarnessLoader).unwrap();
+        let runner = backend_runner(ExecutionMode::Interpreter, &scratch).unwrap();
+        for variant in &plan.variants {
+            assert_eq!(
+                run_variant(&runner, &parsed, &plan, &sources, variant),
+                Err(OracleError::Done(DoneFailure::Error))
+            );
         }
     }
 
