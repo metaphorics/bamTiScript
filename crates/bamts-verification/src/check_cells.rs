@@ -78,6 +78,14 @@ pub struct CheckContext {
 pub struct CaseUnit {
     /// Root-relative virtual path (`foo/testB.ts`).
     pub virtual_path: String,
+    /// The unit name exactly as the case spelled it: the verbatim
+    /// `// @Filename:` value, or the case basename for the implicit entry
+    /// unit. `virtual_path` is lossy (it strips the leading `/` of absolute
+    /// names, drops Windows drive prefixes, and joins relative names under
+    /// the case directory), but upstream's `.types` section headers echo the
+    /// original spelling (`=== /a.ts ===`, `=== A:/foo/bar.ts ===`,
+    /// `=== ./a.ts ===`), so the types emitter needs the unmodified name.
+    pub display_name: String,
     /// UTF-8 unit text (BOMs handled by `decode_case_source` upstream).
     pub text: String,
 }
@@ -445,6 +453,10 @@ pub fn split_case_units(logical_path: &str, text: &str) -> Vec<CaseUnit> {
             existing.text = content;
         } else {
             units.push(CaseUnit {
+                // Slash-normalized verbatim spelling: no `.types` baseline
+                // section header ever contains a backslash, but drive-letter
+                // (`A:/…`) and dot-slash (`./…`) prefixes are preserved.
+                display_name: name.replace('\\', "/"),
                 virtual_path,
                 text: content,
             });
@@ -1348,19 +1360,63 @@ struct TypeAnnotation {
 pub fn emit_types_baseline(case: &CheckedCase, logical_path: &str) -> String {
     let mut out = format!("//// [{logical_path}] ////\n\n");
     for (unit, output) in case.reached_units() {
-        let section = unit
-            .virtual_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&unit.virtual_path);
+        if is_config_unit_name(&unit.display_name) {
+            continue;
+        }
+        // Skip the empty entry unit that multi-file cases (`@filename:`
+        // sections) leave behind — it has no source content and upstream
+        // does not emit a section for it.
+        if output
+            .source_file()
+            .source_text()
+            .as_str()
+            .trim()
+            .is_empty()
+        {
+            continue;
+        }
         emit_unit_types(
             output.semantic_model(),
             output.source_file().source_text(),
-            section,
+            &unit.display_name,
             &mut out,
         );
     }
     out
+}
+
+/// Whether a unit name is a project-config file (`tsconfig.json` /
+/// `jsconfig.json`). Upstream parses those as configuration, never as
+/// program sources, so no `.types` baseline has a section for either;
+/// data `.json` inputs (`b.json`, `package.json`) do get sections with
+/// records.
+fn is_config_unit_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('/').next(),
+        Some("tsconfig.json") | Some("jsconfig.json")
+    )
+}
+
+/// Collapse records with the identical identity tuple (start, end, display,
+/// rendered): the binder can push the same (range, type) pair from both its
+/// symbol and expression indexes, and upstream emits each unique (position,
+/// display, type) triple once. Sort by the identity key, dedup consecutive,
+/// then re-sort into the upstream order (by start, outer node before inner
+/// on ties).
+fn dedup_type_records(mut records: Vec<TypeAnnotation>) -> Vec<TypeAnnotation> {
+    records.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then(a.end.cmp(&b.end))
+            .then(a.display.cmp(&b.display))
+            .then(a.rendered.cmp(&b.rendered))
+    });
+    records.dedup_by(|a, b| {
+        a.start == b.start && a.end == b.end && a.display == b.display && a.rendered == b.rendered
+    });
+    records.sort_by(|left, right| left.start.cmp(&right.start).then(right.end.cmp(&left.end)));
+    records
 }
 
 fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, out: &mut String) {
@@ -1368,7 +1424,15 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
     // Declaration-name records come from source-declared symbols (intrinsics
     // carry an empty range, which the range check below filters out).
     for (index, symbol) in model.symbols().iter().enumerate() {
-        if symbol.kind() == bamts_compiler::checker::SymbolKind::TypeParameter {
+        // Interface declaration names carry no `>name : type` record
+        // upstream: `interface I { (): number; }` baselines echo only
+        // member records (`duplicateConstructSignature.types`,
+        // `interfaceDeclaration1.types`), while class, enum, type-alias,
+        // and namespace names do get records.
+        if matches!(
+            symbol.kind(),
+            SymbolKind::TypeParameter | SymbolKind::Interface
+        ) {
             continue;
         }
         let range = symbol.range();
@@ -1394,8 +1458,7 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
             records.push(annotation);
         }
     }
-    // Upstream order: by start position, outer node before inner on ties.
-    records.sort_by(|left, right| left.start.cmp(&right.start).then(right.end.cmp(&left.end)));
+    let records = dedup_type_records(records);
     let mut by_line: BTreeMap<usize, Vec<&TypeAnnotation>> = BTreeMap::new();
     for record in &records {
         by_line.entry(record.line).or_default().push(record);
@@ -4013,6 +4076,266 @@ export const a2 = 3;
         assert!(
             matches!(compare_types(baseline, &emitted), FacetVerdict::Fail { .. }),
             "under-covered emit must not pass; emitted:\n{emitted}"
+        );
+    }
+
+    /// The dedup pass collapses records with the identical identity tuple
+    /// (start, end, display, rendered) — the binder can push the same
+    /// (range, type) pair from both its symbol and expression indexes — and
+    /// keeps everything else, restoring the upstream order afterwards.
+    ///
+    /// Authority baselines keep adjacent *different-position* records
+    /// (`targetTypeCalls.types` prints `>v : any` twice for the declaration
+    /// name and the resolving reference at different offsets), so dedup keys
+    /// on the full record identity, never on display text alone.
+    #[test]
+    fn dedup_type_records_collapses_identical_identity_only() {
+        let record = |start: usize, end: usize, display: &str, rendered: &str| TypeAnnotation {
+            start,
+            end,
+            line: 0,
+            display: display.to_owned(),
+            rendered: rendered.to_owned(),
+        };
+        let records = vec![
+            record(4, 5, "x", "any"),
+            record(4, 5, "x", "any"),
+            record(8, 9, "x", "any"),
+            record(0, 1, "C", "C"),
+        ];
+        let deduped = dedup_type_records(records);
+        assert_eq!(
+            deduped
+                .iter()
+                .map(|r| (r.start, r.end, r.display.as_str(), r.rendered.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, 1, "C", "C"), (4, 5, "x", "any"), (8, 9, "x", "any")],
+            "identical (start, end, display, rendered) collapses; distinct positions stay"
+        );
+    }
+
+    /// Distinct records at the same range survive dedup: upstream prints the
+    /// declaration-name record and the constructor-side record for a class
+    /// used in `new` on one line (`assignmentCompatability10.types` prints
+    /// `>classWithPublicAndOptional : classWithPublicAndOptional<T, U>` and
+    /// `>classWithPublicAndOptional : typeof classWithPublicAndOptional`), so
+    /// dedup must not collapse differing renderings.
+    #[test]
+    fn dedup_type_records_keeps_distinct_same_range_records() {
+        let record = |display: &str, rendered: &str| TypeAnnotation {
+            start: 10,
+            end: 36,
+            line: 0,
+            display: display.to_owned(),
+            rendered: rendered.to_owned(),
+        };
+        let deduped = dedup_type_records(vec![
+            record("Foo", "Foo<T>"),
+            record("Foo", "typeof Foo"),
+            record("Foo", "Foo<T>"),
+        ]);
+        assert_eq!(
+            deduped
+                .iter()
+                .map(|r| (r.display.as_str(), r.rendered.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Foo", "Foo<T>"), ("Foo", "typeof Foo")],
+            "distinct renderings at one range must survive"
+        );
+    }
+
+    /// Authority pin from `witness.types` (case
+    /// `tests/cases/conformance/types/witness/witness.ts`, line 7): upstream
+    /// prints TWO identical `>varInit : any` pairs for `var varInit =
+    /// varInit;` — declaration name and resolving reference at different
+    /// ranges are both legitimate records. Only exact (start, end, display,
+    /// rendered) tuples collapse; text-identical records at distinct
+    /// positions stay.
+    #[test]
+    fn emit_types_baseline_keeps_distinct_position_records() {
+        let logical = "tests/cases/conformance/types/witness/witnessPin.ts";
+        let units = split_case_units(logical, "var varInit = varInit; // any\n");
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        let baseline = "//// [tests/cases/conformance/types/witness/witnessPin.ts] ////\n\
+            \n\
+            === witnessPin.ts ===\n\
+            var varInit = varInit; // any\n\
+            >varInit : any\n\
+            >        : ^^^\n\
+            >varInit : any\n\
+            >        : ^^^\n";
+        assert_eq!(
+            compare_types(baseline, &emitted),
+            FacetVerdict::Pass,
+            "distinct-position identical records must both stay; emitted:\n{emitted}"
+        );
+    }
+
+    /// A multi-file case's preamble before the first `@Filename:` marker is
+    /// global options, not a unit: upstream `ParseTestFilesAndSymlinks`
+    /// (`AllowImplicitFirstFile: false`) drops a comment-only preamble, so
+    /// no phantom `=== <case>.ts ===` section appears and
+    /// `ClassAndModuleWithSameNameAndCommonRoot.types` opens with
+    /// `=== class.ts ===` directly.
+    #[test]
+    fn types_emitter_skips_empty_entry_units() {
+        let logical =
+            "tests/cases/conformance/internalModules/DeclarationMerging/phantomEntryPin.ts";
+        let case_text = "\
+// @target: es2015\n\
+// @filename: class.ts\n\
+class Point { x: number; }\n\
+\n\
+// @filename: simple.ts\n\
+var a = 1;\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            !emitted.contains("=== phantomEntryPin.ts ==="),
+            "comment/options preamble must not become a phantom unit; emitted:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("=== class.ts ==="),
+            "first @Filename unit keeps its section; emitted:\n{emitted}"
+        );
+    }
+
+    /// Section headers echo the verbatim `// @Filename:` spelling: absolute
+    /// names keep their leading `/` and relative names stay bare, exactly as
+    /// `ambient.types` prints `=== /a.ts ===` and `=== /b.ts ===`.
+    #[test]
+    fn types_section_headers_preserve_verbatim_filename() {
+        let logical = "tests/cases/conformance/externalModules/typeOnly/ambientPin.ts";
+        let case_text = "\
+// @Filename: /a.ts\n\
+export class A { a!: string }\n\
+\n\
+// @Filename: /b.ts\n\
+import type { A } from './a';\n\
+declare class B extends A {}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.contains("=== /a.ts ==="),
+            "absolute @Filename must keep its leading slash; emitted:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("=== /b.ts ==="),
+            "second absolute unit must keep its leading slash; emitted:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("=== a.ts ==="),
+            "lossy basename section must not appear; emitted:\n{emitted}"
+        );
+    }
+
+    /// Drive-letter (`A:/foo/bar.ts`) and dot-slash (`./a.ts`) spellings are
+    /// preserved too — `commonSourceDir4.types` prints `=== A:/foo/bar.ts ===`
+    /// and the `commonJsExportTypeDeclarationError` baselines print
+    /// `=== ./a.ts ===`; `virtual_unit_path` strips both prefixes for the
+    /// loader, so the section name must come from the verbatim name.
+    #[test]
+    fn types_section_headers_preserve_drive_and_dot_prefixes() {
+        let logical = "tests/cases/compiler/drivePrefixPin.ts";
+        let case_text = "\
+// @Filename: A:/foo/bar.ts\n\
+var x = 1;\n";
+        let units = split_case_units(logical, case_text);
+        assert_eq!(units[0].display_name, "A:/foo/bar.ts");
+
+        let logical2 = "tests/cases/compiler/dotSlashPin.ts";
+        let case_text2 = "\
+// @Filename: ./a.ts\n\
+var x = 1;\n";
+        let units2 = split_case_units(logical2, case_text2);
+        assert_eq!(units2[0].display_name, "./a.ts");
+    }
+
+    /// `tsconfig.json` / `jsconfig.json` units are configuration, never
+    /// program sources: `noEmitAndComposite.types` contains only the
+    /// `=== /a.ts ===` section and no `=== /tsconfig.json ===` section, while
+    /// data `.json` inputs (e.g. `=== b.json ===`) do get sections.
+    #[test]
+    fn types_emitter_skips_config_units() {
+        assert!(is_config_unit_name("tsconfig.json"));
+        assert!(is_config_unit_name("/a/b/tsconfig.json"));
+        assert!(is_config_unit_name("/b/TSConfig.JSON"));
+        assert!(is_config_unit_name("jsconfig.json"));
+        assert!(!is_config_unit_name("b.json"));
+        assert!(!is_config_unit_name("/config.json"));
+        assert!(!is_config_unit_name("package.json"));
+
+        let logical = "tests/cases/compiler/noEmitAndCompositePin.ts";
+        let case_text = "\
+// @Filename: /a.ts\n\
+const x = 10;\n\
+\n\
+// @Filename: /tsconfig.json\n\
+{\n\
+    \"compilerOptions\": {\n\
+        \"noEmit\": true,\n\
+        \"composite\": true\n\
+    }\n\
+}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            !emitted.contains("=== /tsconfig.json ==="),
+            "config unit must not get a types section; emitted:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("=== /a.ts ==="),
+            "source unit must keep its section; emitted:\n{emitted}"
+        );
+    }
+
+    /// Interface declaration names carry no `>name : type` record:
+    /// `duplicateConstructSignature.types` echoes `interface I { (): number;
+    /// (): string; }` with zero records, while class names do get records
+    /// (`ClassDeclaration21.types`: `>C : C`).
+    #[test]
+    fn types_emitter_skips_interface_name_records() {
+        let logical = "tests/cases/compiler/duplicateConstructSignaturePin.ts";
+        let case_text = "interface I {\n    (): number;\n    (): string;\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        let baseline = "//// [tests/cases/compiler/duplicateConstructSignaturePin.ts] ////\n\
+            \n\
+            === duplicateConstructSignaturePin.ts ===\n\
+            interface I {\n\
+                (): number;\n\
+                (): string;\n\
+            }\n";
+        assert_eq!(
+            compare_types(baseline, &emitted),
+            FacetVerdict::Pass,
+            "interface name must not produce a record; emitted:\n{emitted}"
+        );
+    }
+
+    /// Class declaration names DO get records (`ClassDeclaration21.types`:
+    /// `>C : C`) — the interface skip must not suppress them.
+    #[test]
+    fn types_emitter_keeps_class_name_records() {
+        let logical = "tests/cases/compiler/ClassDeclaration21.ts";
+        let case_text = "class C {\n    0();\n    1() { }\n}\n";
+        let units = split_case_units(logical, case_text);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            emitted.contains(">C : C\n"),
+            "class name record must survive; emitted:\n{emitted}"
         );
     }
 
