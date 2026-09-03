@@ -12,7 +12,8 @@
 //! * **Type erasure.** JavaScript output removes type-only syntax while
 //!   declaration output preserves the public type surface.
 //! * **Correct precedence.** Parentheses are derived from AST precedence and
-//!   associativity rather than copied from source trivia.
+//!   associativity; explicit parenthesized nodes round-trip their parens,
+//!   matching the upstream printer.
 //! * **Mapped printing.** Generated and original columns use zero-based UTF-16
 //!   code units, including text written by structural helper preludes.
 
@@ -1294,7 +1295,9 @@ impl<'a> Emitter<'a> {
 
     fn emit_expression_statement(&mut self, statement: &ExpressionStatement) {
         let expression = &statement.expression;
-        let wrap = self.leads_with_bad_token(expression, false);
+        // A parenthesized node prints its own parens, so manual wrapping would double them.
+        let wrap = !matches!(expression.data(), Expression::Parenthesized(_))
+            && self.leads_with_bad_token(expression, false);
         if wrap {
             self.raw("(");
             self.emit_expression_prec(expression, 0);
@@ -1979,7 +1982,9 @@ impl<'a> Emitter<'a> {
                 self.emit_block_with_braces(block.data(), block.range(), false);
             }
             FunctionBody::Expression(expression) => {
-                if self.leads_with_bad_token(expression, true) {
+                if !matches!(expression.data(), Expression::Parenthesized(_))
+                    && self.leads_with_bad_token(expression, true)
+                {
                     self.raw("(");
                     self.emit_expression_prec(expression, 0);
                     self.raw(")");
@@ -2336,7 +2341,10 @@ impl<'a> Emitter<'a> {
             | Expression::Member(_)
             | Expression::TaggedTemplate(_)
             | Expression::Import(_) => P_CALL_MEMBER,
-            Expression::Parenthesized(inner) => self.expression_prec(inner),
+            // A parenthesized node always prints its own parens (matching
+            // tsc, which round-trips both source parens and the parens its
+            // transforms synthesize), so it is opaque to outer precedence.
+            Expression::Parenthesized(_) => P_PRIMARY,
             Expression::As(as_expr) => self.expression_prec(&as_expr.expression),
             Expression::Satisfies(satisfies) => self.expression_prec(&satisfies.expression),
             Expression::TypeAssertion(assertion) => self.expression_prec(&assertion.expression),
@@ -2390,7 +2398,11 @@ impl<'a> Emitter<'a> {
             Expression::Conditional(conditional) => self.emit_conditional(conditional),
             Expression::Assignment(assignment) => self.emit_assignment(assignment),
             Expression::Sequence(sequence) => self.emit_sequence(sequence),
-            Expression::Parenthesized(inner) => self.emit_expression_prec(inner, 0),
+            Expression::Parenthesized(inner) => {
+                self.raw("(");
+                self.emit_expression_prec(inner, 0);
+                self.raw(")");
+            }
             Expression::As(as_expr) => self.emit_expression_prec(&as_expr.expression, 0),
             Expression::Satisfies(satisfies) => {
                 self.emit_expression_prec(&satisfies.expression, 0);
@@ -2827,7 +2839,7 @@ impl<'a> Emitter<'a> {
                 self.unwrap_expression(&member.object).data(),
                 Expression::Literal(Literal::Number(_))
             );
-        if numeric_object {
+        if numeric_object && !matches!(member.object.data(), Expression::Parenthesized(_)) {
             self.raw("(");
             self.emit_expression_prec(&member.object, 0);
             self.raw(")");
@@ -3021,7 +3033,9 @@ impl<'a> Emitter<'a> {
         prec: u8,
         is_left: bool,
     ) {
-        if self.coalesce_mix(parent, operand) {
+        if self.coalesce_mix(parent, operand)
+            && !matches!(operand.data(), Expression::Parenthesized(_))
+        {
             self.raw("(");
             self.emit_expression_prec(operand, 0);
             self.raw(")");
@@ -3116,7 +3130,7 @@ impl<'a> Emitter<'a> {
                         self.unwrap_expression(&member.object).data(),
                         Expression::Literal(Literal::Number(_))
                     );
-                if numeric_object {
+                if numeric_object && !matches!(member.object.data(), Expression::Parenthesized(_)) {
                     self.raw("(");
                     self.emit_expression_prec(&member.object, 0);
                     self.raw(")");

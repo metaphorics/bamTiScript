@@ -4453,12 +4453,16 @@ impl<'a> Rewriter<'a> {
                         right: Box::new(void_check),
                     }),
                 );
+                // The alternate is an assignment inside a conditional: wrap it
+                // so the printer keeps tsc's `(a = b)` parens (`a ??= b` →
+                // `a !== null && a !== void 0 ? a : (a = b)`).
+                let alternate = self.node(range, Expression::Parenthesized(Box::new(assign)));
                 self.node(
                     range,
                     Expression::Conditional(ConditionalExpression {
                         test: Box::new(test),
                         consequent: Box::new(plain_read),
-                        alternate: Box::new(assign),
+                        alternate: Box::new(alternate),
                     }),
                 )
             }
