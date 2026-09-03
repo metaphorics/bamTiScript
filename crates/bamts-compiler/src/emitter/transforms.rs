@@ -283,6 +283,7 @@ pub fn emit_transformed(
         PrintSource {
             file: &rewritten,
             original_content: file.source_text().as_str(),
+            synthesized: Some(&rewriter.synthesized_ids),
         },
         model,
         PrintOptions {
@@ -578,6 +579,7 @@ struct Rewriter<'a> {
     expression_temp_scopes: Vec<Vec<IdentifierNode>>,
     parameter_initializer_depths: Vec<usize>,
     cjs: Option<CjsPlan>,
+    synthesized_ids: BTreeSet<NodeId>,
 }
 
 /// Per-file CommonJS lowering plan built before the rewrite walk.
@@ -656,6 +658,7 @@ impl<'a> Rewriter<'a> {
             expression_temp_scopes: Vec::new(),
             parameter_initializer_depths: Vec::new(),
             cjs,
+            synthesized_ids: BTreeSet::new(),
         }
     }
 
@@ -806,7 +809,7 @@ impl<'a> Rewriter<'a> {
     fn cjs_export_assignment(&mut self, exported: &str, local: &str, range: TextRange) -> Stmt {
         let left = self.cjs_export_target(exported, range);
         let right = self.ident_expr(local);
-        let assignment = self.node(
+        let assignment = self.syn_node(
             range,
             Expression::Assignment(AssignmentExpression {
                 operator: AssignmentOperator::Assign,
@@ -814,7 +817,7 @@ impl<'a> Rewriter<'a> {
                 right: Box::new(right),
             }),
         );
-        self.node(
+        self.syn_node(
             range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(assignment),
@@ -825,7 +828,7 @@ impl<'a> Rewriter<'a> {
     /// `exports.default = <value>;`
     fn cjs_export_default_assignment(&mut self, range: TextRange, value: Expr) -> Stmt {
         let left = self.cjs_export_target("default", range);
-        let assignment = self.node(
+        let assignment = self.syn_node(
             range,
             Expression::Assignment(AssignmentExpression {
                 operator: AssignmentOperator::Assign,
@@ -833,7 +836,7 @@ impl<'a> Rewriter<'a> {
                 right: Box::new(value),
             }),
         );
-        self.node(
+        self.syn_node(
             range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(assignment),
@@ -843,9 +846,9 @@ impl<'a> Rewriter<'a> {
 
     fn cjs_export_target(&mut self, exported: &str, range: TextRange) -> AssignmentTargetNode {
         let exports_ident = self.ident("exports");
-        let object = self.node(range, Expression::Identifier(exports_ident));
+        let object = self.syn_node(range, Expression::Identifier(exports_ident));
         let property = MemberProperty::Named(self.ident(exported));
-        self.node(
+        self.syn_node(
             range,
             AssignmentTarget::Member(AssignmentMemberTarget {
                 object: Box::new(object),
@@ -861,10 +864,10 @@ impl<'a> Rewriter<'a> {
         let raw = self.token_text(source.data().token()).to_owned();
         let module = raw.trim_matches(['"', '\'']);
         let require = self.ident("require");
-        let callee = self.node(range, Expression::Identifier(require));
+        let callee = self.syn_node(range, Expression::Identifier(require));
         let literal = self.string_literal(module);
-        let module = self.node(range, Expression::Literal(Literal::String(literal)));
-        let call = self.node(
+        let module = self.syn_node(range, Expression::Literal(Literal::String(literal)));
+        let call = self.syn_node(
             range,
             Expression::Call(CallExpression {
                 callee: Box::new(callee),
@@ -873,7 +876,7 @@ impl<'a> Rewriter<'a> {
                 arguments: vec![CallArgument::Expression(Box::new(module))],
             }),
         );
-        self.node(
+        self.syn_node(
             range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(call),
@@ -936,7 +939,7 @@ impl<'a> Rewriter<'a> {
                 (renamed, String::from("default_1"))
             }
         };
-        let statement = self.node(range, Statement::Class(class));
+        let statement = self.syn_node(range, Statement::Class(class));
         let mut out = self.rewrite_statement(&statement);
         let default_value = self.ident_expr(&name);
         out.push(self.cjs_export_default_assignment(range, default_value));
@@ -1227,7 +1230,7 @@ impl<'a> Rewriter<'a> {
             kind: VariableKind::Var,
             declarations,
         };
-        Some(self.node(range, Statement::Variable(declaration)))
+        Some(self.syn_node(range, Statement::Variable(declaration)))
     }
 
     fn rewrite_root_statements(&mut self, statements: &[Stmt], range: TextRange) -> Vec<Stmt> {
@@ -1242,6 +1245,26 @@ impl<'a> Rewriter<'a> {
 
     fn node<T>(&mut self, range: TextRange, data: T) -> Node<T> {
         Node::new(self.alloc_id(), range, data)
+    }
+    /// Like [`node`](Self::node) but records the minted id as synthesized.
+    fn syn_node<T>(&mut self, range: TextRange, data: T) -> Node<T> {
+        let id = self.alloc_id();
+        self.synthesized_ids.insert(id);
+        Node::new(id, range, data)
+    }
+
+    /// Whether any of `ids` is recorded as synthesized.
+    fn any_marked(&self, ids: impl IntoIterator<Item = NodeId>) -> bool {
+        ids.into_iter().any(|id| self.synthesized_ids.contains(&id))
+    }
+
+    /// Mints a wrapper marked when `child_marked` is true, otherwise unmarked.
+    fn wrap_marked<T>(&mut self, range: TextRange, data: T, child_marked: bool) -> Node<T> {
+        if child_marked {
+            self.syn_node(range, data)
+        } else {
+            self.node(range, data)
+        }
     }
 
     fn diag(&mut self, code: DiagnosticCode, range: TextRange, message: &'static str) {
@@ -2413,7 +2436,7 @@ impl<'a> Rewriter<'a> {
         range: TextRange,
     ) -> Stmt {
         let declaration = self.make_declarator(temp, Some(value), range);
-        self.node(
+        self.syn_node(
             range,
             Statement::Variable(VariableDeclaration {
                 range,
@@ -2450,8 +2473,8 @@ impl<'a> Rewriter<'a> {
                     statements.extend(ctor.body.data().statements.clone());
                     statements
                 };
-                let body = self.node(ctor.body.range(), Block { statements });
-                Some(self.node(
+                let body = self.syn_node(ctor.body.range(), Block { statements });
+                Some(self.syn_node(
                     existing.range(),
                     ClassMember::Constructor(ConstructorDeclaration {
                         body,
@@ -2465,8 +2488,8 @@ impl<'a> Rewriter<'a> {
                     statements.push(self.super_forward_call(range));
                 }
                 statements.extend(inits);
-                let body = self.node(range, Block { statements });
-                Some(self.node(
+                let body = self.syn_node(range, Block { statements });
+                Some(self.syn_node(
                     range,
                     ClassMember::Constructor(ConstructorDeclaration {
                         decorators: Vec::new(),
@@ -2489,8 +2512,13 @@ impl<'a> Rewriter<'a> {
                 }
                 Statement::Block(block) => {
                     let statements = self.splice_after_super(&block.data().statements, inits);
-                    let block = self.node(block.range(), Block { statements });
-                    out.push(self.node(statement.range(), Statement::Block(block)));
+                    let child_marked = self.any_marked(statements.iter().map(|s| s.id()));
+                    let block = self.wrap_marked(block.range(), Block { statements }, child_marked);
+                    out.push(self.wrap_marked(
+                        statement.range(),
+                        Statement::Block(block),
+                        child_marked,
+                    ));
                 }
                 Statement::If(if_stmt) => {
                     let consequent = self.splice_super_statement(&if_stmt.consequent, inits);
@@ -2498,102 +2526,141 @@ impl<'a> Rewriter<'a> {
                         .alternate
                         .as_deref()
                         .map(|value| Box::new(self.splice_super_statement(value, inits)));
-                    out.push(self.node(
+                    let child_marked = self.any_marked(
+                        [consequent.id()]
+                            .into_iter()
+                            .chain(alternate.iter().map(|a| a.id())),
+                    );
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::If(IfStatement {
                             test: if_stmt.test.clone(),
                             consequent: Box::new(consequent),
                             alternate,
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::Try(try_stmt) => {
                     let statements =
                         self.splice_after_super(&try_stmt.block.data().statements, inits);
-                    let block = self.node(try_stmt.block.range(), Block { statements });
+                    let block_marked = self.any_marked(statements.iter().map(|s| s.id()));
+                    let block = self.wrap_marked(
+                        try_stmt.block.range(),
+                        Block { statements },
+                        block_marked,
+                    );
                     let handler = try_stmt.handler.as_ref().map(|handler| {
                         let statements =
                             self.splice_after_super(&handler.data().body.data().statements, inits);
-                        let body = self.node(handler.data().body.range(), Block { statements });
-                        self.node(
+                        let body_marked = self.any_marked(statements.iter().map(|s| s.id()));
+                        let body = self.wrap_marked(
+                            handler.data().body.range(),
+                            Block { statements },
+                            body_marked,
+                        );
+                        let handler_marked = body_marked;
+                        self.wrap_marked(
                             handler.range(),
                             CatchClause {
                                 binding: handler.data().binding.clone(),
                                 body,
                             },
+                            handler_marked,
                         )
                     });
                     let finalizer = try_stmt.finalizer.as_ref().map(|block| {
                         let statements = self.splice_after_super(&block.data().statements, inits);
-                        self.node(block.range(), Block { statements })
+                        let marked = self.any_marked(statements.iter().map(|s| s.id()));
+                        self.wrap_marked(block.range(), Block { statements }, marked)
                     });
-                    out.push(self.node(
+                    let child_marked = block_marked
+                        || handler
+                            .as_ref()
+                            .is_some_and(|h| self.synthesized_ids.contains(&h.id()))
+                        || finalizer
+                            .as_ref()
+                            .is_some_and(|f| self.synthesized_ids.contains(&f.id()));
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::Try(TryStatement {
                             block,
                             handler,
                             finalizer,
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::For(value) => {
                     let body = self.splice_super_statement(&value.body, inits);
-                    out.push(self.node(
+                    let child_marked = self.synthesized_ids.contains(&body.id());
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::For(ForStatement {
                             body: Box::new(body),
                             ..value.clone()
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::ForIn(value) => {
                     let body = self.splice_super_statement(&value.body, inits);
-                    out.push(self.node(
+                    let child_marked = self.synthesized_ids.contains(&body.id());
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::ForIn(ForInStatement {
                             body: Box::new(body),
                             ..value.clone()
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::ForOf(value) => {
                     let body = self.splice_super_statement(&value.body, inits);
-                    out.push(self.node(
+                    let child_marked = self.synthesized_ids.contains(&body.id());
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::ForOf(ForOfStatement {
                             body: Box::new(body),
                             ..value.clone()
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::While(value) => {
                     let body = self.splice_super_statement(&value.body, inits);
-                    out.push(self.node(
+                    let child_marked = self.synthesized_ids.contains(&body.id());
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::While(WhileStatement {
                             body: Box::new(body),
                             ..value.clone()
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::DoWhile(value) => {
                     let body = self.splice_super_statement(&value.body, inits);
-                    out.push(self.node(
+                    let child_marked = self.synthesized_ids.contains(&body.id());
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::DoWhile(DoWhileStatement {
                             body: Box::new(body),
                             ..value.clone()
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::Labeled(value) => {
                     let body = self.splice_super_statement(&value.body, inits);
-                    out.push(self.node(
+                    let child_marked = self.synthesized_ids.contains(&body.id());
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::Labeled(LabeledStatement {
                             label: value.label.clone(),
                             body: Box::new(body),
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::Switch(value) => {
@@ -2603,30 +2670,36 @@ impl<'a> Rewriter<'a> {
                         .map(|case| {
                             let consequent =
                                 self.splice_after_super(&case.data().consequent, inits);
-                            self.node(
+                            let child_marked = self.any_marked(consequent.iter().map(|s| s.id()));
+                            self.wrap_marked(
                                 case.range(),
                                 SwitchCase {
                                     test: case.data().test.clone(),
                                     consequent,
                                 },
+                                child_marked,
                             )
                         })
-                        .collect();
-                    out.push(self.node(
+                        .collect::<Vec<_>>();
+                    let child_marked = self.any_marked(cases.iter().map(|c| c.id()));
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::Switch(SwitchStatement {
                             discriminant: value.discriminant.clone(),
                             cases,
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::Expression(value) => {
                     let expression = self.wrap_super_calls(&value.expression, inits);
-                    out.push(self.node(
+                    let child_marked = self.synthesized_ids.contains(&expression.id());
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::Expression(ExpressionStatement {
                             expression: Box::new(expression),
                         }),
+                        child_marked,
                     ));
                 }
                 Statement::Return(value) => {
@@ -2634,18 +2707,24 @@ impl<'a> Rewriter<'a> {
                         .argument
                         .as_deref()
                         .map(|value| Box::new(self.wrap_super_calls(value, inits)));
-                    out.push(self.node(
+                    let child_marked = argument
+                        .as_ref()
+                        .is_some_and(|a| self.synthesized_ids.contains(&a.id()));
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::Return(ReturnStatement { argument }),
+                        child_marked,
                     ));
                 }
                 Statement::Throw(value) => {
                     let argument = self.wrap_super_calls(&value.argument, inits);
-                    out.push(self.node(
+                    let child_marked = self.synthesized_ids.contains(&argument.id());
+                    out.push(self.wrap_marked(
                         statement.range(),
                         Statement::Throw(ThrowStatement {
                             argument: Box::new(argument),
                         }),
+                        child_marked,
                     ));
                 }
                 _ => out.push(statement.clone()),
@@ -2663,8 +2742,8 @@ impl<'a> Rewriter<'a> {
                 };
                 Some(value.expression.as_ref().clone())
             }));
-            expressions.push(self.node(expression.range(), Expression::This));
-            return self.node(
+            expressions.push(self.syn_node(expression.range(), Expression::This));
+            return self.syn_node(
                 expression.range(),
                 Expression::Sequence(SequenceExpression { expressions }),
             );
@@ -2788,8 +2867,9 @@ impl<'a> Rewriter<'a> {
         if statements.len() == 1 {
             return statements.into_iter().next().expect("one statement");
         }
-        let block = self.node(statement.range(), Block { statements });
-        self.node(statement.range(), Statement::Block(block))
+        let child_marked = self.any_marked(statements.iter().map(|s| s.id()));
+        let block = self.wrap_marked(statement.range(), Block { statements }, child_marked);
+        self.wrap_marked(statement.range(), Statement::Block(block), child_marked)
     }
 
     fn field_statement(
@@ -2802,18 +2882,18 @@ impl<'a> Rewriter<'a> {
             return self.define_field_statement(class_name, field);
         }
         let object = match class_name {
-            Some(name) => self.node(name.range(), Expression::Identifier(name.clone())),
-            None => self.node(field.range, Expression::This),
+            Some(name) => self.syn_node(name.range(), Expression::Identifier(name.clone())),
+            None => self.syn_node(field.range, Expression::This),
         };
         let property = self.member_property(&field.name, field.range);
-        let target = self.node(
+        let target = self.syn_node(
             field.range,
             AssignmentTarget::Member(AssignmentMemberTarget {
                 object: Box::new(object),
                 property,
             }),
         );
-        let assignment = self.node(
+        let assignment = self.syn_node(
             field.range,
             Expression::Assignment(AssignmentExpression {
                 operator: AssignmentOperator::Assign,
@@ -2821,7 +2901,7 @@ impl<'a> Rewriter<'a> {
                 right: Box::new(field.init.clone()),
             }),
         );
-        self.node(
+        self.syn_node(
             field.range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(assignment),
@@ -2837,8 +2917,8 @@ impl<'a> Rewriter<'a> {
         let object = self.ident("Object");
         let callee = self.member_ident(&object, "defineProperty", field.range);
         let receiver = match class_name {
-            Some(name) => self.node(name.range(), Expression::Identifier(name.clone())),
-            None => self.node(field.range, Expression::This),
+            Some(name) => self.syn_node(name.range(), Expression::Identifier(name.clone())),
+            None => self.syn_node(field.range, Expression::This),
         };
         let key = self.property_key_expression(&field.name, field.range);
         let enumerable = self.boolean_expr(true);
@@ -2853,7 +2933,7 @@ impl<'a> Rewriter<'a> {
             ],
             field.range,
         );
-        let call = self.node(
+        let call = self.syn_node(
             field.range,
             Expression::Call(CallExpression {
                 callee: Box::new(callee),
@@ -2866,7 +2946,7 @@ impl<'a> Rewriter<'a> {
                 ],
             }),
         );
-        self.node(
+        self.syn_node(
             field.range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(call),
@@ -3624,7 +3704,7 @@ impl<'a> Rewriter<'a> {
         )
     }
     fn static_block_statement(&mut self, block: BlockNode, range: TextRange) -> Stmt {
-        let arrow = self.node(
+        let arrow = self.syn_node(
             range,
             Expression::Arrow(ArrowFunction {
                 is_async: false,
@@ -3634,7 +3714,7 @@ impl<'a> Rewriter<'a> {
                 body: FunctionBody::Block(block),
             }),
         );
-        let call = self.node(
+        let call = self.syn_node(
             range,
             Expression::Call(CallExpression {
                 callee: Box::new(arrow),
@@ -3643,7 +3723,7 @@ impl<'a> Rewriter<'a> {
                 arguments: Vec::new(),
             }),
         );
-        self.node(
+        self.syn_node(
             range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(call),
@@ -3667,17 +3747,17 @@ impl<'a> Rewriter<'a> {
     ) -> Stmt {
         let object = self.ident("Object");
         let callee = self.member_ident(&object, "defineProperty", range);
-        let receiver = self.node(
+        let receiver = self.syn_node(
             class_name.range(),
             Expression::Identifier(class_name.clone()),
         );
         let key_literal = self.string_literal("name");
-        let key = self.node(
+        let key = self.syn_node(
             key_literal.range(),
             Expression::Literal(Literal::String(key_literal)),
         );
         let value_literal = self.string_literal(value);
-        let value = self.node(
+        let value = self.syn_node(
             value_literal.range(),
             Expression::Literal(Literal::String(value_literal)),
         );
@@ -3686,7 +3766,7 @@ impl<'a> Rewriter<'a> {
             vec![("value", value), ("configurable", configurable)],
             range,
         );
-        let call = self.node(
+        let call = self.syn_node(
             range,
             Expression::Call(CallExpression {
                 callee: Box::new(callee),
@@ -3699,7 +3779,7 @@ impl<'a> Rewriter<'a> {
                 ],
             }),
         );
-        self.node(
+        self.syn_node(
             range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(call),
@@ -3709,8 +3789,8 @@ impl<'a> Rewriter<'a> {
 
     fn super_forward_call(&mut self, range: TextRange) -> Stmt {
         let arguments = self.ident_expr("arguments");
-        let callee = self.node(range, Expression::Super);
-        let call = self.node(
+        let callee = self.syn_node(range, Expression::Super);
+        let call = self.syn_node(
             range,
             Expression::Call(CallExpression {
                 callee: Box::new(callee),
@@ -3721,7 +3801,7 @@ impl<'a> Rewriter<'a> {
                 })],
             }),
         );
-        self.node(
+        self.syn_node(
             range,
             Statement::Expression(ExpressionStatement {
                 expression: Box::new(call),
@@ -3780,10 +3860,17 @@ impl<'a> Rewriter<'a> {
                 self.expression_temp_scopes.push(Vec::new());
                 let mut statements = self.rewrite_statements(&block.data().statements);
                 let temps = self.expression_temp_scopes.pop().unwrap_or_default();
+                let has_temps = !temps.is_empty();
                 if let Some(declaration) = self.temp_declaration(temps, block.range()) {
                     statements.insert(0, declaration);
                 }
-                FunctionBody::Block(self.node(block.range(), Block { statements }))
+                let block_node = if has_temps {
+                    self.syn_node(block.range(), Block { statements })
+                } else {
+                    let child_marked = self.any_marked(statements.iter().map(|s| s.id()));
+                    self.wrap_marked(block.range(), Block { statements }, child_marked)
+                };
+                FunctionBody::Block(block_node)
             }
             FunctionBody::Expression(expression) => {
                 FunctionBody::Expression(Box::new(self.rewrite_expr(expression)))
@@ -3800,7 +3887,7 @@ impl<'a> Rewriter<'a> {
             .as_ref()
             .map(|body| self.rewrite_body(body))
             .unwrap_or_else(|| {
-                FunctionBody::Block(self.node(
+                FunctionBody::Block(self.syn_node(
                     range,
                     Block {
                         statements: Vec::new(),
@@ -3818,14 +3905,14 @@ impl<'a> Rewriter<'a> {
             return_type: None,
             body: Some(inner_body),
         };
-        let inner_expr = self.node(
+        let inner_expr = self.syn_node(
             range,
             Expression::Function(FunctionExpression { function: inner }),
         );
         let awaiter = self.helper_ident(HelperKind::Awaiter);
-        let this_arg = self.node(range, Expression::This);
+        let this_arg = self.syn_node(range, Expression::This);
         let void_zero = self.void_zero(range);
-        let call = self.node(
+        let call = self.syn_node(
             range,
             Expression::Call(CallExpression {
                 callee: Box::new(awaiter),
@@ -3839,7 +3926,7 @@ impl<'a> Rewriter<'a> {
                 ],
             }),
         );
-        let return_stmt = self.node(
+        let return_stmt = self.syn_node(
             range,
             Statement::Return(ReturnStatement {
                 argument: Some(Box::new(call)),
@@ -3848,7 +3935,7 @@ impl<'a> Rewriter<'a> {
         FunctionLike {
             is_async: false,
             is_generator: false,
-            body: Some(FunctionBody::Block(self.node(
+            body: Some(FunctionBody::Block(self.syn_node(
                 range,
                 Block {
                     statements: vec![return_stmt],
@@ -3877,24 +3964,26 @@ impl<'a> Rewriter<'a> {
     ) -> Expr {
         if matches!(FieldMode::for_options(self.options), FieldMode::Native) {
             let lowered = self.lower_class(&class_expression.class, expression.range(), None);
-            return self.node(
+            let child_marked = self.any_marked(lowered.class.members.iter().map(|m| m.id()));
+            return self.wrap_marked(
                 expression.range(),
                 Expression::Class(ClassExpression {
                     class: lowered.class,
                 }),
+                child_marked,
             );
         }
         let temp = self.temp_ident();
         let mut lowered =
             self.lower_class(&class_expression.class, expression.range(), Some(&temp));
-        let class = self.node(
+        let class = self.syn_node(
             expression.range(),
             Expression::Class(ClassExpression {
                 class: lowered.class,
             }),
         );
         let declaration = self.make_declarator(temp.clone(), Some(class), expression.range());
-        lowered.prelude.push(self.node(
+        lowered.prelude.push(self.syn_node(
             expression.range(),
             Statement::Variable(VariableDeclaration {
                 range: expression.range(),
@@ -3910,20 +3999,20 @@ impl<'a> Rewriter<'a> {
             ));
         }
         lowered.prelude.extend(lowered.postlude);
-        let result = self.node(temp.range(), Expression::Identifier(temp));
-        lowered.prelude.push(self.node(
+        let result = self.syn_node(temp.range(), Expression::Identifier(temp));
+        lowered.prelude.push(self.syn_node(
             expression.range(),
             Statement::Return(ReturnStatement {
                 argument: Some(Box::new(result)),
             }),
         ));
-        let body = self.node(
+        let body = self.syn_node(
             expression.range(),
             Block {
                 statements: lowered.prelude,
             },
         );
-        let arrow = self.node(
+        let arrow = self.syn_node(
             expression.range(),
             Expression::Arrow(ArrowFunction {
                 is_async: false,
@@ -3933,7 +4022,7 @@ impl<'a> Rewriter<'a> {
                 body: FunctionBody::Block(body),
             }),
         );
-        self.node(
+        self.syn_node(
             expression.range(),
             Expression::Call(CallExpression {
                 callee: Box::new(arrow),
@@ -4832,13 +4921,13 @@ impl<'a> Rewriter<'a> {
                     if let Some(declaration) = self.temp_declaration(temps, expression.range()) {
                         statements.push(declaration);
                     }
-                    statements.push(self.node(
+                    statements.push(self.syn_node(
                         expression.range(),
                         Statement::Return(ReturnStatement {
                             argument: Some(Box::new(rewritten)),
                         }),
                     ));
-                    let block = self.node(expression.range(), Block { statements });
+                    let block = self.syn_node(expression.range(), Block { statements });
                     FunctionBody::Block(block)
                 }
                 other => self.rewrite_body(other),
@@ -4854,14 +4943,14 @@ impl<'a> Rewriter<'a> {
                 return_type: None,
                 body: Some(body),
             };
-            let inner_expr = self.node(
+            let inner_expr = self.syn_node(
                 expression.range(),
                 Expression::Function(FunctionExpression { function: inner }),
             );
             let awaiter = self.helper_ident(HelperKind::Awaiter);
-            let this_arg = self.node(expression.range(), Expression::This);
+            let this_arg = self.syn_node(expression.range(), Expression::This);
             let void_zero = self.void_zero(expression.range());
-            let call = self.node(
+            let call = self.syn_node(
                 expression.range(),
                 Expression::Call(CallExpression {
                     callee: Box::new(awaiter),
@@ -4875,7 +4964,7 @@ impl<'a> Rewriter<'a> {
                     ],
                 }),
             );
-            return self.node(
+            return self.syn_node(
                 expression.range(),
                 Expression::Arrow(ArrowFunction {
                     is_async: false,
@@ -4894,13 +4983,13 @@ impl<'a> Rewriter<'a> {
                 match self.temp_declaration(temps, expression.range()) {
                     None => FunctionBody::Expression(Box::new(rewritten)),
                     Some(declaration) => {
-                        let returned = self.node(
+                        let returned = self.syn_node(
                             expression.range(),
                             Statement::Return(ReturnStatement {
                                 argument: Some(Box::new(rewritten)),
                             }),
                         );
-                        FunctionBody::Block(self.node(
+                        FunctionBody::Block(self.syn_node(
                             expression.range(),
                             Block {
                                 statements: vec![declaration, returned],
@@ -4911,13 +5000,19 @@ impl<'a> Rewriter<'a> {
             }
             other => self.rewrite_body(other),
         };
-        self.node(
+        let body_marked = match &body {
+            FunctionBody::Block(block) => self.synthesized_ids.contains(&block.id()),
+            FunctionBody::Expression(expr) => self.synthesized_ids.contains(&expr.id()),
+            FunctionBody::Missing(_) => false,
+        };
+        self.wrap_marked(
             expression.range(),
             Expression::Arrow(ArrowFunction {
                 parameters,
                 body,
                 ..arrow.clone()
             }),
+            body_marked,
         )
     }
 }

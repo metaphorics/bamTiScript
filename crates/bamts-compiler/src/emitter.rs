@@ -23,7 +23,11 @@ pub mod sourcemap;
 pub mod transforms;
 pub mod transpile;
 
-use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    sync::Arc,
+};
 
 use crate::checker::{SemanticModel, Type, TypeId, render_type_declaration};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
@@ -473,6 +477,7 @@ pub(crate) struct PrintOptions {
 pub(crate) struct PrintSource<'a> {
     pub(crate) file: &'a SourceFile,
     pub(crate) original_content: &'a str,
+    pub(crate) synthesized: Option<&'a BTreeSet<NodeId>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -536,6 +541,7 @@ pub(crate) fn print(
         PrintSource {
             file,
             original_content: file.source_text().as_str(),
+            synthesized: None,
         },
         model,
         options,
@@ -559,6 +565,7 @@ pub(crate) fn print_with_jsx_plan(
     let PrintSource {
         file,
         original_content,
+        synthesized,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -609,6 +616,8 @@ pub(crate) fn print_with_jsx_plan(
             file.script_kind(),
             crate::source::ScriptKind::JavaScript | crate::source::ScriptKind::JavaScriptReact
         ),
+        authored_len: Utf16Pos::new(utf16_len(original_content)),
+        synthesized,
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -788,6 +797,13 @@ struct Emitter<'a> {
     /// (`allowJs`). tsc does not add `declare` to exported declarations of a
     /// JS file, while it does for a TypeScript source.
     decl_source_is_js: bool,
+    /// UTF-16 length of `PrintSource::original_content` — the authored text
+    /// only, never the extended source range. Used by `preserves_single_line`
+    /// to reject ranges that spill into synthesized appendix text.
+    authored_len: Utf16Pos,
+    /// Synthesized node ids recorded by the rewriter, or `None` when printing
+    /// without a transform (declarations, untransformed JS).
+    synthesized: Option<&'a BTreeSet<NodeId>>,
 }
 
 impl<'a> Emitter<'a> {
@@ -865,6 +881,39 @@ impl<'a> Emitter<'a> {
         Some(Utf16Pos::new(
             range.start().get() + utf16_len(&text[..index]),
         ))
+    }
+    /// Whether `id` is a synthesized node produced by the rewriter.
+    fn is_synthesized(&self, id: NodeId) -> bool {
+        self.synthesized.is_some_and(|set| set.contains(&id))
+    }
+
+    /// Whether a node with `id` and `range` preserves single-line emit:
+    /// not synthesized, range non-empty, range within authored text, and
+    /// the source text does not span multiple lines.
+    fn preserves_single_line(&self, id: NodeId, range: TextRange) -> bool {
+        if self.is_synthesized(id) {
+            return false;
+        }
+        if range.start() == range.end() {
+            return false;
+        }
+        // Mint gate: a parser-assigned id (below the rewriter floor) must
+        // have a range within the authored content. NameBank::intern appends
+        // to the extended text, so a range past `authored_len` on a
+        // non-synthesized id indicates a lowering bug.
+        debug_assert!(
+            id.get() >= 1_000_000 || range.end() <= self.authored_len,
+            "parser id {id:?} has range past authored_len"
+        );
+        if range.end() > self.authored_len {
+            return false;
+        }
+        !self.source.spans_multiple_lines(range)
+    }
+
+    /// Thin wrapper: checks a single AST node by its id and range.
+    fn node_preserves_single_line<T>(&self, node: &Node<T>) -> bool {
+        self.preserves_single_line(node.id(), node.range())
     }
 
     /// Maps `text` to the source position of `ch` inside `range`, falling back
@@ -1185,7 +1234,7 @@ impl<'a> Emitter<'a> {
                 false
             }
             Statement::Block(block) => {
-                self.emit_block(block.data(), block.range());
+                self.emit_block(block);
                 true
             }
             Statement::Empty => false,
@@ -1360,7 +1409,7 @@ impl<'a> Emitter<'a> {
     fn emit_control_body(&mut self, statement: &Stmt) {
         self.raw(" ");
         match statement.data() {
-            Statement::Block(block) => self.emit_block(block.data(), self.anchor),
+            Statement::Block(block) => self.emit_block_with_braces(block, self.anchor, true),
             Statement::Empty => self.raw("{}"),
             _ => {
                 self.raw_mapped("{", self.anchor);
@@ -1375,7 +1424,8 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_block(&mut self, block: &Block, range: TextRange) {
+    fn emit_block(&mut self, block: &BlockNode) {
+        let range = block.range();
         self.emit_block_with_braces(block, range, true);
     }
 
@@ -1384,8 +1434,13 @@ impl<'a> Emitter<'a> {
     /// source token, while function, arrow, and class bodies leave it
     /// unmapped. The closing `}` is always mapped to its source token — tsc
     /// emits a segment for every block close brace regardless of context.
-    fn emit_block_with_braces(&mut self, block: &Block, range: TextRange, map_open_brace: bool) {
-        if block.statements.is_empty() {
+    fn emit_block_with_braces(
+        &mut self,
+        block: &BlockNode,
+        range: TextRange,
+        map_open_brace: bool,
+    ) {
+        if block.data().statements.is_empty() {
             if map_open_brace {
                 self.raw_mapped_char("{", range, '{', 1);
             } else {
@@ -1399,6 +1454,23 @@ impl<'a> Emitter<'a> {
             self.raw_mapped_char_end("}", range, '}');
             return;
         }
+        // Preservation: a non-empty body authored on one line stays on one
+        // line (`{ stmt; stmt; }`). Synthesized, past-authored-text, or
+        // multi-line-authored bodies take the expanded path below.
+        if self.node_preserves_single_line(block) {
+            if map_open_brace {
+                self.raw_mapped_char("{", range, '{', 1);
+            } else {
+                self.raw("{");
+            }
+            self.raw(" ");
+            for statement in &block.data().statements {
+                let _ = self.emit_statement(statement);
+                self.raw(" ");
+            }
+            self.raw_mapped_char_end("}", range, '}');
+            return;
+        }
         if map_open_brace {
             self.raw_mapped_char("{", range, '{', 1);
         } else {
@@ -1406,7 +1478,7 @@ impl<'a> Emitter<'a> {
         }
         self.newline();
         self.indent += 1;
-        for statement in &block.statements {
+        for statement in &block.data().statements {
             if self.emit_statement(statement) {
                 self.newline();
             }
@@ -1515,7 +1587,7 @@ impl<'a> Emitter<'a> {
 
     fn emit_try(&mut self, statement: &TryStatement) {
         self.raw_mapped("try ", self.anchor);
-        self.emit_block(statement.block.data(), statement.block.range());
+        self.emit_block(&statement.block);
         if let Some(handler) = &statement.handler {
             let handler_range = handler.range();
             let handler = handler.data();
@@ -1526,11 +1598,11 @@ impl<'a> Emitter<'a> {
                 self.raw_mapped_pos(")", binding.range().end());
             }
             self.raw(" ");
-            self.emit_block(handler.body.data(), handler.body.range());
+            self.emit_block(&handler.body);
         }
         if let Some(finalizer) = &statement.finalizer {
             self.raw_mapped(" finally ", finalizer.range());
-            self.emit_block(finalizer.data(), finalizer.range());
+            self.emit_block(finalizer);
         }
     }
 
@@ -2008,7 +2080,7 @@ impl<'a> Emitter<'a> {
         self.raw_mapped_token(" => ", arrow_pos, 2);
         match &arrow.body {
             FunctionBody::Block(block) => {
-                self.emit_block_with_braces(block.data(), block.range(), false);
+                self.emit_block_with_braces(block, block.range(), false);
             }
             FunctionBody::Expression(expression) => {
                 if !self.starts_parenthesized(expression)
@@ -2034,7 +2106,7 @@ impl<'a> Emitter<'a> {
     fn emit_function_body_js(&mut self, body: Option<&FunctionBody>) {
         match body {
             Some(FunctionBody::Block(block)) => {
-                self.emit_block_with_braces(block.data(), block.range(), false);
+                self.emit_block_with_braces(block, block.range(), false);
             }
             Some(FunctionBody::Expression(expression)) => {
                 self.raw("{ return ");
@@ -2241,7 +2313,7 @@ impl<'a> Emitter<'a> {
             }
             ClassMember::StaticBlock(block) => {
                 self.raw("static ");
-                self.emit_block(block.data(), block.range());
+                self.emit_block(block);
                 true
             }
             ClassMember::IndexSignature(_) => false,
@@ -5677,6 +5749,56 @@ export default answer;
         assert!(!output.has_errors());
         assert_eq!(javascript(&output).code, "function foo() { }\n");
     }
+
+    #[test]
+    fn single_line_function_body_stays_single_line_in_javascript() {
+        // Authority: 292 true single-line function outputs in the stable
+        // baselines (e.g. newOperatorErrorCases.js). A non-empty body
+        // authored without a line break keeps `{ stmt; stmt; }`.
+        let input = "function f() { return 1; }";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(javascript(&output).code, "function f() { return 1; }\n");
+    }
+
+    #[test]
+    fn multi_line_function_body_stays_expanded_in_javascript() {
+        let input = "function f() {\n  return 1;\n}";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(
+            javascript(&output).code,
+            "function f() {\n    return 1;\n}\n"
+        );
+    }
+
+    #[test]
+    fn single_line_arrow_block_body_stays_single_line_in_javascript() {
+        // Authority: 3 true single-line arrow-block outputs in the stable baselines.
+        let input = "const f = () => { return 1; };";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(javascript(&output).code, "const f = () => { return 1; };\n");
+    }
+
     #[test]
     fn empty_interface_body_expands_in_declaration_emit() {
         // Authority: importTag16 a.d.ts expands tight-authored

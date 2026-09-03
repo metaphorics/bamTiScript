@@ -440,6 +440,27 @@ impl SourceText {
         let line_start = self.line_starts[line_index];
         Ok((line_index, position.get() - line_start.get()))
     }
+
+    /// Returns whether the range crosses at least one line boundary.
+    ///
+    /// True iff some line start `L` satisfies `range.start() < L && L <= range.end()`.
+    /// Out-of-bounds endpoints fail closed: the result is `true` so callers revalidate.
+    #[must_use]
+    pub fn spans_multiple_lines(&self, range: TextRange) -> bool {
+        let start = range.start();
+        let end = range.end();
+        // TextRange::new rejects start > end, so start past the end implies end is too.
+        if end > self.utf16_len {
+            return true;
+        }
+        let first_after_start = self
+            .line_starts
+            .partition_point(|line_start| *line_start <= start);
+        let first_after_end = self
+            .line_starts
+            .partition_point(|line_start| *line_start <= end);
+        first_after_start < first_after_end
+    }
 }
 
 #[cfg(test)]
@@ -663,5 +684,71 @@ mod tests {
             .expect("test source fits the per-file budget");
         assert!(!ordinary.is_declaration_file());
         assert!(ordinary.with_declaration_file(true).is_declaration_file());
+    }
+
+    #[test]
+    fn spans_multiple_lines_detects_lf_single_and_multi_line_ranges() {
+        let source = SourceText::new("ab\ncd").expect("test source fits the per-file budget");
+        // "ab" stays on line 0.
+        let single = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(2)).unwrap();
+        assert!(!source.spans_multiple_lines(single));
+        // "b\nc" crosses the LF boundary at UTF-16 offset 3.
+        let multi = TextRange::new(Utf16Pos::new(1), Utf16Pos::new(4)).unwrap();
+        assert!(source.spans_multiple_lines(multi));
+        // A range ending exactly at a line start still crosses into the next line.
+        let ends_at_boundary = TextRange::new(Utf16Pos::new(1), Utf16Pos::new(3)).unwrap();
+        assert!(source.spans_multiple_lines(ends_at_boundary));
+        // A range starting exactly at a line start but ending on the same line does not.
+        let starts_at_boundary = TextRange::new(Utf16Pos::new(3), Utf16Pos::new(5)).unwrap();
+        assert!(!source.spans_multiple_lines(starts_at_boundary));
+        // A range from zero to a line start still contains the terminator.
+        let from_zero = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(3)).unwrap();
+        assert!(source.spans_multiple_lines(from_zero));
+        // An empty range exactly at a line start spans nothing.
+        let empty_at_boundary = TextRange::new(Utf16Pos::new(3), Utf16Pos::new(3)).unwrap();
+        assert!(!source.spans_multiple_lines(empty_at_boundary));
+    }
+
+    #[test]
+    fn spans_multiple_lines_treats_crlf_as_one_line_break() {
+        let source = SourceText::new("a\r\nb").expect("test source fits the per-file budget");
+        // "a" stays on line 0.
+        let single = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(1)).unwrap();
+        assert!(!source.spans_multiple_lines(single));
+        // The whole source crosses the single CRLF break.
+        let multi = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(4)).unwrap();
+        assert!(source.spans_multiple_lines(multi));
+    }
+
+    #[test]
+    fn spans_multiple_lines_detects_bare_cr_break() {
+        let source = SourceText::new("a\rb").expect("test source fits the per-file budget");
+        let single = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(1)).unwrap();
+        assert!(!source.spans_multiple_lines(single));
+        let multi = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(3)).unwrap();
+        assert!(source.spans_multiple_lines(multi));
+    }
+
+    #[test]
+    fn spans_multiple_lines_detects_unicode_line_separator() {
+        let source = SourceText::new("a\u{2028}b").expect("test source fits the per-file budget");
+        let single = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(1)).unwrap();
+        assert!(!source.spans_multiple_lines(single));
+        let multi = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(3)).unwrap();
+        assert!(source.spans_multiple_lines(multi));
+    }
+
+    #[test]
+    fn spans_multiple_lines_is_false_for_empty_range() {
+        let source = SourceText::new("ab\ncd").expect("test source fits the per-file budget");
+        let empty = TextRange::new(Utf16Pos::new(2), Utf16Pos::new(2)).unwrap();
+        assert!(!source.spans_multiple_lines(empty));
+    }
+
+    #[test]
+    fn spans_multiple_lines_fails_closed_past_end() {
+        let source = SourceText::new("ab").expect("test source fits the per-file budget");
+        let past_end = TextRange::new(Utf16Pos::new(0), Utf16Pos::new(5)).unwrap();
+        assert!(source.spans_multiple_lines(past_end));
     }
 }

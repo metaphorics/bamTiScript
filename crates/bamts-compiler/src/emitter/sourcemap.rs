@@ -1331,7 +1331,7 @@ mod tests {
         // EOL segment for the class-body closing `}` (Emitted(19,2)
         // Source(18,2), 1-based = gen col 1, src col 1) but NO glyph segment
         // for the `}` itself. The opening `{` is also unmapped.
-        let source = "class Greeter {\n    greet() { return 1; }\n}\n";
+        let source = "class Greeter {\n    greet() {\n        return 1;\n    }\n}\n";
         let javascript = emit(
             source,
             &EmitOptions {
@@ -1361,6 +1361,59 @@ mod tests {
         );
         // The EOL segment lands at gen col 1 (after the `}` glyph).
         let (gen_col, _) = decode_vlq(class_close.split(',').next().unwrap()).unwrap();
+        assert_eq!(
+            gen_col, 1,
+            "class close brace EOL at column 1\n  {mappings}"
+        );
+    }
+
+    #[test]
+    fn token_level_mappings_single_line_method_body() {
+        // Preservation gate: a method body authored on one line stays on one
+        // line (`{ return 1; }`). Generated collapses to four lines; the
+        // method line carries glyphs plus a single terminal EOL (no interior
+        // EOL), and the class-close EOL assertion is unchanged.
+        let source = "class Greeter {\n    greet() { return 1; }\n}\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        assert_eq!(
+            javascript.code,
+            "\"use strict\";\nclass Greeter {\n    greet() { return 1; }\n}\n//# sourceMappingURL=output.js.map"
+        );
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        // Line 0: "use strict"; (unmapped)
+        // Line 1: class Greeter { -> class(0), Greeter(6), EOL(15)
+        // Line 2: greet() { return 1; } -> greet(4), return(14), 1(21),
+        //         ;(22), }(24), EOL(25)
+        // Line 3: } -> EOL(1) [class close brace unmapped, EOL kept]
+        assert_eq!(
+            mappings, ";AAAA,MAAM,SAAO;IACT,UAAU,OAAO,CAAC,EAAE,CAAC;CACxB",
+            "mappings mismatch for single-line method body\n  got: {mappings}"
+        );
+        let segments = mappings.split(';').collect::<Vec<_>>();
+        assert_eq!(
+            segments.len(),
+            4,
+            "single-line body collapses to four lines\n  {mappings}"
+        );
+        // Method line opens on the `greet` identifier at column 4.
+        let (method_col, _) = decode_vlq(segments[2].split(',').next().unwrap()).unwrap();
+        assert_eq!(
+            method_col, 4,
+            "method line starts at column 4\n  {mappings}"
+        );
+        // Class close keeps its EOL at column 1.
+        let (gen_col, _) = decode_vlq(segments[3].split(',').next().unwrap()).unwrap();
         assert_eq!(
             gen_col, 1,
             "class close brace EOL at column 1\n  {mappings}"
