@@ -40,7 +40,7 @@ use declarations::DeclarationOptions;
 use helpers::{HelperOptions, HelperStyle};
 use sourcemap::{LineColumn, SourceMap, SourceMapBuilder};
 pub use transforms::ScriptTarget;
-use transforms::{LanguageFeature, TransformOptions};
+use transforms::{LanguageFeature, SYNTHESIZED_ID_FLOOR, TransformOptions};
 
 /// Stable diagnostic identifiers produced by the emitter.
 pub mod codes {
@@ -902,7 +902,7 @@ impl<'a> Emitter<'a> {
         // to the extended text, so a range past `authored_len` on a
         // non-synthesized id indicates a lowering bug.
         debug_assert!(
-            id.get() >= 1_000_000 || range.end() <= self.authored_len,
+            id.get() >= SYNTHESIZED_ID_FLOOR || range.end() <= self.authored_len,
             "parser id {id:?} has range past authored_len"
         );
         if range.end() > self.authored_len {

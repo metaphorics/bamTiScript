@@ -564,6 +564,15 @@ enum ExportWrapper {
     Default,
 }
 
+/// First [`NodeId`](crate::syntax::NodeId) the [`Rewriter`] may mint. The
+/// parser assigns dense ids from zero, so ids at or above this floor are
+/// known rewriter-minted and the printer's mint-gate assert leans on that
+/// split. Taint itself is set membership and the authored-length gate
+/// decides out-of-text ranges, so even a pathological file whose parser
+/// arena crossed the floor would only waive the assert, never misclassify
+/// a node. Change the value in one place only.
+pub(crate) const SYNTHESIZED_ID_FLOOR: u32 = 1_000_000;
+
 struct Rewriter<'a> {
     options: &'a TransformOptions,
     model: Option<&'a SemanticModel>,
@@ -649,7 +658,7 @@ impl<'a> Rewriter<'a> {
             source_id: file.source_id(),
             source_text: file.source_text().as_str().to_owned(),
             bank: NameBank::new(file.source_text()),
-            next_id: 1_000_000,
+            next_id: SYNTHESIZED_ID_FLOOR,
             next_temp: 0,
             diagnostics: Vec::new(),
             replace_await: false,
@@ -1249,6 +1258,10 @@ impl<'a> Rewriter<'a> {
     /// Like [`node`](Self::node) but records the minted id as synthesized.
     fn syn_node<T>(&mut self, range: TextRange, data: T) -> Node<T> {
         let id = self.alloc_id();
+        debug_assert!(
+            id.get() >= SYNTHESIZED_ID_FLOOR,
+            "rewriter minted id {id:?} below the synthesized floor"
+        );
         self.synthesized_ids.insert(id);
         Node::new(id, range, data)
     }
