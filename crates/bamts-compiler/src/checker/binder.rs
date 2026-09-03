@@ -4511,6 +4511,10 @@ pub struct SemanticModel {
     /// class declarations; this map holds the `typeof C` constructor type
     /// needed for value references and `typeof` queries.
     class_constructor_types: HashMap<SymbolId, TypeId>,
+    /// Namespace declaration node to the local scope holding its member
+    /// bindings, used by declaration emit to resolve unqualified names
+    /// inside namespace bodies.
+    namespace_local_scopes: HashMap<NodeId, ScopeId>,
 }
 
 impl SemanticModel {
@@ -4720,6 +4724,13 @@ impl SemanticModel {
             current = scope.parent;
         }
         None
+    }
+
+    /// Returns the local scope holding a namespace body's member bindings,
+    /// used by declaration emit to resolve unqualified names inside the body.
+    #[must_use]
+    pub fn namespace_local_scope(&self, id: NodeId) -> Option<ScopeId> {
+        self.namespace_local_scopes.get(&id).copied()
     }
 }
 
@@ -5988,6 +5999,7 @@ impl<'src> Binder<'src> {
             namespace_facts: NamespaceFacts::unchecked(),
             ambient_modules: std::mem::take(&mut self.ambient_modules),
             class_constructor_types: std::mem::take(&mut self.class_constructor_types),
+            namespace_local_scopes: std::mem::take(&mut self.namespace_local_scopes),
         };
         let (enum_facts, diagnostics) = enum_plan::build(
             &model,

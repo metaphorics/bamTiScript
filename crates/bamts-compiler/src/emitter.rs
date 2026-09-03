@@ -596,6 +596,7 @@ pub(crate) fn print_with_jsx_plan(
         jsx_plan,
         diagnostics: Vec::new(),
         decl_ambient: false,
+        current_scope: model.module_scope(),
         decl_drop_member_export: false,
         decl_source_is_js: matches!(
             file.script_kind(),
@@ -767,6 +768,11 @@ struct Emitter<'a> {
     anchor: TextRange,
     diagnostics: Vec<Diagnostic>,
     decl_ambient: bool,
+    /// Innermost namespace body scope currently being emitted, for resolving
+    /// unqualified declaration names (inferred return types). Starts at the
+    /// module scope; `emit_namespace_decl` narrows it to the namespace's
+    /// local scope while emitting the body.
+    current_scope: crate::checker::ScopeId,
     /// True inside an identifier-named namespace body, where tsc drops the
     /// `export` modifier from member declarations (the namespace itself is
     /// the only public surface). String-named `module "..."` bodies keep it.
@@ -838,7 +844,9 @@ impl<'a> Emitter<'a> {
         let end_byte = self.source.utf16_to_byte(range.end()).ok()?;
         let text = self.source.as_str().get(start_byte..end_byte)?;
         let index = text.find(ch)?;
-        Some(Utf16Pos::new(range.start().get() + utf16_len(&text[..index])))
+        Some(Utf16Pos::new(
+            range.start().get() + utf16_len(&text[..index]),
+        ))
     }
 
     /// UTF-16 position of the last `ch` occurring in the source within `range`.
@@ -847,7 +855,9 @@ impl<'a> Emitter<'a> {
         let end_byte = self.source.utf16_to_byte(range.end()).ok()?;
         let text = self.source.as_str().get(start_byte..end_byte)?;
         let index = text.rfind(ch)?;
-        Some(Utf16Pos::new(range.start().get() + utf16_len(&text[..index])))
+        Some(Utf16Pos::new(
+            range.start().get() + utf16_len(&text[..index]),
+        ))
     }
 
     /// Maps `text` to the source position of `ch` inside `range`, falling back
@@ -1346,12 +1356,7 @@ impl<'a> Emitter<'a> {
     /// `map_braces` mirrors tsc: statement-level blocks (try bodies, catch and
     /// finally arms, standalone blocks) map `{`/`}` to their source tokens,
     /// while function, arrow, and class bodies keep their braces unmapped.
-    fn emit_block_with_braces(
-        &mut self,
-        block: &Block,
-        range: TextRange,
-        map_braces: bool,
-    ) {
+    fn emit_block_with_braces(&mut self, block: &Block, range: TextRange, map_braces: bool) {
         if block.statements.is_empty() {
             if map_braces {
                 self.raw_mapped_char_end("{}", range, '{');
@@ -1446,11 +1451,7 @@ impl<'a> Emitter<'a> {
         let in_pos = self
             .keyword_start_before(statement.object.range().start(), "in")
             .unwrap_or(range.end());
-        self.raw_mapped_token(
-            " in ",
-            Utf16Pos::new(in_pos.get().saturating_sub(1)),
-            2,
-        );
+        self.raw_mapped_token(" in ", Utf16Pos::new(in_pos.get().saturating_sub(1)), 2);
         self.emit_expression_prec(&statement.object, P_ASSIGN);
         self.raw_mapped_pos(")", statement.object.range().end());
         self.emit_control_body(&statement.body);
@@ -1467,11 +1468,7 @@ impl<'a> Emitter<'a> {
         let of_pos = self
             .keyword_start_before(statement.iterable.range().start(), "of")
             .unwrap_or(range.end());
-        self.raw_mapped_token(
-            " of ",
-            Utf16Pos::new(of_pos.get().saturating_sub(1)),
-            2,
-        );
+        self.raw_mapped_token(" of ", Utf16Pos::new(of_pos.get().saturating_sub(1)), 2);
         self.emit_expression_prec(&statement.iterable, P_ASSIGN);
         self.raw_mapped_pos(")", statement.iterable.range().end());
         self.emit_control_body(&statement.body);
@@ -1970,7 +1967,11 @@ impl<'a> Emitter<'a> {
         }
         self.emit_params_js(&arrow.parameters, range);
         let arrow_pos = self
-            .source_pos_of(TextRange::new(self.params_source_end(&arrow.parameters), range.end()).unwrap_or(range), '=')
+            .source_pos_of(
+                TextRange::new(self.params_source_end(&arrow.parameters), range.end())
+                    .unwrap_or(range),
+                '=',
+            )
             .unwrap_or(range.end());
         self.raw_mapped_token(" => ", arrow_pos, 2);
         match &arrow.body {
@@ -2054,7 +2055,10 @@ impl<'a> Emitter<'a> {
             cursor = last_end;
         }
         let close = self
-            .source_pos_of(TextRange::new(last_end, window.end()).unwrap_or(window), ')')
+            .source_pos_of(
+                TextRange::new(last_end, window.end()).unwrap_or(window),
+                ')',
+            )
             .unwrap_or(last_end);
         self.raw_mapped_token(")", close, 1);
     }
@@ -2366,7 +2370,9 @@ impl<'a> Emitter<'a> {
             }
             Expression::Array(array) => self.emit_array(array),
             Expression::Object(object) => self.emit_object(object),
-            Expression::Function(function) => self.emit_function_expression_js(&function.function, self.anchor),
+            Expression::Function(function) => {
+                self.emit_function_expression_js(&function.function, self.anchor)
+            }
             Expression::Class(class) => self.emit_class_js(&class.class),
             Expression::Arrow(arrow) => self.emit_arrow_js(arrow, self.anchor),
             Expression::Call(call) => self.emit_call(call),
@@ -2965,11 +2971,8 @@ impl<'a> Emitter<'a> {
             self.emit_expression_prec(&binary.left, prec);
             let op_pos = self
                 .source_pos_of(
-                    TextRange::new(
-                        binary.left.range().end(),
-                        binary.right.range().start(),
-                    )
-                    .unwrap_or(self.anchor),
+                    TextRange::new(binary.left.range().end(), binary.right.range().start())
+                        .unwrap_or(self.anchor),
                     operator_text.chars().next().unwrap_or('+'),
                 )
                 .unwrap_or(binary.left.range().end())
@@ -2995,16 +2998,13 @@ impl<'a> Emitter<'a> {
         self.emit_logical_operand(&logical.left, logical.operator, prec, true);
         let op_pos = self
             .source_pos_of(
-                TextRange::new(
-                    logical.left.range().end(),
-                    logical.right.range().start(),
-                )
-                .unwrap_or(self.anchor),
+                TextRange::new(logical.left.range().end(), logical.right.range().start())
+                    .unwrap_or(self.anchor),
                 operator_text.chars().next().unwrap_or('&'),
             )
             .unwrap_or(logical.left.range().end())
-                .get()
-                .saturating_sub(1);
+            .get()
+            .saturating_sub(1);
         let op_pos = Utf16Pos::new(op_pos);
         self.raw_mapped_token(
             &format!(" {operator_text} "),
@@ -3082,8 +3082,8 @@ impl<'a> Emitter<'a> {
                 operator_text.chars().next().unwrap_or('='),
             )
             .unwrap_or(assignment.left.range().end())
-                .get()
-                .saturating_sub(1);
+            .get()
+            .saturating_sub(1);
         let op_pos = Utf16Pos::new(op_pos);
         self.raw_mapped_token(
             &format!(" {operator_text} "),
@@ -3500,7 +3500,7 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::Namespace(namespace) => {
-                self.emit_namespace_decl(namespace);
+                self.emit_namespace_decl(statement.id(), namespace);
                 true
             }
             Statement::Declare(inner) => self.emit_declaration(inner),
@@ -3828,10 +3828,7 @@ impl<'a> Emitter<'a> {
             // No explicit return annotation: look up the function's symbol
             // and infer the return type from its signature as tsc does.
             let name_text = self.text(name.data().token()).unwrap_or("");
-            if let Some(symbol) = self
-                .model
-                .lookup_value(self.model.module_scope(), name_text)
-            {
+            if let Some(symbol) = self.model.lookup_value(self.current_scope, name_text) {
                 let type_id = self.model.symbol_type(symbol);
                 if let Type::Function(signature) = self.model.types().get(type_id) {
                     let ret = signature.return_type();
@@ -4105,7 +4102,7 @@ impl<'a> Emitter<'a> {
         self.raw("}");
     }
 
-    fn emit_namespace_decl(&mut self, namespace: &NamespaceDeclaration) {
+    fn emit_namespace_decl(&mut self, id: crate::syntax::NodeId, namespace: &NamespaceDeclaration) {
         self.emit_declare_prefix();
         match &namespace.name {
             NamespaceName::Identifier { name, keyword } => {
@@ -4129,6 +4126,13 @@ impl<'a> Emitter<'a> {
         self.indent += 1;
         let saved_ambient = self.decl_ambient;
         self.decl_ambient = false;
+        let saved_scope = self.current_scope;
+        // Function declarations inside the body resolve unqualified names
+        // (inferred return types) against the namespace's local scope, which
+        // holds the member bindings, not the enclosing module scope.
+        if let Some(scope) = self.model.namespace_local_scope(id) {
+            self.current_scope = scope;
+        }
         let saved_drop = self.decl_drop_member_export;
         // String-named `module "..."` bodies are external module declarations
         // and keep member `export`; identifier-named namespaces and `global`
@@ -4140,6 +4144,7 @@ impl<'a> Emitter<'a> {
             }
         }
         self.decl_drop_member_export = saved_drop;
+        self.current_scope = saved_scope;
         self.decl_ambient = saved_ambient;
         self.indent -= 1;
         self.raw("}");
