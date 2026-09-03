@@ -4148,6 +4148,16 @@ impl<'a> Emitter<'a> {
             }
         }
         self.raw(" ");
+        if interface.members.is_empty() {
+            // Authority: importTag16 a.d.ts expands tight-authored
+            // `export interface I {}` to `{\n}` (0 tight / 21 expand in
+            // true declaration outputs). Object types keep the shared
+            // tight branch below, so the split lives here, not there.
+            self.raw("{");
+            self.newline();
+            self.raw("}");
+            return;
+        }
         self.emit_type_members_block(&interface.members);
     }
 
@@ -5668,13 +5678,12 @@ export default answer;
         assert_eq!(javascript(&output).code, "function foo() { }\n");
     }
     #[test]
-    fn export_default_interface_is_preserved_in_declaration_emit() {
+    fn empty_interface_body_expands_in_declaration_emit() {
+        // Authority: importTag16 a.d.ts expands tight-authored
+        // `export interface I {}` to `export interface I {\n}` (0 tight
+        // / 21 expand in true declaration outputs; the 24 tights are
+        // d.ts input copies echoed into the output zone, not outputs).
         let input = "export default interface Foo {}";
-        // Authority: interfaces preserve authored shape like every other
-        // non-empty body — `exportAssignedNamespaceIsVisibleInDeclarationEmit`
-        // keeps tight `export interface Bar {}` while `commentsInterface`
-        // keeps multi-line `interface i1 {`. Tight pin stands (24 tight vs
-        // 13 expanded declaration outputs, split by source shape).
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
@@ -5685,7 +5694,7 @@ export default answer;
         let output = emit_declaration(parsed.product());
         assert_eq!(
             declaration(&output).code,
-            "export default interface Foo {}\n"
+            "export default interface Foo {\n}\n"
         );
     }
 
