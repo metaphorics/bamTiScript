@@ -608,6 +608,13 @@ pub struct InferenceContext<'table> {
     fresh_literal_sources: HashSet<u32>,
     active_pairs: HashSet<(TypeId, TypeId)>,
     active_aliases: HashSet<AliasInferenceKey>,
+    /// Type parameters whose inferred candidates flowed through an
+    /// instantiated generic *argument* signature. Their candidates may name
+    /// an earlier type parameter of the same session (the argument's type
+    /// parameter was paired with the declared one), so at resolve time the
+    /// candidate routes through the earlier resolution instead of leaking a
+    /// dangling type-parameter occurrence out of the call.
+    substitute_candidate_symbols: HashSet<SymbolId>,
     /// Cooperative cancellation signal. `None` for the non-cancellable path.
     cancel: Option<bamts_cancel::CancellationToken>,
 }
@@ -642,6 +649,7 @@ impl<'table> InferenceContext<'table> {
             fresh_literal_sources: HashSet::new(),
             active_pairs: HashSet::new(),
             active_aliases: HashSet::new(),
+            substitute_candidate_symbols: HashSet::new(),
             cancel,
         }
     }
@@ -984,6 +992,8 @@ impl<'table> InferenceContext<'table> {
             }
             Type::Function(signature) => {
                 if let Type::Function(argument_signature) = self.table.get(argument_type).clone() {
+                    let argument_signature = self
+                        .instantiate_generic_argument_signature(&signature, &argument_signature);
                     for (actual_index, declared) in signature.parameters().iter().enumerate() {
                         if declared.rest() {
                             let actual = &argument_signature.parameters()[actual_index..];
@@ -1083,6 +1093,104 @@ impl<'table> InferenceContext<'table> {
             self.active_aliases.remove(&key);
         }
     }
+
+    /// Instantiates a generic function-typed *argument* against the declared
+    /// (contextual) signature before the positional pairing in
+    /// [`InferenceContext::infer_types`]. TypeScript instantiates the source
+    /// signature in the context of the target: for
+    /// `map<T, U>(x: T, f: (y: T) => U)` called with `identity<V>(y: V)`,
+    /// `V` is paired with the declared parameter type `T`, so the argument
+    /// reads `(y: T) => T` and `U` infers from its return. Without this step
+    /// the argument's own type parameter would flow into the candidates as a
+    /// foreign symbol and the call result would mention a type parameter
+    /// declared by nobody. Returns `argument` unchanged when it is not
+    /// generic, when its type parameters already pair with the declared
+    /// ones, or when some type parameter has no naked parameter-position
+    /// candidate.
+    fn instantiate_generic_argument_signature(
+        &mut self,
+        declared: &FunctionSignature,
+        argument: &FunctionSignature,
+    ) -> FunctionSignature {
+        let argument_parameters = argument.type_parameters();
+        if argument_parameters.is_empty() || argument_parameters == declared.type_parameters() {
+            return argument.clone();
+        }
+        let declared_parameters = declared.parameters();
+        let mut arguments = Vec::new();
+        for (index, parameter) in argument.parameters().iter().enumerate() {
+            if parameter.rest() {
+                break;
+            }
+            let Some(declared_parameter) = declared_parameters.get(index) else {
+                break;
+            };
+            let Type::Named(symbol) = self.table.get(parameter.type_id()) else {
+                continue;
+            };
+            let symbol = *symbol;
+            if !argument_parameters.contains(&symbol)
+                || self.type_mentions_any(declared_parameter.type_id(), argument_parameters)
+                || arguments
+                    .iter()
+                    .any(|resolved: &InferredTypeArgument| resolved.symbol() == symbol)
+            {
+                continue;
+            }
+            arguments.push(InferredTypeArgument::new(
+                symbol,
+                declared_parameter.type_id(),
+                InferenceProvenance::Inferred,
+            ));
+        }
+        if argument_parameters.iter().any(|symbol| {
+            !arguments
+                .iter()
+                .any(|resolved| resolved.symbol() == *symbol)
+        }) {
+            return argument.clone();
+        }
+        // The declared signature's parameters now receive candidates that may
+        // name a sibling type parameter of the same session (`U` names `T`
+        // above); opt them into resolve-time substitution.
+        for symbol in declared.type_parameters() {
+            self.substitute_candidate_symbols.insert(*symbol);
+        }
+        let instantiated =
+            InferredTypeArguments::new(arguments).instantiate_signature(self.table, argument);
+        match self.table.get(instantiated).clone() {
+            Type::Function(instantiated) => instantiated,
+            _ => argument.clone(),
+        }
+    }
+
+    /// Whether `type_id` mentions any of `symbols` as a [`Type::Named`]
+    /// occurrence. Conservative: unenumerated composites report `false`.
+    fn type_mentions_any(&self, type_id: TypeId, symbols: &[SymbolId]) -> bool {
+        match self.table.get(type_id) {
+            Type::Named(symbol) => symbols.contains(symbol),
+            Type::Array(element) => self.type_mentions_any(*element, symbols),
+            Type::Tuple(shape) => shape
+                .all_element_types()
+                .iter()
+                .any(|&element| self.type_mentions_any(element, symbols)),
+            Type::Union(members) => members
+                .iter()
+                .any(|&member| self.type_mentions_any(member, symbols)),
+            Type::Function(signature) => {
+                signature
+                    .parameters()
+                    .iter()
+                    .any(|parameter| self.type_mentions_any(parameter.type_id(), symbols))
+                    || self.type_mentions_any(signature.return_type(), symbols)
+            }
+            Type::AppliedClass { arguments, .. } => arguments
+                .iter()
+                .any(|&argument| self.type_mentions_any(argument, symbols)),
+            _ => false,
+        }
+    }
+
     fn sync_iterator_yield(&mut self, method: TypeId) -> Option<TypeId> {
         let iterator = match self.table.get(method) {
             Type::Any | Type::Never | Type::Error => return Some(method),
@@ -1156,6 +1264,14 @@ impl<'table> InferenceContext<'table> {
                 false,
             );
         }
+        let candidate = if self
+            .substitute_candidate_symbols
+            .contains(&parameter.symbol())
+        {
+            self.substitute_earlier_arguments(candidate, earlier)
+        } else {
+            candidate
+        };
         (
             candidate,
             InferenceProvenance::Inferred,

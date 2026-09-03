@@ -16,9 +16,7 @@ use bamts_native::Value;
 
 use super::{define_data, define_frozen_data, install_constructor_function};
 use crate::intrinsics::{BuiltinHandler, BuiltinOutcome, BuiltinTable};
-use crate::{
-    EvalFailure, HeapEntry, Host, Machine, PropertyMap, ScriptSource, ThrowOrigin,
-};
+use crate::{EvalFailure, HeapEntry, Host, Machine, PropertyMap, ScriptSource, ThrowOrigin};
 
 pub(crate) fn install<H: Host>(
     heap: &mut Vec<HeapEntry>,
@@ -114,9 +112,7 @@ mod tests {
     use bamts_native::{Decoded, Value};
 
     use super::super::test_support::{TestHost, blank_program};
-    use crate::{
-        EvalFailure, HeapEntry, Limits, Machine, Property, PropertyKey,
-    };
+    use crate::{EvalFailure, HeapEntry, Limits, Machine, Property, PropertyKey};
 
     #[test]
     fn function_global_installs_with_spec_identity() {
@@ -148,8 +144,7 @@ mod tests {
             .get_named_property(function, "prototype")
             .expect("Function has a prototype");
         assert_eq!(
-            prototype,
-            machine.intrinsics.function_prototype,
+            prototype, machine.intrinsics.function_prototype,
             "Function.prototype is %FunctionPrototype%"
         );
         let constructor = machine

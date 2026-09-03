@@ -1270,13 +1270,16 @@ impl<'table> TypeRelations<'table> {
                 .iter()
                 .all(|&source| self.relates(source, *target_element, strictness)),
             (Type::Array(_), Type::Tuple(_)) => false,
-            (Type::Array(_) | Type::Tuple(_), Type::ObjectType(target_object))
+            (Type::Array(_) | Type::Tuple(_), Type::ObjectType(target_object)) => {
                 if target_object.iterator_property.is_some()
-                    && target_object.index_signatures.is_empty() =>
-            {
-                self.table
-                    .iterable_view(source)
-                    .is_some_and(|view| self.relates(view, target, strictness))
+                    && target_object.index_signatures.is_empty()
+                {
+                    self.table
+                        .iterable_view(source)
+                        .is_some_and(|view| self.relates(view, target, strictness))
+                } else {
+                    self.array_relates_to_index_object(source, target_object, strictness)
+                }
             }
             (Type::ObjectType(source), Type::ObjectType(target)) => {
                 self.object_relates(source, target, strictness)
@@ -2055,6 +2058,62 @@ impl<'table> TypeRelations<'table> {
                     .unwrap_or_else(|| source.index_signatures.is_empty());
                 properties_relate && signatures_relate
             })
+    }
+
+    /// An array or tuple flows into an object type carrying numeric index
+    /// signatures when the object has no members an array could not provide
+    /// and every element type is assignable to each numeric index value type.
+    /// TypeScript accepts `var x9: { [n: number]: Base; } = [d1, d2]` with
+    /// zero TS2322 (generatedContextualTyping.errors.txt, which holds no
+    /// TS2322 across 452 lines despite nine array-to-index-object writes),
+    /// while assignmentCompatWithNumericIndexer3.errors.txt(14) still rejects
+    /// `{ [x: number]: Base; }` for `A` because `Base` is not assignable to
+    /// `Derived` — the same value-type covariance this check enforces. A
+    /// second counterexample check: indexSignatures1.errors.txt(21) expects
+    /// `IY` not assignable to `IX`, keeping indexer comparisons strict.
+    fn array_relates_to_index_object(
+        &self,
+        source: TypeId,
+        target_object: &ObjectType,
+        strictness: Strictness,
+    ) -> bool {
+        if !target_object.call_signatures.is_empty()
+            || !target_object.construct_signatures.is_empty()
+            || target_object.generator_return.is_some()
+            || target_object.async_iterator_property.is_some()
+            || target_object
+                .properties
+                .iter()
+                .any(|property| !property.optional())
+        {
+            return false;
+        }
+        let mut numeric_values = Vec::new();
+        for signature in &target_object.index_signatures {
+            let Some(parameter) = signature.parameters.first() else {
+                return false;
+            };
+            if matches!(self.table.get(parameter.type_id()), Type::Number) {
+                numeric_values.push(signature.value_type);
+            } else {
+                // Arrays carry no string or symbol index information, so a
+                // target requiring one stays unrelated.
+                return false;
+            }
+        }
+        if numeric_values.is_empty() {
+            return false;
+        }
+        let elements: Vec<TypeId> = match self.table.get(source) {
+            Type::Array(element) => vec![*element],
+            Type::Tuple(shape) => shape.all_element_types().to_vec(),
+            _ => return false,
+        };
+        numeric_values.iter().all(|&value| {
+            elements
+                .iter()
+                .all(|&element| self.relates(element, value, strictness))
+        })
     }
 
     fn object_satisfies_record(

@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use bamts_compiler::pipeline::FrontendMode;
 use bamts_verification::check_cells::{
     CasePragmas, case_stem, compile_case_frontend, emit_declaration_baseline,
-    emit_javascript_baseline, emit_source_map_baseline, entry_virtual_path,
-    extract_dts_sections, parse_case_pragmas, split_case_units,
+    emit_javascript_baseline, emit_source_map_baseline, entry_virtual_path, extract_dts_sections,
+    parse_case_pragmas, split_case_units,
 };
 use bamts_verification::facets::{FacetVerdict, compare_js_emit, compare_source_map};
 
@@ -491,9 +491,7 @@ fn classify_javascript_diff(exp_line: &str, act_line: &str) -> String {
     }
 
     // For-of: `for...of` native vs lowered loop
-    if exp_line.contains("for (") && exp_line.contains(" of ")
-        && !act_line.contains(" of ")
-    {
+    if exp_line.contains("for (") && exp_line.contains(" of ") && !act_line.contains(" of ") {
         return "downlevel-missing:for-of".to_owned();
     }
 

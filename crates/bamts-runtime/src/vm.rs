@@ -376,7 +376,10 @@ fn compile_entry<H: Host>(
     Ok(entry)
 }
 
-pub(crate) fn compile_error<H: Host>(machine: &mut Machine<'_, H>, error: ScriptCompileError) -> EvalFailure {
+pub(crate) fn compile_error<H: Host>(
+    machine: &mut Machine<'_, H>,
+    error: ScriptCompileError,
+) -> EvalFailure {
     let (kind, message) = match error {
         ScriptCompileError::IllFormedSource { unit_offset } => (
             "SyntaxError",

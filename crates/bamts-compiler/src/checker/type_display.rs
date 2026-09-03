@@ -809,11 +809,15 @@ mod tests {
         // tests/baselines/reference/superInObjectLiterals_ES5(target=es2015).types
         // row `>obj : { ... p1: () => void; ... }` — function-expression
         // properties keep `name: () => type` form.
-        let text = "interface I { prop(): { metadata: number; }; }\ndeclare var a: I;\nlet z = a;\n";
+        let text =
+            "interface I { prop(): { metadata: number; }; }\ndeclare var a: I;\nlet z = a;\n";
         let (source, checked) = check_text(text);
         let model = checked.product();
         let type_id = typed_expression_of(model, &source, "a", text.find("let z").unwrap());
-        assert_eq!(render_type(model, type_id), "{ prop(): { metadata: number; }; }");
+        assert_eq!(
+            render_type(model, type_id),
+            "{ prop(): { metadata: number; }; }"
+        );
     }
 
     #[test]
@@ -836,5 +840,4 @@ mod tests {
         let c = typed_expression_of(model, &source, "c", text.find("let w").unwrap());
         assert_eq!(render_type(model, c), "1");
     }
-
 }

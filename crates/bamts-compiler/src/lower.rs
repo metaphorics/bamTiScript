@@ -4447,21 +4447,11 @@ impl<'a> FunctionContext<'a> {
         let to_yield = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
 
         let do_return = self.next_pc();
-        let return_to_yield = self.lower_delegate_return_arm(
-            builder,
-            range,
-            iterator,
-            received,
-            value,
-        )?;
+        let return_to_yield =
+            self.lower_delegate_return_arm(builder, range, iterator, received, value)?;
         let do_throw = self.next_pc();
-        let throw_to_yield = self.lower_delegate_throw_arm(
-            builder,
-            range,
-            iterator,
-            received,
-            value,
-        )?;
+        let throw_to_yield =
+            self.lower_delegate_throw_arm(builder, range, iterator, received, value)?;
 
         // Yield the delegated value and re-enter on the resume edge, where the
         // engine-written mode selects the next arm.
@@ -4500,7 +4490,6 @@ impl<'a> FunctionContext<'a> {
         let result = self.alloc_register(range)?;
         self.move_to(range, result, final_value)?;
         let exit_jump = self.emit(range, Instruction::Jump { target: Pc::new(0) })?;
-
 
         let exit = self.next_pc();
         self.patch_jump(exit_jump, exit);
@@ -14989,16 +14978,13 @@ mod tests {
             "a sync generator's yield* stays on Symbol.iterator"
         );
         assert!(
-            !generator
-                .code()
-                .iter()
-                .any(|instruction| matches!(
-                    instruction,
-                    Instruction::GetIterator {
-                        kind: IteratorKind::Async,
-                        ..
-                    }
-                )),
+            !generator.code().iter().any(|instruction| matches!(
+                instruction,
+                Instruction::GetIterator {
+                    kind: IteratorKind::Async,
+                    ..
+                }
+            )),
             "the enclosing async function must not leak into the nested generator"
         );
         assert_round_trips(&module);

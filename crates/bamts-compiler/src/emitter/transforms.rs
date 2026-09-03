@@ -4235,7 +4235,6 @@ impl<'a> Rewriter<'a> {
         )
     }
 
-
     /// Lowers `a ?? b` below ES2020 to
     /// `a !== null && a !== void 0 ? a : b`.
     ///
@@ -4265,7 +4264,10 @@ impl<'a> Rewriter<'a> {
                     right: Box::new(left),
                 }),
             );
-            (self.node(range, Expression::Parenthesized(Box::new(capture))), reference)
+            (
+                self.node(range, Expression::Parenthesized(Box::new(capture))),
+                reference,
+            )
         };
         let null_check = self.strict_not_equal_null(&read, range);
         let void_check = self.strict_not_equal_void(&consequent, range);
@@ -4356,10 +4358,14 @@ impl<'a> Rewriter<'a> {
         let right = self.rewrite_expr(&assignment.right);
         match assignment.left.data() {
             AssignmentTarget::Identifier(identifier) => {
-                let read =
-                    self.node(identifier.range(), Expression::Identifier(identifier.clone()));
-                let plain_read =
-                    self.node(identifier.range(), Expression::Identifier(identifier.clone()));
+                let read = self.node(
+                    identifier.range(),
+                    Expression::Identifier(identifier.clone()),
+                );
+                let plain_read = self.node(
+                    identifier.range(),
+                    Expression::Identifier(identifier.clone()),
+                );
                 let inner_assign = self.node(
                     range,
                     Expression::Assignment(AssignmentExpression {
@@ -4474,10 +4480,7 @@ impl<'a> Rewriter<'a> {
     fn capture_member_parts(
         &mut self,
         member: &AssignmentMemberTarget,
-    ) -> (
-        (AssignmentTargetNode, Expr),
-        (AssignmentTargetNode, Expr),
-    ) {
+    ) -> ((AssignmentTargetNode, Expr), (AssignmentTargetNode, Expr)) {
         let range = member.object.range();
         let object = self.rewrite_expr(&member.object);
         let (capture_object, reference_object) = if matches!(object.data(), Expression::Super) {
@@ -4503,7 +4506,8 @@ impl<'a> Rewriter<'a> {
                 let key_temp = self.expression_temp();
                 let key_reference =
                     self.node(key_temp.range(), Expression::Identifier(key_temp.clone()));
-                let key_target = self.node(key_temp.range(), AssignmentTarget::Identifier(key_temp));
+                let key_target =
+                    self.node(key_temp.range(), AssignmentTarget::Identifier(key_temp));
                 let key_assignment = self.node(
                     key_range,
                     Expression::Assignment(AssignmentExpression {
@@ -4535,7 +4539,10 @@ impl<'a> Rewriter<'a> {
                 property: reference_property,
             }),
         );
-        ((captured_target, captured_read), (reference_target, reference_read))
+        (
+            (captured_target, captured_read),
+            (reference_target, reference_read),
+        )
     }
 
     /// Lowers an optional chain below ES2020.
@@ -4697,8 +4704,7 @@ impl<'a> Rewriter<'a> {
                 }
                 // JS evaluates an assignment's left side before its right,
                 // so the capture assignments belong to the assignment target.
-                let ((captured_target, _), (_, reference_read)) =
-                    self.capture_member_parts(member);
+                let ((captured_target, _), (_, reference_read)) = self.capture_member_parts(member);
                 let read = reference_read;
                 let lowered = Expression::Assignment(AssignmentExpression {
                     operator: AssignmentOperator::Assign,
@@ -7126,8 +7132,14 @@ console.log(JSON.stringify([bar, bar4, log]));
             lowered_code.contains("names === null || names === void 0 ? void 0 :"),
             "{lowered_code}"
         );
-        assert!(!lowered_code.contains("?.") || lowered_code.contains("\"use strict\""), "{lowered_code}");
+        assert!(
+            !lowered_code.contains("?.") || lowered_code.contains("\"use strict\""),
+            "{lowered_code}"
+        );
         let native = emit_at("const v = names?.filter(f);\n", ScriptTarget::Es2020);
-        assert!(javascript(&native).contains("names?.filter(f)"), "{native:?}");
+        assert!(
+            javascript(&native).contains("names?.filter(f)"),
+            "{native:?}"
+        );
     }
 }
