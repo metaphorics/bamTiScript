@@ -7605,8 +7605,93 @@ impl<'src> Binder<'src> {
                         );
                     }
                 }
+                self.bind_signature_parameter_symbols(&method.function, scope);
             }
-            _ => {}
+            TypeMember::Call(call) => {
+                self.bind_signature_parameter_symbols(&call.function, scope);
+            }
+            TypeMember::Construct(construct) => {
+                self.bind_signature_parameter_symbols(&construct.function.function, scope);
+            }
+            TypeMember::Index(index) => {
+                let parameter_scope = self.new_scope(ScopeKind::Function, Some(scope));
+                for parameter in &index.parameters {
+                    let name = self.identifier_text(&parameter.name);
+                    if name.as_ref() == "this" {
+                        continue;
+                    }
+                    self.declare(
+                        name.as_ref(),
+                        SymbolKind::Parameter,
+                        parameter_scope,
+                        parameter.name.id(),
+                        parameter.name.range(),
+                    );
+                }
+            }
+            TypeMember::Missing(_) => {}
+        }
+    }
+
+    /// Binds the named parameters of one type-side signature (method, call,
+    /// or construct) as `Parameter` symbols so upstream's bare
+    /// `>s : Symbol(s, Decl(...))` rows render. The parameters live in a
+    /// fresh function scope with no owner, keeping their rendered names
+    /// unqualified under the container's member scope.
+    fn bind_signature_parameter_symbols(&mut self, function: &'src FunctionType, parent: ScopeId) {
+        let scope = self.new_scope(ScopeKind::Function, Some(parent));
+        for parameter in &function.parameters {
+            let name = self.identifier_text(&parameter.name);
+            if name.as_ref() == "this" {
+                continue;
+            }
+            self.declare(
+                name.as_ref(),
+                SymbolKind::Parameter,
+                scope,
+                parameter.name.id(),
+                parameter.name.range(),
+            );
+        }
+        self.bind_type_function_parameter_symbols(&function.return_type, scope);
+    }
+
+    /// Declares the parameter names of any function or constructor type a
+    /// return type directly contains (`b(): (n: number) => void` renders
+    /// `>n`), recursing through the containers that preserve function types.
+    fn bind_type_function_parameter_symbols(&mut self, ty: &'src Ty, parent: ScopeId) {
+        match ty.data() {
+            TypeNode::Function(function) => {
+                self.bind_signature_parameter_symbols(function, parent);
+            }
+            TypeNode::Constructor(constructor) => {
+                self.bind_signature_parameter_symbols(&constructor.function, parent);
+            }
+            TypeNode::Parenthesized(inner) => {
+                self.bind_type_function_parameter_symbols(inner, parent);
+            }
+            TypeNode::Union(members) | TypeNode::Intersection(members) => {
+                for member in members {
+                    self.bind_type_function_parameter_symbols(member, parent);
+                }
+            }
+            TypeNode::Keyword(_)
+            | TypeNode::Infer(_)
+            | TypeNode::Literal(_)
+            | TypeNode::Reference(_)
+            | TypeNode::Array(_)
+            | TypeNode::Tuple(_)
+            | TypeNode::Object(_)
+            | TypeNode::Query(_)
+            | TypeNode::Operator { .. }
+            | TypeNode::IndexedAccess(_)
+            | TypeNode::Conditional(_)
+            | TypeNode::Mapped(_)
+            | TypeNode::Import(_)
+            | TypeNode::TemplateLiteral(_)
+            | TypeNode::This
+            | TypeNode::Predicate(_)
+            | TypeNode::Missing(_) => {}
         }
     }
 
@@ -11386,7 +11471,7 @@ impl<'src> Binder<'src> {
         };
         match member.data() {
             ClassMember::Property(property) => {
-                if let Some(name) = self.property_key(&property.name) {
+                if let Some(name) = self.member_symbol_key(&property.name) {
                     self.declare(
                         &name,
                         SymbolKind::Variable(VariableKind::Let),
@@ -11398,7 +11483,7 @@ impl<'src> Binder<'src> {
                 }
             }
             ClassMember::AutoAccessor(accessor) => {
-                if let Some(name) = self.property_key(&accessor.name) {
+                if let Some(name) = self.member_symbol_key(&accessor.name) {
                     self.declare(
                         &name,
                         SymbolKind::Variable(VariableKind::Let),
@@ -11410,7 +11495,7 @@ impl<'src> Binder<'src> {
                 }
             }
             ClassMember::Method(method) if method.modifier == PropertyModifier::None => {
-                if let Some(name) = self.property_key(&method.name) {
+                if let Some(name) = self.member_symbol_key(&method.name) {
                     self.declare(
                         &name,
                         SymbolKind::Function,
@@ -11421,7 +11506,27 @@ impl<'src> Binder<'src> {
                     anchor(self, &name, &method.name);
                 }
             }
-            _ => {}
+            ClassMember::IndexSignature(index) => {
+                // Upstream renders index-signature parameters as bare
+                // `>s : Symbol(s, Decl(...))` rows (classIndexer.symbols), so
+                // each parameter binds in a fresh function scope.
+                let parameter_scope = self.new_scope(ScopeKind::Function, Some(scope));
+                for parameter in &index.parameters {
+                    if self.is_this_parameter(parameter) {
+                        continue;
+                    }
+                    self.bind_pattern(
+                        &parameter.data().binding,
+                        VariableKind::Let,
+                        parameter_scope,
+                        parameter.id(),
+                    );
+                }
+            }
+            ClassMember::Method(_)
+            | ClassMember::Constructor(_)
+            | ClassMember::StaticBlock(_)
+            | ClassMember::Missing(_) => {}
         }
     }
 
@@ -11846,10 +11951,10 @@ impl<'src> Binder<'src> {
                 {
                     self.record_symbol_member_reference_rows(
                         object_symbol,
-                        &name,
                         &member.property,
                         expression.range(),
                     );
+                    self.member_reference_recorded.insert(expression.id());
                 }
                 let base = object_symbol
                     .filter(|symbol| self.symbols[symbol.get() as usize].kind == SymbolKind::Import)
@@ -13261,6 +13366,15 @@ impl<'src> Binder<'src> {
                     |symbol| self.symbol_types[symbol.get() as usize],
                 ),
             AssignmentTarget::Member(member) => {
+                let object_type = self.type_of_expr(&member.object, scope);
+                self.record_member_reference_rows(
+                    &member.object,
+                    &member.property,
+                    false,
+                    object_type,
+                    target.range(),
+                    target.id(),
+                );
                 self.type_of_member(&member.object, &member.property, false, false, scope)
             }
             _ => self.types.any(),
@@ -13903,6 +14017,24 @@ impl<'src> Binder<'src> {
                     self.local_enum_member_targets
                         .insert(target.id(), enum_symbol);
                     return;
+                }
+                // Symbol-direct path: an assignment target whose base resolves
+                // to a class or interface symbol records the same reference
+                // rows a read access would (`this.connItem = c.item` renders
+                // `>this.connItem` and `>connItem`), including private names.
+                if let Some(object_symbol) = object_symbol
+                    && matches!(
+                        self.symbols[object_symbol.get() as usize].kind,
+                        SymbolKind::Class | SymbolKind::Interface
+                    )
+                    && !self.member_reference_recorded.contains(&target.id())
+                {
+                    self.record_symbol_member_reference_rows(
+                        object_symbol,
+                        &member.property,
+                        target.range(),
+                    );
+                    self.member_reference_recorded.insert(target.id());
                 }
                 let Some(name) =
                     enum_plan::cook_member_property_name(self.source, &member.property)
@@ -15810,6 +15942,20 @@ impl<'src> Binder<'src> {
         }
     }
 
+    /// The symbol-table key a container member declaration binds under.
+    /// Private names bind under their `#`-prefixed source spelling so
+    /// declarations and references render `Foo.#name` upstream; the ordinary
+    /// `property_key` keeps excluding them because private names must never
+    /// surface as structural properties of the instance type.
+    fn member_symbol_key(&self, name: &PropertyName) -> Option<String> {
+        match name {
+            PropertyName::Private(identifier) => {
+                Some(self.text(identifier.data().token()).to_owned())
+            }
+            other => self.property_key(other),
+        }
+    }
+
     fn fresh_object_candidates(&mut self, target: TypeId) -> Vec<ObjectType> {
         let target = self.types.non_nullable(target);
         let target = self
@@ -16679,51 +16825,82 @@ impl<'src> Binder<'src> {
 
     /// Records the `.symbols` reference rows for a member access whose base
     /// resolves directly to a class or interface symbol (`this.n`, `C.s`).
-    /// Rows land at the property identifier and the whole access path; both
-    /// render the qualified member symbol.
+    /// Named members land at the property identifier and the whole access
+    /// path; private names (`this.#p`) render the whole path only, matching
+    /// upstream, which emits no bare `>#p` row. Members declared on a base
+    /// class are looked up through the heritage chain, so `d.foo` with `foo`
+    /// on `C` records `Symbol(C.foo, ...)`.
     fn record_symbol_member_reference_rows(
         &mut self,
         owner: SymbolId,
-        name: &EcmaString,
         property: &'src MemberProperty,
         path_range: TextRange,
     ) {
-        let MemberProperty::Named(identifier) = property else {
+        let identifier_range = match property {
+            MemberProperty::Named(identifier) => Some(identifier.range()),
+            MemberProperty::Private(_) | MemberProperty::Computed(_) => None,
+        };
+        let Some(name) = self.member_symbol_name(property) else {
             return;
         };
-        let Some(member_scope) = self.container_member_scope_by_kind(owner) else {
+        let Some(member_symbol) = self.member_symbol(owner, &name) else {
             return;
         };
-        let Some(member_symbol) = self.scopes[member_scope.0 as usize].value(&name.to_utf8_lossy())
-        else {
-            return;
-        };
-        self.symbol_references
-            .push((identifier.range(), member_symbol));
+        if let Some(range) = identifier_range {
+            self.symbol_references.push((range, member_symbol));
+        }
         self.symbol_references.push((path_range, member_symbol));
+    }
+
+    /// The member-scope key a `.symbols` member reference resolves under.
+    /// Named and computed keys cook as ordinary properties; private names
+    /// keep their `#`-prefixed source spelling (`Foo.#name` upstream).
+    fn member_symbol_name(&self, property: &MemberProperty) -> Option<EcmaString> {
+        match property {
+            MemberProperty::Private(identifier) => {
+                Some(EcmaString::encode(self.text(identifier.data().token())))
+            }
+            other => enum_plan::cook_member_property_name(self.source, other),
+        }
+    }
+
+    /// Looks a member up in the owner's member scope, walking base classes so
+    /// inherited members resolve to the base class's declaring symbol.
+    fn member_symbol(&self, owner: SymbolId, name: &EcmaString) -> Option<SymbolId> {
+        let mut current = Some(owner);
+        let mut visited = HashSet::new();
+        while let Some(owner) = current
+            && visited.insert(owner)
+        {
+            if let Some(member_scope) = self.container_member_scope_by_kind(owner)
+                && let Some(member) =
+                    self.scopes[member_scope.0 as usize].value(&name.to_utf8_lossy())
+            {
+                return Some(member);
+            }
+            current = self.class_base_symbols.get(&owner).copied();
+        }
+        None
     }
 
     /// Typing-phase counterpart: records rows when the base is typed as an
     /// applied class instance, an interface, or a `this` type, covering
     /// `instance.prop` accesses whose base carries no direct symbol. Nodes the
-    /// resolve phase already recorded are skipped.
+    /// resolve phase already recorded are skipped. Assignment targets
+    /// (`this.x = v`) share this path with `optional` clear.
     fn record_member_reference_rows(
         &mut self,
-        member: &'src crate::syntax::MemberExpression,
+        object: &'src Expr,
+        property: &'src MemberProperty,
+        optional: bool,
         object_type: TypeId,
         path_range: TextRange,
         expression_id: NodeId,
     ) {
-        if member.optional || self.member_reference_recorded.contains(&expression_id) {
+        if optional || self.member_reference_recorded.contains(&expression_id) {
             return;
         }
-        let MemberProperty::Named(_) = &member.property else {
-            return;
-        };
-        let Some(name) = enum_plan::cook_member_property_name(self.source, &member.property) else {
-            return;
-        };
-        let owner = match self.resolved_expression_reference(&member.object) {
+        let owner = match self.resolved_expression_reference(object) {
             Some(symbol)
                 if matches!(
                     self.symbols[symbol.get() as usize].kind,
@@ -16746,7 +16923,8 @@ impl<'src> Binder<'src> {
         let Some(owner) = owner else {
             return;
         };
-        self.record_symbol_member_reference_rows(owner, &name, &member.property, path_range);
+        self.record_symbol_member_reference_rows(owner, property, path_range);
+        self.member_reference_recorded.insert(expression_id);
     }
 
     fn container_member_scope_by_kind(&self, owner: SymbolId) -> Option<ScopeId> {
@@ -16945,7 +17123,9 @@ impl<'src> Binder<'src> {
                     scope,
                 );
                 self.record_member_reference_rows(
-                    member,
+                    &member.object,
+                    &member.property,
+                    member.optional,
                     object_type,
                     expression.range(),
                     expression.id(),
@@ -20282,6 +20462,210 @@ namespace undefined { export var x = 42; }",
         assert!(
             !has_cannot_find_type(&diagnostics),
             "m1.C2_private should NOT report TS2304: {diagnostics:?}"
+        );
+    }
+
+    // -- symbols facet gap regressions -------------------------------------
+    //
+    // Each test pins the `.symbols` rows a cited authority baseline renders.
+    // The `Decl(unit, line, character)` coordinates follow the observer's
+    // full-start rule (the position just past the last non-whitespace source
+    // character before the declaration name); the test sources below carry no
+    // comments or decorators, so a whitespace scan reproduces it exactly.
+
+    /// Full-start `(line, character)` for a UTF-16 offset into an ASCII test
+    /// source: skip trailing whitespace backward, then count to the position.
+    fn full_start(text: &str, start: usize) -> (usize, usize) {
+        let bytes = text.as_bytes();
+        let mut cursor = start;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let mut line = 0usize;
+        let mut character = 0usize;
+        for &byte in &bytes[..cursor] {
+            if byte == b'\n' {
+                line += 1;
+                character = 0;
+            } else {
+                character += 1;
+            }
+        }
+        (line, character)
+    }
+
+    fn symbol_by_qualified_name(
+        model: &super::SemanticModel,
+        qualified: &str,
+    ) -> (SymbolId, usize) {
+        model
+            .symbols()
+            .iter()
+            .enumerate()
+            .find(|(index, symbol)| {
+                model.qualified_name(SymbolId::new(*index as u32)) == qualified
+                    && symbol.name() == qualified.rsplit('.').next().unwrap_or(qualified)
+            })
+            .map(|(index, _)| (SymbolId::new(index as u32), index))
+            .unwrap_or_else(|| panic!("symbol `{qualified}` is not bound"))
+    }
+
+    fn reference_ranges(model: &super::SemanticModel, symbol: SymbolId) -> Vec<(usize, usize)> {
+        model
+            .symbol_references()
+            .iter()
+            .filter(|(_, id)| *id == symbol)
+            .map(|(range, _)| (range.start().get(), range.end().get()))
+            .collect()
+    }
+
+    /// `declarationImportTypeAliasInferredAndEmittable.symbols` renders, for
+    /// `this.connItem = c.item;`:
+    /// `>this.connItem : Symbol(Wrap.connItem, ...)`,
+    /// `>this : Symbol(Wrap, ...)`,
+    /// `>connItem : Symbol(Wrap.connItem, ...)`.
+    #[test]
+    fn assignment_target_records_member_reference_rows() {
+        let text = "class Wrap {\n    connItem: number;\n    constructor() {\n        this.connItem = 3;\n    }\n}\n";
+        let (model, _) = bound(text);
+        let (conn_item, conn_item_index) = symbol_by_qualified_name(&model, "Wrap.connItem");
+        let (wrap, _) = symbol_by_qualified_name(&model, "Wrap");
+
+        // Declaration row: `>connItem : Symbol(Wrap.connItem, Decl(..., 0, 12))`
+        // — full-start at the end of `class Wrap {`.
+        let declaration = &model.symbols()[conn_item_index];
+        assert_eq!(
+            full_start(text, declaration.range().start().get()),
+            (0, 12),
+            "connItem Decl anchors at the full start of its declaration"
+        );
+
+        let line3 = text.split('\n').take(3).map(str::len).sum::<usize>() + 3;
+        let path = (line3 + 8, line3 + 21);
+        let identifier = (line3 + 13, line3 + 21);
+        let this_range = (line3 + 8, line3 + 12);
+        let ranges = reference_ranges(&model, conn_item);
+        assert!(
+            ranges.contains(&path),
+            "assignment path `this.connItem` must record a reference row: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&identifier),
+            "property identifier `connItem` must record a reference row: {ranges:?}"
+        );
+        assert!(
+            reference_ranges(&model, wrap).contains(&this_range),
+            "`this` must reference Wrap on the assignment target"
+        );
+    }
+
+    /// `classExtendingClass.symbols` renders, for `var r = d.foo;` with `foo`
+    /// declared on base `C`:
+    /// `>d.foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))`,
+    /// `>foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))`.
+    #[test]
+    fn inherited_member_reference_resolves_to_base_symbol() {
+        let text = "class C {\n    foo: string;\n    thing() { }\n    static other() { }\n}\n\nclass D extends C {\n    bar: string;\n}\n\nvar d: D;\nvar r = d.foo;\n";
+        let (model, _) = bound(text);
+        let (c_foo, c_foo_index) = symbol_by_qualified_name(&model, "C.foo");
+
+        // `>foo : Symbol(C.foo, Decl(classExtendingClass.ts, 0, 9))`.
+        let declaration = &model.symbols()[c_foo_index];
+        assert_eq!(
+            full_start(text, declaration.range().start().get()),
+            (0, 9),
+            "C.foo Decl anchors at the end of the class C header"
+        );
+
+        let line11 = text.split('\n').take(11).map(str::len).sum::<usize>() + 11;
+        let path = (line11 + 8, line11 + 13);
+        let identifier = (line11 + 10, line11 + 13);
+        let ranges = reference_ranges(&model, c_foo);
+        assert!(
+            ranges.contains(&path),
+            "`d.foo` must reference the base symbol C.foo: {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&identifier),
+            "`foo` must reference the base symbol C.foo: {ranges:?}"
+        );
+    }
+
+    /// `privateNameComputedPropertyName3(target=esnext).symbols` renders:
+    /// `>#name : Symbol(Foo.#name, Decl(..., 0, 11))` at the declaration and,
+    /// for `this.#name = name;`, the path-only rows
+    /// `>this.#name : Symbol(Foo.#name, ...)` plus `>this : Symbol(Foo, ...)`
+    /// — no bare `>#name` identifier row.
+    #[test]
+    fn private_names_bind_as_symbols_and_record_path_rows() {
+        let text = "class Foo {\n    #name;\n    constructor(name) {\n        this.#name = name;\n    }\n}\n";
+        let (model, _) = bound(text);
+        let (hash_name, hash_name_index) = symbol_by_qualified_name(&model, "Foo.#name");
+        let (foo, _) = symbol_by_qualified_name(&model, "Foo");
+
+        // `>#name : Symbol(Foo.#name, Decl(..., 0, 11))`.
+        let declaration = &model.symbols()[hash_name_index];
+        assert_eq!(declaration.name(), "#name");
+        assert_eq!(
+            full_start(text, declaration.range().start().get()),
+            (0, 11),
+            "#name Decl anchors at the end of the class Foo header"
+        );
+
+        let line3 = text.split('\n').take(3).map(str::len).sum::<usize>() + 3;
+        let path = (line3 + 8, line3 + 18);
+        let bare_identifier = (line3 + 13, line3 + 18);
+        let this_range = (line3 + 8, line3 + 12);
+        let ranges = reference_ranges(&model, hash_name);
+        assert!(
+            ranges.contains(&path),
+            "`this.#name` must record the whole-path reference row: {ranges:?}"
+        );
+        assert!(
+            !ranges.contains(&bare_identifier),
+            "private names render no bare `>#name` identifier row: {ranges:?}"
+        );
+        assert!(
+            reference_ranges(&model, foo).contains(&this_range),
+            "`this` must reference Foo on the private assignment target"
+        );
+    }
+
+    /// `contextualTypingFunctionReturningFunction.symbols` renders bare
+    /// parameter rows for signature parameters:
+    /// `>s : Symbol(s, Decl(..., 1, 3))` on `a(s: string): void;` and
+    /// `>n : Symbol(n, Decl(..., 2, 7))` for the `n` inside the return type
+    /// `(n: number) => void` of `b(): (n: number) => void;`.
+    #[test]
+    fn interface_signature_parameters_bind_as_symbols() {
+        let text = "interface I {\n\ta(s: string): void;\n\tb(): (n: number) => void;\n}\n";
+        let (model, _) = bound(text);
+        let (_, s_index) = symbol_by_qualified_name(&model, "s");
+        let (_, n_index) = symbol_by_qualified_name(&model, "n");
+        assert!(matches!(
+            model.symbols()[s_index].kind(),
+            SymbolKind::Parameter
+        ));
+        assert!(matches!(
+            model.symbols()[n_index].kind(),
+            SymbolKind::Parameter
+        ));
+
+        // `>s : Symbol(s, Decl(..., 1, 3))` — full-start at the end of `(`.
+        assert_eq!(
+            full_start(text, model.symbols()[s_index].range().start().get()),
+            (1, 3),
+            "parameter `s` Decl anchors at the end of `(`"
+        );
+        // `>n : Symbol(n, Decl(..., 2, 7))` — inside the return function type.
+        assert_eq!(
+            model.symbols()[n_index].range().start().get(),
+            text.split('\n').take(2).map(str::len).sum::<usize>() + 2 + 7
+        );
+        assert_eq!(
+            full_start(text, model.symbols()[n_index].range().start().get()),
+            (2, 7),
+            "parameter `n` Decl anchors at the end of `(` in the return type"
         );
     }
 }
