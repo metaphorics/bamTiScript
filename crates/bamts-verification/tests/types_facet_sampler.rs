@@ -198,23 +198,42 @@ fn comparator_comparable(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether a `>`-prefixed line is a caret annotation (`>  : ^^^`) rather than
+/// a type record (`>display : type`). Caret lines have no display name before
+/// the colon — their content after `>` starts with `:` or is empty.
+fn is_caret_line(line: &str) -> bool {
+    let after = line.strip_prefix('>').unwrap_or(line);
+    let content = after.trim_start();
+    content.starts_with(':') || content.trim().is_empty()
+}
+
 /// Find the first differing line pair, prioritizing type records (`>`).
 /// Skips the `//// [path] ////` marker line (line 1) and empty lines.
 fn first_diff(expected: &str, actual: &str) -> Option<(usize, String, usize, String)> {
     let exp_lines: Vec<&str> = expected.lines().collect();
     let act_lines: Vec<&str> = actual.lines().collect();
 
-    // Collect all record lines (starting with '>') from both sides
+    // Collect all type-record lines (starting with '>') from both sides,
+    // excluding caret lines (`>  : ^^^`). Caret lines are visual annotations
+    // of the preceding `>display : type` record; when the type string differs
+    // the caret line differs too, but that is a type-display issue, not a
+    // wrong-expression issue. Including them causes misalignment: the first
+    // diff lands on a caret line, `classify_diff` sees an empty display vs a
+    // real display, and misclassifies as `wrong-expression-typed` instead of
+    // `type-display-mismatch-other`.
+    // Verified: `argumentsBindsToFunctionScopeArgumentList.types:7` has
+    // `>foo : (a: any) => void` followed by `>    : ^ ^^^^^^^^^^^^^^`.
+
     let exp_records: Vec<(usize, &str)> = exp_lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.starts_with('>'))
+        .filter(|(_, l)| l.starts_with('>') && !is_caret_line(l))
         .map(|(i, l)| (i, *l))
         .collect();
     let act_records: Vec<(usize, &str)> = act_lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.starts_with('>'))
+        .filter(|(_, l)| l.starts_with('>') && !is_caret_line(l))
         .map(|(i, l)| (i, *l))
         .collect();
 
@@ -358,8 +377,14 @@ fn classify_diff(
     // Missing record in actual
     if exp_is_record && act_line == "<MISSING>" {
         // Check if it's a total coverage gap (many missing records)
-        let exp_record_count = expected.lines().filter(|l| l.starts_with('>')).count();
-        let act_record_count = actual.lines().filter(|l| l.starts_with('>')).count();
+        let exp_record_count = expected
+            .lines()
+            .filter(|l| l.starts_with('>') && !is_caret_line(l))
+            .count();
+        let act_record_count = actual
+            .lines()
+            .filter(|l| l.starts_with('>') && !is_caret_line(l))
+            .count();
         if act_record_count == 0 {
             return "missing-records-total".to_owned();
         }
@@ -757,4 +782,140 @@ fn types_facet_sample() {
     }
 
     eprintln!("\nReport written to: {}", report_path.display());
+}
+
+/// LCS-based alignment of record lines to sub-cluster wrong-expression-typed.
+///
+/// For each wrong-expression-typed case, align expected vs actual `>` records
+/// using LCS. Cases where the display names differ at aligned positions are
+/// (a) observer-side (wrong node set/order). Cases where expected records have
+/// no match in actual are (b) compiler-side (missing type_of_expr entries).
+#[test]
+#[ignore]
+fn types_facet_wrong_expr_diagnostic() {
+    let sample = load_sample();
+    let mut observer_side: Vec<String> = Vec::new();
+    let mut compiler_side: Vec<String> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+
+    for case in &sample {
+        let case_path = authority_case_path(&case.logical_path);
+        let source_text = match fs::read_to_string(&case_path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let harness_logical = case
+            .logical_path
+            .strip_prefix("compiler/")
+            .or_else(|| case.logical_path.strip_prefix("conformance/"))
+            .unwrap_or(&case.logical_path)
+            .to_owned();
+        let pragmas = parse_case_pragmas(&source_text);
+        if pragmas.no_types_and_symbols {
+            continue;
+        }
+        let units = split_case_units(&harness_logical, &source_text);
+        let entry = entry_virtual_path(&harness_logical, &units);
+        let compiled = match compile_case_with_pragmas(&units, &entry, &pragmas) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let emitted = emit_types_baseline(&compiled, &harness_logical);
+        let stem = case_stem(&harness_logical);
+        let baseline_path = match resolve_baseline_fs(stem, &pragmas) {
+            Some(p) => p,
+            None => continue,
+        };
+        let expected = match fs::read_to_string(&baseline_path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let verdict = compare_types(&expected, &emitted);
+        if verdict != FacetVerdict::Pass {
+            if let Some((_, exp_line, _, act_line)) = first_diff(&expected, &emitted) {
+                let family = classify_diff(&expected, &emitted, &exp_line, &act_line, "");
+                if family != "wrong-expression-typed" {
+                    continue;
+                }
+                // Extract record lines (only `>display : type` lines, not
+                // caret lines), using the same predicate as `first_diff`.
+                let exp_records: Vec<&str> = expected
+                    .lines()
+                    .filter(|l| l.starts_with('>') && !is_caret_line(l))
+                    .collect();
+                let act_records: Vec<&str> = emitted
+                    .lines()
+                    .filter(|l| l.starts_with('>') && !is_caret_line(l))
+                    .collect();
+
+                // LCS alignment on display names
+                let exp_displays: Vec<String> =
+                    exp_records.iter().map(|l| extract_display(l)).collect();
+                let act_displays: Vec<String> =
+                    act_records.iter().map(|l| extract_display(l)).collect();
+
+                // Simple LCS on display names
+                let m = exp_displays.len();
+                let n = act_displays.len();
+                let mut dp = vec![vec![0usize; n + 1]; m + 1];
+                for i in 1..=m {
+                    for j in 1..=n {
+                        if exp_displays[i - 1] == act_displays[j - 1] {
+                            dp[i][j] = dp[i - 1][j - 1] + 1;
+                        } else {
+                            dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+                        }
+                    }
+                }
+                let lcs_len = dp[m][n];
+                let match_ratio = if m > 0 {
+                    lcs_len as f64 / m as f64
+                } else {
+                    0.0
+                };
+
+                // If most expected displays match actual displays, the diff is
+                // at a specific position — likely (a) observer emitting wrong
+                // node at that position. If many expected displays are missing,
+                // it's (b) compiler not recording type_of_expr for those nodes.
+                let exp_only = m.saturating_sub(lcs_len);
+                let act_only = n.saturating_sub(lcs_len);
+
+                let label = format!(
+                    "{} | exp_records={} act_records={} lcs={} exp_only={} act_only={} match_ratio={:.2} | EXP:{} | ACT:{}",
+                    case.logical_path,
+                    m,
+                    n,
+                    lcs_len,
+                    exp_only,
+                    act_only,
+                    match_ratio,
+                    exp_line,
+                    act_line
+                );
+
+                if exp_only > 3 && match_ratio < 0.5 {
+                    compiler_side.push(label);
+                } else if exp_only <= 2 && act_only <= 2 {
+                    observer_side.push(label);
+                } else {
+                    ambiguous.push(label);
+                }
+            }
+        }
+    }
+
+    eprintln!("\n=== WRONG-EXPRESSION-TYPED SUB-CLUSTER ===");
+    eprintln!("Observer-side (a): {}", observer_side.len());
+    for l in &observer_side {
+        eprintln!("  {l}");
+    }
+    eprintln!("\nCompiler-side (b): {}", compiler_side.len());
+    for l in &compiler_side {
+        eprintln!("  {l}");
+    }
+    eprintln!("\nAmbiguous: {}", ambiguous.len());
+    for l in &ambiguous {
+        eprintln!("  {l}");
+    }
 }

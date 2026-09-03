@@ -1435,6 +1435,18 @@ fn emit_unit_types(model: &SemanticModel, source: &SourceText, section: &str, ou
         ) {
             continue;
         }
+        // Class constructors do not get a `>constructor : type` record in
+        // upstream `.types` baselines: the constructor keyword is a member
+        // declaration, not a value expression, and tsc's type writer only
+        // emits records for symbols whose name appears as an expression or
+        // declaration name in source order. Verified against
+        // `parserClassDeclaration12.types:4` (class C with two constructor
+        // signatures — baseline has `>C : C` and `>a : any` but no
+        // `>constructor`), and `ClassDeclaration26.types:4` (class with
+        // constructor body — same pattern, no `>constructor` record).
+        if symbol.kind() == SymbolKind::Function && symbol.name() == "constructor" {
+            continue;
+        }
         let range = symbol.range();
         if range.start() == range.end() {
             continue;
@@ -5804,6 +5816,70 @@ export const foo = 1;\n";
         assert!(
             exports_pos < imports_pos,
             "exports.d.ts must precede imports.d.ts (module-index order), got:\n{emitted}"
+        );
+    }
+
+    /// Class constructors must NOT produce a `>constructor : type` record in
+    /// the `.types` baseline. Upstream tsc emits records for declaration names
+    /// and typed expressions, but the `constructor` keyword is a member
+    /// declaration, not a value expression — it gets no `>expr : type` row.
+    /// Verified against `parserClassDeclaration12.types:4` (class C with two
+    /// constructor signatures — baseline has `>C : C` and `>a : any` but no
+    /// `>constructor`) and `ClassDeclaration26.types:4` (class with
+    /// constructor body — same pattern, no `>constructor` record).
+    /// The binder creates a `SymbolKind::Function` symbol named "constructor"
+    /// for bodyless constructor overload signatures (parsed as Method at
+    /// `parser.rs:2158`), which the observer must filter out.
+    #[test]
+    fn types_emitter_skips_constructor_function_symbols() {
+        let source = "\
+// @target: es2015\n\
+// @strict: false\n\
+class C {\n\
+   constructor();\n\
+   constructor(a) { }\n\
+}\n";
+        let logical = "tests/cases/compiler/parserClassDeclaration12.ts";
+        let units = split_case_units(logical, source);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            !emitted.contains(">constructor"),
+            "constructor keyword must not produce a >constructor record:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(">C : C"),
+            "class name record must be present:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(">a : any"),
+            "parameter record must be present:\n{emitted}"
+        );
+    }
+
+    /// A class with a constructor body (not just overload signatures) must
+    /// also not emit `>constructor`. Verified against
+    /// `ClassDeclaration26.types:4` which has `>C : C` and `>x : any` but
+    /// no `>constructor` record.
+    #[test]
+    fn types_emitter_skips_constructor_with_body() {
+        let source = "\
+class C {\n\
+    constructor(public x: number) {}\n\
+}\n";
+        let logical = "tests/cases/compiler/ClassDeclaration26.ts";
+        let units = split_case_units(logical, source);
+        let entry = entry_virtual_path(logical, &units);
+        let case = compile_case(&units, &entry).expect("case compiles");
+        let emitted = emit_types_baseline(&case, logical);
+        assert!(
+            !emitted.contains(">constructor"),
+            "constructor with body must not produce a >constructor record:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(">C : C"),
+            "class name record must be present:\n{emitted}"
         );
     }
 }
