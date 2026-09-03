@@ -1391,6 +1391,11 @@ impl<'a> Emitter<'a> {
             } else {
                 self.raw("{");
             }
+            // Authority: tsc prints an empty block as `{ }` (strict census
+            // over 4501 single-unit `.ts` baselines: 2011 spaced paren-blocks
+            // plus arrows/try/static, zero true-tight outputs). The space is
+            // synthesized, so it stays unmapped like any other separator.
+            self.raw(" ");
             self.raw_mapped_char_end("}", range, '}');
             return;
         }
@@ -2284,7 +2289,12 @@ impl<'a> Emitter<'a> {
             .collect();
         let body = constructor.body.data();
         if injections.is_empty() && body.statements.is_empty() {
-            self.raw("{}");
+            // Same authority as any other empty block (`constructor() { }`:
+            // 243 spaced vs zero true-tight outputs). Open brace unmapped
+            // here as before; only the synthesized space and mapped close
+            // change.
+            self.raw("{ ");
+            self.raw_mapped_char_end("}", range, '}');
             return;
         }
         self.raw("{");
@@ -5622,9 +5632,10 @@ export default answer;
     fn empty_class_body_expands_in_javascript() {
         // Authority: `exnextmodulekindExportClassNameWithObject(target=es2015)`
         // emits `export class Object {}` as `export class Object {\n}`. The TS
-        // emitter always expands class bodies: 17,047 js sections hold zero
-        // single-line classes from `.ts` sources (the only `{}` keepers are
-        // allowJs passthrough echoes, which carry no javascript rows).
+        // emitter always expands class bodies: a strict doc-header-aware
+        // census over 3846 single-unit `.ts` baselines finds zero single-line
+        // classes in any `.js` output section (every `{}` keeper is an echo,
+        // declaration-only, or error artifact).
         let input = "export class Object {}";
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
@@ -5635,6 +5646,26 @@ export default answer;
         let output = emit_output(parsed.product(), &EmitOptions::default());
         assert!(!output.has_errors());
         assert_eq!(javascript(&output).code, "export class Object {\n}\n");
+    }
+
+    #[test]
+    fn empty_block_body_emits_spaced_braces_in_javascript() {
+        // Authority: `expandoFunctionSymbolProperty.js` emits a tight source
+        // `function inner() {}` as `function inner() { }`. The TS emitter
+        // normalizes every empty block (function, method, arrow, try, static)
+        // to `{ }`: 2011 spaced paren-blocks vs zero true-tight `.js`
+        // outputs under the same strict census (every tight keeper is an
+        // echo, declaration-only, error, or comment artifact).
+        let input = "function foo() {}";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(javascript(&output).code, "function foo() { }\n");
     }
 
     #[test]
@@ -5683,10 +5714,10 @@ export default answer;
                 "class C {\n",
                 "    @constructorFirst\n",
                 "    @constructorSecond\n",
-                "    constructor(@constructorParameterFirst @constructorParameterSecond parameter) {}\n",
+                "    constructor(@constructorParameterFirst @constructorParameterSecond parameter) { }\n",
                 "    @methodFirst\n",
                 "    @methodSecond\n",
-                "    method(@methodParameterFirst @methodParameterSecond parameter) {}\n",
+                "    method(@methodParameterFirst @methodParameterSecond parameter) { }\n",
                 "    @propertyFirst\n",
                 "    @propertySecond\n",
                 "    property = 1;\n",

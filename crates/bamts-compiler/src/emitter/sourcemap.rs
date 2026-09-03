@@ -1506,16 +1506,16 @@ mod tests {
 
     #[test]
     fn token_level_mappings_empty_function_body_close_brace() {
-        // Empty function body `{}`: the close `}` must map at its own
-        // generated column (after `{`), not at the `{` column. Before the
-        // fix, `raw_mapped_char_end("{}", …)` recorded the mapping before
-        // writing both glyphs, collapsing the close-brace column onto `{`.
+        // Empty function body `{ }`: the close `}` must map at its own
+        // generated column (after `{ `), not at the `{` column. Authority:
+        // tsc prints an empty block spaced (`function foo() { }`), so a
+        // tight source still emits the synthesized unmapped space.
         //
         // Source (0-based): `function foo() {}\n`
-        //   0: function foo() {}   ← `}` at col 16 (after space + `{`)
+        //   0: function foo() {}   ← `}` at col 16
         //
-        // Generated line 1: `function foo() {}`
-        //   `}` glyph at gen col 16, EOL at gen col 17.
+        // Generated line 1: `function foo() { }`
+        //   `}` glyph at gen col 17, EOL at gen col 18.
         let source = "function foo() {}\n";
         let javascript = emit(
             source,
@@ -1531,26 +1531,26 @@ mod tests {
         let map = javascript.source_map.expect("source map");
         let mappings = map.encode_mappings();
         let segs = decode_all_segments(&mappings);
-        // Close `}` glyph on generated line 1 at col 16, src line 0, src col 16.
+        // Close `}` glyph on generated line 1 at col 17, src line 0, src col 16.
         let close = segs
             .iter()
-            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 16)
+            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 17)
             .unwrap_or_else(|| {
-                panic!("empty function close brace missing at line 1 col 16\n  {mappings}")
+                panic!("empty function close brace missing at line 1 col 17\n  {mappings}")
             });
         assert_eq!(
             *close,
-            (1, 16, 0, 16),
+            (1, 17, 0, 16),
             "empty function close brace glyph\n  {mappings}"
         );
-        // EOL at gen col 17, src col 17.
+        // EOL at gen col 18, src col 17.
         let eol = segs
             .iter()
-            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 17)
-            .unwrap_or_else(|| panic!("empty function EOL missing at line 1 col 17\n  {mappings}"));
+            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 18)
+            .unwrap_or_else(|| panic!("empty function EOL missing at line 1 col 18\n  {mappings}"));
         assert_eq!(
             *eol,
-            (1, 17, 0, 17),
+            (1, 18, 0, 17),
             "empty function close EOL\n  {mappings}"
         );
     }
