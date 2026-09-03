@@ -4236,25 +4236,28 @@ declare class B extends A {}\n";
     }
 
     /// Drive-letter (`A:/foo/bar.ts`) and dot-slash (`./a.ts`) spellings are
-    /// preserved too — `commonSourceDir4.types` prints `=== A:/foo/bar.ts ===`
-    /// and the `commonJsExportTypeDeclarationError` baselines print
-    /// `=== ./a.ts ===`; `virtual_unit_path` strips both prefixes for the
-    /// loader, so the section name must come from the verbatim name.
+    /// preserved too — `commonSourceDir4.types:3` prints `=== A:/foo/bar.ts ===`
+    /// and `decoratorMetadataTypeOnlyExport.types:3` prints `=== ./a.ts ===`;
+    /// `virtual_unit_path` strips both prefixes for the loader, so the
+    /// section name must come from the verbatim name all the way through
+    /// the emitter.
     #[test]
     fn types_section_headers_preserve_drive_and_dot_prefixes() {
-        let logical = "tests/cases/compiler/drivePrefixPin.ts";
-        let case_text = "\
-// @Filename: A:/foo/bar.ts\n\
-var x = 1;\n";
-        let units = split_case_units(logical, case_text);
-        assert_eq!(units[0].display_name, "A:/foo/bar.ts");
-
-        let logical2 = "tests/cases/compiler/dotSlashPin.ts";
-        let case_text2 = "\
-// @Filename: ./a.ts\n\
-var x = 1;\n";
-        let units2 = split_case_units(logical2, case_text2);
-        assert_eq!(units2[0].display_name, "./a.ts");
+        for (logical, name) in [
+            ("tests/cases/compiler/drivePrefixPin.ts", "A:/foo/bar.ts"),
+            ("tests/cases/compiler/dotSlashPin.ts", "./a.ts"),
+        ] {
+            let case_text = format!("// @Filename: {name}\nvar x = 1;\n");
+            let units = split_case_units(logical, &case_text);
+            assert_eq!(units[0].display_name, name);
+            let entry = entry_virtual_path(logical, &units);
+            let case = compile_case(&units, &entry).expect("case compiles");
+            let emitted = emit_types_baseline(&case, logical);
+            assert!(
+                emitted.contains(&format!("=== {name} ===")),
+                "verbatim section header for {name} missing from:\n{emitted}"
+            );
+        }
     }
 
     /// `tsconfig.json` / `jsconfig.json` units are configuration, never
@@ -5803,91 +5806,4 @@ export const foo = 1;\n";
             "exports.d.ts must precede imports.d.ts (module-index order), got:\n{emitted}"
         );
     }
-}
-
-// ---- Section-header-diff fixes (wave 4) -----------------------------
-
-/// `extract_dts_sections` must skip input-echo sections: a `.d.ts`-named
-/// section in the echo zone is an input file, not a generated declaration.
-/// The `echo_count` parameter tells the extractor how many leading
-/// sections are echoes (one per `// @filename:` unit).
-#[test]
-fn extract_dts_sections_skips_echo_dts_inputs() {
-    // Mirrors `exportSpecifierForAGlobal.js`: `a.d.ts` is an input echo,
-    // `b.d.ts` is the generated output. With `echo_count = 2` (a.d.ts +
-    // b.ts), only the output `b.d.ts` section survives.
-    let doc = "\
-//// [tests/cases/compiler/exportSpecifierForAGlobal.ts] ////\n\
-\n\
-//// [a.d.ts]\ndeclare const g: number;\n\
-\n\
-//// [b.ts]\nexport { g };\n\
-\n\
-//// [b.js]\n\"use strict\";\nexport { g };\n\
-\n\
-//// [b.d.ts]\ndeclare const g: number;\n";
-    assert_eq!(
-        extract_dts_sections(doc, 2),
-        "//// [b.d.ts]\ndeclare const g: number;\n"
-    );
-}
-
-/// JSON inputs must not produce declaration sections. Upstream's output
-/// mapping skips `.json` files for declaration emit entirely.
-#[test]
-fn declaration_baseline_skips_json_input_units() {
-    let source = "\
-// @declaration: true\n\
-// @resolveJsonModule: true\n\
-// @module: nodenext\n\
-\n\
-// @filename: package.json\n\
-{\"name\": \"pkg\", \"type\": \"module\"}\n\
-\n\
-// @filename: index.ts\n\
-export const x: number = 1;\n";
-    let logical = "tests/cases/compiler/jsonSkipTest.ts";
-    let units = split_case_units(logical, source);
-    let entry = entry_virtual_path(logical, &units);
-    let case = compile_case(&units, &entry).expect("case compiles");
-    let emitted = emit_declaration_baseline(&case).expect("declaration emit");
-    // Must contain index.d.ts but NOT package.d.json.ts or any JSON-derived section
-    assert!(
-        emitted.contains("//// [index.d.ts]"),
-        "expected index.d.ts section, got:\n{emitted}"
-    );
-    assert!(
-        !emitted.contains("package"),
-        "JSON input must not produce a declaration section, got:\n{emitted}"
-    );
-}
-
-/// Declaration output sections must follow module-index order
-/// (dependency-first), not split order (`// @filename:` directive order).
-/// `exportSpecifiers` has split [imports.ts, exports.ts] but modules()
-/// is [exports.ts, imports.ts], and the baseline emits exports.d.ts
-/// before imports.d.ts.
-#[test]
-fn declaration_baseline_emits_in_module_index_order() {
-    let source = "\
-// @module: esnext\n\
-// @declaration: true\n\
-\n\
-// @filename: imports.ts\n\
-import { foo } from \"./exports\";\n\
-export { foo };\n\
-\n\
-// @filename: exports.ts\n\
-export const foo = 1;\n";
-    let logical = "tests/cases/compiler/exportSpecifiers.ts";
-    let units = split_case_units(logical, source);
-    let entry = entry_virtual_path(logical, &units);
-    let case = compile_case(&units, &entry).expect("case compiles");
-    let emitted = emit_declaration_baseline(&case).expect("declaration emit");
-    let exports_pos = emitted.find("//// [exports.d.ts]").unwrap_or(usize::MAX);
-    let imports_pos = emitted.find("//// [imports.d.ts]").unwrap_or(usize::MAX);
-    assert!(
-        exports_pos < imports_pos,
-        "exports.d.ts must precede imports.d.ts (module-index order), got:\n{emitted}"
-    );
 }
