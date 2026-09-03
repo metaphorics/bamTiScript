@@ -1955,6 +1955,80 @@ function $ERROR(message) {\n\
             Err(OracleError::Done(DoneFailure::Duplicate))
         );
     }
+    #[test]
+    fn an_async_late_failure_dominates_a_negative_request() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::Test262Error,
+        }));
+        let late = RunOutcome::Async(AsyncTrace {
+            events: vec![DoneEvent {
+                kind: DoneEventKind::Error,
+                at: Duration::from_millis(101),
+            }],
+            failure_value: Some("Test262Error: too slow".to_owned()),
+            exited_at: None,
+            deadline: Duration::from_millis(100),
+        });
+
+        assert_eq!(
+            judge_run(&request, &late),
+            Err(OracleError::Done(DoneFailure::Late))
+        );
+    }
+
+    #[test]
+    fn an_async_missing_failure_dominates_a_negative_request() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::Test262Error,
+        }));
+        let missing = RunOutcome::Async(AsyncTrace {
+            events: vec![],
+            failure_value: None,
+            exited_at: None,
+            deadline: Duration::from_millis(100),
+        });
+
+        assert_eq!(
+            judge_run(&request, &missing),
+            Err(OracleError::Done(DoneFailure::Missing))
+        );
+    }
+
+    #[test]
+    fn an_async_early_exit_dominates_a_negative_request() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::Test262Error,
+        }));
+        let early = RunOutcome::Async(AsyncTrace {
+            events: vec![],
+            failure_value: None,
+            exited_at: Some(Duration::from_millis(1)),
+            deadline: Duration::from_millis(100),
+        });
+
+        assert_eq!(
+            judge_run(&request, &early),
+            Err(OracleError::Done(DoneFailure::EarlyExit))
+        );
+    }
+
+    #[test]
+    fn an_async_done_failure_with_an_unknown_constructor_is_a_mismatch() {
+        let request = negative_async_request(Some(Negative {
+            phase: NegativePhase::Runtime,
+            error_type: NegativeType::Test262Error,
+        }));
+        let outcome =
+            async_done_outcome(DoneEventKind::Error, Some("CustomError: not a known type"));
+
+        assert!(matches!(
+            judge_run(&request, &outcome),
+            Err(OracleError::ExpectationMismatch { .. })
+        ));
+    }
 
     #[test]
     fn the_internal_marker_captures_the_done_argument_for_negative_matching() {
