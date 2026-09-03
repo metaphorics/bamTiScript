@@ -1,9 +1,9 @@
 use std::fmt::Write as _;
 
-use super::binder::{FunctionSignature, ObjectType};
+use super::binder::{FunctionSignature, ObjectType, PropertyType};
 use super::{SemanticModel, SymbolId, Type, TypeId};
+use crate::literal::number_value;
 use bamts_bytecode::EcmaString;
-
 /// Renders an interned type as its canonical TypeScript display string.
 #[must_use]
 pub fn render_type(model: &SemanticModel, type_id: TypeId) -> String {
@@ -43,7 +43,8 @@ fn render_type_grouped(
         Type::Symbol => "symbol".to_owned(),
         Type::Object => "object".to_owned(),
         Type::BooleanLiteral(value) => if *value { "true" } else { "false" }.to_owned(),
-        Type::NumberLiteral(text) | Type::BigIntLiteral(text) => text.to_string(),
+        Type::NumberLiteral(text) => render_number_literal(text),
+        Type::BigIntLiteral(text) => text.to_string(),
         Type::StringLiteral(text) => render_string_literal(text),
         Type::Array(element) => format!(
             "{}[]",
@@ -423,19 +424,7 @@ fn render_object_type_declaration(
         )
     }));
     members.extend(object.properties.iter().map(|property| {
-        format!(
-            "{}{}{}: {}",
-            if property.readonly() { "readonly " } else { "" },
-            property.name(),
-            if property.optional() { "?" } else { "" },
-            render_type_declaration_grouped(
-                model,
-                property.type_id(),
-                false,
-                inner_indent,
-                visiting_aliases
-            )
-        )
+        render_property_declaration(model, property, inner_indent, visiting_aliases)
     }));
     if members.is_empty() {
         "{}".to_owned()
@@ -567,19 +556,111 @@ fn render_object_type(
             render_type_grouped(model, signature.value_type, false, visiting_aliases)
         )
     }));
-    members.extend(object.properties.iter().map(|property| {
-        format!(
-            "{}{}{}: {}",
-            if property.readonly() { "readonly " } else { "" },
-            property.name(),
-            if property.optional() { "?" } else { "" },
-            render_type_grouped(model, property.type_id(), false, visiting_aliases)
-        )
-    }));
+    members.extend(
+        object
+            .properties
+            .iter()
+            .map(|property| render_property(model, property, visiting_aliases)),
+    );
     if members.is_empty() {
         "{}".to_owned()
     } else {
         format!("{{ {}; }}", members.join("; "))
+    }
+}
+
+/// Normalizes a numeric lexeme to tsc's canonical display form.
+///
+/// tsc renders number literal types via `ts.numberToString`, which parses
+/// the value and emits the shortest decimal representation. Hex/octal/binary
+/// prefixes, trailing `.0`, and integer-valued exponents all collapse to
+/// the plain integer. A bare `0x` (no digits) is `NaN` in JS but tsc treats
+/// it as `0` in the type position.
+///
+/// Baseline proof: `tests/baselines/reference/numericLiteralTypes1.types`
+/// rows `>A2 : 1` (source `1.0`), `>A3 : 1` (source `1e0`), `>A4 : 1`
+/// (source `10e-1`).
+/// Counterexample checked: `tests/baselines/reference/literalTypes1.types`
+/// row `>c2 : 100` (source `100`), confirming plain integers pass through.
+fn render_number_literal(text: &str) -> String {
+    match number_value(text) {
+        Some(value) if value.is_finite() => {
+            if value == 0.0 {
+                "0".to_owned()
+            } else if value == value.trunc() && value.abs() < 1e21 {
+                format!("{value:.0}")
+            } else {
+                // Fall back to Rust's f64 Display, which matches tsc for
+                // non-integer values in the common cases.
+                value.to_string()
+            }
+        }
+        _ => text.to_owned(),
+    }
+}
+
+/// Renders one property of an object type, choosing method shorthand
+/// (`name(params): ret`) or property form (`name: type`) to match tsc.
+///
+/// tsc distinguishes method declarations (`method() { }`) from function-
+/// expression properties (`prop: () => void`). Methods use the
+/// `name(params): ret` shorthand; properties use `name: type`.
+///
+/// Baseline proof: `tests/baselines/reference/objectSpreadWithinMethodWithinObjectWithSpread.types`
+/// row `>a : { prop(): { metadata: number; }; }` — `prop` is a method
+/// shorthand, rendered with `()` not `: () =>`.
+/// Counterexample checked: same baseline row `>p1 : () => void` inside the
+/// object — `p1` is a function-expression property, rendered as `name: type`.
+fn render_property(
+    model: &SemanticModel,
+    property: &PropertyType,
+    visiting_aliases: &mut Vec<SymbolId>,
+) -> String {
+    let prefix = if property.readonly() { "readonly " } else { "" };
+    let optional = if property.optional() { "?" } else { "" };
+    if property.is_method()
+        && let Type::Function(signature) = model.types().get(property.type_id())
+    {
+        // Method shorthand: `name?(params): returnType` (no `=>`).
+        // The optional marker sits between the name and the parameter list.
+        let body = render_signature(model, signature, ": ", visiting_aliases);
+        format!("{prefix}{}{optional}{body}", property.name())
+    } else {
+        format!(
+            "{prefix}{}{optional}: {}",
+            property.name(),
+            render_type_grouped(model, property.type_id(), false, visiting_aliases)
+        )
+    }
+}
+
+/// Declaration-emit variant of [`render_property`], using the declaration
+/// renderer for nested types and passing the indent context.
+fn render_property_declaration(
+    model: &SemanticModel,
+    property: &PropertyType,
+    indent: usize,
+    visiting_aliases: &mut Vec<SymbolId>,
+) -> String {
+    let prefix = if property.readonly() { "readonly " } else { "" };
+    let optional = if property.optional() { "?" } else { "" };
+    if property.is_method()
+        && let Type::Function(signature) = model.types().get(property.type_id())
+    {
+        let body = render_signature_declaration(model, signature, ": ", indent, visiting_aliases);
+        format!("{prefix}{}{optional}{body}", property.name())
+    } else {
+        format!(
+            "{prefix}{}{optional}: {}",
+            property.name(),
+            render_type_declaration_grouped(
+                model,
+                property.type_id(),
+                false,
+                indent,
+                visiting_aliases
+            )
+        )
     }
 }
 
@@ -717,4 +798,43 @@ mod tests {
             "{ (a: string): void; new (): Local; [key: string]: unknown; readonly id: number; }"
         );
     }
+
+    #[test]
+    fn method_shorthand_renders_as_call_not_arrow() {
+        // Upstream baseline:
+        // tests/baselines/reference/objectSpreadWithinMethodWithinObjectWithSpread.types
+        // row `>a : { prop(): { metadata: number; }; }` — method shorthand
+        // `prop()` renders with `()` not `: () =>`.
+        // Counterexample checked:
+        // tests/baselines/reference/superInObjectLiterals_ES5(target=es2015).types
+        // row `>obj : { ... p1: () => void; ... }` — function-expression
+        // properties keep `name: () => type` form.
+        let text = "interface I { prop(): { metadata: number; }; }\ndeclare var a: I;\nlet z = a;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+        let type_id = typed_expression_of(model, &source, "a", text.find("let z").unwrap());
+        assert_eq!(render_type(model, type_id), "{ prop(): { metadata: number; }; }");
+    }
+
+    #[test]
+    fn number_literal_normalizes_hex_and_decimal_forms() {
+        // Upstream baseline:
+        // tests/baselines/reference/numericLiteralTypes1.types
+        // rows `>A2 : 1` (source `1.0`), `>A3 : 1` (source `1e0`),
+        // `>A4 : 1` (source `10e-1`) — all normalize to `1`.
+        // Counterexample checked:
+        // tests/baselines/reference/scannerS7.8.3_A6.1_T1.types
+        // row `>0x : 0` — bare `0x` normalizes to `0`.
+        // `const` preserves the literal type (unlike `let` which widens).
+        let text = "const a = 1.0;\nconst b = 1e0;\nconst c = 10e-1;\nlet z = a;\nlet y = b;\nlet w = c;\n";
+        let (source, checked) = check_text(text);
+        let model = checked.product();
+        let a = typed_expression_of(model, &source, "a", text.find("let z").unwrap());
+        assert_eq!(render_type(model, a), "1");
+        let b = typed_expression_of(model, &source, "b", text.find("let y").unwrap());
+        assert_eq!(render_type(model, b), "1");
+        let c = typed_expression_of(model, &source, "c", text.find("let w").unwrap());
+        assert_eq!(render_type(model, c), "1");
+    }
+
 }
