@@ -2032,6 +2032,7 @@ impl<'a> Emitter<'a> {
             .iter()
             .any(|parameter| !self.is_this_parameter(parameter.data()));
         if !has_params {
+            self.raw("()");
             return;
         }
         let open = self.source_pos_of(window, '(').unwrap_or(window.start());
