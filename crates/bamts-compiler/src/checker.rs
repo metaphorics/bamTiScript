@@ -131,6 +131,8 @@ const DUPLICATE_MESSAGE: &str = "A block-scoped declaration cannot redeclare an 
 const CANNOT_FIND_NAME_MESSAGE: &str = "Cannot find name in any enclosing scope.";
 const CANNOT_FIND_TYPE_MESSAGE: &str = "Cannot find type name in any enclosing scope.";
 const CANNOT_FIND_NAMESPACE_MESSAGE: &str = "Cannot find namespace in any enclosing scope.";
+const CANNOT_FIND_NAME_LIB_GATED_MESSAGE: &str =
+    "Cannot find name. Do you need to change your target library?";
 const NOT_ASSIGNABLE_MESSAGE: &str = "Initializer type is not assignable to the annotated type.";
 /// Diagnostic emitted when a class property has no initializer and is not
 /// definitely assigned in the constructor.
@@ -192,6 +194,10 @@ pub const DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL: DiagnosticCode =
 /// a namespace's local scope but is not exported. Corresponds to TypeScript's
 /// TS2694.
 pub const NAMESPACE_NO_EXPORTED_MEMBER: DiagnosticCode = DiagnosticCode::new("BAMTS-C088");
+/// Diagnostic emitted when a value reference resolves to a name that is a
+/// known lib-gated global not included in the active lib set. Corresponds to
+/// TypeScript's TS2583.
+pub const CANNOT_FIND_NAME_LIB_GATED: DiagnosticCode = DiagnosticCode::new("BAMTS-C089");
 /// Diagnostic emitted when the number of arguments in a call does not match
 /// the callable's parameter count.
 pub const ARGUMENT_COUNT_MISMATCH: DiagnosticCode = DiagnosticCode::new("BAMTS-C054");
@@ -2133,8 +2139,9 @@ fn imported_enum_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME, CANNOT_FIND_NAMESPACE,
-        CANNOT_FIND_TYPE, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
+        ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
+        CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
+        CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
         DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
         IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, INVALID_ASSIGNMENT_TARGET,
         MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
@@ -3053,6 +3060,82 @@ mod tests {
             es2021_codes.contains(&CANNOT_FIND_NAME.as_str()),
             "Float16Array must not resolve at es2021 default lib: {:?}",
             es2021.diagnostics()
+        );
+    }
+
+    #[test]
+    fn temporal_global_resolves_with_esnext_temporal_lib() {
+        // Authority baseline: temporal.ts uses @lib: ...,esnext.temporal,...
+        // and Temporal must resolve. Without the esnext.temporal lib stem
+        // mapping in from_lib_names, Temporal fires TS2304 (C002).
+        let result = check_text_with(
+            "Temporal;",
+            ProgramCheckOptions::standard().with_libs(
+                super::intrinsic_environment::LibSet::from_lib_names(&[
+                    "es6",
+                    "esnext.temporal",
+                    "dom",
+                ]),
+            ),
+        );
+        let codes = checker_codes(&result);
+        assert!(
+            !codes.contains(&CANNOT_FIND_NAME.as_str()),
+            "Temporal must resolve with esnext.temporal lib: {:?}",
+            result.diagnostics()
+        );
+
+        // Without esnext.temporal, Temporal is unresolved.
+        let result_no_temporal = check_text_with(
+            "Temporal;",
+            ProgramCheckOptions::standard().with_libs(
+                super::intrinsic_environment::LibSet::from_lib_names(&["es6", "dom"]),
+            ),
+        );
+        let codes_no_temporal = checker_codes(&result_no_temporal);
+        assert!(
+            codes_no_temporal.contains(&CANNOT_FIND_NAME.as_str()),
+            "Temporal must not resolve without esnext.temporal lib: {:?}",
+            result_no_temporal.diagnostics()
+        );
+    }
+
+    #[test]
+    fn bigint_without_lib_emits_ts2583_not_ts2304() {
+        // Authority baseline: bigintWithoutLib(target=es5).errors.txt line 4
+        // emits TS2583 for BigInt, not TS2304. With es5 lib, BigInt is a
+        // known lib-gated global (Es2020BigInt) not in the active set.
+        let result = check_text_with(
+            "BigInt(123);",
+            ProgramCheckOptions::standard().with_libs(
+                super::intrinsic_environment::LibSet::from_lib_names(&["es5"]),
+            ),
+        );
+        let codes = checker_codes(&result);
+        assert!(
+            codes.contains(&CANNOT_FIND_NAME_LIB_GATED.as_str()),
+            "BigInt without es2020 lib must emit C089 (TS2583): {:?}",
+            result.diagnostics()
+        );
+        assert!(
+            !codes.contains(&CANNOT_FIND_NAME.as_str()),
+            "BigInt without es2020 lib must not emit C002 (TS2304): {:?}",
+            result.diagnostics()
+        );
+    }
+
+    #[test]
+    fn enum_member_qualified_type_reference_resolves() {
+        // tsc resolves `Color.Red` as a type to the enum member's literal
+        // type. Without the enum-member fallback in qualified type reference
+        // resolution, this fires TS2304 (C003).
+        let result =
+            check_text("enum Color { Red, Green, Blue }\nlet k: Color.Red;\nlet m: Color.Green;\n");
+        let codes = checker_codes(&result);
+        assert!(
+            !codes.contains(&CANNOT_FIND_TYPE.as_str()),
+            "Color.Red must resolve as a type reference: {:?}",
+            result.diagnostics()
         );
     }
 
@@ -5016,11 +5099,26 @@ function check(options: Options = {}) {
 
     #[test]
     fn qualified_enum_member_types_use_the_enum_container_scope() {
+        // tsc resolves `N.E.A` as a type to the enum member's literal type.
+        // The qualified type reference path falls through the enum's member
+        // scope and finds the EnumMember in the value plane.
         let checked = check_text("namespace N { export enum E { A } } type Value = N.E.A;");
-        assert_eq!(checker_codes(&checked), [CANNOT_FIND_TYPE.as_str()]);
+        assert!(
+            checker_codes(&checked)
+                .iter()
+                .all(|c| !c.starts_with("BAMTS-C00")),
+            "N.E.A must resolve as a type reference: {:?}",
+            checked.diagnostics()
+        );
 
         let checked = check_text("namespace N { export const enum E { A } } type Value = N.E.A;");
-        assert_eq!(checker_codes(&checked), [CANNOT_FIND_TYPE.as_str()]);
+        assert!(
+            checker_codes(&checked)
+                .iter()
+                .all(|c| !c.starts_with("BAMTS-C00")),
+            "N.E.A must resolve as a type reference (const enum): {:?}",
+            checked.diagnostics()
+        );
 
         let checked = check_text("namespace N { export enum E { A } } type Value = N.E;");
         assert!(checker_codes(&checked).is_empty());

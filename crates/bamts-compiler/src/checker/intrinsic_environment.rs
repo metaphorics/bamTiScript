@@ -146,7 +146,7 @@ impl LibSet {
                 "es6" | "es2015" => {
                     set = set.with(Lib::Es5).with(Lib::Es2015);
                 }
-                "es2016" => {
+                "es7" | "es2016" => {
                     set = set.with(Lib::Es5).with(Lib::Es2015);
                 }
                 "es2017" => {
@@ -229,6 +229,39 @@ impl LibSet {
                         .with(Lib::EsnextDisposable)
                         .with(Lib::EsnextTemporal);
                 }
+                // Sub-lib stems that introduce new top-level globals.
+                "esnext.temporal" => {
+                    set = set.with(Lib::EsnextTemporal);
+                }
+                "esnext.disposable" => {
+                    set = set.with(Lib::EsnextDisposable);
+                }
+                "es2025.float16" => {
+                    set = set.with(Lib::Es2025Float16);
+                }
+                "es2017.sharedmemory" => {
+                    set = set.with(Lib::Es2017SharedMemory);
+                }
+                // Sub-lib stems that refine existing interfaces but declare no
+                // new top-level globals beyond what the parent lib provides.
+                "es2015.core"
+                | "es2015.generator"
+                | "es2015.iterable"
+                | "es2015.promise"
+                | "es2015.proxy"
+                | "es2015.reflect"
+                | "es2015.symbol"
+                | "es2015.symbol.wellknown"
+                | "es2021.intl"
+                | "es2023.intl"
+                | "es2024.intl"
+                | "es2025.intl"
+                | "esnext.date"
+                | "esnext.intl"
+                | "es2024.arraybuffer"
+                | "es2024.sharedmemory"
+                | "webworker.asynciterable"
+                | "webworker.iterable" => {}
                 "dom" => {
                     set = set.with(Lib::Dom);
                 }
@@ -320,6 +353,54 @@ impl GlobalEnvironment {
             ModuleEnvironment::Standard => Vec::new(),
             ModuleEnvironment::CommonJs => COMMONJS_WRAPPER_VALUES.to_vec(),
         }
+    }
+
+    /// Names for which tsc emits TS2583 ("Cannot find name X. Do you need
+    /// to change your target library?") instead of the generic TS2304 when
+    /// the name is a known global absent from the active lib set. This is a
+    /// hardcoded list in tsc, not derivable from the Lib category alone:
+    /// `Proxy` (Es2015) gets TS2304, but `Map` (also Es2015) gets TS2583.
+    const TS2583_NAMES: &[&str] = &[
+        "BigInt",
+        "BigInt64Array",
+        "BigUint64Array",
+        "Atomics",
+        "SharedArrayBuffer",
+        "Map",
+        "Set",
+        "Reflect",
+        "WeakMap",
+        "WeakSet",
+        "AsyncGenerator",
+        "AsyncGeneratorFunction",
+        "AsyncIterable",
+        "AsyncIterableIterator",
+        "AsyncIterator",
+        "Iterator",
+    ];
+
+    /// Returns `true` when a value name is a known lib-gated global that tsc
+    /// reports as TS2583 (not TS2304) when absent from the active lib set.
+    #[must_use]
+    pub fn is_lib_gated_value(&self, name: &str) -> bool {
+        if !Self::TS2583_NAMES.contains(&name) {
+            return false;
+        }
+        self.values
+            .iter()
+            .any(|entry| entry.name == name && !self.libs.contains(entry.lib))
+    }
+
+    /// Returns `true` when a type name is a known lib-gated global that tsc
+    /// reports as TS2583 (not TS2304) when absent from the active lib set.
+    #[must_use]
+    pub fn is_lib_gated_type(&self, name: &str) -> bool {
+        if !Self::TS2583_NAMES.contains(&name) {
+            return false;
+        }
+        self.types
+            .iter()
+            .any(|entry| entry.name == name && !self.libs.contains(entry.lib))
     }
 }
 

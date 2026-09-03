@@ -534,6 +534,12 @@
       "evidence": "Reserved for parser-side `using` declaration grammar recovery.",
       "status": "unmapped",
       "tsCode": null
+    },
+    {
+      "bamtsCode": "BAMTS-C089",
+      "evidence": "Value or type reference resolves to a known lib-gated global not in the active lib set -> TS2583 in the TypeScript 7.0.2 authority baselines: bigintWithoutLib(target=es5) (line 4).",
+      "status": "mapped",
+      "tsCode": 2583
     }
   ]
 }
