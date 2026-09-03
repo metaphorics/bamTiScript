@@ -776,7 +776,7 @@ mod tests {
 
     /// Mapped types break across lines in `.d.ts` output.
     ///
-    /// Authority: `tests/baselines/reference/mappedTypes3.js:5-7`
+    /// Authority: `tests/baselines/reference/mappedTypes3.js:8-10`
     /// ```text
     /// type Boxified<T> = {
     ///     [K in keyof T]: Box<T[K]>;
@@ -899,7 +899,7 @@ mod tests {
 
     /// Functions without explicit return type get inferred `: void` in `.d.ts`.
     ///
-    /// Authority: `tests/baselines/reference/mappedTypes3.js:18`
+    /// Authority: `tests/baselines/reference/mappedTypes3.js:81`
     /// ```text
     /// declare function f1(b: Bacon): void;
     /// ```
@@ -919,7 +919,7 @@ mod tests {
     /// Generic function-type arguments in type arguments are wrapped in
     /// parens to disambiguate `<<T>() => T>` from a misplaced `<<`.
     ///
-    /// Authority: `tests/baselines/reference/declarationEmitFirstTypeArgumentGenericFunctionType.js:54`
+    /// Authority: `tests/baselines/reference/declarationEmitFirstTypeArgumentGenericFunctionType.js:56`
     /// ```text
     /// declare var prop11: X<(<Tany>() => Tany)>;
     /// ```
