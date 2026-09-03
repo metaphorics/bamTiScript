@@ -1349,7 +1349,11 @@ mod tests {
         // Line 5 (class close `}`): EOL segment at gen col 1 -> src col 1
         // (one past the `}` on source line 2). No glyph segment at col 0.
         let segments = mappings.split(';').collect::<Vec<_>>();
-        assert!(segments.len() >= 6, "expected >= 6 lines, got {}\n  {mappings}", segments.len());
+        assert!(
+            segments.len() >= 6,
+            "expected >= 6 lines, got {}\n  {mappings}",
+            segments.len()
+        );
         let class_close = segments[5];
         assert!(
             !class_close.is_empty(),
@@ -1357,7 +1361,10 @@ mod tests {
         );
         // The EOL segment lands at gen col 1 (after the `}` glyph).
         let (gen_col, _) = decode_vlq(class_close.split(',').next().unwrap()).unwrap();
-        assert_eq!(gen_col, 1, "class close brace EOL at column 1\n  {mappings}");
+        assert_eq!(
+            gen_col, 1,
+            "class close brace EOL at column 1\n  {mappings}"
+        );
     }
 
     #[test]
@@ -1385,7 +1392,11 @@ mod tests {
         // Line 2: return 1; -> return(4), 1(11), ;(12), EOL(13)
         // Line 3: } -> }(0), EOL(1)  [function close brace mapped]
         let segments = mappings.split(';').collect::<Vec<_>>();
-        assert!(segments.len() >= 4, "expected >= 4 lines, got {}\n  {mappings}", segments.len());
+        assert!(
+            segments.len() >= 4,
+            "expected >= 4 lines, got {}\n  {mappings}",
+            segments.len()
+        );
         // Line 3 (function close): must have a segment at column 0.
         let func_close = segments[3];
         assert!(
@@ -1396,10 +1407,60 @@ mod tests {
         assert_eq!(gen_col, 0, "function close brace at column 0\n  {mappings}");
     }
 
+    /// Decodes every segment in a mappings string into absolute
+    /// `(gen_line, gen_col, src_line, src_col)` tuples. Generated columns
+    /// reset per line; source index/line/column accumulate across lines,
+    /// matching the Source Map v3 VLQ relative-delta convention.
+    fn decode_all_segments(mappings: &str) -> Vec<(usize, i64, i64, i64)> {
+        let mut out = Vec::new();
+        let mut src_line: i64 = 0;
+        let mut src_col: i64 = 0;
+        for (li, line) in mappings.split(';').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let mut gen_col: i64 = 0;
+            for seg in line.split(',') {
+                let mut rest = seg;
+                let (dc, n) = decode_vlq(rest).unwrap();
+                gen_col += dc;
+                rest = &rest[n..];
+                let (_si, n) = decode_vlq(rest).unwrap();
+                rest = &rest[n..];
+                let (sl, n) = decode_vlq(rest).unwrap();
+                src_line += sl;
+                rest = &rest[n..];
+                let (sc, n) = decode_vlq(rest).unwrap();
+                src_col += sc;
+                let _ = &rest[n..]; // optional name index — ignored
+                out.push((li, gen_col, src_line, src_col));
+            }
+        }
+        out
+    }
+
     #[test]
     fn token_level_mappings_switch_block_braces() {
         // Authority: sourceMapValidationSwitch — tsc maps both the switch
         // block opening `{` and closing `}` to their source tokens.
+        //
+        // Source (0-based lines):
+        //   0: var x = 10;
+        //   1: switch (x) {
+        //   2: case 5: x++; break;
+        //   3: default: x = 0;
+        //   4: }
+        //
+        // Generated (0-based lines, after "use strict"; prelude):
+        //   0: "use strict";
+        //   1: var x = 10;
+        //   2: switch (x) {        ← open brace at gen col 12
+        //   3:     case 5:
+        //   4:         x++;
+        //   5:         break;
+        //   6:     default:
+        //   7:         x = 0;
+        //   8: }                    ← close brace at gen col 0, EOL at gen col 1
         let source = "var x = 10;\nswitch (x) {\ncase 5: x++; break;\ndefault: x = 0;\n}\n";
         let javascript = emit(
             source,
@@ -1414,17 +1475,143 @@ mod tests {
         .expect("javascript output");
         let map = javascript.source_map.expect("source map");
         let mappings = map.encode_mappings();
-        // The switch close brace must have a mapping segment.
-        let segments = mappings.split(';').collect::<Vec<_>>();
-        // Find the line containing the switch close brace (last non-empty line
-        // before the sourceMappingURL comment).
-        let last_mapped = segments.iter().rev().find(|s| !s.is_empty()).unwrap();
-        assert!(
-            !last_mapped.is_empty(),
-            "switch close brace must have a mapping\n  {mappings}"
+        let segs = decode_all_segments(&mappings);
+        // Switch open `{` on generated line 2: gen col 12, src line 1, src col 12.
+        let open = segs
+            .iter()
+            .find(|(gl, gc, _sl, _sc)| *gl == 2 && *gc == 12)
+            .unwrap_or_else(|| panic!("switch open brace missing on line 2 col 12\n  {mappings}"));
+        assert_eq!(
+            *open,
+            (2, 12, 1, 12),
+            "switch open brace mapping\n  {mappings}"
+        );
+        // Switch close `}` on generated line 8: glyph at gen col 0, src line 4, src col 0.
+        let close = segs
+            .iter()
+            .find(|(gl, gc, _sl, _sc)| *gl == 8 && *gc == 0)
+            .unwrap_or_else(|| panic!("switch close brace missing on line 8 col 0\n  {mappings}"));
+        assert_eq!(
+            *close,
+            (8, 0, 4, 0),
+            "switch close brace glyph mapping\n  {mappings}"
+        );
+        // EOL segment right after: gen col 1, src line 4, src col 1.
+        let eol = segs
+            .iter()
+            .find(|(gl, gc, _sl, _sc)| *gl == 8 && *gc == 1)
+            .unwrap_or_else(|| panic!("switch close EOL missing on line 8 col 1\n  {mappings}"));
+        assert_eq!(*eol, (8, 1, 4, 1), "switch close EOL mapping\n  {mappings}");
+    }
+
+    #[test]
+    fn token_level_mappings_empty_function_body_close_brace() {
+        // Empty function body `{}`: the close `}` must map at its own
+        // generated column (after `{`), not at the `{` column. Before the
+        // fix, `raw_mapped_char_end("{}", …)` recorded the mapping before
+        // writing both glyphs, collapsing the close-brace column onto `{`.
+        //
+        // Source (0-based): `function foo() {}\n`
+        //   0: function foo() {}   ← `}` at col 16 (after space + `{`)
+        //
+        // Generated line 1: `function foo() {}`
+        //   `}` glyph at gen col 16, EOL at gen col 17.
+        let source = "function foo() {}\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        let segs = decode_all_segments(&mappings);
+        // Close `}` glyph on generated line 1 at col 16, src line 0, src col 16.
+        let close = segs
+            .iter()
+            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 16)
+            .unwrap_or_else(|| {
+                panic!("empty function close brace missing at line 1 col 16\n  {mappings}")
+            });
+        assert_eq!(
+            *close,
+            (1, 16, 0, 16),
+            "empty function close brace glyph\n  {mappings}"
+        );
+        // EOL at gen col 17, src col 17.
+        let eol = segs
+            .iter()
+            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 17)
+            .unwrap_or_else(|| panic!("empty function EOL missing at line 1 col 17\n  {mappings}"));
+        assert_eq!(
+            *eol,
+            (1, 17, 0, 17),
+            "empty function close EOL\n  {mappings}"
         );
     }
 
+    #[test]
+    fn token_level_mappings_empty_switch_block_braces() {
+        // Empty switch body `{}`: both `{` and `}` must map at their own
+        // generated columns. Before the fix, `raw_mapped_char_end("{}", …,
+        // '{')` mapped only the opening brace and left `}` unmapped.
+        //
+        // Source (0-based): `switch (x) {}\n`
+        //   0: switch (x) {}   ← `{` at col 11, `}` at col 12
+        //
+        // Generated line 1: `switch (x) {}`
+        //   `{` glyph at gen col 11, `}` glyph at gen col 12, EOL at gen col 13.
+        let source = "switch (x) {}\n";
+        let javascript = emit(
+            source,
+            &EmitOptions {
+                source_map: true,
+                target: ScriptTarget::Es2015,
+                always_strict: true,
+                ..EmitOptions::default()
+            },
+        )
+        .javascript
+        .expect("javascript output");
+        let map = javascript.source_map.expect("source map");
+        let mappings = map.encode_mappings();
+        let segs = decode_all_segments(&mappings);
+        // Open `{` at gen col 11, src line 0, src col 11.
+        let open = segs
+            .iter()
+            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 11)
+            .unwrap_or_else(|| {
+                panic!("empty switch open brace missing at line 1 col 11\n  {mappings}")
+            });
+        assert_eq!(
+            *open,
+            (1, 11, 0, 11),
+            "empty switch open brace\n  {mappings}"
+        );
+        // Close `}` at gen col 12, src line 0, src col 12.
+        let close = segs
+            .iter()
+            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 12)
+            .unwrap_or_else(|| {
+                panic!("empty switch close brace missing at line 1 col 12\n  {mappings}")
+            });
+        assert_eq!(
+            *close,
+            (1, 12, 0, 12),
+            "empty switch close brace\n  {mappings}"
+        );
+        // EOL at gen col 13, src col 13.
+        let eol = segs
+            .iter()
+            .find(|(gl, gc, _sl, _sc)| *gl == 1 && *gc == 13)
+            .unwrap_or_else(|| panic!("empty switch EOL missing at line 1 col 13\n  {mappings}"));
+        assert_eq!(*eol, (1, 13, 0, 13), "empty switch close EOL\n  {mappings}");
+    }
     #[test]
     fn inline_sources_requires_a_javascript_source_map() {
         let output = emit(

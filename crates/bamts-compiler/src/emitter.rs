@@ -1381,10 +1381,11 @@ impl<'a> Emitter<'a> {
     fn emit_block_with_braces(&mut self, block: &Block, range: TextRange, map_open_brace: bool) {
         if block.statements.is_empty() {
             if map_open_brace {
-                self.raw_mapped_char_end("{}", range, '{');
+                self.raw_mapped_char("{", range, '{', 1);
             } else {
-                self.raw_mapped_char_end("{}", range, '}');
+                self.raw("{");
             }
+            self.raw_mapped_char_end("}", range, '}');
             return;
         }
         if map_open_brace {
@@ -1408,7 +1409,8 @@ impl<'a> Emitter<'a> {
         self.emit_expression(&switch.discriminant);
         self.raw_mapped_pos(") ", switch.discriminant.range().end());
         if switch.cases.is_empty() {
-            self.raw_mapped_char_end("{}", range, '{');
+            self.raw_mapped_char("{", range, '{', 1);
+            self.raw_mapped_char_end("}", range, '}');
             return;
         }
         self.raw_mapped_char("{", range, '{', 1);
