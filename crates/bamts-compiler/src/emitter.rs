@@ -2164,6 +2164,8 @@ impl<'a> Emitter<'a> {
         }
         if has {
             self.indent -= 1;
+        } else {
+            self.newline();
         }
         self.raw_mapped_eol("}", range, '}');
     }
@@ -5614,6 +5616,25 @@ export default answer;
 
         let output = emit_output(parsed.product(), &EmitOptions::default());
         assert_eq!(javascript(&output).code, "");
+    }
+
+    #[test]
+    fn empty_class_body_expands_in_javascript() {
+        // Authority: `exnextmodulekindExportClassNameWithObject(target=es2015)`
+        // emits `export class Object {}` as `export class Object {\n}`. The TS
+        // emitter always expands class bodies: 17,047 js sections hold zero
+        // single-line classes from `.ts` sources (the only `{}` keepers are
+        // allowJs passthrough echoes, which carry no javascript rows).
+        let input = "export class Object {}";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(javascript(&output).code, "export class Object {\n}\n");
     }
 
     #[test]
