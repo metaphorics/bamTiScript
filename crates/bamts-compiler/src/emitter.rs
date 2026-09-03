@@ -2322,7 +2322,7 @@ impl<'a> Emitter<'a> {
             }
         }
         self.indent -= 1;
-        self.raw("}");
+        self.raw_mapped_char_end("}", range, '}');
     }
 
     // =======================================================================
@@ -5667,10 +5667,14 @@ export default answer;
         assert!(!output.has_errors());
         assert_eq!(javascript(&output).code, "function foo() { }\n");
     }
-
     #[test]
     fn export_default_interface_is_preserved_in_declaration_emit() {
         let input = "export default interface Foo {}";
+        // Authority: interfaces preserve authored shape like every other
+        // non-empty body — `exportAssignedNamespaceIsVisibleInDeclarationEmit`
+        // keeps tight `export interface Bar {}` while `commentsInterface`
+        // keeps multi-line `interface i1 {`. Tight pin stands (24 tight vs
+        // 13 expanded declaration outputs, split by source shape).
         let parsed = crate::parser::parse(crate::scanner::scan(
             SourceId::new(0),
             ScriptKind::TypeScript,
