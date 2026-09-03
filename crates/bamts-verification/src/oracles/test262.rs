@@ -843,6 +843,9 @@ impl Test262Runner for InterpreterRunner {
         let limits = interpreter_fuel(request.deadline);
         let started = Instant::now();
         let mut host = bamts_node::NodeHost::new();
+        // Dynamic `Function(...)` synthesis needs a compile provider; the
+        // facade's ScriptCompiler is the same one `bamts::run_program` uses.
+        host.set_script_compiler(Box::new(bamts::ScriptCompiler));
         let result: Result<(), bamts_runtime::RuntimeError> = match request.mode {
             ExecutionMode::Interpreter => {
                 bamts_runtime::run(executable.wire(), &mut host, &limits).map(|_| ())

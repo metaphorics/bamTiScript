@@ -1790,16 +1790,6 @@ mod tests {
         let _ = machine.intrinsics.builtins.arraybuffer_constructor();
         let _ = machine.intrinsics.builtins.arraybuffer_prototype();
     }
-    #[test]
-    fn function_global_remains_unimplemented() {
-        let module = module();
-        let mut host = TestHost;
-        let machine = Machine::new(&module, &mut host, Limits::default());
-        assert!(
-            machine.intrinsics.global("Function").is_none(),
-            "checker-only Function compatibility must not imply runtime support"
-        );
-    }
     fn constructor_name(machine: &mut Machine<'_, TestHost>, constructor: Value) -> EcmaString {
         let name = machine
             .get_named_property(constructor, "name")

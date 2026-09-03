@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 mod array;
 pub(crate) mod bigint;
 mod collections;
+mod function_constructor;
 mod date_full;
 mod json_edge;
 mod number;
@@ -60,6 +61,7 @@ pub(crate) fn install<H: Host>(
     collections::install_generator_prototype(heap, builtins);
     collections::install_async_generator_prototype(heap, builtins);
     collections::install(heap, globals, builtins);
+    function_constructor::install(heap, globals, builtins);
     map_set_edge::install(heap, globals, builtins);
     date_full::install(heap, globals, builtins);
     object::install(heap, globals, builtins);
