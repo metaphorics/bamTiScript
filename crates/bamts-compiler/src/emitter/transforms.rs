@@ -1182,6 +1182,17 @@ impl<'a> Rewriter<'a> {
         )
     }
 
+    fn null_expr(&mut self) -> Expr {
+        let range = self.bank.intern("null");
+        let token = Token::new(TokenKind::KwNull, range);
+        let literal = Node::new(self.alloc_id(), range, NullLiteral::new(token));
+        Node::new(
+            self.alloc_id(),
+            range,
+            Expression::Literal(Literal::Null(literal)),
+        )
+    }
+
     fn string_literal(&mut self, unquoted: &str) -> StringLiteralNode {
         let lexeme = format!("\"{unquoted}\"");
         let range = self.bank.intern(&lexeme);
@@ -3968,6 +3979,12 @@ impl<'a> Rewriter<'a> {
                     }),
                 )
             }
+            Expression::Call(_)
+                if Self::needs(LanguageFeature::OptionalChaining, self.options)
+                    && spine_has_optional(expression) =>
+            {
+                self.lower_optional_chain(expression)
+            }
             Expression::Call(call) => {
                 let needs_safe_wrap = self.cjs_call_needs_safe_wrap(&call.callee);
                 let callee = self.rewrite_expr(&call.callee);
@@ -3998,6 +4015,12 @@ impl<'a> Rewriter<'a> {
                         arguments,
                     }),
                 )
+            }
+            Expression::Member(_)
+                if Self::needs(LanguageFeature::OptionalChaining, self.options)
+                    && spine_has_optional(expression) =>
+            {
+                self.lower_optional_chain(expression)
             }
             Expression::Member(member) => {
                 let object = self.rewrite_expr(&member.object);
@@ -4067,6 +4090,11 @@ impl<'a> Rewriter<'a> {
             Expression::Logical(value) => {
                 let left = self.rewrite_expr(&value.left);
                 let right = self.rewrite_expr(&value.right);
+                if value.operator == LogicalOperator::Nullish
+                    && Self::needs(LanguageFeature::NullishCoalescing, self.options)
+                {
+                    return self.lower_nullish_coalescing(left, right, expression.range());
+                }
                 self.node(
                     expression.range(),
                     Expression::Logical(LogicalExpression {
@@ -4159,6 +4187,16 @@ impl<'a> Rewriter<'a> {
                 {
                     return self.lower_compound_exponentiation(expression, assignment);
                 }
+                if Self::needs(LanguageFeature::LogicalAssignment, self.options)
+                    && matches!(
+                        assignment.operator,
+                        AssignmentOperator::LogicalAndAssign
+                            | AssignmentOperator::LogicalOrAssign
+                            | AssignmentOperator::NullishAssign
+                    )
+                {
+                    return self.lower_logical_assignment(expression, assignment);
+                }
                 let right = self.rewrite_expr(&assignment.right);
                 self.node(
                     expression.range(),
@@ -4195,6 +4233,416 @@ impl<'a> Rewriter<'a> {
                 ],
             }),
         )
+    }
+
+
+    /// Lowers `a ?? b` below ES2020 to
+    /// `a !== null && a !== void 0 ? a : b`.
+    ///
+    /// Baseline `nullishCoalescingOperator1.js` (default ES5 target) shows the
+    /// canonical identifier form `a1 !== null && a1 !== void 0 ? a1 : 'whatever'`.
+    /// Baseline `nullishCoalescingOperator2.js` (target=es2015) keeps the same
+    /// lowered form at ES2015.  Counterexample side: at ES2020+ the native `??`
+    /// is preserved (see the sampler's es2020-target cases emitting `??`
+    /// verbatim).  A non-identifier left operand is captured once through an
+    /// expression temp — tsc emits `var _a; (_a = f()) !== null && _a !==
+    /// void 0 ? _a : rhs` — so the operand evaluates exactly once.
+    ///
+    /// `left` and `right` arrive already rewritten by the caller; this method
+    /// must not rewrite either again.
+    fn lower_nullish_coalescing(&mut self, left: Expr, right: Expr, range: TextRange) -> Expr {
+        let (read, consequent) = if matches!(left.data(), Expression::Identifier(_)) {
+            (left.clone(), left)
+        } else {
+            let temp = self.expression_temp();
+            let reference = self.node(temp.range(), Expression::Identifier(temp.clone()));
+            let target = self.node(temp.range(), AssignmentTarget::Identifier(temp));
+            let capture = self.node(
+                range,
+                Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left: target,
+                    right: Box::new(left),
+                }),
+            );
+            (self.node(range, Expression::Parenthesized(Box::new(capture))), reference)
+        };
+        let null_check = self.strict_not_equal_null(&read, range);
+        let void_check = self.strict_not_equal_void(&consequent, range);
+        let test = self.node(
+            range,
+            Expression::Logical(LogicalExpression {
+                operator: LogicalOperator::And,
+                left: Box::new(null_check),
+                right: Box::new(void_check),
+            }),
+        );
+        self.node(
+            range,
+            Expression::Conditional(ConditionalExpression {
+                test: Box::new(test),
+                consequent: Box::new(consequent),
+                alternate: Box::new(right),
+            }),
+        )
+    }
+    /// `left !== null` — one piece of the nullish coalescing lowering.
+    fn strict_not_equal_null(&mut self, left: &Expr, range: TextRange) -> Expr {
+        let null_lit = self.null_expr();
+        self.node(
+            range,
+            Expression::Binary(BinaryExpression {
+                operator: BinaryOperator::StrictNotEqual,
+                left: Box::new(left.clone()),
+                right: Box::new(null_lit),
+            }),
+        )
+    }
+    /// `left !== void 0` — the other piece of the nullish coalescing lowering.
+    fn strict_not_equal_void(&mut self, left: &Expr, range: TextRange) -> Expr {
+        let void_zero = self.void_zero(range);
+        self.node(
+            range,
+            Expression::Binary(BinaryExpression {
+                operator: BinaryOperator::StrictNotEqual,
+                left: Box::new(left.clone()),
+                right: Box::new(void_zero),
+            }),
+        )
+    }
+
+    /// `left === null` — the is-nullish check for optional-chain lowering.
+    fn strict_equal_null(&mut self, left: &Expr, range: TextRange) -> Expr {
+        let null_lit = self.null_expr();
+        self.node(
+            range,
+            Expression::Binary(BinaryExpression {
+                operator: BinaryOperator::StrictEqual,
+                left: Box::new(left.clone()),
+                right: Box::new(null_lit),
+            }),
+        )
+    }
+
+    /// `left === void 0` — the is-undefined check for optional-chain lowering.
+    fn strict_equal_void(&mut self, left: &Expr, range: TextRange) -> Expr {
+        let void_zero = self.void_zero(range);
+        self.node(
+            range,
+            Expression::Binary(BinaryExpression {
+                operator: BinaryOperator::StrictEqual,
+                left: Box::new(left.clone()),
+                right: Box::new(void_zero),
+            }),
+        )
+    }
+
+    /// Lowers `a ||= b`, `a &&= b`, and `a ??= b` below ES2021.
+    ///
+    /// Identifier targets: `a || (a = b)`, `a && (a = b)`, and
+    /// `a !== null && a !== void 0 ? a : (a = b)`.
+    ///
+    /// Baseline `equalityWithtNullishCoalescingAssignment(strict=false).js`
+    /// shows `??=` lowered to `a !== null && a !== void 0 ? a : (a = true)`.
+    /// Member targets base-capture through an expression temp so the object
+    /// (and computed key) evaluate once, matching tsc's
+    /// `(_a = obj).prop || (_a.prop = rhs)` shape.
+    fn lower_logical_assignment(
+        &mut self,
+        expression: &Expr,
+        assignment: &AssignmentExpression,
+    ) -> Expr {
+        let range = expression.range();
+        let right = self.rewrite_expr(&assignment.right);
+        match assignment.left.data() {
+            AssignmentTarget::Identifier(identifier) => {
+                let read =
+                    self.node(identifier.range(), Expression::Identifier(identifier.clone()));
+                let plain_read =
+                    self.node(identifier.range(), Expression::Identifier(identifier.clone()));
+                let inner_assign = self.node(
+                    range,
+                    Expression::Assignment(AssignmentExpression {
+                        operator: AssignmentOperator::Assign,
+                        left: assignment.left.clone(),
+                        right: Box::new(right),
+                    }),
+                );
+                self.compose_logical_assignment(
+                    assignment.operator,
+                    read,
+                    plain_read,
+                    inner_assign,
+                    range,
+                )
+            }
+            AssignmentTarget::Member(member) => {
+                // JS evaluates `read` first in `read || assign`, so the
+                // capture assignments belong to the READ side; the inner
+                // assignment writes through plain temp references.
+                let ((captured_target, captured_read), (reference_target, reference_read)) =
+                    self.capture_member_parts(member);
+                let _ = captured_target;
+                let inner_assign = self.node(
+                    range,
+                    Expression::Assignment(AssignmentExpression {
+                        operator: AssignmentOperator::Assign,
+                        left: reference_target,
+                        right: Box::new(right),
+                    }),
+                );
+                self.compose_logical_assignment(
+                    assignment.operator,
+                    captured_read,
+                    reference_read,
+                    inner_assign,
+                    range,
+                )
+            }
+            AssignmentTarget::Object(_)
+            | AssignmentTarget::Array(_)
+            | AssignmentTarget::Missing(_)
+            | AssignmentTarget::Invalid(_) => expression.clone(),
+        }
+    }
+
+    /// Wraps single-evaluation reads and the plain assignment into the
+    /// target's logical-assignment lowering form.  `first_read` sits in the
+    /// position JS evaluates first (the logical test, and for `??=` the
+    /// conditional test); `plain_read` is used where the operand is read
+    /// again after the capture has run (the `??=` consequent).
+    fn compose_logical_assignment(
+        &mut self,
+        operator: AssignmentOperator,
+        first_read: Expr,
+        plain_read: Expr,
+        assign: Expr,
+        range: TextRange,
+    ) -> Expr {
+        match operator {
+            AssignmentOperator::LogicalOrAssign => self.node(
+                range,
+                Expression::Logical(LogicalExpression {
+                    operator: LogicalOperator::Or,
+                    left: Box::new(first_read),
+                    right: Box::new(assign),
+                }),
+            ),
+            AssignmentOperator::LogicalAndAssign => self.node(
+                range,
+                Expression::Logical(LogicalExpression {
+                    operator: LogicalOperator::And,
+                    left: Box::new(first_read),
+                    right: Box::new(assign),
+                }),
+            ),
+            AssignmentOperator::NullishAssign => {
+                let null_check = self.strict_not_equal_null(&first_read, range);
+                let void_check = self.strict_not_equal_void(&plain_read, range);
+                let test = self.node(
+                    range,
+                    Expression::Logical(LogicalExpression {
+                        operator: LogicalOperator::And,
+                        left: Box::new(null_check),
+                        right: Box::new(void_check),
+                    }),
+                );
+                self.node(
+                    range,
+                    Expression::Conditional(ConditionalExpression {
+                        test: Box::new(test),
+                        consequent: Box::new(plain_read),
+                        alternate: Box::new(assign),
+                    }),
+                )
+            }
+            _ => first_read,
+        }
+    }
+
+    /// Captures a member assignment target for single evaluation: the base
+    /// object (and every computed key) is stored into an expression temp.
+    /// Returns `((captured_target, captured_read), (reference_target,
+    /// reference_read))`.  The `captured` pair embeds the temp assignments —
+    /// use it on the position JS evaluates FIRST (an assignment's left side,
+    /// or a logical chain's left operand).  The `reference` pair reads the
+    /// temps plainly — use it on later positions.  tsc's member-target
+    /// logical-assignment form is `(_a = obj).prop || (_a.prop = rhs)`:
+    /// `captured_read` is the left of `||`, `reference_target` is the left of
+    /// the inner `=`.  Compound exponentiation mirrors this: `(_a =
+    /// obj).v = Math.pow(_a.v, rhs)`.
+    fn capture_member_parts(
+        &mut self,
+        member: &AssignmentMemberTarget,
+    ) -> (
+        (AssignmentTargetNode, Expr),
+        (AssignmentTargetNode, Expr),
+    ) {
+        let range = member.object.range();
+        let object = self.rewrite_expr(&member.object);
+        let (capture_object, reference_object) = if matches!(object.data(), Expression::Super) {
+            (object.clone(), object)
+        } else {
+            let base = self.expression_temp();
+            let base_reference = self.node(base.range(), Expression::Identifier(base.clone()));
+            let base_target = self.node(base.range(), AssignmentTarget::Identifier(base));
+            let base_assignment = self.node(
+                object.range(),
+                Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left: base_target,
+                    right: Box::new(object),
+                }),
+            );
+            (base_assignment, base_reference)
+        };
+        let (capture_property, reference_property) = match &member.property {
+            MemberProperty::Computed(key) => {
+                let coerced_key = self.coerce_property_key(key);
+                let key_range = coerced_key.range();
+                let key_temp = self.expression_temp();
+                let key_reference =
+                    self.node(key_temp.range(), Expression::Identifier(key_temp.clone()));
+                let key_target = self.node(key_temp.range(), AssignmentTarget::Identifier(key_temp));
+                let key_assignment = self.node(
+                    key_range,
+                    Expression::Assignment(AssignmentExpression {
+                        operator: AssignmentOperator::Assign,
+                        left: key_target,
+                        right: Box::new(coerced_key),
+                    }),
+                );
+                (
+                    MemberProperty::Computed(Box::new(key_assignment)),
+                    MemberProperty::Computed(Box::new(key_reference)),
+                )
+            }
+            other => (other.clone(), other.clone()),
+        };
+        let captured_read = self.member_expr(&capture_object, capture_property.clone(), range);
+        let captured_target = self.node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(capture_object),
+                property: capture_property,
+            }),
+        );
+        let reference_read = self.member_expr(&reference_object, reference_property.clone(), range);
+        let reference_target = self.node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(reference_object),
+                property: reference_property,
+            }),
+        );
+        ((captured_target, captured_read), (reference_target, reference_read))
+    }
+
+    /// Lowers an optional chain below ES2020.
+    ///
+    /// Rule: `a?.b` becomes `a === null || a === void 0 ? void 0 : a.b`.
+    /// Proven by baseline `optionalChainingInArrow(target=es5).js`:
+    /// `names === null || names === void 0 ? void 0 : names.filter(...)`.
+    /// The check covers the chain BEFORE the first optional link; every
+    /// later link — the optional one included — moves into the consequent,
+    /// so `a?.b.c` short-circuits the whole chain.  The checked prefix is
+    /// captured through an expression temp whenever it is not a bare
+    /// identifier read, matching tsc's single-evaluation guarantee.
+    fn lower_optional_chain(&mut self, expression: &Expr) -> Expr {
+        let range = expression.range();
+        let (root, segments) = collect_chain(expression);
+        let Some(opt_idx) = segments.iter().position(ChainSegment::optional) else {
+            return expression.clone();
+        };
+        let checked = &segments[..opt_idx];
+        let continuation = &segments[opt_idx..];
+
+        let rewritten_root = self.rewrite_expr(&root);
+        let needs_capture = !matches!(root.data(), Expression::Identifier(_) | Expression::Super)
+            || !checked.is_empty();
+        let (checked_first_root, checked_plain_root) = if needs_capture {
+            let temp = self.expression_temp();
+            let reference = self.node(temp.range(), Expression::Identifier(temp.clone()));
+            let target = self.node(temp.range(), AssignmentTarget::Identifier(temp));
+            let capture = self.node(
+                rewritten_root.range(),
+                Expression::Assignment(AssignmentExpression {
+                    operator: AssignmentOperator::Assign,
+                    left: target,
+                    right: Box::new(rewritten_root),
+                }),
+            );
+            (
+                self.node(range, Expression::Parenthesized(Box::new(capture))),
+                reference,
+            )
+        } else {
+            (rewritten_root.clone(), rewritten_root)
+        };
+
+        // The capture assignment rides on the first read; the void check
+        // and the chain read the plain reference.
+        let checked_first = self.fold_chain(checked_first_root, checked, range);
+        let checked_plain = self.fold_chain(checked_plain_root.clone(), checked, range);
+        let null_check = self.strict_equal_null(&checked_first, range);
+        let void_check = self.strict_equal_void(&checked_plain, range);
+        let test = self.node(
+            range,
+            Expression::Logical(LogicalExpression {
+                operator: LogicalOperator::Or,
+                left: Box::new(null_check),
+                right: Box::new(void_check),
+            }),
+        );
+        let consequent = self.void_zero(range);
+        let alternate = self.fold_chain(checked_plain_root, continuation, range);
+        self.node(
+            range,
+            Expression::Conditional(ConditionalExpression {
+                test: Box::new(test),
+                consequent: Box::new(consequent),
+                alternate: Box::new(alternate),
+            }),
+        )
+    }
+    /// Folds chain segments onto `base`, lowering each optional link's
+    /// `?.` into a plain access (the surrounding ternary owns the check).
+    fn fold_chain(&mut self, base: Expr, segments: &[ChainSegment], _range: TextRange) -> Expr {
+        let mut current = base;
+        for segment in segments {
+            current = match segment {
+                ChainSegment::Member {
+                    property,
+                    range: segment_range,
+                    ..
+                } => {
+                    let property = match property {
+                        MemberProperty::Computed(key) => {
+                            MemberProperty::Computed(Box::new(self.rewrite_expr(key)))
+                        }
+                        other => other.clone(),
+                    };
+                    self.member_expr(&current, property, *segment_range)
+                }
+                ChainSegment::Call {
+                    arguments,
+                    range: segment_range,
+                    ..
+                } => {
+                    let arguments = self.rewrite_call_arguments(arguments);
+                    self.node(
+                        *segment_range,
+                        Expression::Call(CallExpression {
+                            callee: Box::new(current),
+                            optional: false,
+                            type_arguments: None,
+                            arguments,
+                        }),
+                    )
+                }
+            };
+        }
+        current
     }
 
     fn coerce_property_key(&mut self, key: &Expr) -> Expr {
@@ -4247,59 +4695,14 @@ impl<'a> Rewriter<'a> {
                         expression, assignment, member, key, right,
                     );
                 }
-                let object = self.rewrite_expr(&member.object);
-                let (target_object, read_object) = if matches!(object.data(), Expression::Super) {
-                    (object.clone(), object)
-                } else {
-                    let base = self.expression_temp();
-                    let base_reference =
-                        self.node(base.range(), Expression::Identifier(base.clone()));
-                    let base_target = self.node(base.range(), AssignmentTarget::Identifier(base));
-                    let base_assignment = self.node(
-                        object.range(),
-                        Expression::Assignment(AssignmentExpression {
-                            operator: AssignmentOperator::Assign,
-                            left: base_target,
-                            right: Box::new(object),
-                        }),
-                    );
-                    (base_assignment, base_reference)
-                };
-                let (target_property, read_property) = match &member.property {
-                    MemberProperty::Computed(key) => {
-                        let coerced_key = self.coerce_property_key(key);
-                        let key_range = coerced_key.range();
-                        let key_temp = self.expression_temp();
-                        let key_reference =
-                            self.node(key_temp.range(), Expression::Identifier(key_temp.clone()));
-                        let key_target =
-                            self.node(key_temp.range(), AssignmentTarget::Identifier(key_temp));
-                        let key_assignment = self.node(
-                            key_range,
-                            Expression::Assignment(AssignmentExpression {
-                                operator: AssignmentOperator::Assign,
-                                left: key_target,
-                                right: Box::new(coerced_key),
-                            }),
-                        );
-                        (
-                            MemberProperty::Computed(Box::new(key_assignment)),
-                            MemberProperty::Computed(Box::new(key_reference)),
-                        )
-                    }
-                    other => (other.clone(), other.clone()),
-                };
-                let read = self.member_expr(&read_object, read_property, expression.range());
-                let target = self.node(
-                    assignment.left.range(),
-                    AssignmentTarget::Member(AssignmentMemberTarget {
-                        object: Box::new(target_object),
-                        property: target_property,
-                    }),
-                );
+                // JS evaluates an assignment's left side before its right,
+                // so the capture assignments belong to the assignment target.
+                let ((captured_target, _), (_, reference_read)) =
+                    self.capture_member_parts(member);
+                let read = reference_read;
                 let lowered = Expression::Assignment(AssignmentExpression {
                     operator: AssignmentOperator::Assign,
-                    left: target,
+                    left: captured_target,
                     right: Box::new(self.math_pow(read, right, expression.range())),
                 });
                 self.node(expression.range(), lowered)
@@ -4503,6 +4906,81 @@ fn is_super_call_expression(expression: &Expr) -> bool {
         return false;
     };
     matches!(call.callee.data(), Expression::Super)
+}
+
+/// One member/call link of an optional-chain spine, ordered root-outward.
+enum ChainSegment {
+    Member {
+        property: MemberProperty,
+        optional: bool,
+        range: TextRange,
+    },
+    Call {
+        arguments: Vec<CallArgument>,
+        optional: bool,
+        range: TextRange,
+    },
+}
+
+impl ChainSegment {
+    const fn optional(&self) -> bool {
+        match self {
+            Self::Member { optional, .. } | Self::Call { optional, .. } => *optional,
+        }
+    }
+}
+
+/// Splits a member/call spine into `(root, segments)` ordered root-outward.
+/// Returns `None` only when the walk cannot proceed; callers guard with
+/// [`spine_has_optional`] first.
+fn collect_chain(expression: &Expr) -> (Expr, Vec<ChainSegment>) {
+    let mut segments = Vec::new();
+    let mut current = expression;
+    loop {
+        match current.data() {
+            Expression::Member(member) => {
+                segments.push(ChainSegment::Member {
+                    property: member.property.clone(),
+                    optional: member.optional,
+                    range: current.range(),
+                });
+                current = &member.object;
+            }
+            Expression::Call(call) => {
+                segments.push(ChainSegment::Call {
+                    arguments: call.arguments.clone(),
+                    optional: call.optional,
+                    range: current.range(),
+                });
+                current = &call.callee;
+            }
+            _ => break,
+        }
+    }
+    segments.reverse();
+    (current.clone(), segments)
+}
+
+/// Whether any link of the member/call spine is optional (`?.`).
+fn spine_has_optional(expression: &Expr) -> bool {
+    let mut current = expression;
+    loop {
+        match current.data() {
+            Expression::Member(member) => {
+                if member.optional {
+                    return true;
+                }
+                current = &member.object;
+            }
+            Expression::Call(call) => {
+                if call.optional {
+                    return true;
+                }
+                current = &call.callee;
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Converts a UTF-16 offset into a byte offset for plain-source text.
@@ -4868,6 +5346,14 @@ fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) 
             if value.operator == AssignmentOperator::ExponentiateAssign {
                 features.insert(LanguageFeature::Exponentiation);
             }
+            if matches!(
+                value.operator,
+                AssignmentOperator::LogicalAndAssign
+                    | AssignmentOperator::LogicalOrAssign
+                    | AssignmentOperator::NullishAssign
+            ) {
+                features.insert(LanguageFeature::LogicalAssignment);
+            }
             scan_expression(&value.right, features);
         }
         Expression::Template(value) => {
@@ -4915,6 +5401,9 @@ fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) 
             scan_nested_body(Some(&value.body), features);
         }
         Expression::Call(value) => {
+            if value.optional {
+                features.insert(LanguageFeature::OptionalChaining);
+            }
             scan_expression(&value.callee, features);
             for argument in &value.arguments {
                 match argument {
@@ -4925,6 +5414,9 @@ fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) 
             }
         }
         Expression::Member(value) => {
+            if value.optional {
+                features.insert(LanguageFeature::OptionalChaining);
+            }
             scan_expression(&value.object, features);
             if let MemberProperty::Computed(key) = &value.property {
                 scan_expression(key, features);
@@ -4949,6 +5441,9 @@ fn scan_expression(expression: &Expr, features: &mut BTreeSet<LanguageFeature>) 
         Expression::Unary(value) => scan_expression(&value.argument, features),
         Expression::Update(value) => scan_target(value.argument.data(), features),
         Expression::Logical(value) => {
+            if value.operator == LogicalOperator::Nullish {
+                features.insert(LanguageFeature::NullishCoalescing);
+            }
             scan_expression(&value.left, features);
             scan_expression(&value.right, features);
         }
@@ -6523,5 +7018,116 @@ console.log(JSON.stringify([bar, bar4, log]));
             !code.contains("require("),
             "a qualified alias must not emit a require call: {code}"
         );
+    }
+
+    #[test]
+    fn es5_lowers_nullish_coalescing_identifier_to_the_conditional_form() {
+        // Rule: `a ?? b` lowers below ES2020 to `a !== null && a !== void 0 ? a : b`.
+        // Proven by baseline `nullishCoalescingOperator1.js` (default ES5
+        // target): `const aa1 = a1 !== null && a1 !== void 0 ? a1 : 'whatever';`.
+        // Counterexample-side check: `optionalChainingInArrow(target=es2015).js`
+        // keeps the lowered form at ES2015, so the gate is ES2020, not ES2015.
+        // This test fails without the production change: the pre-change
+        // rewriter passed `??` through verbatim.
+        let output = emit_at("const out = a1 ?? 'whatever';\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            code.contains("a1 !== null && a1 !== void 0 ? a1 : 'whatever'"),
+            "{code}"
+        );
+        assert!(!code.contains("??"), "{code}");
+    }
+
+    #[test]
+    fn es2020_keeps_nullish_coalescing_native() {
+        // Same rule's at-and-above-threshold side: `LanguageFeature::
+        // NullishCoalescing::since()` is `ScriptTarget::Es2020`, so at ES2020
+        // the native `??` survives unchanged (tsc gates emitNullishCoalescing
+        // on `languageVersion >= ES2020`).
+        let output = emit_at("const out = a1 ?? 'whatever';\n", ScriptTarget::Es2020);
+        let code = javascript(&output);
+        assert!(code.contains("a1 ?? 'whatever'"), "{code}");
+        assert!(!code.contains("a1 !== null"), "{code}");
+    }
+
+    #[test]
+    fn es5_nullish_coalescing_captures_non_identifier_operands_once() {
+        // A non-identifier left operand must evaluate exactly once, captured
+        // through an expression temp — tsc emits
+        // `var _t; (_t = f()) !== null && _t !== void 0 ? _t : rhs`.
+        let output = emit_at("const out = f() ?? 'x';\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert_eq!(code.matches("f()").count(), 1, "f() must run once: {code}");
+        assert!(code.contains("!== null &&"), "{code}");
+        assert!(!code.contains("??"), "{code}");
+    }
+
+    #[test]
+    fn es5_lowers_nullish_assignment_to_the_conditional_assignment_form() {
+        // Rule: `a ??= b` lowers below ES2021 to
+        // `a !== null && a !== void 0 ? a : (a = b)`.
+        // Proven by baseline
+        // `equalityWithtNullishCoalescingAssignment(strict=false).js`:
+        // `a !== null && a !== void 0 ? a : (a = true);`.
+        let output = emit_at("let a = false;\na ??= true;\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(
+            code.contains("a !== null && a !== void 0 ? a : (a = true)"),
+            "{code}"
+        );
+        assert!(!code.contains("??="), "{code}");
+    }
+
+    #[test]
+    fn es5_lowers_or_and_and_assignment_to_expanded_logical_form() {
+        // Rule: `a ||= b` → `a || (a = b)` and `a &&= b` → `a && (a = b)`
+        // below ES2021 (tsc's emitLogicalAssignment expansion).
+        let output = emit_at("let a = 0;\na ||= 1;\na &&= 2;\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(code.contains("a || (a = 1)"), "{code}");
+        assert!(code.contains("a && (a = 2)"), "{code}");
+        assert!(!code.contains("||="), "{code}");
+        assert!(!code.contains("&&="), "{code}");
+    }
+
+    #[test]
+    fn es2021_keeps_logical_assignment_native() {
+        // `LanguageFeature::LogicalAssignment::since()` is Es2021: at ES2021
+        // the operators survive verbatim.
+        let output = emit_at("let a = 0;\na ||= 1;\n", ScriptTarget::Es2021);
+        let code = javascript(&output);
+        assert!(code.contains("a ||= 1"), "{code}");
+    }
+
+    #[test]
+    fn es5_member_target_logical_assignment_captures_the_base_once() {
+        // Member targets base-capture through an expression temp so the
+        // object evaluates once: tsc's form is
+        // `(_t = obj).p || ((_t.p) = rhs)` with the capture in the READ
+        // position (JS evaluates a logical chain's left operand first).
+        let output = emit_at("let o = { p: 0 };\no.p ||= 1;\n", ScriptTarget::Es5);
+        let code = javascript(&output);
+        assert!(code.contains("(_t0 = o).p || (_t0.p = 1)"), "{code}");
+        assert!(!code.contains("||="), "{code}");
+    }
+
+    #[test]
+    fn es2020_keeps_optional_chaining_native_but_es5_lowers_it() {
+        // Rule: `a?.b` lowers below ES2020 to
+        // `a === null || a === void 0 ? void 0 : a.b`.
+        // Proven by baseline `optionalChainingInArrow(target=es5).js`:
+        // `names === null || names === void 0 ? void 0 : names.filter(...)`;
+        // the `target=esnext` variant of the same case
+        // (`optionalChainingInParameterBindingPattern(target=esnext).js`)
+        // exists on the at-threshold side.
+        let lowered = emit_at("const v = names?.filter(f);\n", ScriptTarget::Es5);
+        let lowered_code = javascript(&lowered);
+        assert!(
+            lowered_code.contains("names === null || names === void 0 ? void 0 :"),
+            "{lowered_code}"
+        );
+        assert!(!lowered_code.contains("?.") || lowered_code.contains("\"use strict\""), "{lowered_code}");
+        let native = emit_at("const v = names?.filter(f);\n", ScriptTarget::Es2020);
+        assert!(javascript(&native).contains("names?.filter(f)"), "{native:?}");
     }
 }

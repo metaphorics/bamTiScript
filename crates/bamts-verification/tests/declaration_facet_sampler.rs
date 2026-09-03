@@ -1,14 +1,14 @@
-//! Declaration/source-map facet sampler: compile stratified sample cases
+//! Declaration/source-map/javascript facet sampler: compile stratified sample cases
 //! through the same code path the harness uses (`observe_declaration` /
-//! `observe_source_map` in `check_cells.rs`), compare against authority
-//! baselines, classify first-delta families, and write a structured report
-//! to `target/tmp/`.
+//! `observe_source_map` / `observe_javascript` in `check_cells.rs`), compare
+//! against authority baselines, classify first-delta families, and write a
+//! structured report to `target/tmp/`.
 //!
-//! The facet is selected by `BAMTS_FACET` (`declaration` or `source-map`).
-//! The sample list is read from the file path in `BAMTS_FACET_SAMPLE`
-//! (one logical path per line). An optional cfg mapping can be provided
-//! via `BAMTS_FACET_CFG` (JSONL with `{"case":"...","cfg":"..."}` rows);
-//! if unset, `{sample_path}.cfg.jsonl` is tried.
+//! The facet is selected by `BAMTS_FACET` (`declaration`, `source-map`, or
+//! `javascript`).  The sample list is read from the file path in
+//! `BAMTS_FACET_SAMPLE` (one logical path per line).  An optional cfg mapping
+//! can be provided via `BAMTS_FACET_CFG` (JSONL with `{"case":"...","cfg":"..."}`
+//! rows); if unset, `{sample_path}.cfg.jsonl` is tried.
 //!
 //! The authority root is read from `BAMTS_AUTHORITY_ROOT` (default:
 //! `/home/alpha/compiler/bamTiScript/target/authority/typescript-7.0.2-tests`).
@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use bamts_compiler::pipeline::FrontendMode;
 use bamts_verification::check_cells::{
     CasePragmas, case_stem, compile_case_frontend, emit_declaration_baseline,
-    emit_source_map_baseline, entry_virtual_path, extract_dts_sections, parse_case_pragmas,
-    split_case_units,
+    emit_javascript_baseline, emit_source_map_baseline, entry_virtual_path,
+    extract_dts_sections, parse_case_pragmas, split_case_units,
 };
 use bamts_verification::facets::{FacetVerdict, compare_js_emit, compare_source_map};
 
@@ -288,6 +288,8 @@ fn classify_diff(
         "section-boundary-shift".to_owned()
     } else if facet == "declaration" {
         classify_declaration_diff(exp_line, act_line)
+    } else if facet == "javascript" {
+        classify_javascript_diff(exp_line, act_line)
     } else {
         classify_source_map_diff(exp_line, act_line)
     };
@@ -372,11 +374,211 @@ fn classify_source_map_diff(exp_line: &str, act_line: &str) -> String {
     "sourcemap-content-diff".to_owned()
 }
 
+/// Extract only the `.js` sections from a baseline by name (never by position).
+/// A baseline `.js` file may contain `//// [name.js]`, `//// [name.d.ts]`,
+/// and echo sections; we keep only the `.js` output sections and the document
+/// header, dropping `.d.ts`, echoes, and everything else.
+fn extract_js_sections(baseline: &str) -> String {
+    let mut out = String::new();
+    let mut in_js_section = false;
+    for line in baseline.lines() {
+        if line.starts_with("//// [") {
+            if let Some(end) = line.find(']') {
+                let name = &line[6..end];
+                in_js_section = name.ends_with(".js");
+            }
+        }
+        if in_js_section {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Classify a javascript facet first-delta into a family pattern.
+///
+/// Families:
+/// - `helper-missing:<name>` — a tslib helper call that the baseline has but
+///   our emit does not (or vice-versa).  Checked by scanning for known helper
+///   identifiers in the expected/actual lines.
+/// - `downlevel-missing:<feature>` — the baseline lowers a feature (class
+///   fields, optional chaining, nullish coalescing, async, for-of,
+///   destructuring, template, exponent) but our emit keeps native syntax, or
+///   the baseline keeps native syntax but our emit lowers it.
+/// - `formatting:<shape>` — blank lines, indentation, parens, trailing comma,
+///   semicolons, prologue, module-wrapper, or other printer-level differences.
+fn classify_javascript_diff(exp_line: &str, act_line: &str) -> String {
+    // Helper-missing: one side has a tslib helper call the other lacks.
+    const HELPERS: &[&str] = &[
+        "__awaiter",
+        "__generator",
+        "__extends",
+        "__assign",
+        "__rest",
+        "__spreadArray",
+        "__values",
+        "__read",
+        "__decorate",
+        "__classPrivateFieldGet",
+        "__classPrivateFieldSet",
+        "__classPrivateFieldIn",
+        "__metadata",
+        "__param",
+        "__exportStar",
+        "__createBinding",
+        "__importDefault",
+        "__importStar",
+    ];
+    for helper in HELPERS {
+        let exp_has = exp_line.contains(helper);
+        let act_has = act_line.contains(helper);
+        if exp_has && !act_has {
+            return format!("helper-missing:{helper}");
+        }
+        if !exp_has && act_has {
+            return format!("helper-extra:{helper}");
+        }
+    }
+
+    // Downlevel-missing: the baseline lowered a feature but we kept native
+    // syntax, or vice-versa.  We detect by looking for native syntax on one
+    // side and lowered syntax on the other.
+
+    // Optional chaining: `?.` native vs lowered `&&` / ternary
+    if exp_line.contains("?.") && !act_line.contains("?.") {
+        return "downlevel-missing:optional-chaining".to_owned();
+    }
+    if !exp_line.contains("?.") && act_line.contains("?.") {
+        return "downlevel-extra:optional-chaining".to_owned();
+    }
+
+    // Nullish coalescing: `??` native vs lowered `||` / ternary
+    if exp_line.contains("??") && !act_line.contains("??") {
+        return "downlevel-missing:nullish-coalescing".to_owned();
+    }
+    if !exp_line.contains("??") && act_line.contains("??") {
+        return "downlevel-extra:nullish-coalescing".to_owned();
+    }
+
+    // Logical assignment: `||=`, `&&=`, `??=`
+    for op in ["||=", "&&=", "??="] {
+        if exp_line.contains(op) && !act_line.contains(op) {
+            return "downlevel-missing:logical-assignment".to_owned();
+        }
+        if !exp_line.contains(op) && act_line.contains(op) {
+            return "downlevel-extra:logical-assignment".to_owned();
+        }
+    }
+
+    // Exponentiation: `**` native vs `Math.pow` lowered
+    if exp_line.contains("**") && !act_line.contains("**") {
+        return "downlevel-missing:exponentiation".to_owned();
+    }
+    if !exp_line.contains("**") && act_line.contains("**") {
+        return "downlevel-extra:exponentiation".to_owned();
+    }
+    if exp_line.contains("Math.pow") && !act_line.contains("Math.pow") {
+        return "downlevel-missing:exponentiation".to_owned();
+    }
+
+    // Async functions: `async` keyword
+    if exp_line.contains("async ") && !act_line.contains("async ") {
+        return "downlevel-missing:async".to_owned();
+    }
+    if !exp_line.contains("async ") && act_line.contains("async ") {
+        return "downlevel-extra:async".to_owned();
+    }
+
+    // For-of: `for...of` native vs lowered loop
+    if exp_line.contains("for (") && exp_line.contains(" of ")
+        && !act_line.contains(" of ")
+    {
+        return "downlevel-missing:for-of".to_owned();
+    }
+
+    // Destructuring: `{ a, b } =` or `[a, b] =` native vs lowered
+    if (exp_line.contains("{ ") || exp_line.contains("["))
+        && exp_line.contains(" = ")
+        && !act_line.contains("{ ")
+        && !act_line.contains("[")
+    {
+        return "downlevel-missing:destructuring".to_owned();
+    }
+
+    // Template literals: backtick strings
+    if exp_line.contains('`') && !act_line.contains('`') {
+        return "downlevel-missing:template".to_owned();
+    }
+    if !exp_line.contains('`') && act_line.contains('`') {
+        return "downlevel-extra:template".to_owned();
+    }
+
+    // Class fields: `x = 1` inside class body vs `this.x = 1` in constructor
+    if exp_line.contains("this.") && !act_line.contains("this.") {
+        return "downlevel-missing:class-fields".to_owned();
+    }
+    if !exp_line.contains("this.") && act_line.contains("this.") {
+        return "downlevel-extra:class-fields".to_owned();
+    }
+
+    // Formatting families
+    if exp_line.trim().is_empty() && !act_line.trim().is_empty() {
+        return "formatting:blank-line".to_owned();
+    }
+    if !exp_line.trim().is_empty() && act_line.trim().is_empty() {
+        return "formatting:blank-line".to_owned();
+    }
+    // Indentation difference (same content, different leading whitespace)
+    let exp_trimmed = exp_line.trim_start();
+    let act_trimmed = act_line.trim_start();
+    if exp_trimmed == act_trimmed && exp_line != act_line {
+        return "formatting:indentation".to_owned();
+    }
+    // Trailing comma
+    if exp_line.ends_with(',') && !act_line.ends_with(',') {
+        return "formatting:trailing-comma".to_owned();
+    }
+    if !exp_line.ends_with(',') && act_line.ends_with(',') {
+        return "formatting:trailing-comma".to_owned();
+    }
+    // Semicolon difference
+    if exp_line.ends_with(';') && !act_line.ends_with(';') {
+        return "formatting:semicolon".to_owned();
+    }
+    if !exp_line.ends_with(';') && act_line.ends_with(';') {
+        return "formatting:semicolon".to_owned();
+    }
+    // Parenthesization difference
+    if exp_trimmed == act_trimmed {
+        return "formatting:parens".to_owned();
+    }
+    // Prologue: "use strict" presence/absence
+    if exp_line.contains("\"use strict\"") || act_line.contains("\"use strict\"") {
+        return "formatting:prologue".to_owned();
+    }
+    // Module wrapper: require/exports/Object.defineProperty
+    if exp_line.contains("Object.defineProperty(exports")
+        || act_line.contains("Object.defineProperty(exports")
+    {
+        return "formatting:module-wrapper".to_owned();
+    }
+    if exp_line.contains("require(") || act_line.contains("require(") {
+        return "formatting:module-wrapper".to_owned();
+    }
+    if exp_line.contains("exports.") || act_line.contains("exports.") {
+        return "formatting:module-wrapper".to_owned();
+    }
+
+    "formatting:other".to_owned()
+}
+
 /// Total applicable population for extrapolation, per facet.
 fn extrapolation_denominator(facet: &str) -> f64 {
     match facet {
         "declaration" => 2215.0,
         "source-map" => 237.0,
+        "javascript" => 14060.0,
         _ => 1000.0,
     }
 }
@@ -386,8 +588,8 @@ fn extrapolation_denominator(facet: &str) -> f64 {
 fn declaration_facet_sample() {
     let facet = env::var("BAMTS_FACET").unwrap_or_else(|_| "declaration".to_owned());
     assert!(
-        facet == "declaration" || facet == "source-map",
-        "BAMTS_FACET must be 'declaration' or 'source-map', got: {facet}"
+        facet == "declaration" || facet == "source-map" || facet == "javascript",
+        "BAMTS_FACET must be 'declaration', 'source-map', or 'javascript', got: {facet}"
     );
 
     let sample = load_sample();
@@ -429,10 +631,9 @@ fn declaration_facet_sample() {
             continue;
         }
 
-        let mode = if facet == "declaration" {
-            FrontendMode::Declaration
-        } else {
-            FrontendMode::JavaScript
+        let mode = match facet.as_str() {
+            "declaration" => FrontendMode::Declaration,
+            _ => FrontendMode::JavaScript,
         };
 
         let compiled = match compile_case_frontend(&units, &entry, &pragmas, mode) {
@@ -450,6 +651,18 @@ fn declaration_facet_sample() {
         // Emit
         let emitted = if facet == "declaration" {
             match emit_declaration_baseline(&compiled) {
+                Ok(text) => text,
+                Err(detail) => {
+                    results.push(AnalysisResult {
+                        case: case.logical_path.clone(),
+                        cfg: case.cfg.clone(),
+                        outcome: Outcome::EmitError(detail),
+                    });
+                    continue;
+                }
+            }
+        } else if facet == "javascript" {
+            match emit_javascript_baseline(&compiled, &harness_logical) {
                 Ok(text) => text,
                 Err(detail) => {
                     results.push(AnalysisResult {
@@ -478,13 +691,14 @@ fn declaration_facet_sample() {
         };
 
         // Resolve baseline
-        let (extension, comparator) = if facet == "declaration" {
-            ("js", compare_js_emit as fn(&str, &str) -> FacetVerdict)
-        } else {
-            (
+        let (extension, comparator) = match facet.as_str() {
+            "declaration" | "javascript" => {
+                ("js", compare_js_emit as fn(&str, &str) -> FacetVerdict)
+            }
+            _ => (
                 "js.map",
                 compare_source_map as fn(&str, &str) -> FacetVerdict,
-            )
+            ),
         };
 
         let stem = case_stem(&harness_logical);
@@ -512,11 +726,22 @@ fn declaration_facet_sample() {
             }
         };
 
-        // For declaration, extract only the .d.ts sections from the .js baseline
+        // For declaration, extract only the .d.ts sections from the .js
+        // baseline.  For javascript, extract only the `.js` sections by name
+        // from BOTH the baseline and the emitted document (never by position
+        // — the last section is often `.d.ts`), so the first diff lands
+        // inside a `.js` section rather than at an echo header.
         let expected = if facet == "declaration" {
             extract_dts_sections(&raw_baseline, units.len())
+        } else if facet == "javascript" {
+            extract_js_sections(&raw_baseline)
         } else {
             raw_baseline
+        };
+        let emitted = if facet == "javascript" {
+            extract_js_sections(&emitted)
+        } else {
+            emitted
         };
 
         let verdict = comparator(&expected, &emitted);
