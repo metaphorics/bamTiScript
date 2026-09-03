@@ -2369,6 +2369,18 @@ impl<'a> Emitter<'a> {
             self.raw_mapped_char_end("}", range, '}');
             return;
         }
+        // Preservation: a non-empty injection-free body authored on one line
+        // stays on one line. Parameter-property injections are synthesized
+        // at print time, so any injection forces the expanded path.
+        if injections.is_empty() && self.node_preserves_single_line(&constructor.body) {
+            self.raw("{ ");
+            for statement in &body.statements {
+                let _ = self.emit_statement(statement);
+                self.raw(" ");
+            }
+            self.raw_mapped_char_end("}", range, '}');
+            return;
+        }
         self.raw("{");
         self.newline();
         self.indent += 1;
@@ -2486,7 +2498,9 @@ impl<'a> Emitter<'a> {
                 self.emit_template(&tagged.template);
             }
             Expression::Array(array) => self.emit_array(array),
-            Expression::Object(object) => self.emit_object(object),
+            Expression::Object(object) => {
+                self.emit_object(object, expression.id(), expression.range())
+            }
             Expression::Function(function) => {
                 self.emit_function_expression_js(&function.function, self.anchor)
             }
@@ -2783,9 +2797,24 @@ impl<'a> Emitter<'a> {
         self.raw_mapped_char_end("]", range, ']');
     }
 
-    fn emit_object(&mut self, object: &ObjectLiteral) {
+    fn emit_object(&mut self, object: &ObjectLiteral, id: NodeId, range: TextRange) {
         if object.members.is_empty() {
             self.raw("{}");
+            return;
+        }
+        // Preservation: members authored on one line join with `, `.
+        // Synthesized or multi-line-authored objects take the expanded path.
+        if self.preserves_single_line(id, range) {
+            self.raw("{ ");
+            let count = object.members.len();
+            for (index, member) in object.members.iter().enumerate() {
+                self.emit_object_member(member.data());
+                if index + 1 < count {
+                    self.raw(",");
+                }
+                self.raw(" ");
+            }
+            self.raw("}");
             return;
         }
         self.raw("{");
@@ -5797,6 +5826,83 @@ export default answer;
         let output = emit_output(parsed.product(), &EmitOptions::default());
         assert!(!output.has_errors());
         assert_eq!(javascript(&output).code, "const f = () => { return 1; };\n");
+    }
+
+    #[test]
+    fn single_line_constructor_body_stays_single_line_in_javascript() {
+        // The constructor's own body preserves one-line layout while the
+        // class body around it still expands.
+        let input = "class C { constructor() { this.x = 1; } }";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(!output.has_errors());
+        assert_eq!(
+            javascript(&output).code,
+            "class C {\n    constructor() { this.x = 1; }\n}\n"
+        );
+    }
+
+    #[test]
+    fn constructor_parameter_property_always_expands_in_javascript() {
+        // Parameter-property injections are synthesized at print time, so
+        // the body expands even when authored on one line.
+        let input = "class C { constructor(public x: number) {} }";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert_eq!(
+            javascript(&output).code,
+            "class C {\n    constructor(x) {\n        this.x = x;\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn single_line_object_literal_joins_members_in_javascript() {
+        let input = "({ a: 1, b: 2 });";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert_eq!(javascript(&output).code, "({ a: 1, b: 2 });\n");
+    }
+
+    #[test]
+    fn tight_authored_object_literal_gains_uniform_spacing_in_javascript() {
+        // Authority: downlevelLetConst15 emits authored `{a: 1}` as `{ a: 1 }`.
+        let input = "({a:1});";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert_eq!(javascript(&output).code, "({ a: 1 });\n");
+    }
+
+    #[test]
+    fn multi_line_object_literal_stays_expanded_in_javascript() {
+        let input = "({\n  a: 1\n});";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert_eq!(javascript(&output).code, "({\n    a: 1\n});\n");
     }
 
     #[test]
