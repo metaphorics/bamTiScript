@@ -2024,10 +2024,13 @@ function $ERROR(message) {\n\
         let outcome =
             async_done_outcome(DoneEventKind::Error, Some("CustomError: not a known type"));
 
-        assert!(matches!(
-            judge_run(&request, &outcome),
-            Err(OracleError::ExpectationMismatch { .. })
-        ));
+        match judge_run(&request, &outcome) {
+            Err(OracleError::ExpectationMismatch { expected, actual }) => {
+                assert_eq!(expected, "Runtime/Test262Error");
+                assert_eq!(actual, "Runtime/CustomError: not a known type");
+            }
+            other => panic!("expected ExpectationMismatch, got {other:?}"),
+        }
     }
 
     #[test]
