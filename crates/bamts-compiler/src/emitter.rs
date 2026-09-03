@@ -596,6 +596,11 @@ pub(crate) fn print_with_jsx_plan(
         jsx_plan,
         diagnostics: Vec::new(),
         decl_ambient: false,
+        decl_drop_member_export: false,
+        decl_source_is_js: matches!(
+            file.script_kind(),
+            crate::source::ScriptKind::JavaScript | crate::source::ScriptKind::JavaScriptReact
+        ),
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -762,6 +767,14 @@ struct Emitter<'a> {
     anchor: TextRange,
     diagnostics: Vec<Diagnostic>,
     decl_ambient: bool,
+    /// True inside an identifier-named namespace body, where tsc drops the
+    /// `export` modifier from member declarations (the namespace itself is
+    /// the only public surface). String-named `module "..."` bodies keep it.
+    decl_drop_member_export: bool,
+    /// True when the declaration is generated from a JavaScript source
+    /// (`allowJs`). tsc does not add `declare` to exported declarations of a
+    /// JS file, while it does for a TypeScript source.
+    decl_source_is_js: bool,
 }
 
 impl<'a> Emitter<'a> {
@@ -3172,14 +3185,36 @@ impl<'a> Emitter<'a> {
                 if !self.decl_statement_emits(inner) {
                     return false;
                 }
+                // tsc prefixes exported declarations of a TypeScript source with
+                // `declare`, but not those of a JavaScript source. Inside a
+                // namespace body `decl_ambient` is already false, so no prefix
+                // is emitted there either. An explicit `export declare X` in
+                // the source keeps its prefix through `Statement::Declare`;
+                // `export import X = ...` never takes the ambient prefix.
+                let saved_ambient = self.decl_ambient;
+                let is_import_equals = matches!(inner.data(), Statement::ImportEquals(_));
+                self.decl_ambient = (saved_ambient && !self.decl_source_is_js && !is_import_equals)
+                    || matches!(inner.data(), Statement::Declare(_));
+                // Identifier-named namespaces and `global` bodies drop the
+                // `export` keyword from member declarations; the container is
+                // the public surface.
+                let export_keyword = if self.decl_drop_member_export && !is_import_equals {
+                    ""
+                } else {
+                    "export "
+                };
                 if let Statement::Class(class) = inner.data() {
                     self.emit_decorators_block(&class.decorators);
-                    self.raw("export declare ");
+                    self.raw(export_keyword);
+                    self.emit_declare_prefix();
                     self.emit_class_core_decl(class);
+                    self.decl_ambient = saved_ambient;
                     return true;
                 }
-                self.raw("export ");
-                self.emit_declaration(inner)
+                self.raw(export_keyword);
+                let emitted = self.emit_declaration(inner);
+                self.decl_ambient = saved_ambient;
+                emitted
             }
             ExportDeclaration::Named(ExportNamedDeclaration::Specifiers {
                 type_only,
@@ -3709,11 +3744,17 @@ impl<'a> Emitter<'a> {
         self.indent += 1;
         let saved_ambient = self.decl_ambient;
         self.decl_ambient = false;
+        let saved_drop = self.decl_drop_member_export;
+        // String-named `module "..."` bodies are external module declarations
+        // and keep member `export`; identifier-named namespaces and `global`
+        // expose members through the container, so tsc drops the keyword.
+        self.decl_drop_member_export = !matches!(&namespace.name, NamespaceName::StringLiteral(_));
         for statement in &body.statements {
             if self.emit_declaration(statement) {
                 self.newline();
             }
         }
+        self.decl_drop_member_export = saved_drop;
         self.decl_ambient = saved_ambient;
         self.indent -= 1;
         self.raw("}");

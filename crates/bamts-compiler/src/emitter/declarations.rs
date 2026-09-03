@@ -954,4 +954,157 @@ mod tests {
             "expected no parens around non-generic function type argument, got: {code}"
         );
     }
+
+    /// Rule: a JavaScript source does not get the `declare` prefix on its
+    /// exported declarations, while a TypeScript one does.
+    ///
+    /// Authority: `tests/cases/conformance/jsdoc/callbackOnConstructor.ts`
+    /// (allowJs) emits `export class Preferences {`; `tests/cases/compiler/
+    /// accessorDeclarationEmitVisibilityErrors.ts` (TypeScript) emits
+    /// `export declare class Q {`.
+    #[test]
+    fn js_source_exported_class_omits_declare_prefix() {
+        let source = "export class C {}\n";
+        let ts = emit_dts(source, DeclarationOptions::default());
+        assert_eq!(
+            ts.declaration.as_ref().unwrap().code,
+            "export declare class C {\n}\n"
+        );
+        let parsed = parser::parse(scanner::scan(
+            SourceId::new(0),
+            ScriptKind::JavaScript,
+            Arc::new(SourceText::new(source).expect("static test source fits size limit")),
+        ));
+        let model = checker::check(&parsed).into_product();
+        let js = emit_declarations(
+            parsed.product(),
+            &model,
+            DeclarationOptions::default(),
+            &crate::emitter::EmitFileNames::default(),
+        );
+        assert_eq!(
+            js.declaration.as_ref().unwrap().code,
+            "export class C {\n}\n"
+        );
+    }
+
+    /// Rule: inside an identifier-named namespace body the `export` keyword is
+    /// dropped from member declarations; inside a string-named `module "..."`
+    /// body it is kept.
+    ///
+    /// Authority: `tests/baselines/reference/declFileTypeofInAnonymousType.js`
+    /// ```text
+    /// declare namespace m1 {
+    ///     class c {
+    /// ```
+    /// and `declarationEmitPrefersPathKindBasedOnBundling2`
+    /// ```text
+    /// declare module "lib/operators/scalar" {
+    ///     export interface Scalar {
+    /// ```
+    #[test]
+    fn namespace_members_drop_export_but_module_bodies_keep_it() {
+        let ns = emit_dts(
+            "namespace m1 { export class c { } }\n",
+            DeclarationOptions::default(),
+        );
+        let ns_code = &ns.declaration.as_ref().unwrap().code;
+        assert!(
+            ns_code.contains("declare namespace m1 {"),
+            "namespace keeps declare: {ns_code}"
+        );
+        assert!(
+            ns_code.contains("\n    class c {"),
+            "member export dropped in namespace: {ns_code}"
+        );
+        assert!(
+            !ns_code.contains("export class"),
+            "no member export keyword in namespace: {ns_code}"
+        );
+        let module = emit_dts(
+            "declare module \"m\" { export interface I { } }\n",
+            DeclarationOptions::default(),
+        );
+        let module_code = &module.declaration.as_ref().unwrap().code;
+        assert!(
+            module_code.contains("export interface I {"),
+            "member export kept in module body: {module_code}"
+        );
+    }
+
+    /// Rule: `export import X = ...` never takes the `declare` prefix, even at
+    /// top level, and keeps `export` inside a namespace body.
+    ///
+    /// Authority: `tests/baselines/reference/declFileForExportedImport.js`
+    /// ```text
+    /// export import a = require('./declFileForExportedImport_0');
+    /// ```
+    /// and `aliasInaccessibleModule.js`
+    /// ```text
+    /// declare namespace M {
+    ///     export import X = N;
+    /// ```
+    #[test]
+    fn exported_import_equals_has_no_declare_and_keeps_export_in_namespace() {
+        let top = emit_dts(
+            "import a = require(\"./m\");\nexport import a2 = require(\"./m\");\n",
+            DeclarationOptions::default(),
+        );
+        let top_code = &top.declaration.as_ref().unwrap().code;
+        assert!(
+            top_code.contains("export import a2 = require"),
+            "export keyword kept on exported import equals: {top_code}"
+        );
+        let line = top_code
+            .lines()
+            .find(|line| line.contains("export import a2"))
+            .expect("exported import equals line is emitted");
+        assert!(
+            !line.contains("declare"),
+            "no declare prefix on exported import equals: {line}"
+        );
+        let nested = emit_dts(
+            "namespace M { namespace N { } export import X = N; }\n",
+            DeclarationOptions::default(),
+        );
+        let nested_code = &nested.declaration.as_ref().unwrap().code;
+        assert!(
+            nested_code.contains("export import X = N;"),
+            "export import keeps export inside namespace: {nested_code}"
+        );
+    }
+
+    /// Rule: a non-exported top-level declaration still gets the `declare`
+    /// prefix, in both TypeScript and JavaScript sources.
+    ///
+    /// Authority: `tests/baselines/reference/jsDeclarationsClassStatic2.js`
+    /// ```text
+    /// declare class Base {
+    /// ```
+    #[test]
+    fn non_exported_top_level_declarations_keep_declare() {
+        let output = emit_dts("class A {}\n", DeclarationOptions::default());
+        assert_eq!(
+            output.declaration.as_ref().unwrap().code,
+            "declare class A {\n}\n"
+        );
+    }
+
+    /// Rule: an explicit `export declare X` in the source keeps its prefix.
+    ///
+    /// Authority: `tests/cases/compiler/exportedInterfaceInaccessibleInCallbackInModule.ts`
+    /// ```text
+    /// export declare class TPromise<V> {
+    /// ```
+    #[test]
+    fn explicit_export_declare_is_preserved() {
+        let output = emit_dts(
+            "export declare class T { }\n",
+            DeclarationOptions::default(),
+        );
+        assert_eq!(
+            output.declaration.as_ref().unwrap().code,
+            "export declare class T {\n}\n"
+        );
+    }
 }
