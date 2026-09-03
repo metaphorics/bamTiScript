@@ -818,6 +818,113 @@ impl<'a> Emitter<'a> {
         self.raw_mapped(text, range);
     }
 
+    /// Writes `text` and maps it to a source token of `width` UTF-16 units
+    /// starting at `pos`, advancing `last_mapped_end` past the token so the
+    /// following end-of-line mapping lands just after it, as in tsc segments.
+    fn raw_mapped_token(&mut self, text: &str, pos: Utf16Pos, width: usize) {
+        if text.is_empty() {
+            return;
+        }
+        let end = Utf16Pos::new(pos.get().saturating_add(width));
+        match TextRange::new(pos, end) {
+            Ok(range) => self.raw_mapped(text, range),
+            Err(_) => self.raw_mapped_pos(text, pos),
+        }
+    }
+
+    /// UTF-16 position of the first `ch` occurring in the source within `range`.
+    fn source_pos_of(&self, range: TextRange, ch: char) -> Option<Utf16Pos> {
+        let start_byte = self.source.utf16_to_byte(range.start()).ok()?;
+        let end_byte = self.source.utf16_to_byte(range.end()).ok()?;
+        let text = self.source.as_str().get(start_byte..end_byte)?;
+        let index = text.find(ch)?;
+        Some(Utf16Pos::new(range.start().get() + utf16_len(&text[..index])))
+    }
+
+    /// UTF-16 position of the last `ch` occurring in the source within `range`.
+    fn source_pos_of_last(&self, range: TextRange, ch: char) -> Option<Utf16Pos> {
+        let start_byte = self.source.utf16_to_byte(range.start()).ok()?;
+        let end_byte = self.source.utf16_to_byte(range.end()).ok()?;
+        let text = self.source.as_str().get(start_byte..end_byte)?;
+        let index = text.rfind(ch)?;
+        Some(Utf16Pos::new(range.start().get() + utf16_len(&text[..index])))
+    }
+
+    /// Maps `text` to the source position of `ch` inside `range`, falling back
+    /// to `range.start()` when the character cannot be located.
+    fn raw_mapped_char(&mut self, text: &str, range: TextRange, ch: char, width: usize) {
+        let pos = self.source_pos_of(range, ch).unwrap_or(range.start());
+        self.raw_mapped_token(text, pos, width);
+    }
+
+    /// Maps `text` to the last `ch` inside `range` (closing punctuation sits at
+    /// the tail of the owning node), falling back to the last unit of `range`.
+    fn raw_mapped_char_end(&mut self, text: &str, range: TextRange, ch: char) {
+        let pos = self
+            .source_pos_of_last(range, ch)
+            .unwrap_or_else(|| Utf16Pos::new(range.end().get().saturating_sub(1)));
+        self.raw_mapped_token(text, pos, 1);
+    }
+
+    /// Maps the `, ` separator to the comma between two list elements.
+    fn raw_mapped_list_separator(&mut self, previous_end: Utf16Pos, next: TextRange) {
+        if let Some(window) = TextRange::new(previous_end, next.start())
+            .ok()
+            .filter(|range| !range.is_empty())
+            && let Some(pos) = self.source_pos_of(window, ',')
+        {
+            self.raw_mapped_token(", ", pos, 1);
+            return;
+        }
+        self.raw_mapped_pos(", ", next.start());
+    }
+
+    /// Emits the `, ` separator preceding a list element, anchoring the comma
+    /// to its own source position found between `cursor` and `limit`. Returns
+    /// the position just past the comma, or `cursor` when it cannot be located.
+    fn mapped_list_separator_from(&mut self, cursor: Utf16Pos, limit: Utf16Pos) -> Utf16Pos {
+        if let Some(window) = TextRange::new(cursor, limit)
+            .ok()
+            .filter(|range| !range.is_empty())
+            && let Some(pos) = self.source_pos_of(window, ',')
+        {
+            self.raw_mapped_token(", ", pos, 1);
+            return Utf16Pos::new(pos.get().saturating_add(1));
+        }
+        self.raw_mapped_pos(", ", cursor);
+        cursor
+    }
+
+    /// Start position of `keyword` when it is the word immediately preceding
+    /// `pos` in the source, ignoring intervening whitespace.
+    fn keyword_start_before(&self, pos: Utf16Pos, keyword: &str) -> Option<Utf16Pos> {
+        let end_byte = self.source.utf16_to_byte(pos).ok()?;
+        let text = self.source.as_str().get(..end_byte)?;
+        let trimmed = text.trim_end();
+        let start = trimmed.len().checked_sub(keyword.len())?;
+        if !trimmed[start..].starts_with(keyword) {
+            return None;
+        }
+        let boundary_ok = trimmed[..start].chars().next_back().is_none_or(|previous| {
+            !(previous.is_alphanumeric() || previous == '_' || previous == '$')
+        });
+        if !boundary_ok {
+            return None;
+        }
+        self.source.byte_to_utf16(start).ok()
+    }
+
+    /// End position of the last parameter, for use as a scan window start.
+    fn params_source_end(&self, parameters: &[ParameterNode]) -> Utf16Pos {
+        parameters.last().map_or(Utf16Pos::ZERO, |parameter| {
+            let parameter = parameter.data();
+            parameter.initializer.as_ref().map_or_else(
+                || parameter.binding.range().end(),
+                |initializer| initializer.range().end(),
+            )
+        })
+    }
+
     /// Records an end-of-line mapping: the current generated column
     /// (after the last token on this line, before the newline) maps to
     /// the source position just past the last mapped token's end.
@@ -1004,7 +1111,7 @@ impl<'a> Emitter<'a> {
     fn emit_statement(&mut self, statement: &Stmt) -> bool {
         let previous = self.anchor;
         self.anchor = statement.range();
-        let stmt_range = statement.range();
+        let stmt_range = self.anchor;
         let emitted = match statement.data() {
             Statement::Import(import) => self.emit_import(import, false),
             Statement::ImportEquals(import) => {
@@ -1028,7 +1135,7 @@ impl<'a> Emitter<'a> {
                 if function.function.body.is_none() {
                     false
                 } else {
-                    self.emit_function_declaration_js(&function.function);
+                    self.emit_function_declaration_js(&function.function, stmt_range);
                     true
                 }
             }
@@ -1046,7 +1153,7 @@ impl<'a> Emitter<'a> {
                 false
             }
             Statement::Block(block) => {
-                self.emit_block(block.data());
+                self.emit_block(block.data(), block.range());
                 true
             }
             Statement::Empty => false,
@@ -1075,18 +1182,21 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::While(statement) => {
-                self.raw("while (");
+                self.raw_mapped_char("while (", self.anchor, 'w', 5);
                 self.emit_expression(&statement.test);
-                self.raw(")");
+                self.raw_mapped_pos(")", statement.test.range().end());
                 self.emit_control_body(&statement.body);
                 true
             }
             Statement::DoWhile(statement) => {
-                self.raw("do");
+                self.raw_mapped_char("do", self.anchor, 'd', 2);
                 self.emit_control_body(&statement.body);
-                self.raw(" while (");
+                let while_pos = self
+                    .keyword_start_before(statement.test.range().start(), "while")
+                    .unwrap_or(self.anchor.end());
+                self.raw_mapped_token(" while (", while_pos, 5);
                 self.emit_expression(&statement.test);
-                self.raw(");");
+                self.raw_mapped_pos(");", statement.test.range().end());
                 true
             }
             Statement::Try(statement) => {
@@ -1107,40 +1217,56 @@ impl<'a> Emitter<'a> {
                 true
             }
             Statement::Break(jump) => {
-                self.raw("break");
+                self.raw_mapped_char("break", self.anchor, 'b', 5);
                 if let Some(label) = &jump.label {
                     self.raw(" ");
                     self.emit_ident(label);
                 }
-                self.raw(";");
+                self.raw_mapped_pos(
+                    ";",
+                    Utf16Pos::new(self.anchor.end().get().saturating_sub(1)),
+                );
                 true
             }
             Statement::Continue(jump) => {
-                self.raw("continue");
+                self.raw_mapped_char("continue", self.anchor, 'c', 8);
                 if let Some(label) = &jump.label {
                     self.raw(" ");
                     self.emit_ident(label);
                 }
-                self.raw(";");
+                self.raw_mapped_pos(
+                    ";",
+                    Utf16Pos::new(self.anchor.end().get().saturating_sub(1)),
+                );
                 true
             }
             Statement::Return(statement) => {
-                self.raw("return");
+                self.raw_mapped_char("return", self.anchor, 'r', 6);
                 if let Some(argument) = &statement.argument {
                     self.raw(" ");
                     self.emit_expression(argument);
                 }
-                self.raw(";");
+                self.raw_mapped_pos(
+                    ";",
+                    Utf16Pos::new(self.anchor.end().get().saturating_sub(1)),
+                );
                 true
             }
             Statement::Throw(statement) => {
-                self.raw("throw ");
+                self.raw_mapped_char("throw ", self.anchor, 't', 5);
                 self.emit_expression(&statement.argument);
-                self.raw(";");
+                self.raw_mapped_pos(
+                    ";",
+                    Utf16Pos::new(self.anchor.end().get().saturating_sub(1)),
+                );
                 true
             }
             Statement::Debugger => {
-                self.raw("debugger;");
+                self.raw_mapped_char("debugger", self.anchor, 'd', 8);
+                self.raw_mapped_pos(
+                    ";",
+                    Utf16Pos::new(self.anchor.end().get().saturating_sub(1)),
+                );
                 true
             }
             Statement::Missing(_) => {
@@ -1198,27 +1324,47 @@ impl<'a> Emitter<'a> {
     fn emit_control_body(&mut self, statement: &Stmt) {
         self.raw(" ");
         match statement.data() {
-            Statement::Block(block) => self.emit_block(block.data()),
+            Statement::Block(block) => self.emit_block(block.data(), self.anchor),
             Statement::Empty => self.raw("{}"),
             _ => {
-                self.raw_mapped("{", statement.range());
+                self.raw_mapped("{", self.anchor);
                 self.newline();
                 self.indent += 1;
                 if self.emit_statement(statement) {
                     self.newline();
                 }
                 self.indent -= 1;
-                self.raw_mapped_pos("}", statement.range().end());
+                self.raw_mapped_pos("}", self.anchor.end());
             }
         }
     }
 
-    fn emit_block(&mut self, block: &Block) {
+    fn emit_block(&mut self, block: &Block, range: TextRange) {
+        self.emit_block_with_braces(block, range, true);
+    }
+
+    /// `map_braces` mirrors tsc: statement-level blocks (try bodies, catch and
+    /// finally arms, standalone blocks) map `{`/`}` to their source tokens,
+    /// while function, arrow, and class bodies keep their braces unmapped.
+    fn emit_block_with_braces(
+        &mut self,
+        block: &Block,
+        range: TextRange,
+        map_braces: bool,
+    ) {
         if block.statements.is_empty() {
-            self.raw("{}");
+            if map_braces {
+                self.raw_mapped_char_end("{}", range, '{');
+            } else {
+                self.raw("{}");
+            }
             return;
         }
-        self.raw("{");
+        if map_braces {
+            self.raw_mapped_char("{", range, '{', 1);
+        } else {
+            self.raw("{");
+        }
         self.newline();
         self.indent += 1;
         for statement in &block.statements {
@@ -1227,7 +1373,11 @@ impl<'a> Emitter<'a> {
             }
         }
         self.indent -= 1;
-        self.raw("}");
+        if map_braces {
+            self.raw_mapped_char_end("}", range, '}');
+        } else {
+            self.raw("}");
+        }
     }
     fn emit_switch(&mut self, switch: &SwitchStatement) {
         self.raw_mapped("switch (", self.anchor);
@@ -1290,24 +1440,40 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_for_in(&mut self, statement: &ForInStatement) {
-        self.raw("for (");
+        let range = self.anchor;
+        self.raw_mapped_char("for (", range, 'f', 3);
         self.emit_for_binding(&statement.binding);
-        self.raw(" in ");
+        let in_pos = self
+            .keyword_start_before(statement.object.range().start(), "in")
+            .unwrap_or(range.end());
+        self.raw_mapped_token(
+            " in ",
+            Utf16Pos::new(in_pos.get().saturating_sub(1)),
+            2,
+        );
         self.emit_expression_prec(&statement.object, P_ASSIGN);
-        self.raw(")");
+        self.raw_mapped_pos(")", statement.object.range().end());
         self.emit_control_body(&statement.body);
     }
 
     fn emit_for_of(&mut self, statement: &ForOfStatement) {
+        let range = self.anchor;
         if matches!(statement.mode, ForOfMode::Async) {
-            self.raw("for await (");
+            self.raw_mapped_char("for await (", range, 'f', 3);
         } else {
-            self.raw("for (");
+            self.raw_mapped_char("for (", range, 'f', 3);
         }
         self.emit_for_binding(&statement.binding);
-        self.raw(" of ");
+        let of_pos = self
+            .keyword_start_before(statement.iterable.range().start(), "of")
+            .unwrap_or(range.end());
+        self.raw_mapped_token(
+            " of ",
+            Utf16Pos::new(of_pos.get().saturating_sub(1)),
+            2,
+        );
         self.emit_expression_prec(&statement.iterable, P_ASSIGN);
-        self.raw(")");
+        self.raw_mapped_pos(")", statement.iterable.range().end());
         self.emit_control_body(&statement.body);
     }
 
@@ -1320,7 +1486,7 @@ impl<'a> Emitter<'a> {
 
     fn emit_try(&mut self, statement: &TryStatement) {
         self.raw_mapped("try ", self.anchor);
-        self.emit_block(statement.block.data());
+        self.emit_block(statement.block.data(), statement.block.range());
         if let Some(handler) = &statement.handler {
             let handler_range = handler.range();
             let handler = handler.data();
@@ -1331,11 +1497,11 @@ impl<'a> Emitter<'a> {
                 self.raw_mapped_pos(")", binding.range().end());
             }
             self.raw(" ");
-            self.emit_block(handler.body.data());
+            self.emit_block(handler.body.data(), handler.body.range());
         }
         if let Some(finalizer) = &statement.finalizer {
             self.raw_mapped(" finally ", finalizer.range());
-            self.emit_block(finalizer.data());
+            self.emit_block(finalizer.data(), finalizer.range());
         }
     }
 
@@ -1555,7 +1721,12 @@ impl<'a> Emitter<'a> {
             ExportDeclaration::Default(default) => match &default.value {
                 ExportDefaultValue::Function(function) => {
                     self.raw("export default ");
-                    self.emit_function_declaration_js(function);
+                    let function_range = self
+                        .keyword_start_before(self.anchor.end(), "function")
+                        .map_or(self.anchor, |start| {
+                            TextRange::new(start, self.anchor.end()).unwrap_or(self.anchor)
+                        });
+                    self.emit_function_declaration_js(function, function_range);
                     true
                 }
                 ExportDefaultValue::Class(class) => {
@@ -1749,48 +1920,63 @@ impl<'a> Emitter<'a> {
     // functions / classes (JavaScript)
     // =======================================================================
 
-    fn emit_function_declaration_js(&mut self, function: &FunctionLike) {
+    fn emit_function_declaration_js(&mut self, function: &FunctionLike, range: TextRange) {
         if function.is_async {
-            self.raw("async ");
+            self.raw_mapped_char("async ", range, 'a', 5);
         }
-        self.raw("function");
+        let keyword_pos = function
+            .name
+            .as_ref()
+            .and_then(|name| self.keyword_start_before(name.range().start(), "function"))
+            .unwrap_or(range.start());
+        self.raw_mapped_token("function", keyword_pos, 8);
         if function.is_generator {
-            self.raw("*");
+            self.raw_mapped_char("*", range, '*', 1);
         }
         if let Some(name) = &function.name {
             self.raw(" ");
             self.emit_ident(name);
         }
-        self.emit_params_js(&function.parameters);
+        self.emit_params_js(&function.parameters, range);
         self.raw(" ");
         self.emit_function_body_js(function.body.as_ref());
     }
 
-    fn emit_function_expression_js(&mut self, function: &FunctionLike) {
+    fn emit_function_expression_js(&mut self, function: &FunctionLike, range: TextRange) {
         if function.is_async {
-            self.raw("async ");
+            self.raw_mapped_char("async ", range, 'a', 5);
         }
-        self.raw("function");
+        let keyword_pos = function
+            .name
+            .as_ref()
+            .and_then(|name| self.keyword_start_before(name.range().start(), "function"))
+            .unwrap_or(range.start());
+        self.raw_mapped_token("function", keyword_pos, 8);
         if function.is_generator {
-            self.raw("*");
+            self.raw_mapped_char("*", range, '*', 1);
         }
         if let Some(name) = &function.name {
             self.raw(" ");
             self.emit_ident(name);
         }
-        self.emit_params_js(&function.parameters);
+        self.emit_params_js(&function.parameters, range);
         self.raw(" ");
         self.emit_function_body_js(function.body.as_ref());
     }
 
-    fn emit_arrow_js(&mut self, arrow: &ArrowFunction) {
+    fn emit_arrow_js(&mut self, arrow: &ArrowFunction, range: TextRange) {
         if arrow.is_async {
-            self.raw("async ");
+            self.raw_mapped_char("async ", range, 'a', 5);
         }
-        self.emit_params_js(&arrow.parameters);
-        self.raw(" => ");
+        self.emit_params_js(&arrow.parameters, range);
+        let arrow_pos = self
+            .source_pos_of(TextRange::new(self.params_source_end(&arrow.parameters), range.end()).unwrap_or(range), '=')
+            .unwrap_or(range.end());
+        self.raw_mapped_token(" => ", arrow_pos, 2);
         match &arrow.body {
-            FunctionBody::Block(block) => self.emit_block(block.data()),
+            FunctionBody::Block(block) => {
+                self.emit_block_with_braces(block.data(), block.range(), false);
+            }
             FunctionBody::Expression(expression) => {
                 if self.leads_with_bad_token(expression, true) {
                     self.raw("(");
@@ -1812,7 +1998,9 @@ impl<'a> Emitter<'a> {
 
     fn emit_function_body_js(&mut self, body: Option<&FunctionBody>) {
         match body {
-            Some(FunctionBody::Block(block)) => self.emit_block(block.data()),
+            Some(FunctionBody::Block(block)) => {
+                self.emit_block_with_braces(block.data(), block.range(), false);
+            }
             Some(FunctionBody::Expression(expression)) => {
                 self.raw("{ return ");
                 self.emit_expression_prec(expression, 0);
@@ -1828,26 +2016,47 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_params_js(&mut self, parameters: &[ParameterNode]) {
-        self.raw("(");
+    fn emit_params_js(&mut self, parameters: &[ParameterNode], window: TextRange) {
+        // tsc leaves an empty parameter list unmapped: only the callee name
+        // carries a segment (e.g. `constructor() {`), while each token of a
+        // non-empty list (`(`, params, separators, `)`) is mapped individually.
+        let has_params = parameters
+            .iter()
+            .any(|parameter| !self.is_this_parameter(parameter.data()));
+        if !has_params {
+            return;
+        }
+        let open = self.source_pos_of(window, '(').unwrap_or(window.start());
+        self.raw_mapped_token("(", open, 1);
+        let mut cursor = Utf16Pos::new(open.get().saturating_add(1));
         let mut first = true;
+        let mut last_end = cursor;
         for parameter in parameters {
             let parameter = parameter.data();
             if self.is_this_parameter(parameter) {
                 continue;
             }
             if !first {
-                self.raw(", ");
+                let limit = parameter.binding.range().start();
+                cursor = self.mapped_list_separator_from(cursor, limit);
             }
             first = false;
             self.emit_decorators_inline(&parameter.decorators);
             self.emit_pattern(&parameter.binding);
             if let Some(initializer) = &parameter.initializer {
-                self.raw(" = ");
+                self.raw_mapped_pos(" = ", parameter.binding.range().end());
                 self.emit_expression_prec(initializer, P_ASSIGN);
             }
+            last_end = parameter.initializer.as_ref().map_or_else(
+                || parameter.binding.range().end(),
+                |initializer| initializer.range().end(),
+            );
+            cursor = last_end;
         }
-        self.raw(")");
+        let close = self
+            .source_pos_of(TextRange::new(last_end, window.end()).unwrap_or(window), ')')
+            .unwrap_or(last_end);
+        self.raw_mapped_token(")", close, 1);
     }
 
     fn is_this_parameter(&self, parameter: &Parameter) -> bool {
@@ -1883,20 +2092,29 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_class_core_js(&mut self, class: &ClassDeclaration) {
-        self.raw("class");
+        let range = self.anchor;
+        let keyword_pos = class
+            .name
+            .as_ref()
+            .and_then(|name| self.keyword_start_before(name.range().start(), "class"))
+            .unwrap_or(range.start());
+        self.raw_mapped_token("class", keyword_pos, 5);
         if let Some(name) = &class.name {
             self.raw(" ");
             self.emit_ident(name);
         }
         if let Some(heritage) = &class.extends {
-            self.raw(" extends ");
+            let extends_pos = self
+                .keyword_start_before(heritage.expression.range().start(), "extends")
+                .unwrap_or(range.end());
+            self.raw_mapped_token(" extends ", extends_pos, 7);
             self.emit_expression_prec(&heritage.expression, P_CALL_MEMBER);
         }
         self.raw(" ");
-        self.emit_class_body_js(&class.members);
+        self.emit_class_body_js(&class.members, range);
     }
 
-    fn emit_class_body_js(&mut self, members: &[ClassMemberNode]) {
+    fn emit_class_body_js(&mut self, members: &[ClassMemberNode], range: TextRange) {
         self.raw("{");
         let has = members
             .iter()
@@ -1982,7 +2200,7 @@ impl<'a> Emitter<'a> {
             }
             ClassMember::StaticBlock(block) => {
                 self.raw("static ");
-                self.emit_block(block.data());
+                self.emit_block(block.data(), block.range());
                 true
             }
             ClassMember::IndexSignature(_) => false,
@@ -1994,30 +2212,33 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_method_js(&mut self, method: &MethodDeclaration) {
+        let range = self.anchor;
         if method.modifiers.is_static {
-            self.raw("static ");
+            self.raw_mapped_char("static ", range, 's', 6);
         }
         match method.modifier {
-            PropertyModifier::Get => self.raw("get "),
-            PropertyModifier::Set => self.raw("set "),
+            PropertyModifier::Get => self.raw_mapped_char("get ", range, 'g', 3),
+            PropertyModifier::Set => self.raw_mapped_char("set ", range, 's', 3),
             PropertyModifier::None => {
                 if method.function.is_async {
-                    self.raw("async ");
+                    self.raw_mapped_char("async ", range, 'a', 5);
                 }
                 if method.function.is_generator {
-                    self.raw("*");
+                    self.raw_mapped_char("*", range, '*', 1);
                 }
             }
         }
         self.emit_property_name(&method.name);
-        self.emit_params_js(&method.function.parameters);
+        self.emit_params_js(&method.function.parameters, self.anchor);
         self.raw(" ");
         self.emit_function_body_js(method.function.body.as_ref());
     }
 
     fn emit_constructor_js(&mut self, constructor: &ConstructorDeclaration) {
-        self.raw("constructor");
-        self.emit_params_js(&constructor.parameters);
+        let range = self.anchor;
+        let keyword_pos = self.source_pos_of(range, 'c').unwrap_or(range.start());
+        self.raw_mapped_token("constructor", keyword_pos, 11);
+        self.emit_params_js(&constructor.parameters, self.anchor);
         self.raw(" ");
 
         let injections: Vec<&ParameterNode> = constructor
@@ -2145,9 +2366,9 @@ impl<'a> Emitter<'a> {
             }
             Expression::Array(array) => self.emit_array(array),
             Expression::Object(object) => self.emit_object(object),
-            Expression::Function(function) => self.emit_function_expression_js(&function.function),
+            Expression::Function(function) => self.emit_function_expression_js(&function.function, self.anchor),
             Expression::Class(class) => self.emit_class_js(&class.class),
-            Expression::Arrow(arrow) => self.emit_arrow_js(arrow),
+            Expression::Arrow(arrow) => self.emit_arrow_js(arrow, self.anchor),
             Expression::Call(call) => self.emit_call(call),
             Expression::Member(member) => self.emit_member(member),
             Expression::New(new) => self.emit_new(new),
@@ -2399,18 +2620,22 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_array(&mut self, array: &ArrayLiteral) {
-        self.raw("[");
+        let range = self.anchor;
+        self.raw_mapped_char("[", range, '[', 1);
         let elements = &array.elements;
+        let mut cursor = Utf16Pos::new(range.start().get().saturating_add(1));
         for (index, element) in elements.iter().enumerate() {
+            let element_range = array_element_range(element);
             if index > 0 {
-                self.raw(", ");
+                let limit = element_range.map_or(range.end(), |r| r.start());
+                cursor = self.mapped_list_separator_from(cursor, limit);
             }
             match element {
                 ArrayElement::Expression(expression) => {
                     self.emit_expression_prec(expression, P_ASSIGN);
                 }
                 ArrayElement::Spread(spread) => {
-                    self.raw("...");
+                    self.raw_mapped_char("...", spread.argument.range(), '.', 3);
                     self.emit_expression_prec(&spread.argument, P_ASSIGN);
                 }
                 ArrayElement::Elision => {}
@@ -2421,11 +2646,14 @@ impl<'a> Emitter<'a> {
                     );
                 }
             }
+            if let Some(element_range) = element_range {
+                cursor = element_range.end();
+            }
         }
         if matches!(elements.last(), Some(ArrayElement::Elision)) {
-            self.raw(",");
+            self.raw_mapped_char_end(",", range, ',');
         }
-        self.raw("]");
+        self.raw_mapped_char_end("]", range, ']');
     }
 
     fn emit_object(&mut self, object: &ObjectLiteral) {
@@ -2484,7 +2712,7 @@ impl<'a> Emitter<'a> {
             }
         }
         self.emit_property_name(&method.name);
-        self.emit_params_js(&method.function.parameters);
+        self.emit_params_js(&method.function.parameters, self.anchor);
         self.raw(" ");
         self.emit_function_body_js(method.function.body.as_ref());
     }
@@ -2510,18 +2738,28 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_call(&mut self, call: &CallExpression) {
+        let range = self.anchor;
         self.emit_expression_prec(&call.callee, P_CALL_MEMBER);
+        let open_pos = self
+            .source_pos_of(
+                TextRange::new(call.callee.range().end(), range.end()).unwrap_or(range),
+                '(',
+            )
+            .unwrap_or(range.end());
         if call.optional {
-            self.raw("?.(");
+            self.raw_mapped_token("?.(", open_pos, 2);
         } else {
-            self.raw("(");
+            self.raw_mapped_token("(", open_pos, 1);
         }
         self.emit_arguments(&call.arguments);
-        self.raw(")");
+        let close_pos = self.source_pos_of_last(range, ')').unwrap_or(range.end());
+        self.raw_mapped_token(")", close_pos, 1);
     }
 
     fn emit_new(&mut self, new: &NewExpression) {
-        self.raw("new ");
+        let range = self.anchor;
+        let new_pos = self.source_pos_of(range, 'n').unwrap_or(range.start());
+        self.raw_mapped_token("new ", new_pos, 3);
         let callee = self.unwrap_expression(&new.callee);
         let wrap = matches!(callee.data(), Expression::Call(_)) || self.chain_has_optional(callee);
         if wrap {
@@ -2531,22 +2769,37 @@ impl<'a> Emitter<'a> {
         } else {
             self.emit_expression_prec(callee, P_CALL_MEMBER);
         }
-        self.raw("(");
+        let open_pos = self
+            .source_pos_of(
+                TextRange::new(callee.range().end(), range.end()).unwrap_or(range),
+                '(',
+            )
+            .unwrap_or(callee.range().end());
+        self.raw_mapped_token("(", open_pos, 1);
         self.emit_arguments(&new.arguments);
-        self.raw(")");
+        let close_pos = self.source_pos_of_last(range, ')').unwrap_or(range.end());
+        self.raw_mapped_token(")", close_pos, 1);
     }
 
     fn emit_arguments(&mut self, arguments: &[CallArgument]) {
+        let mut previous_end: Option<Utf16Pos> = None;
         for (index, argument) in arguments.iter().enumerate() {
+            let argument_range = call_argument_range(argument);
             if index > 0 {
-                self.raw(", ");
+                match (previous_end, argument_range) {
+                    (Some(end), Some(next)) => {
+                        self.mapped_list_separator_from(end, next.start());
+                    }
+                    (Some(end), None) => self.raw_mapped_pos(", ", end),
+                    (None, _) => {}
+                }
             }
             match argument {
                 CallArgument::Expression(expression) => {
                     self.emit_expression_prec(expression, P_ASSIGN);
                 }
                 CallArgument::Spread(spread) => {
-                    self.raw("...");
+                    self.raw_mapped_char("...", spread.argument.range(), '.', 3);
                     self.emit_expression_prec(&spread.argument, P_ASSIGN);
                 }
                 CallArgument::Missing(_) => {
@@ -2556,10 +2809,12 @@ impl<'a> Emitter<'a> {
                     );
                 }
             }
+            previous_end = argument_range.map(|range| range.end());
         }
     }
 
     fn emit_member(&mut self, member: &MemberExpression) {
+        let range = self.anchor;
         let dotted = !matches!(member.property, MemberProperty::Computed(_));
         let numeric_object = dotted
             && matches!(
@@ -2575,25 +2830,55 @@ impl<'a> Emitter<'a> {
         }
         match &member.property {
             MemberProperty::Named(name) => {
-                self.raw(if member.optional { "?." } else { "." });
+                let dot_pos = self
+                    .source_pos_of(
+                        TextRange::new(member.object.range().end(), name.range().start())
+                            .unwrap_or(self.anchor),
+                        '.',
+                    )
+                    .unwrap_or(name.range().start());
+                self.raw_mapped_token(if member.optional { "?." } else { "." }, dot_pos, 1);
                 self.emit_ident(name);
             }
             MemberProperty::Private(private) => {
-                self.raw(if member.optional { "?." } else { "." });
+                let dot_pos = self
+                    .source_pos_of(
+                        TextRange::new(member.object.range().end(), range.end()).unwrap_or(range),
+                        '.',
+                    )
+                    .unwrap_or(range.end());
+                self.raw_mapped_token(if member.optional { "?." } else { "." }, dot_pos, 1);
                 self.emit_token(private.data().token());
             }
             MemberProperty::Computed(expression) => {
-                self.raw(if member.optional { "?.[" } else { "[" });
+                let bracket_pos = self
+                    .source_pos_of(
+                        TextRange::new(member.object.range().end(), expression.range().start())
+                            .unwrap_or(range),
+                        '[',
+                    )
+                    .unwrap_or(expression.range().start());
+                self.raw_mapped_token(if member.optional { "?.[" } else { "[" }, bracket_pos, 1);
                 self.emit_expression_prec(expression, 0);
-                self.raw("]");
+                let close_pos = self.source_pos_of_last(range, ']').unwrap_or(range.end());
+                self.raw_mapped_token("]", close_pos, 1);
             }
         }
     }
 
     fn emit_yield(&mut self, expression: &YieldExpression) {
-        self.raw("yield");
+        let range = self.anchor;
+        let yield_pos = self.source_pos_of(range, 'y').unwrap_or(range.start());
+        self.raw_mapped_token("yield", yield_pos, 5);
         if expression.delegate {
-            self.raw("*");
+            let star_pos = self
+                .source_pos_of(
+                    TextRange::new(Utf16Pos::new(yield_pos.get() + 5), range.end())
+                        .unwrap_or(range),
+                    '*',
+                )
+                .unwrap_or(range.end());
+            self.raw_mapped_token("*", star_pos, 1);
         }
         if let Some(argument) = &expression.argument {
             self.raw(" ");
@@ -2602,14 +2887,23 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_unary(&mut self, unary: &UnaryExpression) {
-        match unary.operator {
-            UnaryOperator::Typeof => self.raw("typeof "),
-            UnaryOperator::Void => self.raw("void "),
-            UnaryOperator::Delete => self.raw("delete "),
-            UnaryOperator::Plus => self.raw("+"),
-            UnaryOperator::Minus => self.raw("-"),
-            UnaryOperator::Not => self.raw("!"),
-            UnaryOperator::BitNot => self.raw("~"),
+        let range = self.anchor;
+        let (text, anchor_char, width): (&str, char, usize) = match unary.operator {
+            UnaryOperator::Typeof => ("typeof ", 't', 6),
+            UnaryOperator::Void => ("void ", 'v', 4),
+            UnaryOperator::Delete => ("delete ", 'd', 6),
+            UnaryOperator::Plus => ("+", '+', 1),
+            UnaryOperator::Minus => ("-", '-', 1),
+            UnaryOperator::Not => ("!", '!', 1),
+            UnaryOperator::BitNot => ("~", '~', 1),
+        };
+        let keyword = text.strip_suffix(' ').unwrap_or(text);
+        let op_pos = self
+            .source_pos_of(range, anchor_char)
+            .unwrap_or(range.start());
+        self.raw_mapped_token(keyword, op_pos, width);
+        if text != keyword {
+            self.raw(" ");
         }
         if matches!(unary.operator, UnaryOperator::Plus | UnaryOperator::Minus)
             && self.needs_unary_space(&unary.argument)
@@ -2630,16 +2924,24 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_update(&mut self, update: &UpdateExpression) {
+        let range = self.anchor;
         let operator = match update.operator {
             UpdateOperator::Increment => "++",
             UpdateOperator::Decrement => "--",
         };
+        let anchor_char = operator.chars().next().unwrap_or('+');
         if update.prefix {
-            self.raw(operator);
+            let op_pos = self
+                .source_pos_of(range, anchor_char)
+                .unwrap_or(range.start());
+            self.raw_mapped_token(operator, op_pos, 2);
             self.emit_assignment_target(&update.argument);
         } else {
             self.emit_assignment_target(&update.argument);
-            self.raw(operator);
+            let op_pos = self
+                .source_pos_of_last(range, anchor_char)
+                .unwrap_or(range.end());
+            self.raw_mapped_token(operator, op_pos, 2);
         }
     }
 
@@ -2659,10 +2961,26 @@ impl<'a> Emitter<'a> {
             self.raw_mapped_pos(" ** ", binary.left.range().end());
             self.emit_expression_prec(&binary.right, P_EXPONENT);
         } else {
+            let operator_text = binary_str(binary.operator);
             self.emit_expression_prec(&binary.left, prec);
-            self.raw_mapped_pos(" ", binary.left.range().end());
-            self.raw(binary_str(binary.operator));
-            self.raw(" ");
+            let op_pos = self
+                .source_pos_of(
+                    TextRange::new(
+                        binary.left.range().end(),
+                        binary.right.range().start(),
+                    )
+                    .unwrap_or(self.anchor),
+                    operator_text.chars().next().unwrap_or('+'),
+                )
+                .unwrap_or(binary.left.range().end())
+                .get()
+                .saturating_sub(1);
+            let op_pos = Utf16Pos::new(op_pos);
+            self.raw_mapped_token(
+                &format!(" {operator_text} "),
+                op_pos,
+                operator_text.chars().count(),
+            );
             self.emit_expression_prec(&binary.right, prec + 1);
         }
     }
@@ -2673,10 +2991,26 @@ impl<'a> Emitter<'a> {
             LogicalOperator::Or => P_LOGICAL_OR,
             LogicalOperator::Nullish => P_NULLISH,
         };
+        let operator_text = logical_str(logical.operator);
         self.emit_logical_operand(&logical.left, logical.operator, prec, true);
-        self.raw(" ");
-        self.raw(logical_str(logical.operator));
-        self.raw(" ");
+        let op_pos = self
+            .source_pos_of(
+                TextRange::new(
+                    logical.left.range().end(),
+                    logical.right.range().start(),
+                )
+                .unwrap_or(self.anchor),
+                operator_text.chars().next().unwrap_or('&'),
+            )
+            .unwrap_or(logical.left.range().end())
+                .get()
+                .saturating_sub(1);
+        let op_pos = Utf16Pos::new(op_pos);
+        self.raw_mapped_token(
+            &format!(" {operator_text} "),
+            op_pos,
+            operator_text.chars().count(),
+        );
         self.emit_logical_operand(&logical.right, logical.operator, prec, false);
     }
 
@@ -2709,26 +3043,64 @@ impl<'a> Emitter<'a> {
 
     fn emit_conditional(&mut self, conditional: &ConditionalExpression) {
         self.emit_expression_prec(&conditional.test, P_CONDITIONAL + 1);
-        self.raw(" ? ");
+        let question_pos = self
+            .source_pos_of(
+                TextRange::new(
+                    conditional.test.range().end(),
+                    conditional.consequent.range().start(),
+                )
+                .unwrap_or(self.anchor),
+                '?',
+            )
+            .unwrap_or(conditional.test.range().end());
+        self.raw_mapped_token(" ? ", question_pos, 1);
         self.emit_expression_prec(&conditional.consequent, P_ASSIGN);
-        self.raw(" : ");
+        let colon_pos = self
+            .source_pos_of(
+                TextRange::new(
+                    conditional.consequent.range().end(),
+                    conditional.alternate.range().start(),
+                )
+                .unwrap_or(self.anchor),
+                ':',
+            )
+            .unwrap_or(conditional.consequent.range().end());
+        self.raw_mapped_token(" : ", colon_pos, 1);
         self.emit_expression_prec(&conditional.alternate, P_ASSIGN);
     }
 
     fn emit_assignment(&mut self, assignment: &AssignmentExpression) {
+        let operator_text = assignment_str(assignment.operator);
         self.emit_assignment_target(&assignment.left);
-        self.raw(" ");
-        self.raw(assignment_str(assignment.operator));
-        self.raw(" ");
+        let op_pos = self
+            .source_pos_of(
+                TextRange::new(
+                    assignment.left.range().end(),
+                    assignment.right.range().start(),
+                )
+                .unwrap_or(self.anchor),
+                operator_text.chars().next().unwrap_or('='),
+            )
+            .unwrap_or(assignment.left.range().end())
+                .get()
+                .saturating_sub(1);
+        let op_pos = Utf16Pos::new(op_pos);
+        self.raw_mapped_token(
+            &format!(" {operator_text} "),
+            op_pos,
+            operator_text.chars().count(),
+        );
         self.emit_expression_prec(&assignment.right, P_ASSIGN);
     }
 
     fn emit_sequence(&mut self, sequence: &SequenceExpression) {
-        for (index, expression) in sequence.expressions.iter().enumerate() {
-            if index > 0 {
-                self.raw(", ");
+        let mut previous_end: Option<Utf16Pos> = None;
+        for expression in sequence.expressions.iter() {
+            if let Some(end) = previous_end {
+                self.mapped_list_separator_from(end, expression.range().start());
             }
             self.emit_expression_prec(expression, P_ASSIGN);
+            previous_end = Some(expression.range().end());
         }
     }
 
@@ -2836,27 +3208,36 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_pattern(&mut self, pattern: &Pattern) {
+        let pattern_range = pattern.range();
         match pattern.data() {
             BindingPattern::Identifier(ident) => self.emit_ident(ident),
             BindingPattern::Object(object) => {
                 if object.properties.is_empty() {
-                    self.raw("{}");
+                    self.raw_mapped_char_end("{}", pattern_range, '{');
                     return;
                 }
-                self.raw("{ ");
-                for (index, property) in object.properties.iter().enumerate() {
-                    if index > 0 {
-                        self.raw(", ");
+                self.raw_mapped_char("{ ", pattern_range, '{', 1);
+                let mut previous_end: Option<Utf16Pos> = None;
+                for property in object.properties.iter() {
+                    let property_range = object_binding_property_range(property);
+                    match (previous_end, property_range) {
+                        (Some(end), Some(next)) => self.raw_mapped_list_separator(end, next),
+                        (Some(end), None) => self.raw_mapped_pos(", ", end),
+                        (None, _) => {}
                     }
                     self.emit_object_binding_property(property);
+                    previous_end = property_range.map(|range| range.end());
                 }
-                self.raw(" }");
+                self.raw_mapped_char_end(" }", pattern_range, '}');
             }
             BindingPattern::Array(array) => {
-                self.raw("[");
+                self.raw_mapped_char("[", pattern_range, '[', 1);
+                let mut cursor = Utf16Pos::new(pattern_range.start().get().saturating_add(1));
                 for (index, element) in array.elements.iter().enumerate() {
+                    let element_range = array_binding_element_range(element);
                     if index > 0 {
-                        self.raw(", ");
+                        let limit = element_range.map_or(pattern_range.end(), |r| r.start());
+                        cursor = self.mapped_list_separator_from(cursor, limit);
                     }
                     match element {
                         ArrayBindingElement::Binding(binding) => self.emit_pattern(binding),
@@ -2865,19 +3246,23 @@ impl<'a> Emitter<'a> {
                             self.diag_here(codes::MISSING_BINDING, "cannot emit a missing binding");
                         }
                     }
+                    if let Some(element_range) = element_range {
+                        cursor = element_range.end();
+                    }
                 }
                 if matches!(array.elements.last(), Some(ArrayBindingElement::Elision)) {
-                    self.raw(",");
+                    self.raw_mapped_char_end(",", pattern_range, ',');
                 }
-                self.raw("]");
+                self.raw_mapped_char_end("]", pattern_range, ']');
             }
             BindingPattern::Rest(rest) => {
-                self.raw("...");
+                let rest_argument = rest.argument.range();
+                self.raw_mapped_char("...", rest_argument, '.', 3);
                 self.emit_pattern(&rest.argument);
             }
             BindingPattern::Assignment(assignment) => {
                 self.emit_pattern(&assignment.left);
-                self.raw(" = ");
+                self.raw_mapped_pos(" = ", assignment.left.range().end());
                 self.emit_expression_prec(&assignment.right, P_ASSIGN);
             }
             BindingPattern::Missing(_) => {
@@ -3078,7 +3463,7 @@ impl<'a> Emitter<'a> {
                 | Statement::Export(_)
         );
         if needs_jsdoc {
-            self.emit_jsdoc_for_range(statement.range());
+            self.emit_jsdoc_for_range(self.anchor);
         }
         let emitted = match statement.data() {
             Statement::Import(import) => self.emit_import(import, true),
@@ -4202,6 +4587,68 @@ impl<'a> Emitter<'a> {
 }
 
 // ---- free helpers ---------------------------------------------------------
+
+/// UTF-16 length of `text`, for width arithmetic in mapping positions.
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// Source range of an array-literal element, `None` for elisions and missing
+/// placeholders, neither of which has a source token.
+fn array_element_range(element: &ArrayElement) -> Option<TextRange> {
+    match element {
+        ArrayElement::Expression(expression) => Some(expression.range()),
+        ArrayElement::Spread(spread) => Some(spread.argument.range()),
+        _ => None,
+    }
+}
+
+/// Source range of an array binding-pattern element.
+fn array_binding_element_range(element: &ArrayBindingElement) -> Option<TextRange> {
+    match element {
+        ArrayBindingElement::Binding(binding) => Some(binding.range()),
+        _ => None,
+    }
+}
+
+/// Source range of an assignment-target array-pattern element.
+fn assignment_array_element_range(element: &AssignmentArrayElement) -> Option<TextRange> {
+    match element {
+        AssignmentArrayElement::Target(target) => Some(target.range()),
+        _ => None,
+    }
+}
+
+/// Source range of a call argument.
+fn call_argument_range(argument: &CallArgument) -> Option<TextRange> {
+    match argument {
+        CallArgument::Expression(expression) => Some(expression.range()),
+        CallArgument::Spread(spread) => Some(spread.argument.range()),
+        CallArgument::Missing(_) => None,
+    }
+}
+
+/// Source range of a binding-property name, `None` for a missing name.
+fn property_name_range(name: &PropertyName) -> Option<TextRange> {
+    match name {
+        PropertyName::Identifier(node) => Some(node.range()),
+        PropertyName::Private(node) => Some(node.range()),
+        PropertyName::String(node) => Some(node.range()),
+        PropertyName::Number(node) => Some(node.range()),
+        PropertyName::Computed(expression) => Some(expression.range()),
+        PropertyName::Missing(_) => None,
+    }
+}
+
+/// Source range spanning one object binding property: name through initializer.
+fn object_binding_property_range(property: &ObjectBindingProperty) -> Option<TextRange> {
+    let start = property_name_range(&property.name)?;
+    let end = property.initializer.as_ref().map_or_else(
+        || property.binding.range().end(),
+        |initializer| initializer.range().end(),
+    );
+    TextRange::new(start.start(), end).ok()
+}
 
 fn is_parameter_property(parameter: &Parameter) -> bool {
     parameter.modifiers.accessibility.is_some()
