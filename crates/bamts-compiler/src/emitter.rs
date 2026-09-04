@@ -6534,6 +6534,33 @@ export default answer;
     }
 
     #[test]
+    fn es5_async_switch_case_await_builds_dispatch_chain() {
+        // Authority: es5-asyncFunctionSwitchStatements(target=es5)
+        // switchStatement2 — a suspending case test yields, and its
+        // resume opens a dispatch over the held discriminant comparing
+        // the sent value, falling through to the default body's label.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x, y, a, b;\nasync function switchStatement2() {\n    switch (x) { case await y: a; break; default: b; break; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(
+            code.contains("case _b.sent(): return [3 /*break*/, 2];"),
+            "{code}"
+        );
+        assert!(code.contains("return [3 /*break*/, 3];"), "{code}");
+    }
+
+    #[test]
     fn es5_async_arrow_with_this_keeps_the_arrow() {
         // Bodies referencing `this` need the hoisted-capture machinery, so
         // the conversion refuses and the arrow form stays.

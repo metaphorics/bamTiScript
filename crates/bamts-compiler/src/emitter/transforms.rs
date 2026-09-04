@@ -4215,6 +4215,9 @@ impl<'a> Rewriter<'a> {
                 Statement::For(for_statement) => {
                     self.machine_emit_for(statement, for_statement, ctx)?;
                 }
+                Statement::Switch(switch_statement) => {
+                    self.machine_emit_switch(statement, switch_statement, ctx)?;
+                }
                 Statement::Labeled(labeled) => {
                     let name = self.identifier_name(&labeled.label)?;
                     ctx.loop_labels.push(name);
@@ -4695,6 +4698,250 @@ impl<'a> Rewriter<'a> {
 
         ctx.segments.push(Vec::new());
         debug_assert_eq!(ctx.segments.len() as u32 - 1, exit_label);
+        Some(())
+    }
+
+    /// Lowers a switch-statement into the machine. A clean switch stays
+    /// inline; a suspending discriminant with clean members reassembles
+    /// inline around the resumed value. Otherwise the machine form: the
+    /// discriminant is held in a temp, body labels run in source case
+    /// order after the dispatch phases, clean tests join the head's
+    /// dispatch switch, each suspending test closes it and yields and its
+    /// resume opens the next holding the sent comparison plus later clean
+    /// tests, and the chain falls through to the default body's label or
+    /// the end. Bodies run at their labels; break jumps to the end and a
+    /// break-less body marks the next body's label.
+    fn machine_emit_switch(
+        &mut self,
+        statement: &Stmt,
+        switch_statement: &SwitchStatement,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        let range = statement.range();
+        let case_test_suspends =
+            |case: &SwitchCaseNode| case.data().test.as_deref().is_some_and(contains_yield);
+        let case_body_resumes =
+            |case: &SwitchCaseNode| count_branch_yields(&case.data().consequent);
+        let disc_suspends = contains_yield(&switch_statement.discriminant);
+        let any_test = switch_statement.cases.iter().any(case_test_suspends);
+        let any_body = switch_statement
+            .cases
+            .iter()
+            .any(|case| case_body_resumes(case) > 0);
+        if !disc_suspends && !any_test && !any_body {
+            ctx.push(statement.clone());
+            return Some(());
+        }
+        if disc_suspends && !any_test && !any_body {
+            // Only the discriminant suspends: reassemble inline around
+            // the resumed value, cases cloned.
+            let discriminant = self.eval(&switch_statement.discriminant, ctx)?;
+            let rebuilt = self.node(
+                range,
+                Statement::Switch(SwitchStatement {
+                    discriminant: Box::new(discriminant),
+                    cases: switch_statement.cases.clone(),
+                }),
+            );
+            ctx.push(rebuilt);
+            return Some(());
+        }
+        if disc_suspends {
+            // A suspending discriminant alongside suspending members is
+            // beyond this slice.
+            return None;
+        }
+        for case in &switch_statement.cases {
+            if !case.data().consequent.iter().all(|statement| {
+                matches!(
+                    statement.data(),
+                    Statement::Expression(_)
+                        | Statement::Variable(_)
+                        | Statement::Break(_)
+                        | Statement::Empty
+                )
+            }) {
+                return None;
+            }
+        }
+        if ctx.terminated {
+            return None;
+        }
+
+        let head = ctx.segments.len() as u32 - 1;
+        let suspending_tests = switch_statement
+            .cases
+            .iter()
+            .filter(|case| case_test_suspends(case))
+            .count() as u32;
+        // Each suspending test's yield lands in the current segment and
+        // its resume opens one new segment, so the dispatch phases span
+        // head..head+suspending_tests and bodies start after.
+        let mut cursor = head + 1 + suspending_tests;
+        let mut body_labels = Vec::new();
+        for case in &switch_statement.cases {
+            body_labels.push(cursor);
+            // A body occupies its own label plus one per resume phase
+            // inside it; the next body starts after all of them.
+            let resumes = case_body_resumes(case);
+            cursor += resumes + 1;
+        }
+        let end_label = cursor;
+        let default_label = switch_statement
+            .cases
+            .iter()
+            .position(|case| case.data().test.is_none())
+            .map(|index| body_labels[index]);
+
+        // The discriminant is always held in a temp in machine form.
+        let bank_range = self.bank.intern("switch");
+        let disc_temp = self.materialize(
+            switch_statement.discriminant.as_ref().clone(),
+            ctx,
+            bank_range,
+        )?;
+
+        // Dispatch chain.
+        let mut clean_entries: Vec<(Expr, u32)> = Vec::new();
+        let mut sent_entry: Option<(Expr, u32)> = None;
+        for (index, case) in switch_statement.cases.iter().enumerate() {
+            let target = body_labels[index];
+            match case.data().test.as_deref() {
+                Some(test) if contains_yield(test) => {
+                    let dispatch = self.push_dispatch_switch(
+                        &disc_temp,
+                        &clean_entries,
+                        sent_entry.take(),
+                        range,
+                    )?;
+                    if let Some(dispatch) = dispatch {
+                        ctx.push(dispatch);
+                    }
+                    clean_entries.clear();
+                    // eval splits the suspension (`return [4, arg];`),
+                    // opens the resume segment, and returns the resumed
+                    // value — the sent comparison's test in the next phase.
+                    let resumed = self.eval(test, ctx)?;
+                    sent_entry = Some((resumed, target));
+                }
+                Some(test) => clean_entries.push((test.clone(), target)),
+                None => {}
+            }
+        }
+        let dispatch = self.push_dispatch_switch(&disc_temp, &clean_entries, sent_entry, range)?;
+        if let Some(dispatch) = dispatch {
+            ctx.push(dispatch);
+        }
+        let fallthrough_target = default_label.unwrap_or(end_label);
+        let fallthrough = self.break_to(fallthrough_target, range);
+        ctx.push(fallthrough);
+
+        // Bodies at their labels, in source order.
+        for (index, case) in switch_statement.cases.iter().enumerate() {
+            let label = body_labels[index];
+            ctx.segments.push(Vec::new());
+            debug_assert_eq!(ctx.segments.len() as u32 - 1, label);
+            self.machine_emit_switch_body(
+                &case.data().consequent,
+                end_label,
+                index,
+                &body_labels,
+                case.range(),
+                ctx,
+            )?;
+        }
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, end_label);
+        Some(())
+    }
+
+    /// The dispatch mini-switch: one inline jump case per clean entry, the
+    /// sent comparison first when a suspending test just resumed. Tests
+    /// carry bank-interned ranges so the printer's inline rule fires.
+    fn push_dispatch_switch(
+        &mut self,
+        disc_temp: &Expr,
+        clean_entries: &[(Expr, u32)],
+        sent_entry: Option<(Expr, u32)>,
+        range: TextRange,
+    ) -> Option<Option<Stmt>> {
+        if clean_entries.is_empty() && sent_entry.is_none() {
+            return Some(None);
+        }
+        let mut cases = Vec::new();
+        if let Some((sent, target)) = sent_entry {
+            // Re-mint with a bank range so the printer's inline rule
+            // fires for the comparison case.
+            let bank = self.bank.intern("sent");
+            let minted = self.node(bank, sent.data().clone());
+            let jump = self.break_to(target, range);
+            let case = self.node(
+                range,
+                SwitchCase {
+                    test: Some(Box::new(minted)),
+                    consequent: vec![jump],
+                },
+            );
+            cases.push(case);
+        }
+        for (test, target) in clean_entries {
+            let bank = self.bank.intern("case");
+            let minted = self.node(bank, test.data().clone());
+            let jump = self.break_to(*target, range);
+            let case = self.node(
+                range,
+                SwitchCase {
+                    test: Some(Box::new(minted)),
+                    consequent: vec![jump],
+                },
+            );
+            cases.push(case);
+        }
+        let switch = self.syn_node(
+            range,
+            Statement::Switch(SwitchStatement {
+                discriminant: Box::new(disc_temp.clone()),
+                cases,
+            }),
+        );
+        Some(Some(switch))
+    }
+
+    /// One case body: statements flow through the branch emitter, break
+    /// jumps to the end, and a body ending without a break marks the next
+    /// body's label (switch fallthrough).
+    fn machine_emit_switch_body(
+        &mut self,
+        statements: &[Stmt],
+        end_label: u32,
+        index: usize,
+        body_labels: &[u32],
+        case_range: TextRange,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        let mut fell_through = true;
+        for statement in statements {
+            match statement.data() {
+                Statement::Break(_) => {
+                    let bank_range = self.bank.intern("break");
+                    let out = self.break_to(end_label, bank_range);
+                    ctx.push(out);
+                    fell_through = false;
+                }
+                Statement::Empty => {}
+                Statement::Expression(_) | Statement::Variable(_) => {
+                    self.machine_emit_branch(std::slice::from_ref(statement), ctx)?;
+                }
+                _ => return None,
+            }
+        }
+        if fell_through {
+            let next = body_labels.get(index + 1).copied().unwrap_or(end_label);
+            let state = ctx.state.clone();
+            let mark = self.label_assignment(next, &state, case_range);
+            ctx.push(mark);
+        }
         Some(())
     }
 
@@ -7144,6 +7391,8 @@ fn statements_contain_await(statements: &[Stmt]) -> bool {
                 })
         }
         Statement::Labeled(labeled) => branch_awaits(&labeled.body),
+        // Jumps and empties hold no expressions.
+        Statement::Break(_) | Statement::Continue(_) | Statement::Empty => false,
         _ => true,
     })
 }
@@ -7152,9 +7401,10 @@ fn statements_contain_await(statements: &[Stmt]) -> bool {
 /// true, matching the machine's refusal of them.
 fn branch_awaits(statement: &Stmt) -> bool {
     match statement.data() {
-        Statement::Block(block) => statements_contain_await(&block.data().statements),
-        Statement::Expression(expression) => contains_await(&expression.expression),
-        _ => true,
+        Statement::Break(_) | Statement::Continue(_) | Statement::Empty => false,
+        // Delegate to the full statement walker so labeled and bare
+        // control-flow bodies share one coverage set.
+        _ => statements_contain_await(std::slice::from_ref(statement)),
     }
 }
 
