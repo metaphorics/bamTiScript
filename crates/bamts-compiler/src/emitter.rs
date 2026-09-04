@@ -1536,7 +1536,8 @@ impl<'a> Emitter<'a> {
         self.raw_mapped("if (", self.anchor);
         self.emit_expression(&if_statement.test);
         self.raw_mapped_pos(")", if_statement.test.range().end());
-        self.emit_control_body(&if_statement.consequent);
+        let hug = if_statement.test.id().get() >= self.synthesized_floor;
+        self.emit_control_body_hug(&if_statement.consequent, hug);
         let machine_if = statement.id().get() >= self.synthesized_floor;
         if let Some(alternate) = &if_statement.alternate {
             let alt_range = alternate.range();
@@ -1566,25 +1567,44 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_control_body(&mut self, statement: &Stmt) {
-        self.raw(" ");
+        self.emit_control_body_hug(statement, true)
+    }
+
+    /// Emits a brace-less control body. `hug` carries tsc's layout rule:
+    /// a fully synthesized guard (`if (!x) return [3 /*break*/, 2];`)
+    /// keeps the body on the head's line, while a translated body — an
+    /// authored test with a synthesized jump — breaks to its own line.
+    fn emit_control_body_hug(&mut self, statement: &Stmt, hug: bool) {
         match statement.data() {
             Statement::Block(block) => {
+                self.raw(" ");
                 self.emit_block_with_braces(block, self.anchor, BlockLayout::Statement)
             }
-            Statement::Empty => self.raw("{}"),
+            Statement::Empty => self.raw(" {}"),
             _ if self.body_authored_same_line(statement) => {
                 // tsc keeps a brace-less control body authored on the
                 // head's line bare (`if (cond) return mod;`, APISample_*).
+                self.raw(" ");
                 if self.emit_statement(statement) {
                     self.newline();
                 }
             }
-            _ if statement.id().get() >= self.synthesized_floor => {
+            _ if statement.id().get() >= self.synthesized_floor && hug => {
                 // Machine control flow keeps the bare form tsc emits for
                 // synthesized bodies (`if (!x) return [3 /*break*/, 2];`).
+                self.raw(" ");
                 self.emit_statement(statement);
             }
+            _ if statement.id().get() >= self.synthesized_floor => {
+                // A translated jump — authored test, synthesized body —
+                // breaks to its own line.
+                self.newline();
+                self.indent += 1;
+                self.emit_statement(statement);
+                self.indent -= 1;
+            }
             _ => {
+                self.raw(" ");
                 self.raw_mapped("{", self.anchor);
                 self.newline();
                 self.indent += 1;
@@ -6425,6 +6445,33 @@ export default answer;
         assert!(code.contains("if (!x) return [3 /*break*/, 2];"), "{code}");
         assert!(
             code.contains("case 2:\n                    z;\n                    _a.label = 3;\n                case 3: return [2 /*return*/];"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn es5_async_while_body_await_builds_loop_machine() {
+        // Authority: es5-asyncFunctionWhileStatements(target=es5)
+        // whileStatement2 — a suspending loop body builds the labeled
+        // shape: guard at the head, resume translating to a head jump,
+        // exit label after.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x, y;\nasync function whileStatement2() {\n    while (x) { await y; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("if (!x) return [3 /*break*/, 2];"), "{code}");
+        assert!(
+            code.contains("case 1:\n                    _a.sent();\n                    return [3 /*break*/, 0];\n                case 2: return [2 /*return*/];"),
             "{code}"
         );
     }

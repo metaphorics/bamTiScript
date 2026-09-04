@@ -4200,6 +4200,16 @@ impl<'a> Rewriter<'a> {
                 Statement::If(if_statement) => {
                     self.machine_emit_if(statement, if_statement, ctx)?;
                 }
+                Statement::While(while_statement) => {
+                    self.machine_emit_while(statement, while_statement, ctx)?;
+                }
+                Statement::Labeled(labeled) => {
+                    let name = self.identifier_name(&labeled.label)?;
+                    ctx.loop_labels.push(name);
+                    let result = self.machine_emit_labeled(statement, &labeled.body, ctx);
+                    ctx.loop_labels.pop();
+                    result?;
+                }
 
                 Statement::Return(returned) => {
                     let terminator = match &returned.argument {
@@ -4300,19 +4310,17 @@ impl<'a> Rewriter<'a> {
         if contains_yield(&if_statement.test) || ctx.terminated {
             return None;
         }
-
         let base = ctx.segments.len() as u32;
-        let else_label = base + cons_resumes;
-        let end_label = else_label + 1 + alt_resumes;
-
-        // `if (!test) return [3 /*break*/, else];` — bare body.
         let negated = self.node(
-            range,
+            if_statement.test.range(),
             Expression::Unary(UnaryExpression {
                 operator: UnaryOperator::Not,
                 argument: Box::new(if_statement.test.as_ref().clone()),
             }),
         );
+        let else_label = base + cons_resumes;
+        let end_label = else_label + 1 + alt_resumes;
+
         let jump = self.break_to(else_label, range);
         let guard = self.node(
             range,
@@ -4327,7 +4335,6 @@ impl<'a> Rewriter<'a> {
         self.machine_emit_branch(cons_block, ctx)?;
         let cons_break = self.break_to(end_label, range);
         ctx.push(cons_break);
-
         ctx.segments.push(Vec::new());
         debug_assert_eq!(ctx.segments.len() as u32 - 1, else_label);
         self.machine_emit_branch(alt_block, ctx)?;
@@ -4339,8 +4346,194 @@ impl<'a> Rewriter<'a> {
         debug_assert_eq!(ctx.segments.len() as u32 - 1, end_label);
         Some(())
     }
+    fn machine_emit_labeled(
+        &mut self,
+        statement: &Stmt,
+        body: &Stmt,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        match body.data() {
+            Statement::While(while_statement) => {
+                let body_block = block_statements(&while_statement.body)?;
+                if count_yields(&while_statement.test) == 0 && count_branch_yields(body_block) == 0
+                {
+                    // Clean loops stay inline, label attached.
+                    ctx.push(statement.clone());
+                    return Some(());
+                }
+                self.machine_emit_while(body, while_statement, ctx)
+            }
+            Statement::Labeled(labeled) => {
+                let name = self.identifier_name(&labeled.label)?;
+                ctx.loop_labels.push(name);
+                let result = self.machine_emit_labeled(body, &labeled.body, ctx);
+                ctx.loop_labels.pop();
+                result
+            }
+            _ => None,
+        }
+    }
 
-    /// Emits a branch's simple statements into the current segment.
+    /// Lowers a while-loop into the machine. Clean loops stay inline;
+    /// suspending ones build the labeled shape: the loop head holds the
+    /// guard (after a suspending test resumes), `if (!test) return
+    /// [3 /*break*/, exit];`, the body translates continue to a head jump
+    /// and break to an exit jump, the body's completion loops back to the
+    /// head, and the exit label continues the machine.
+    fn machine_emit_while(
+        &mut self,
+        statement: &Stmt,
+        while_statement: &WhileStatement,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        let range = statement.range();
+        let body_block = block_statements(&while_statement.body)?;
+        let test_resumes = count_yields(&while_statement.test);
+        let body_resumes = count_branch_yields(body_block);
+        if test_resumes == 0 && body_resumes == 0 {
+            ctx.push(statement.clone());
+            return Some(());
+        }
+        if ctx.terminated {
+            return None;
+        }
+        let head = ctx.segments.len() as u32 - 1;
+        let exit_label = head + test_resumes + body_resumes + 1;
+
+        let test = self.eval(&while_statement.test, ctx)?;
+        let negated = self.node(
+            while_statement.test.range(),
+            Expression::Unary(UnaryExpression {
+                operator: UnaryOperator::Not,
+                argument: Box::new(test),
+            }),
+        );
+        let jump = self.break_to(exit_label, range);
+        let guard = self.node(
+            range,
+            Statement::If(IfStatement {
+                test: Box::new(negated),
+                consequent: Box::new(jump),
+                alternate: None,
+            }),
+        );
+        ctx.push(guard);
+
+        self.machine_emit_loop_body(body_block, head, exit_label, ctx)?;
+        let body_terminated = ctx
+            .segments
+            .last()
+            .and_then(|segment| segment.last())
+            .is_some_and(|statement| matches!(statement.data(), Statement::Return(_)));
+        if !body_terminated {
+            let loop_back = self.break_to(head, range);
+            ctx.push(loop_back);
+        }
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, exit_label);
+        Some(())
+    }
+
+    /// Emits loop-body statements, translating continue/break jumps and
+    /// single-jump if-guards; other statements flow through the shared
+    /// branch emitter. Translated jumps carry bank ranges so authored
+    /// same-line detection cannot claim them.
+    fn machine_emit_loop_body(
+        &mut self,
+        statements: &[Stmt],
+        head: u32,
+        exit: u32,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        for statement in statements {
+            match statement.data() {
+                Statement::Continue(jump) => {
+                    self.jump_label_matches(&jump.label, ctx)?;
+                    let bank_range = self.bank.intern("continue");
+                    let back = self.break_to(head, bank_range);
+                    ctx.push(back);
+                }
+                Statement::Break(jump) => {
+                    self.jump_label_matches(&jump.label, ctx)?;
+                    let bank_range = self.bank.intern("break");
+                    let out = self.break_to(exit, bank_range);
+                    ctx.push(out);
+                }
+                Statement::If(if_statement) if if_statement.alternate.is_none() => {
+                    self.machine_emit_jump_guard(if_statement, head, exit, ctx)?;
+                }
+                Statement::Expression(_) | Statement::Variable(_) => {
+                    self.machine_emit_branch(std::slice::from_ref(statement), ctx)?;
+                }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    /// `if (cond) continue|break;` — rewrites the jump into a labeled
+    /// break with the body on its own line.
+    fn machine_emit_jump_guard(
+        &mut self,
+        if_statement: &IfStatement,
+        head: u32,
+        exit: u32,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        if contains_yield(&if_statement.test) {
+            return None;
+        }
+        let branch: &[Stmt] = match if_statement.consequent.data() {
+            Statement::Block(block) => &block.data().statements,
+            _ => std::slice::from_ref(&if_statement.consequent),
+        };
+        if branch.len() != 1
+            || !matches!(
+                branch[0].data(),
+                Statement::Continue(_) | Statement::Break(_)
+            )
+        {
+            return None;
+        }
+        let bank_range = self.bank.intern("jump");
+        let jump = match branch[0].data() {
+            Statement::Continue(j) => {
+                self.jump_label_matches(&j.label, ctx)?;
+                self.break_to(head, bank_range)
+            }
+            Statement::Break(j) => {
+                self.jump_label_matches(&j.label, ctx)?;
+                self.break_to(exit, bank_range)
+            }
+            _ => return None,
+        };
+        let rebuilt = self.node(
+            if_statement.consequent.range(),
+            Statement::If(IfStatement {
+                test: Box::new(if_statement.test.as_ref().clone()),
+                consequent: Box::new(jump),
+                alternate: None,
+            }),
+        );
+        ctx.push(rebuilt);
+        Some(())
+    }
+
+    /// A labeled jump must target an enclosing loop of this machine.
+    fn jump_label_matches(&self, label: &Option<IdentifierNode>, ctx: &MachineCtx) -> Option<()> {
+        match label {
+            None => Some(()),
+            Some(label) => {
+                let name = self.identifier_name(label)?;
+                if ctx.loop_labels.iter().any(|candidate| candidate == &name) {
+                    Some(())
+                } else {
+                    None
+                }
+            }
+        }
+    }
     fn machine_emit_branch(&mut self, statements: &[Stmt], ctx: &mut MachineCtx) -> Option<()> {
         for statement in statements {
             match statement.data() {
@@ -6422,6 +6615,7 @@ struct MachineCtx {
     terminated: bool,
     state: String,
     skip: std::collections::HashSet<String>,
+    loop_labels: Vec<String>,
 }
 
 impl MachineCtx {
@@ -6432,8 +6626,9 @@ impl MachineCtx {
             temp_names: Vec::new(),
             segments: vec![Vec::new()],
             terminated: false,
-            state: state.to_string(),
             skip,
+            loop_labels: Vec::new(),
+            state: state.to_string(),
         }
     }
 
