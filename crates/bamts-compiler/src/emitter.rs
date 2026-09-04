@@ -6477,6 +6477,31 @@ export default answer;
     }
 
     #[test]
+    fn es5_async_do_while_builds_positive_guard_machine() {
+        // Authority: es5-asyncFunctionDoStatements(target=es5)
+        // doStatement1 — the do-while guard is positive (loop-back is the
+        // taken branch) and continue jumps to the test label, not the head.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x, y;\nasync function doStatement1() {\n    do { await x; } while (y);\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(
+            code.contains("case 2:\n                    if (y) return [3 /*break*/, 0];\n                    _a.label = 3;\n                case 3: return [2 /*return*/];"),
+            "{code}"
+        );
+    }
+
+    #[test]
     fn es5_async_arrow_with_this_keeps_the_arrow() {
         // Bodies referencing `this` need the hoisted-capture machinery, so
         // the conversion refuses and the arrow form stays.

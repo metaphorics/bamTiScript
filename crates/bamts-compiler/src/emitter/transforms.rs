@@ -4203,6 +4203,9 @@ impl<'a> Rewriter<'a> {
                 Statement::While(while_statement) => {
                     self.machine_emit_while(statement, while_statement, ctx)?;
                 }
+                Statement::DoWhile(do_statement) => {
+                    self.machine_emit_do(statement, do_statement, ctx)?;
+                }
                 Statement::Labeled(labeled) => {
                     let name = self.identifier_name(&labeled.label)?;
                     ctx.loop_labels.push(name);
@@ -4363,6 +4366,14 @@ impl<'a> Rewriter<'a> {
                 }
                 self.machine_emit_while(body, while_statement, ctx)
             }
+            Statement::DoWhile(do_statement) => {
+                let body_block = block_statements(&do_statement.body)?;
+                if count_yields(&do_statement.test) == 0 && count_branch_yields(body_block) == 0 {
+                    ctx.push(statement.clone());
+                    return Some(());
+                }
+                self.machine_emit_do(body, do_statement, ctx)
+            }
             Statement::Labeled(labeled) => {
                 let name = self.identifier_name(&labeled.label)?;
                 ctx.loop_labels.push(name);
@@ -4429,6 +4440,71 @@ impl<'a> Rewriter<'a> {
             let loop_back = self.break_to(head, range);
             ctx.push(loop_back);
         }
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, exit_label);
+        Some(())
+    }
+
+    /// Lowers a do-while loop into the machine. Clean loops stay inline.
+    /// The body starts at the head; its completion marks the test label
+    /// (a suspending test resumes into the guard), the guard is POSITIVE
+    /// (`if (test) return [3 /*break*/, head];`) because the loop-back is
+    /// the taken branch, and continue jumps to the test label rather than
+    /// the head — JS do-while semantics.
+    fn machine_emit_do(
+        &mut self,
+        statement: &Stmt,
+        do_statement: &DoWhileStatement,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        let range = statement.range();
+        let body_block = block_statements(&do_statement.body)?;
+        let test_resumes = count_yields(&do_statement.test);
+        let body_resumes = count_branch_yields(body_block);
+        if test_resumes == 0 && body_resumes == 0 {
+            ctx.push(statement.clone());
+            return Some(());
+        }
+        if ctx.terminated {
+            return None;
+        }
+        let head = ctx.segments.len() as u32 - 1;
+        let test_label = head + body_resumes + 1;
+        let exit_label = test_label + test_resumes + 1;
+
+        self.machine_emit_loop_body(body_block, test_label, exit_label, ctx)?;
+        let body_terminated = ctx
+            .segments
+            .last()
+            .and_then(|segment| segment.last())
+            .is_some_and(|statement| matches!(statement.data(), Statement::Return(_)));
+        if !body_terminated {
+            let state = ctx.state.clone();
+            let mark = self.label_assignment(test_label, &state, range);
+            ctx.push(mark);
+        }
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, test_label);
+        let test = self.eval(&do_statement.test, ctx)?;
+
+        // Positive guard: the loop-back is the taken branch. Re-mint the
+        // test so a clean authored condition still hugs the head line.
+        let guard_test = self.node(do_statement.test.range(), test.data().clone());
+        let jump = self.break_to(head, range);
+        let guard = self.node(
+            range,
+            Statement::If(IfStatement {
+                test: Box::new(guard_test),
+                consequent: Box::new(jump),
+                alternate: None,
+            }),
+        );
+        ctx.push(guard);
+        let state = ctx.state.clone();
+        let mark = self.label_assignment(exit_label, &state, range);
+        ctx.push(mark);
 
         ctx.segments.push(Vec::new());
         debug_assert_eq!(ctx.segments.len() as u32 - 1, exit_label);
