@@ -450,7 +450,7 @@ fn inline_prelude(helpers: &[HelperKind]) -> String {
     // and tsc's own order is deterministic (awaiter before generator).
     let ordered: BTreeSet<HelperKind> = helpers.iter().copied().collect();
     for helper in ordered {
-        append(*helper, &mut emitted, &mut prelude);
+        append(helper, &mut emitted, &mut prelude);
     }
     prelude
 }
