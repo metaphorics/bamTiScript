@@ -2469,6 +2469,8 @@ impl<'a> Rewriter<'a> {
                 let ClassMember::Constructor(ctor) = existing.data() else {
                     unreachable!("constructor slot must contain constructor");
                 };
+                let original_len = ctor.body.data().statements.len();
+                let inits_empty = inits.is_empty();
                 let statements = if derived {
                     self.splice_after_super(&ctor.body.data().statements, &inits)
                 } else {
@@ -2476,7 +2478,16 @@ impl<'a> Rewriter<'a> {
                     statements.extend(ctor.body.data().statements.clone());
                     statements
                 };
-                let body = self.syn_node(ctor.body.range(), Block { statements });
+                // A body carrying no field inits and no spliced statements
+                // is authored content: keep the wrapper untainted (original
+                // id space) so the empty-body layout gate can read its
+                // authored lines (ParameterList6 keeps `constructor(C) {\n}`).
+                // Any synthesized content keeps the tainted mint.
+                let body = if inits_empty && statements.len() == original_len {
+                    self.node(ctor.body.range(), Block { statements })
+                } else {
+                    self.syn_node(ctor.body.range(), Block { statements })
+                };
                 Some(self.syn_node(
                     existing.range(),
                     ClassMember::Constructor(ConstructorDeclaration {
