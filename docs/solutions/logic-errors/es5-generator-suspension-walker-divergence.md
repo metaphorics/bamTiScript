@@ -134,9 +134,14 @@ actually mints.
   `es5_async_identifier_assignment_test_stays_inline`,
   `es5_async_for_update_increment_lowers` (emitter.rs cfg(test)).
 - The corpus-level regression gate is the suite pair
-  (`cargo test -p bamts-compiler` + `cargo test -p bamts-verification` with
-  `BAMTS_ALLOW_NODE_COMPAT=1`), never the bare CLI `-p` path (it never
-  lowers the machine — refusal form only). That pair is the leaf evidence;
+  (`cargo test -p bamts-compiler` + `cargo test -p bamts-verification`),
+  never the bare CLI `-p` path (it never lowers the machine — refusal form
+  only). The verification crate's corpus_differential target additionally
+  demands the pinned `node@24.18.0` first on `PATH`
+  (`mise install node@24.18.0`, then prefix the install's bin dir) — the
+  `BAMTS_ALLOW_NODE_COMPAT=1` flag covers the lib target only and leaves
+  corpus_differential panicking on the version check. That pair is the
+  leaf evidence;
   the completion claim itself binds to the receipt-backed G3 compiler root
   gate in `.outline/GATES.md` — a green suite pair is necessary, not
   sufficient, and closure language must cite the G3 receipts, not the leaf
