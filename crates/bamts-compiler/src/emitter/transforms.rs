@@ -6199,6 +6199,8 @@ mod tests {
 
     #[test]
     fn es2015_downlevels_async_to_awaiter() {
+        // Authority: es5-importHelpersAsyncFunctions(target=es2015).js emits
+        // the awaiter alone — native generators need no __generator.
         let output = emit_at(
             "async function f(x) { return await x; }\n",
             ScriptTarget::Es2015,
@@ -6217,6 +6219,7 @@ mod tests {
 
     #[test]
     fn helper_emission_uses_rewriter_demand_not_analysis_prediction() {
+        // Authority: es5-importHelpersAsyncFunctions(target=es2015).js.
         let source = "function outer() { return async () => await 1; }\n";
         let file = parse(source);
         let checked = checker::check(&Recovered::clean(parse(source)));

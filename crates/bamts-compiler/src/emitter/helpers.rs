@@ -445,7 +445,11 @@ fn inline_prelude(helpers: &[HelperKind]) -> String {
 
     let mut emitted = BTreeSet::new();
     let mut prelude = String::new();
-    for helper in helpers {
+    // Canonical catalog order regardless of request order: the documented
+    // promise is that [B, A] and [A, B] produce byte-identical preludes,
+    // and tsc's own order is deterministic (awaiter before generator).
+    let ordered: BTreeSet<HelperKind> = helpers.iter().copied().collect();
+    for helper in ordered {
         append(*helper, &mut emitted, &mut prelude);
     }
     prelude
