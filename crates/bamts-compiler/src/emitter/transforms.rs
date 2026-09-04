@@ -6749,7 +6749,10 @@ fn count_yields(expression: &Expr) -> u32 {
             .map(|member| match member.data() {
                 ObjectMember::Property(property) => {
                     count_yields(&property.value)
-                        + matches!(&property.name, PropertyName::Computed(key) if count_yields(key) > 0) as u32
+                        + match &property.name {
+                            PropertyName::Computed(key) => count_yields(key),
+                            _ => 0,
+                        }
                 }
                 _ => 0,
             })
