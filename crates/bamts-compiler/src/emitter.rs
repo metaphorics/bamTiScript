@@ -5941,6 +5941,25 @@ export default answer;
     }
 
     #[test]
+    fn anonymous_function_expressions_space_before_parameters() {
+        // Authority: 2dArrays (`function (val) { ... }`), FunctionExpression1_es6
+        // (`function* () { }`), asyncAwaitIsolatedModules_es2017 (`async function ()`).
+        // Named forms bind the space to the name: `function f(v)`, `function* g()`.
+        let input = "var a = function(v) { return v; };\nvar b = function*(w) { yield w; };\nvar c = function named(x) { return x; };\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        let code = &javascript(&output).code;
+        assert!(code.contains("function (v)"), "{code}");
+        assert!(code.contains("function* (w)"), "{code}");
+        assert!(code.contains("function named(x)"), "{code}");
+    }
+
+    #[test]
     fn statement_block_expands_even_when_authored_single_line() {
         // Authority: parser768531 baseline expands an authored single-line
         // standalone block; preservation belongs to function-family bodies.
