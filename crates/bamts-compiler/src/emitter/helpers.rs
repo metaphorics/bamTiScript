@@ -51,6 +51,8 @@ pub struct HelperOptions {
     /// When true, bind helpers from [`HelperOptions::module_specifier`] instead
     /// of inlining their bodies.
     pub import_helpers: bool,
+    /// Assume helpers exist globally; emit no prelude (`noEmitHelpers`).
+    pub no_emit_helpers: bool,
     /// How imported helpers are bound. Ignored when `import_helpers` is false.
     pub style: HelperStyle,
     /// The module specifier used for imported helpers. Defaults to `tslib`.
@@ -61,6 +63,7 @@ impl Default for HelperOptions {
     fn default() -> Self {
         Self {
             import_helpers: false,
+            no_emit_helpers: false,
             style: HelperStyle::Inline,
             module_specifier: String::from("tslib"),
         }
@@ -79,6 +82,7 @@ impl HelperOptions {
     pub fn es_module() -> Self {
         Self {
             import_helpers: true,
+            no_emit_helpers: false,
             style: HelperStyle::EsModule,
             module_specifier: String::from("tslib"),
         }
@@ -89,6 +93,7 @@ impl HelperOptions {
     pub fn common_js() -> Self {
         Self {
             import_helpers: true,
+            no_emit_helpers: false,
             style: HelperStyle::CommonJs,
             module_specifier: String::from("tslib"),
         }
@@ -303,6 +308,15 @@ pub fn emit_helpers(
     file: Option<&SourceFile>,
 ) -> HelperEmit {
     let helpers = close_helpers(requested);
+    if options.no_emit_helpers {
+        // `noEmitHelpers`: callers provide the helpers; the closed set is
+        // still recorded but no definition text is emitted.
+        return HelperEmit {
+            prelude: String::new(),
+            helpers,
+            diagnostics: Vec::new(),
+        };
+    }
     emit_closed(helpers, options, file, Vec::new())
 }
 
@@ -638,6 +652,7 @@ mod tests {
     fn import_helpers_false_inlines_even_when_style_is_esm() {
         let options = HelperOptions {
             import_helpers: false,
+            no_emit_helpers: false,
             style: HelperStyle::EsModule,
             module_specifier: String::from("tslib"),
         };

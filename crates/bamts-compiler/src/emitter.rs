@@ -115,6 +115,9 @@ pub struct EmitOptions {
     /// Whether every source file receives a strict-mode prologue.
     pub always_strict: bool,
     pub import_helpers: bool,
+    /// Assume downleveling helpers exist globally; emit no helper prelude
+    /// (`noEmitHelpers`, tsc's noEmitHelpers).
+    pub no_emit_helpers: bool,
     pub use_define_for_class_fields: Option<bool>,
     pub declaration: bool,
     pub emit_declaration_only: bool,
@@ -144,6 +147,7 @@ impl Default for EmitOptions {
             module: None,
             always_strict: false,
             import_helpers: false,
+            no_emit_helpers: false,
             use_define_for_class_fields: None,
             declaration: false,
             emit_declaration_only: false,
@@ -239,6 +243,12 @@ impl EmitOptions {
                     return Some(invalid());
                 };
                 self.always_strict = always_strict;
+            }
+            "noemithelpers" => {
+                let Some(no_emit_helpers) = parse_bool(value) else {
+                    return Some(invalid());
+                };
+                self.no_emit_helpers = no_emit_helpers;
             }
             "module" => {
                 let Some(module) = parse_module(value) else {
@@ -359,6 +369,7 @@ impl EmitOptions {
                 .unwrap_or_else(|| self.target.supports(LanguageFeature::ClassFields)),
             helpers: HelperOptions {
                 import_helpers: self.import_helpers,
+                no_emit_helpers: self.no_emit_helpers,
                 style,
                 module_specifier: String::from("tslib"),
             },
@@ -6165,6 +6176,32 @@ export default answer;
         let code = &javascript(&output).code;
         assert!(code.contains("var x = 1; // first\n"), "{code}");
         assert!(code.contains("var y; // Expect no error here\n"), "{code}");
+    }
+
+    #[test]
+    fn no_emit_helpers_omits_helper_definitions() {
+        // Authority: asyncAliasReturnType_es6 — with noEmitHelpers the
+        // __awaiter reference remains but no helper body is emitted.
+        let options = EmitOptions {
+            target: ScriptTarget::Es2015,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "async function f(): Promise<void> {\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(
+            code.contains("return __awaiter(this, void 0, void 0, function* () {"),
+            "{code}"
+        );
+        assert!(!code.contains("function __awaiter("), "{code}");
+        assert!(!code.contains("function __generator("), "{code}");
     }
 
     #[test]

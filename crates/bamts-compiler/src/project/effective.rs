@@ -703,6 +703,7 @@ fn emit_options(options: &CompilerOptions, source_id: SourceId) -> (EmitOptions,
         ("declarationMap", options.declaration_map()),
         ("inlineSources", options.inline_sources()),
         ("alwaysStrict", options.always_strict()),
+        ("noEmitHelpers", options.no_emit_helpers()),
     ] {
         if enabled {
             directives.insert(name.to_owned(), String::from("true"));

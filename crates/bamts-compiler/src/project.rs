@@ -966,6 +966,7 @@ pub struct CompilerOptions {
     source_map: bool,
     inline_source_map: bool,
     inline_sources: bool,
+    no_emit_helpers: bool,
     map_root: Option<Arc<str>>,
     source_root: Option<Arc<str>>,
     no_emit: bool,
@@ -1046,6 +1047,11 @@ impl CompilerOptions {
     #[must_use]
     pub const fn always_strict(&self) -> bool {
         self.always_strict
+    }
+
+    #[must_use]
+    pub const fn no_emit_helpers(&self) -> bool {
+        self.no_emit_helpers
     }
     #[must_use]
     pub const fn use_define_for_class_fields(&self) -> Option<bool> {
@@ -1252,6 +1258,7 @@ impl ProjectConfig {
             source_map: optional_bool(compiler, "sourceMap")?.unwrap_or(false),
             inline_source_map: optional_bool(compiler, "inlineSourceMap")?.unwrap_or(false),
             inline_sources: optional_bool(compiler, "inlineSources")?.unwrap_or(false),
+            no_emit_helpers: optional_bool(compiler, "noEmitHelpers")?.unwrap_or(false),
             map_root: optional_nested_string(compiler, "mapRoot")?,
             source_root: optional_nested_string(compiler, "sourceRoot")?,
             no_emit: optional_bool(compiler, "noEmit")?.unwrap_or(false),
