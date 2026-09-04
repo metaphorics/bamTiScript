@@ -6843,7 +6843,18 @@ impl<'a> Rewriter<'a> {
                 body: Some(body),
             };
             let inner = if Self::needs(LanguageFeature::Generators, self.options) {
-                self.lower_generator_function(&inner)
+                let lowered = self.lower_generator_function(&inner);
+                if lowered.is_generator {
+                    // Same contract as the named-function path: the machine
+                    // declined and the inner stays a native generator inside
+                    // __awaiter, which the target cannot run — signal it.
+                    self.diag(
+                        codes::GENERATOR_REQUIRES_ES2015,
+                        expression.range(),
+                        "generators require ScriptTarget::Es2015 or later",
+                    );
+                }
+                lowered
             } else {
                 inner
             };
@@ -7052,11 +7063,11 @@ fn count_branch_yields(statements: &[Stmt]) -> u32 {
             }
             Statement::While(while_statement) => {
                 count_yields(&while_statement.test)
-                    + count_branch_yields(loop_body_statements(&while_statement.body))
+                    + count_branch_yields(branch_statements(&while_statement.body))
             }
             Statement::DoWhile(do_statement) => {
                 count_yields(&do_statement.test)
-                    + count_branch_yields(loop_body_statements(&do_statement.body))
+                    + count_branch_yields(branch_statements(&do_statement.body))
             }
             Statement::Labeled(labeled) => count_branch_yields(branch_statements(&labeled.body)),
             _ => 1,
@@ -7064,24 +7075,14 @@ fn count_branch_yields(statements: &[Stmt]) -> u32 {
         .sum()
 }
 
-/// The statements of an if/else branch: a block flattens, any other
-/// statement is a single-statement branch.
+/// The statements of a branch or loop body: a block flattens, any other
+/// statement is a single-statement branch. Counters and the return guard
+/// must see through non-block bodies, or a nested `while (x) return z;`
+/// hides its return and the clone gate drops the value.
 fn branch_statements(statement: &Stmt) -> &[Stmt] {
     match statement.data() {
         Statement::Block(block) => &block.data().statements,
         _ => std::slice::from_ref(statement),
-    }
-}
-
-/// The statements of a loop body: non-block bodies are shapes this slice
-/// refuses anyway; None renders as empty for counting purposes.
-fn loop_body_statements(body: &Stmt) -> &[Stmt] {
-    // Non-block bodies are single-statement branches: counters and the
-    // return guard must see through them, or a nested `while (x) return z;`
-    // hides its return and the clone gate drops the value.
-    match body.data() {
-        Statement::Block(block) => &block.data().statements,
-        _ => std::slice::from_ref(body),
     }
 }
 
@@ -7101,10 +7102,10 @@ fn statements_contain_return(statements: &[Stmt]) -> bool {
                     .is_some_and(|alt| statements_contain_return(branch_statements(alt)))
         }
         Statement::While(while_statement) => {
-            statements_contain_return(loop_body_statements(&while_statement.body))
+            statements_contain_return(branch_statements(&while_statement.body))
         }
         Statement::DoWhile(do_statement) => {
-            statements_contain_return(loop_body_statements(&do_statement.body))
+            statements_contain_return(branch_statements(&do_statement.body))
         }
         Statement::Labeled(labeled) => statements_contain_return(branch_statements(&labeled.body)),
         _ => false,

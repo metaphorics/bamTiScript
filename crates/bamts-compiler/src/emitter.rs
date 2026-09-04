@@ -7180,7 +7180,7 @@ var c = () => 1;
         // must not leak), `false` refuses (native form + the requires-es2015
         // diagnostic + no machine). Expectations were derived from emitted
         // output; all-refusing output fails every `true` row.
-        let snippets: [(&str, &str, bool); 22] = [
+        let snippets: [(&str, &str, bool); 25] = [
             (
                 "update-computed-while",
                 "declare var o: any, k: any;\nfunction* g() { while (o[k ? k : 0][`x`], o[yield k]++ < 3) { } }\n",
@@ -7212,12 +7212,12 @@ var c = () => 1;
                 true,
             ),
             (
-                "conditional-in-machine",
+                "conditional-expr-statement",
                 "declare var x: any, y: any;\nfunction* g() { return (yield x) ? y : (yield x); }\n",
                 false,
             ),
             (
-                "logical-in-machine",
+                "logical-expr-statement",
                 "declare var x: any, y: any;\nfunction* g() { return (yield x) || (yield y); }\n",
                 false,
             ),
@@ -7290,6 +7290,21 @@ var c = () => 1;
                 "as-cast-lowers",
                 "declare var k: any;\nfunction* g() { while ((yield k) as any) { } }\n",
                 true,
+            ),
+            (
+                "call-spread-while-test",
+                "declare var f: any, x: any;\nfunction* g() { while (f(...(yield x)) < 3) { } }\n",
+                false,
+            ),
+            (
+                "method-computed-while-test",
+                "declare var k: any;\nfunction* g() { while ({ [yield k]() {} }) { } }\n",
+                false,
+            ),
+            (
+                "async-arrow-refusal-signals",
+                "declare var x: any, y: any, z: any;\nvar f = async () => { while (x) { if (y) { await z; } } };\n",
+                false,
             ),
         ];
         for (name, input, lowers) in snippets {
