@@ -6747,7 +6747,10 @@ fn count_yields(expression: &Expr) -> u32 {
             .members
             .iter()
             .map(|member| match member.data() {
-                ObjectMember::Property(property) => count_yields(&property.value),
+                ObjectMember::Property(property) => {
+                    count_yields(&property.value)
+                        + matches!(&property.name, PropertyName::Computed(key) if count_yields(key) > 0) as u32
+                }
                 _ => 0,
             })
             .sum(),
@@ -6769,7 +6772,17 @@ fn count_yields(expression: &Expr) -> u32 {
                     _ => 0,
                 }
         }
-        Expression::New(new) => count_yields(&new.callee),
+        Expression::New(new) => {
+            count_yields(&new.callee)
+                + new
+                    .arguments
+                    .iter()
+                    .map(|argument| match argument {
+                        CallArgument::Expression(value) => count_yields(value),
+                        _ => 0,
+                    })
+                    .sum::<u32>()
+        }
         Expression::Await(awaited) => count_yields(&awaited.argument),
         Expression::Unary(unary) => count_yields(&unary.argument),
         Expression::Binary(binary) => count_yields(&binary.left) + count_yields(&binary.right),
@@ -7022,7 +7035,12 @@ fn contains_yield(expression: &Expr) -> bool {
                 || contains_yield(&conditional.consequent)
                 || contains_yield(&conditional.alternate)
         }
-        Expression::Assignment(assignment) => contains_yield(&assignment.right),
+        Expression::Assignment(assignment) => {
+            contains_yield(&assignment.right)
+                || matches!(assignment.left.data(), AssignmentTarget::Member(member)
+                    if contains_yield(&member.object)
+                        || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key)))
+        }
         Expression::Sequence(sequence) => sequence.expressions.iter().any(contains_yield),
         Expression::Parenthesized(nested) => contains_yield(nested),
         Expression::As(cast) => contains_yield(&cast.expression),
