@@ -2471,13 +2471,44 @@ pub fn extract_tsbuildinfo_sections(baseline: &str) -> String {
     out
 }
 
+/// Whether the case's resolved options turn on build-info emission, mirroring
+/// the catalog's `ObservableKind::BuildInfo` source predicate: `incremental`
+/// or `composite` must be true (a bare `tsBuildInfoFile` does not emit —
+/// optionsTsBuildInfoFileWithoutIncrementalAndComposite writes no artifact).
+fn build_info_implied(pragmas: &CasePragmas) -> bool {
+    let config_source = build_tsconfig(pragmas);
+    let Ok(value) = bamts_compiler::project::parse_jsonc(&config_source) else {
+        return false;
+    };
+    let bamts_compiler::project::JsonValue::Object(obj) = &value else {
+        return false;
+    };
+    let Some(compiler) = obj
+        .get("compilerOptions")
+        .and_then(|value| value.as_object())
+    else {
+        return false;
+    };
+    ["incremental", "composite"].iter().any(|key| {
+        matches!(
+            compiler.get(key),
+            Some(bamts_compiler::project::JsonValue::Bool(true))
+        )
+    })
+}
+
 /// Produce the BAMTS `.tsbuildinfo` content for a compiled case.
 ///
 /// Constructs a [`BuildInfo`] from the program's source modules and the
-/// canonical compiler-options signature, then encodes it in the on-disk
-/// JSON format. The output is deterministic for the same inputs.
+/// canonical compiler-options signature, then encodes it in the on-disk JSON
+/// format. The output is deterministic for the same inputs. Returns empty
+/// when the config implies no build-info emission (`incremental` or
+/// `composite` unset).
 #[must_use]
 pub fn emit_build_info_baseline(case: &CheckedCase, pragmas: &CasePragmas) -> String {
+    if !build_info_implied(pragmas) {
+        return String::new();
+    }
     let config_source = build_tsconfig(pragmas);
     let option_signature = match bamts_compiler::project::parse_jsonc(&config_source) {
         Ok(value) => match &value {
@@ -2519,9 +2550,11 @@ pub fn emit_build_info_baseline(case: &CheckedCase, pragmas: &CasePragmas) -> St
 /// `//// [name.tsbuildinfo]` sections; the comparator compares only those
 /// sections with the javascript facet's line-wise normalization. Compile
 /// failures are `FAIL_BEHAVIOR`/`CRASH`; a missing owned `.js` baseline is a
-/// classification/execution drift `HARNESS_ERROR`. When the baseline has no
-/// `.tsbuildinfo` sections, the observer reports a precise producer gap
-/// rather than fabricating output.
+/// classification/execution drift `HARNESS_ERROR`. No baseline in the entire
+/// 7.0.2 reference tree carries a `.tsbuildinfo` section (the harness drops
+/// the artifact as environment dependent), so the no-section path is the
+/// live one: it demands emission exactly when the config implies it
+/// (`incremental` or `composite`) and no artifact otherwise.
 pub(crate) fn observe_build_info(
     snapshot: &(impl SnapshotAssets + ?Sized),
     groups: &BaselineGroups,
@@ -2567,12 +2600,43 @@ pub(crate) fn observe_build_info(
             let expected = String::from_utf8_lossy(&bytes).into_owned();
             let expected_sections = extract_tsbuildinfo_sections(&expected);
             if expected_sections.is_empty() {
-                return CompilerCheckObservation {
-                    class: FailureClass::HarnessError,
-                    detail: "producer missing: baseline has no `//// [name.tsbuildinfo]` \
-                        section for this case"
-                        .to_owned(),
-                    artifact: Some(emitted.into_bytes()),
+                // Upstream never baselines `.tsbuildinfo` content: zero
+                // sections exist across the entire 7.0.2 reference tree.
+                // With no expected bytes the contract is emission-shape:
+                // produce an artifact exactly when the config implies one
+                // (`incremental`/`composite`), none otherwise.
+                let implied = build_info_implied(pragmas);
+                let produced =
+                    !emitted.is_empty() && !emitted.starts_with("build-info encode error:");
+                return match (implied, produced) {
+                    (true, true) => CompilerCheckObservation {
+                        class: FailureClass::Pass,
+                        detail: "build-info produced; content not baselined upstream".to_owned(),
+                        artifact: Some(emitted.into_bytes()),
+                    },
+                    (true, false) => CompilerCheckObservation {
+                        class: FailureClass::FailBehavior,
+                        detail: "config implies a .tsbuildinfo artifact but the \
+                            producer emitted none"
+                            .to_owned(),
+                        artifact: Some(emitted.into_bytes()),
+                    },
+                    (false, false) => CompilerCheckObservation {
+                        class: FailureClass::Pass,
+                        detail: "config implies no .tsbuildinfo artifact; none emitted".to_owned(),
+                        artifact: Some(
+                            "config implies no .tsbuildinfo artifact; none emitted\n"
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                    },
+                    (false, true) => CompilerCheckObservation {
+                        class: FailureClass::FailBehavior,
+                        detail: "producer emitted a .tsbuildinfo artifact the config \
+                            does not imply"
+                            .to_owned(),
+                        artifact: Some(emitted.into_bytes()),
+                    },
                 };
             }
             match compare_js_emit(&expected_sections, &emitted) {
