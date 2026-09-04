@@ -5453,6 +5453,265 @@ export const t = 1;
         write_facet_report("types-60", &report);
     }
 
+    /// Region-attributed first-delta measurement over authority javascript
+    /// cells (receipt-independent): resolves the baseline with the harness's
+    /// own variant logic, assembles our document with
+    /// `emit_javascript_baseline`, and classifies the first whole-document
+    /// delta by the section it lands in — echo (framing/input text), `.js`
+    /// (emit bytes), `.d.ts` (declaration drift surfacing here), or a
+    /// section header itself (section-set drift). Measurement only; the
+    /// report lands under the session scratch root.
+    #[test]
+    fn javascript_facet_first_delta_sample() {
+        let authority =
+            std::path::PathBuf::from(std::env::var("BAMTS_AUTHORITY_ROOT").unwrap_or_else(|_| {
+                "/home/alpha/compiler/bamTiScript/target/authority/\
+                 typescript-7.0.2-tests"
+                    .to_owned()
+            }));
+        let sample_cap: usize = std::env::var("BAMTS_JS_SAMPLE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120);
+        let cases_root = authority.join("tests/cases");
+        let mut index = SuiteIndex {
+            entries: BTreeMap::new(),
+        };
+        let reference = authority.join("tests/baselines/reference");
+        let mut baseline_names: Vec<String> = std::fs::read_dir(&reference)
+            .expect("reference baselines")
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "js"))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        baseline_names.sort();
+        for name in &baseline_names {
+            index.entries.insert(
+                format!("{BASELINE_REFERENCE_PREFIX}{name}"),
+                IndexEntry {
+                    logical_path: format!("{BASELINE_REFERENCE_PREFIX}{name}"),
+                    sha256: "0".repeat(64),
+                    asset_kind: crate::suite::AssetKind::BaselineFacet,
+                    facet: None,
+                    partition: None,
+                },
+            );
+        }
+        let groups = baseline_groups(&index);
+        let mut case_paths = Vec::new();
+        for dir in ["compiler", "conformance"] {
+            let dir_path = cases_root.join(dir);
+            let entries = std::fs::read_dir(&dir_path).expect("case tree");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("ts") {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let stem = name.trim_end_matches(".ts");
+                if !baseline_names.iter().any(|base| {
+                    base.trim_end_matches(".js") == stem || base.starts_with(&format!("{stem}("))
+                }) {
+                    continue;
+                }
+                let logical = format!("tests/cases/{dir}/{name}");
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                };
+                case_paths.push((logical, text));
+            }
+        }
+        case_paths.sort();
+        case_paths.dedup();
+        let sample: Vec<_> = case_paths.into_iter().take(sample_cap).collect();
+
+        let mut regions: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut passes = 0usize;
+        let mut skipped = 0usize;
+        let mut examples: BTreeMap<&str, String> = BTreeMap::new();
+        for (logical, text) in &sample {
+            let units = split_case_units(logical, text);
+            let entry = entry_virtual_path(logical, &units);
+            let pragmas = parse_case_pragmas(text);
+            let compile_options = compile_option_pairs(&pragmas);
+            let Some(baseline_logical) =
+                resolve_stem_baseline(&groups, logical, "js", &compile_options)
+                    .ok()
+                    .flatten()
+            else {
+                skipped += 1;
+                continue;
+            };
+            let case =
+                match compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript) {
+                    Ok(case) => case,
+                    Err(_) => {
+                        *regions.entry("compile-failure").or_default() += 1;
+                        continue;
+                    }
+                };
+            let emitted = match emit_javascript_baseline(&case, logical) {
+                Ok(emitted) => emitted,
+                Err(_) => {
+                    *regions.entry("emit-error").or_default() += 1;
+                    continue;
+                }
+            };
+            let expected =
+                std::fs::read_to_string(authority.join(&baseline_logical)).unwrap_or_default();
+            let canon = |text: &str| -> Vec<String> {
+                text.replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .lines()
+                    .map(|line| line.trim_end().to_owned())
+                    .collect()
+            };
+            let (exp, act) = (canon(&expected), canon(&emitted));
+            if exp == act {
+                passes += 1;
+                continue;
+            }
+            let first = exp
+                .iter()
+                .zip(act.iter())
+                .position(|(e, a)| e != a)
+                .unwrap_or_else(|| exp.len().min(act.len()));
+            let region = if exp
+                .get(first)
+                .is_some_and(|line| line.starts_with("//// ["))
+            {
+                "section-set"
+            } else {
+                let section = exp
+                    .iter()
+                    .take(first + 1)
+                    .rev()
+                    .find(|line| line.starts_with("//// ["))
+                    .and_then(|header| header.strip_prefix("//// ["))
+                    .map(|rest| rest.trim_end_matches(']'))
+                    .unwrap_or("header");
+                if section.ends_with(".d.ts") || section.ends_with(".ts") {
+                    "echo-or-dts"
+                } else if section.ends_with(".js") {
+                    "js-bytes"
+                } else {
+                    "other"
+                }
+            };
+            *regions.entry(region).or_default() += 1;
+            examples.entry(region).or_insert_with(|| {
+                format!(
+                    "{logical} line {first}\n    expected: {}\n    emitted:   {}",
+                    exp.get(first).map(String::as_str).unwrap_or("<eof>"),
+                    act.get(first).map(String::as_str).unwrap_or("<eof>"),
+                )
+            });
+        }
+        // Alignment-free family mass: multiset surplus/deficit over every
+        // canonical line, so downstream deltas hidden behind an earlier
+        // first-delta still count. Indent-only pairs are same-trim lines on
+        // opposite sides; textual families are counted by substring.
+        let mut surplus: BTreeMap<String, isize> = BTreeMap::new();
+        for (logical, text) in &sample {
+            let units = split_case_units(logical, text);
+            let entry = entry_virtual_path(logical, &units);
+            let pragmas = parse_case_pragmas(text);
+            let compile_options = compile_option_pairs(&pragmas);
+            let Some(baseline_logical) =
+                resolve_stem_baseline(&groups, logical, "js", &compile_options)
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            let Ok(case) =
+                compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
+            else {
+                continue;
+            };
+            let Ok(emitted) = emit_javascript_baseline(&case, logical) else {
+                continue;
+            };
+            let Ok(expected) = std::fs::read_to_string(authority.join(&baseline_logical)) else {
+                continue;
+            };
+            let canon = |text: &str| -> Vec<String> {
+                text.replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .lines()
+                    .map(|line| line.trim_end().to_owned())
+                    .collect()
+            };
+            for line in canon(&expected) {
+                *surplus.entry(line).or_default() += 1;
+            }
+            for line in canon(&emitted) {
+                *surplus.entry(line).or_default() -= 1;
+            }
+        }
+        let mut indent_only = 0usize;
+        let mut text_families: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut top_deficits: Vec<(isize, String)> = surplus
+            .iter()
+            .filter(|(_, count)| **count < 0)
+            .map(|(line, count)| (*count, line.clone()))
+            .collect();
+        top_deficits.sort_by(|a, b| b.0.cmp(&a.0));
+        for (line, count) in &surplus {
+            let Some(twin) = surplus.get(line.trim_start()) else {
+                continue;
+            };
+            if *count < 0 && *twin > 0 {
+                indent_only += 1;
+            }
+        }
+        for (line, count) in &surplus {
+            if *count == 0 {
+                continue;
+            }
+            let family = if line.contains("function(") || line.contains("function (") {
+                "function-space"
+            } else if line.starts_with("//// [") {
+                "section-header"
+            } else if line.trim().is_empty() {
+                "blank-line"
+            } else {
+                "content"
+            };
+            *text_families.entry(family).or_default() += count.unsigned_abs();
+        }
+        let mut report = format!(
+            "javascript_first_delta: sampled={} pass={} skipped={} indent_only_pairs={}\n",
+            sample.len(),
+            passes,
+            skipped,
+            indent_only / 2
+        );
+        for (region, count) in &regions {
+            report.push_str(&format!(
+                "  {region}: {count}\n{}",
+                examples
+                    .get(region)
+                    .map(|example| format!("    example: {example}\n"))
+                    .unwrap_or_default()
+            ));
+        }
+        report.push_str("  surplus/deficit families (line instances):\n");
+        for (family, count) in &text_families {
+            report.push_str(&format!("    {family}: {count}\n"));
+        }
+        report.push_str("  top emitted-side deficits:\n");
+        for (count, line) in top_deficits.iter().take(10) {
+            report.push_str(&format!(
+                "    {count:4}  {}\n",
+                line.chars().take(120).collect::<String>()
+            ));
+        }
+        write_facet_report("javascript-first-delta", &report);
+        assert!(!sample.is_empty(), "no javascript cases sampled");
+    }
+
     /// Writes a facet measurement report under the session scratch root so the
     /// orchestrator can read the numbers without library-path printing.
     fn write_facet_report(name: &str, text: &str) {
