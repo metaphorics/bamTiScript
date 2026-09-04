@@ -4897,12 +4897,20 @@ impl<'a> Rewriter<'a> {
             }
             Expression::Logical(_) | Expression::Conditional(_) => None,
             Expression::Assignment(assignment) => {
-                if let AssignmentTarget::Member(member) = assignment.left.data() {
-                    let base_suspends = contains_yield(&member.object)
-                        || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key));
-                    if base_suspends {
-                        return None;
+                match assignment.left.data() {
+                    AssignmentTarget::Member(member) => {
+                        let base_suspends = contains_yield(&member.object)
+                            || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key));
+                        if base_suspends {
+                            return None;
+                        }
                     }
+                    // Pattern and invalid targets are beyond this slice.
+                    AssignmentTarget::Object(_)
+                    | AssignmentTarget::Array(_)
+                    | AssignmentTarget::Missing(_)
+                    | AssignmentTarget::Invalid(_) => return None,
+                    AssignmentTarget::Identifier(_) => {}
                 }
                 let right = self.eval(&assignment.right, ctx)?;
                 Some(self.node(
@@ -7040,9 +7048,20 @@ fn contains_yield(expression: &Expr) -> bool {
         }
         Expression::Assignment(assignment) => {
             contains_yield(&assignment.right)
-                || matches!(assignment.left.data(), AssignmentTarget::Member(member)
-                    if contains_yield(&member.object)
-                        || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key)))
+                || match assignment.left.data() {
+                    AssignmentTarget::Member(member) => {
+                        contains_yield(&member.object)
+                            || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key))
+                    }
+                    // Pattern and invalid targets can carry expressions in
+                    // computed keys and defaults; report containment so the
+                    // machine refuses rather than clones.
+                    AssignmentTarget::Object(_)
+                    | AssignmentTarget::Array(_)
+                    | AssignmentTarget::Missing(_)
+                    | AssignmentTarget::Invalid(_) => true,
+                    AssignmentTarget::Identifier(_) => false,
+                }
         }
         Expression::Sequence(sequence) => sequence.expressions.iter().any(contains_yield),
         Expression::Parenthesized(nested) => contains_yield(nested),
