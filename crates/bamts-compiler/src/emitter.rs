@@ -480,6 +480,23 @@ pub(crate) struct PrintSource<'a> {
     pub(crate) synthesized: Option<&'a BTreeSet<NodeId>>,
 }
 
+/// Print context for a braced block. Carries two tsc behaviors that split on
+/// different axes: which braces get source-map segments, and whether an
+/// authored single-line body may stay single-line.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum BlockLayout {
+    /// Function, arrow, and method bodies: braces unmapped, layout preserved.
+    FunctionBody,
+    /// Static initialization blocks: braces map like statement blocks, layout
+    /// still preserved (classThisReference keeps `static { this; }` on its
+    /// authored line).
+    StaticInitBody,
+    /// Statement-position blocks (standalone, try/catch/finally, control
+    /// bodies): braces mapped, always expanded (parser768531 expands an
+    /// authored single-line standalone block).
+    Statement,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Surface {
     JavaScript,
@@ -1409,7 +1426,9 @@ impl<'a> Emitter<'a> {
     fn emit_control_body(&mut self, statement: &Stmt) {
         self.raw(" ");
         match statement.data() {
-            Statement::Block(block) => self.emit_block_with_braces(block, self.anchor, true),
+            Statement::Block(block) => {
+                self.emit_block_with_braces(block, self.anchor, BlockLayout::Statement)
+            }
             Statement::Empty => self.raw("{}"),
             _ => {
                 self.raw_mapped("{", self.anchor);
@@ -1426,20 +1445,12 @@ impl<'a> Emitter<'a> {
 
     fn emit_block(&mut self, block: &BlockNode) {
         let range = block.range();
-        self.emit_block_with_braces(block, range, true);
+        self.emit_block_with_braces(block, range, BlockLayout::Statement);
     }
 
-    /// `map_open_brace` mirrors tsc: statement-level blocks (try bodies,
-    /// catch and finally arms, standalone blocks) map the opening `{` to its
-    /// source token, while function, arrow, and class bodies leave it
-    /// unmapped. The closing `}` is always mapped to its source token — tsc
-    /// emits a segment for every block close brace regardless of context.
-    fn emit_block_with_braces(
-        &mut self,
-        block: &BlockNode,
-        range: TextRange,
-        map_open_brace: bool,
-    ) {
+    fn emit_block_with_braces(&mut self, block: &BlockNode, range: TextRange, layout: BlockLayout) {
+        let map_open_brace = layout != BlockLayout::FunctionBody;
+        let may_preserve = layout != BlockLayout::Statement;
         if block.data().statements.is_empty() {
             if map_open_brace {
                 self.raw_mapped_char("{", range, '{', 1);
@@ -1454,15 +1465,14 @@ impl<'a> Emitter<'a> {
             self.raw_mapped_char_end("}", range, '}');
             return;
         }
-        // Preservation: a non-empty FUNCTION-family body (function, arrow;
-        // ctor checks separately) authored on one line stays on one line
-        // (`{ stmt; stmt; }`). `map_open_brace` encodes the same tsc split
-        // the brace-mapping doc above names: statement-level and control
-        // blocks always expand (authority: parser768531 baseline expands an
-        // authored single-line `{ a: 3; }`), so only unmapped bodies may
-        // preserve. Synthesized, past-authored-text, or multi-line-authored
-        // bodies take the expanded path below.
-        if !map_open_brace && self.node_preserves_single_line(block) {
+        // Preservation: a non-empty declaration-family body (function,
+        // arrow, static initialization block; ctor checks separately)
+        // authored on one line stays on one line (`{ stmt; stmt; }`).
+        // Statement-position blocks (standalone, try arms, control bodies)
+        // always expand: parser768531's baseline expands an authored
+        // single-line `{ a: 3; }`. Synthesized, past-authored-text, or
+        // multi-line-authored bodies take the expanded path below.
+        if may_preserve && self.node_preserves_single_line(block) {
             if map_open_brace {
                 self.raw_mapped_char("{", range, '{', 1);
             } else {
@@ -2085,7 +2095,7 @@ impl<'a> Emitter<'a> {
         self.raw_mapped_token(" => ", arrow_pos, 2);
         match &arrow.body {
             FunctionBody::Block(block) => {
-                self.emit_block_with_braces(block, block.range(), false);
+                self.emit_block_with_braces(block, block.range(), BlockLayout::FunctionBody);
             }
             FunctionBody::Expression(expression) => {
                 if !self.starts_parenthesized(expression)
@@ -2111,7 +2121,7 @@ impl<'a> Emitter<'a> {
     fn emit_function_body_js(&mut self, body: Option<&FunctionBody>) {
         match body {
             Some(FunctionBody::Block(block)) => {
-                self.emit_block_with_braces(block, block.range(), false);
+                self.emit_block_with_braces(block, block.range(), BlockLayout::FunctionBody);
             }
             Some(FunctionBody::Expression(expression)) => {
                 self.raw("{ return ");
@@ -2318,7 +2328,7 @@ impl<'a> Emitter<'a> {
             }
             ClassMember::StaticBlock(block) => {
                 self.raw("static ");
-                self.emit_block(block);
+                self.emit_block_with_braces(block, block.range(), BlockLayout::StaticInitBody);
                 true
             }
             ClassMember::IndexSignature(_) => false,
@@ -5924,6 +5934,25 @@ export default answer;
         assert!(parsed.diagnostics().is_empty());
         let output = emit_output(parsed.product(), &EmitOptions::default());
         assert_eq!(javascript(&output).code, "{\n    a: 3;\n}\n/x/;\n");
+    }
+
+    #[test]
+    fn static_init_block_preserves_single_line_in_javascript() {
+        // Authority: classThisReference(target=esnext).js keeps
+        // `static { this; }` on its authored line while the class body
+        // around it expands.
+        let input = "class C { static { this; } static x = this; }";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert!(
+            javascript(&output).code.contains("static { this; }"),
+            "{output:?}"
+        );
     }
 
     #[test]
