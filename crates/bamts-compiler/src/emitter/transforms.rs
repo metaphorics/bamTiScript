@@ -7055,6 +7055,7 @@ fn count_yields(expression: &Expr) -> u32 {
                     .iter()
                     .map(|argument| match argument {
                         CallArgument::Expression(value) => count_yields(value),
+                          CallArgument::Spread(spread) => count_yields(&spread.argument),
                         _ => 0,
                     })
                     .sum::<u32>()
@@ -7073,6 +7074,7 @@ fn count_yields(expression: &Expr) -> u32 {
                     .iter()
                     .map(|argument| match argument {
                         CallArgument::Expression(value) => count_yields(value),
+                          CallArgument::Spread(spread) => count_yields(&spread.argument),
                         _ => 0,
                     })
                     .sum::<u32>()
@@ -7301,7 +7303,10 @@ fn machine_state_name(skip: &std::collections::HashSet<String>, temps: &[String]
 }
 
 fn call_argument_suspends(argument: &CallArgument) -> bool {
-    matches!(argument, CallArgument::Expression(value) if contains_yield(value))
+    match argument {
+        CallArgument::Expression(value) => contains_yield(value),
+        CallArgument::Spread(spread) => contains_yield(&spread.argument),
+    }
 }
 
 /// Whether an assignment target subtree still holds an await, so the
@@ -7340,6 +7345,7 @@ fn contains_await(expression: &Expr) -> bool {
             contains_await(&call.callee)
                 || call.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(value) => contains_await(value),
+                      CallArgument::Spread(spread) => contains_await(&spread.argument),
                     _ => false,
                 })
         }
@@ -7348,6 +7354,7 @@ fn contains_await(expression: &Expr) -> bool {
             contains_await(&new.callee)
                 || new.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(value) => contains_await(value),
+                      CallArgument::Spread(spread) => contains_await(&spread.argument),
                     _ => false,
                 })
         }
@@ -7388,6 +7395,10 @@ fn contains_await(expression: &Expr) -> bool {
         Expression::Parenthesized(inner) => contains_await(inner),
         Expression::As(cast) => contains_await(&cast.expression),
         Expression::NonNull(non_null) => contains_await(&non_null.expression),
+          Expression::Import(import) => {
+              contains_await(&import.source)
+                  || import.options.as_deref().is_some_and(contains_await)
+          }
         _ => true,
     }
 }
