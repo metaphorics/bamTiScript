@@ -532,6 +532,29 @@ mod tests {
     }
 
     #[test]
+    fn prelude_order_is_request_order_independent() {
+        // The documented contract: [B, A] and [A, B] produce byte-identical
+        // preludes. Canonical catalog order is structural, not caller luck.
+        let canonical = emit_helpers(
+            &[HelperKind::Awaiter, HelperKind::Generator],
+            &HelperOptions::inline(),
+            None,
+        );
+        let reversed = emit_helpers(
+            &[HelperKind::Generator, HelperKind::Awaiter],
+            &HelperOptions::inline(),
+            None,
+        );
+        assert_eq!(canonical.prelude, reversed.prelude);
+        assert!(
+            canonical.prelude.find("__awaiter").unwrap()
+                < canonical.prelude.find("__generator").unwrap(),
+            "awaiter precedes generator: {}",
+            canonical.prelude
+        );
+    }
+
+    #[test]
     fn awaiter_emits_alone_in_the_tsc_guard_form() {
         // tsc 7.0.2 binds helpers as `var __awaiter = (this && this.__awaiter)
         // || function ...` and emits no __generator alongside the awaiter:
