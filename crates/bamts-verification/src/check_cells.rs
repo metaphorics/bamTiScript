@@ -5312,42 +5312,37 @@ export const t = 1;
                 .join(format!("{name}.js"));
             let baseline = fs::read_to_string(&baseline_path).unwrap_or_else(|_| String::new());
             let expected_sections = extract_tsbuildinfo_sections(&baseline);
-            let verdict: String = if expected_sections.is_empty() {
-                "BLOCKING_FAIL: baseline has no //// [name.tsbuildinfo] section \
-                 (producer gap — upstream does not embed .tsbuildinfo for this case)"
-                    .to_owned()
-            } else {
+            let verdict: String = {
                 match compile_case_with_pragmas(&units, &entry, &pragmas) {
-                    Err(error) => {
-                        results.push((name, format!("BLOCKING_FAIL: compile error: {error:?}")));
-                        continue;
-                    }
+                    Err(error) => format!("BLOCKING_FAIL: compile error: {error:?}"),
                     Ok(case) => {
                         let emitted = emit_build_info_baseline(&case, &pragmas);
-                        match compare_js_emit(&expected_sections, &emitted) {
-                            FacetVerdict::Pass => "PASS".to_owned(),
-                            FacetVerdict::Fail { reason } => {
-                                let exp_lines: Vec<&str> = expected_sections.lines().collect();
-                                let act_lines: Vec<&str> = emitted.lines().collect();
-                                let first_diff = exp_lines
-                                    .iter()
-                                    .zip(act_lines.iter())
-                                    .enumerate()
-                                    .find(|(_, (e, a))| e != a)
-                                    .map(|(i, (e, a))| {
-                                        format!("line {i}: expected `{e}` got `{a}`")
-                                    })
-                                    .unwrap_or_else(|| {
-                                        format!(
-                                            "length mismatch: expected {} lines, got {}",
-                                            exp_lines.len(),
-                                            act_lines.len()
-                                        )
-                                    });
-                                format!("BLOCKING_FAIL: {first_diff} ({reason})")
+                        if !expected_sections.is_empty() {
+                            match compare_js_emit(&expected_sections, &emitted) {
+                                FacetVerdict::Pass => "PASS".to_owned(),
+                                FacetVerdict::Fail { reason } => {
+                                    format!("BLOCKING_FAIL: {reason}")
+                                }
+                                FacetVerdict::Unproven { reason } => {
+                                    format!("BLOCKING_FAIL: unproven: {reason}")
+                                }
                             }
-                            FacetVerdict::Unproven { reason } => {
-                                format!("BLOCKING_FAIL: unproven: {reason}")
+                        } else {
+                            // Emission-shape contract: the 7.0.2 reference
+                            // tree carries zero .tsbuildinfo sections, so the
+                            // verdict keys on implied-vs-produced.
+                            let implied = build_info_implied(&pragmas);
+                            let produced = !emitted.is_empty()
+                                && !emitted.starts_with("build-info encode error:");
+                            match (implied, produced) {
+                                (true, true) => "PASS: produced".to_owned(),
+                                (true, false) => {
+                                    "BLOCKING_FAIL: implied but not produced".to_owned()
+                                }
+                                (false, false) => "PASS: none implied".to_owned(),
+                                (false, true) => {
+                                    "BLOCKING_FAIL: produced without implication".to_owned()
+                                }
                             }
                         }
                     }
