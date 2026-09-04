@@ -4160,6 +4160,12 @@ impl<'a> Rewriter<'a> {
     /// order is preserved by materializing already-computed sibling values
     /// into temps before a suspending sibling splits the segment.
     fn machine_statements(&mut self, block: &BlockNode, ctx: &mut MachineCtx) -> Option<()> {
+        if statements_contain_await(&block.data().statements) {
+            // A leaked await means a conversion hole upstream; refusing
+            // keeps the failure mode a wrong-but-valid generator instead
+            // of `await` inside a plain function.
+            return None;
+        }
         let range = block.range();
         for statement in &block.data().statements {
             if ctx.terminated {
@@ -5801,6 +5807,7 @@ impl<'a> Rewriter<'a> {
                 let right = self.rewrite_expr(&assignment.right);
                 let left = if self.replace_await
                     && let AssignmentTarget::Member(member) = assignment.left.data()
+                    && target_contains_await(&member.object, &member.property)
                 {
                     // Convert awaits inside the target too, so a
                     // suspending target becomes a visible machine refusal
@@ -7019,6 +7026,136 @@ fn machine_state_name(skip: &std::collections::HashSet<String>, temps: &[String]
 
 fn call_argument_suspends(argument: &CallArgument) -> bool {
     matches!(argument, CallArgument::Expression(value) if contains_yield(value))
+}
+
+/// Whether an assignment target subtree still holds an await, so the
+/// left-side conversion only rebuilds targets it must touch.
+fn target_contains_await(object: &Expr, property: &MemberProperty) -> bool {
+    let key = match property {
+        MemberProperty::Computed(key) => contains_await(key),
+        _ => false,
+    };
+    contains_await(object) || key
+}
+
+/// Whether an expression still holds an await of THIS function (nested
+/// function-likes own their own awaits).
+fn contains_await(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Await(_) => true,
+        Expression::Identifier(_) | Expression::This | Expression::Super => false,
+        Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => false,
+        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
+        Expression::Yield(yielded) => yielded.argument.as_deref().is_some_and(contains_await),
+        Expression::Template(template) => template.expressions.iter().any(contains_await),
+        Expression::Array(array) => array.elements.iter().any(|element| match element {
+            ArrayElement::Expression(value) => contains_await(value),
+            ArrayElement::Spread(spread) => contains_await(&spread.argument),
+            _ => false,
+        }),
+        Expression::Object(object) => object.members.iter().any(|member| match member.data() {
+            ObjectMember::Property(property) => {
+                contains_await(&property.value)
+                    || matches!(&property.name, PropertyName::Computed(key) if contains_await(key))
+            }
+            _ => true,
+        }),
+        Expression::Call(call) => {
+            contains_await(&call.callee)
+                || call.arguments.iter().any(|argument| match argument {
+                    CallArgument::Expression(value) => contains_await(value),
+                    _ => false,
+                })
+        }
+        Expression::Member(member) => {
+            contains_await(&member.object)
+                || matches!(&member.property, MemberProperty::Computed(key) if contains_await(key))
+        }
+        Expression::New(new) => {
+            contains_await(&new.callee)
+                || new.arguments.iter().any(|argument| match argument {
+                    CallArgument::Expression(value) => contains_await(value),
+                    _ => false,
+                })
+        }
+        Expression::Unary(unary) => contains_await(&unary.argument),
+        Expression::Binary(binary) => contains_await(&binary.left) || contains_await(&binary.right),
+        Expression::Logical(logical) => {
+            contains_await(&logical.left) || contains_await(&logical.right)
+        }
+        Expression::Conditional(conditional) => {
+            contains_await(&conditional.test)
+                || contains_await(&conditional.consequent)
+                || contains_await(&conditional.alternate)
+        }
+        Expression::Assignment(assignment) => {
+            contains_await(&assignment.right)
+                || matches!(assignment.left.data(), AssignmentTarget::Member(member)
+                    if contains_await(&member.object))
+        }
+        Expression::Sequence(sequence) => sequence.expressions.iter().any(contains_await),
+        Expression::Parenthesized(inner) => contains_await(inner),
+        Expression::As(cast) => contains_await(&cast.expression),
+        Expression::NonNull(non_null) => contains_await(&non_null.expression),
+        _ => true,
+    }
+}
+
+/// Whether any statement still holds an await. Walks exactly the
+/// statement shapes the machine accepts; other shapes report true, which
+/// is consistent because the machine refuses them regardless.
+fn statements_contain_await(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match statement.data() {
+        Statement::Expression(expression) => contains_await(&expression.expression),
+        Statement::Variable(declaration) => declaration.declarations.iter().any(|declarator| {
+            declarator
+                .data()
+                .initializer
+                .as_deref()
+                .is_some_and(contains_await)
+        }),
+        Statement::Return(returned) => returned.argument.as_deref().is_some_and(contains_await),
+        Statement::Block(block) => statements_contain_await(&block.data().statements),
+        Statement::If(if_statement) => {
+            contains_await(&if_statement.test)
+                || branch_awaits(&if_statement.consequent)
+                || if_statement.alternate.as_deref().is_some_and(branch_awaits)
+        }
+        Statement::While(while_statement) => {
+            contains_await(&while_statement.test) || branch_awaits(&while_statement.body)
+        }
+        Statement::DoWhile(do_statement) => {
+            contains_await(&do_statement.test) || branch_awaits(&do_statement.body)
+        }
+        Statement::For(for_statement) => {
+            let init = match &for_statement.initializer {
+                Some(ForInitializer::Expression(expression)) => contains_await(expression),
+                _ => false,
+            };
+            let test = for_statement.test.as_deref().is_some_and(contains_await);
+            let update = for_statement.update.as_deref().is_some_and(contains_await);
+            init || test || update || branch_awaits(&for_statement.body)
+        }
+        Statement::Switch(switch_statement) => {
+            contains_await(&switch_statement.discriminant)
+                || switch_statement.cases.iter().any(|case| {
+                    case.data().test.as_deref().is_some_and(contains_await)
+                        || statements_contain_await(&case.data().consequent)
+                })
+        }
+        Statement::Labeled(labeled) => branch_awaits(&labeled.body),
+        _ => true,
+    })
+}
+
+/// A branch's awaits: blocks walk their statements; other shapes report
+/// true, matching the machine's refusal of them.
+fn branch_awaits(statement: &Stmt) -> bool {
+    match statement.data() {
+        Statement::Block(block) => statements_contain_await(&block.data().statements),
+        Statement::Expression(expression) => contains_await(&expression.expression),
+        _ => true,
+    }
 }
 
 fn contains_yield_array(array: &ArrayLiteral) -> bool {
