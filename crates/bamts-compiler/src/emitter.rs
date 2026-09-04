@@ -2086,6 +2086,13 @@ impl<'a> Emitter<'a> {
         if let Some(name) = &function.name {
             self.raw(" ");
             self.emit_ident(name);
+        } else {
+            // Anonymous expressions carry a synthesized space before the
+            // parameter list (`function (val)`, `function* ()`, even async):
+            // authority FunctionExpression1_es6, asyncAwaitIsolatedModules,
+            // and 2dArrays all print it; named forms bind the space to the
+            // name instead.
+            self.raw(" ");
         }
         self.emit_params_js(&function.parameters, range);
         self.raw(" ");
