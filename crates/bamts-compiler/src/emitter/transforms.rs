@@ -5799,9 +5799,33 @@ impl<'a> Rewriter<'a> {
                     return self.lower_logical_assignment(expression, assignment);
                 }
                 let right = self.rewrite_expr(&assignment.right);
+                let left = if self.replace_await
+                    && let AssignmentTarget::Member(member) = assignment.left.data()
+                {
+                    // Convert awaits inside the target too, so a
+                    // suspending target becomes a visible machine refusal
+                    // instead of a live `await` in ES5 output.
+                    let object = self.rewrite_expr(&member.object);
+                    let property = match &member.property {
+                        MemberProperty::Computed(key) => {
+                            MemberProperty::Computed(Box::new(self.rewrite_expr(key)))
+                        }
+                        other => other.clone(),
+                    };
+                    self.node(
+                        assignment.left.range(),
+                        AssignmentTarget::Member(AssignmentMemberTarget {
+                            object: Box::new(object),
+                            property,
+                        }),
+                    )
+                } else {
+                    assignment.left.clone()
+                };
                 self.node(
                     expression.range(),
                     Expression::Assignment(AssignmentExpression {
+                        left,
                         right: Box::new(right),
                         ..assignment.clone()
                     }),
@@ -6803,7 +6827,19 @@ fn count_yields(expression: &Expr) -> u32 {
                 + count_yields(&conditional.consequent)
                 + count_yields(&conditional.alternate)
         }
-        Expression::Assignment(assignment) => count_yields(&assignment.right),
+        Expression::Assignment(assignment) => {
+            count_yields(&assignment.right)
+                + match assignment.left.data() {
+                    AssignmentTarget::Member(member) => {
+                        count_yields(&member.object)
+                            + match &member.property {
+                                MemberProperty::Computed(key) => count_yields(key),
+                                _ => 0,
+                            }
+                    }
+                    _ => 0,
+                }
+        }
         Expression::Sequence(sequence) => sequence.expressions.iter().map(count_yields).sum(),
         Expression::Parenthesized(inner) => count_yields(inner),
         Expression::As(cast) => count_yields(&cast.expression),
