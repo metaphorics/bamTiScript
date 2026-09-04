@@ -210,6 +210,13 @@ impl NodeIdSource {
         self.next = self.next.checked_add(1).expect("node id space exhausted");
         id
     }
+
+    /// The next id `fresh` would hand out; also the number of ids minted
+    /// past the seed. Snapshot before a consumer mints to record its floor.
+    #[must_use]
+    pub const fn position(&self) -> u32 {
+        self.next
+    }
 }
 
 /// A failed checked source-position operation.
@@ -490,6 +497,15 @@ mod tests {
         let mut ids = NodeIdSource::after(crate::syntax::NodeId::new(40));
         assert_eq!(ids.fresh(), crate::syntax::NodeId::new(41));
         assert_eq!(ids.fresh(), crate::syntax::NodeId::new(42));
+    }
+
+    #[test]
+    fn id_source_position_reports_the_next_unminted_id() {
+        let mut ids = NodeIdSource::after(crate::syntax::NodeId::new(40));
+        assert_eq!(ids.position(), 41);
+        let _ = ids.fresh();
+        let _ = ids.fresh();
+        assert_eq!(ids.position(), 43);
     }
 
     #[test]

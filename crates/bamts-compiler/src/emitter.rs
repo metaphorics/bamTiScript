@@ -40,7 +40,7 @@ use declarations::DeclarationOptions;
 use helpers::{HelperOptions, HelperStyle};
 use sourcemap::{LineColumn, SourceMap, SourceMapBuilder};
 pub use transforms::ScriptTarget;
-use transforms::{LanguageFeature, SYNTHESIZED_ID_FLOOR, TransformOptions};
+use transforms::{LanguageFeature, TransformOptions};
 
 /// Stable diagnostic identifiers produced by the emitter.
 pub mod codes {
@@ -478,6 +478,10 @@ pub(crate) struct PrintSource<'a> {
     pub(crate) file: &'a SourceFile,
     pub(crate) original_content: &'a str,
     pub(crate) synthesized: Option<&'a BTreeSet<NodeId>>,
+    /// First id the rewriter may mint for this file (its seed past the
+    /// parser tree and any JSX-desugar consumption). Ids below it are
+    /// parser-assigned and must carry ranges within the authored text.
+    pub(crate) synthesized_floor: u32,
 }
 
 /// Print context for a braced block. Carries two tsc behaviors that split on
@@ -559,6 +563,9 @@ pub(crate) fn print(
             file,
             original_content: file.source_text().as_str(),
             synthesized: None,
+            // No rewriter ran: every id is parser-assigned, so the mint
+            // gate's range check applies universally.
+            synthesized_floor: u32::MAX,
         },
         model,
         options,
@@ -583,6 +590,7 @@ pub(crate) fn print_with_jsx_plan(
         file,
         original_content,
         synthesized,
+        synthesized_floor,
     } = source;
     let mut source_map = (options.source_map || options.inline_source_map).then(|| {
         let mut builder = SourceMapBuilder::new()
@@ -635,6 +643,7 @@ pub(crate) fn print_with_jsx_plan(
         ),
         authored_len: Utf16Pos::new(utf16_len(original_content)),
         synthesized,
+        synthesized_floor,
     };
     if let Some(prelude) = prelude.filter(|prelude| !prelude.is_empty()) {
         let has_trailing_newline = prelude.ends_with('\n');
@@ -821,6 +830,9 @@ struct Emitter<'a> {
     /// Synthesized node ids recorded by the rewriter, or `None` when printing
     /// without a transform (declarations, untransformed JS).
     synthesized: Option<&'a BTreeSet<NodeId>>,
+    /// First rewriter-minted id for this file; ids below it are
+    /// parser-assigned and must carry ranges within the authored text.
+    synthesized_floor: u32,
 }
 
 impl<'a> Emitter<'a> {
@@ -919,7 +931,7 @@ impl<'a> Emitter<'a> {
         // to the extended text, so a range past `authored_len` on a
         // non-synthesized id indicates a lowering bug.
         debug_assert!(
-            id.get() >= SYNTHESIZED_ID_FLOOR || range.end() <= self.authored_len,
+            id.get() >= self.synthesized_floor || range.end() <= self.authored_len,
             "parser id {id:?} has range past authored_len"
         );
         if range.end() > self.authored_len {

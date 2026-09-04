@@ -214,7 +214,8 @@ pub fn emit_transformed(
     names: &EmitFileNames,
 ) -> EmitOutput {
     let plan = analyze(file, options);
-    let jsx_plan = executable_jsx_plan(file, options, names);
+    let mut ids = NodeIdSource::after(file.id());
+    let jsx_plan = executable_jsx_plan(file, options, names, &mut ids);
     let mut jsx_diagnostics = Vec::new();
     if let Err(diagnostic) = &jsx_plan {
         jsx_diagnostics.push((**diagnostic).clone());
@@ -225,7 +226,7 @@ pub fn emit_transformed(
         .map(|plan| bind_and_render_jsx_runtime(file, plan))
         .unwrap_or_default();
 
-    let mut rewriter = Rewriter::new(file, options, Some(model));
+    let mut rewriter = Rewriter::new(file, options, Some(model), &mut ids);
     if jsx_plan
         .as_ref()
         .is_some_and(|plan| plan.demand.needs_assign)
@@ -284,6 +285,7 @@ pub fn emit_transformed(
             file: &rewritten,
             original_content: file.source_text().as_str(),
             synthesized: Some(&rewriter.synthesized_ids),
+            synthesized_floor: rewriter.synthesized_floor,
         },
         model,
         PrintOptions {
@@ -311,6 +313,7 @@ fn executable_jsx_plan(
     file: &SourceFile,
     options: &TransformOptions,
     names: &EmitFileNames,
+    ids: &mut NodeIdSource,
 ) -> Result<Option<JsxSourceDesugarPlan>, Box<Diagnostic>> {
     let Some(emit @ (JsxEmit::React | JsxEmit::ReactJsx | JsxEmit::ReactJsxDev)) = options.jsx
     else {
@@ -324,8 +327,7 @@ fn executable_jsx_plan(
         import_style: options.jsx_import_style,
         file_name: Some(Arc::clone(&names.source_name)),
     };
-    let mut ids = NodeIdSource::after(file.id());
-    desugar_source_jsx(file, file.source_text(), &emit_options, &mut ids)
+    desugar_source_jsx(file, file.source_text(), &emit_options, ids)
         .map(Some)
         .map_err(|_| {
             Box::new(Diagnostic::error(
@@ -564,25 +566,14 @@ enum ExportWrapper {
     Default,
 }
 
-/// First [`NodeId`](crate::syntax::NodeId) the [`Rewriter`] may mint. The
-/// parser assigns dense ids from zero, so on ordinary files ids at or above
-/// this floor are rewriter-minted and the printer's mint-gate assert leans
-/// on that split. Taint itself is set membership, so a pathological file
-/// (multi-MB dense nodes, parser ids past the floor) can alias
-/// rewriter-minted values into the set and wrongly expand an authored
-/// single-line body; bytes stay valid, preservation just loses. Deriving
-/// the seed from the file's real high-water id (including JSX-desugar
-/// consumption) is the exact fix, queued for phase 2. Change the value in
-/// one place only.
-pub(crate) const SYNTHESIZED_ID_FLOOR: u32 = 1_000_000;
-
 struct Rewriter<'a> {
     options: &'a TransformOptions,
     model: Option<&'a SemanticModel>,
     source_id: SourceId,
     source_text: String,
     bank: NameBank,
-    next_id: u32,
+    ids: &'a mut NodeIdSource,
+    synthesized_floor: u32,
     next_temp: u32,
     diagnostics: Vec<Diagnostic>,
     replace_await: bool,
@@ -649,19 +640,22 @@ impl<'a> Rewriter<'a> {
         file: &'a SourceFile,
         options: &'a TransformOptions,
         model: Option<&'a SemanticModel>,
+        ids: &'a mut NodeIdSource,
     ) -> Self {
         let cjs = if options.module_kind == Some(ModuleKind::CommonJs) {
             model.and_then(|model| Self::build_cjs_plan(file, options, model))
         } else {
             None
         };
+        let synthesized_floor = ids.position();
         Self {
             options,
             model,
             source_id: file.source_id(),
             source_text: file.source_text().as_str().to_owned(),
             bank: NameBank::new(file.source_text()),
-            next_id: SYNTHESIZED_ID_FLOOR,
+            ids,
+            synthesized_floor,
             next_temp: 0,
             diagnostics: Vec::new(),
             replace_await: false,
@@ -673,7 +667,6 @@ impl<'a> Rewriter<'a> {
             synthesized_ids: BTreeSet::new(),
         }
     }
-
     /// Scans top-level module syntax into a CommonJS lowering plan.
     fn build_cjs_plan(
         file: &SourceFile,
@@ -1148,16 +1141,14 @@ impl<'a> Rewriter<'a> {
         }
     }
 
-    fn alloc_id(&mut self) -> NodeId {
-        let id = NodeId::new(self.next_id);
-        self.next_id += 1;
-        id
-    }
-
     fn ident(&mut self, name: &str) -> IdentifierNode {
         let range = self.bank.intern(name);
         let token = Token::new(TokenKind::Identifier, range);
         Node::new(self.alloc_id(), range, Identifier::new(token))
+    }
+
+    fn alloc_id(&mut self) -> NodeId {
+        self.ids.fresh()
     }
 
     fn ident_expr(&mut self, name: &str) -> Expr {
@@ -1261,10 +1252,6 @@ impl<'a> Rewriter<'a> {
     /// Like [`node`](Self::node) but records the minted id as synthesized.
     fn syn_node<T>(&mut self, range: TextRange, data: T) -> Node<T> {
         let id = self.alloc_id();
-        debug_assert!(
-            id.get() >= SYNTHESIZED_ID_FLOOR,
-            "rewriter minted id {id:?} below the synthesized floor"
-        );
         self.synthesized_ids.insert(id);
         Node::new(id, range, data)
     }
@@ -5863,6 +5850,59 @@ mod tests {
 
     fn javascript(output: &EmitOutput) -> &str {
         &output.javascript.as_ref().expect("JavaScript output").code
+    }
+
+    #[test]
+    fn dense_million_node_file_keeps_authored_preservation_unaliased() {
+        // The rewriter's id source is seeded past the parser high-water
+        // (and any JSX-desugar consumption), so minted ids are disjoint
+        // from authored ids BY CONSTRUCTION — the structural fix for the
+        // old constant floor. This pins the observable consequences on a
+        // dense million-node file: emit completes, no statements drop,
+        // authored single-line preservation holds, and field lowering
+        // still mints its descriptors.
+        let mut statements = 330_000usize;
+        let tail = "function probe() { return 1; }\nclass K { }";
+        // Grow the prefix until the parser high-water crosses 1_000_100:
+        // node yield per statement amortizes, so calibrate on the real
+        // construction rather than a small sample.
+        let high_water = loop {
+            let probe = format!("{}{tail}", "a;".repeat(statements));
+            let water = parse(&probe).id().get();
+            if water >= 1_000_400 || statements > 600_000 {
+                break water;
+            }
+            statements += 2_000;
+        };
+        let mut source = String::with_capacity(2_000_000);
+        source.push_str(&"a;".repeat(statements));
+        source.push_str("function probe() { return 1; }\n");
+        source.push_str("class K { ");
+        for i in 0..60 {
+            source.push_str(&format!("f{i} = 1; "));
+        }
+        source.push_str("}\n");
+        assert!(
+            (1_000_350..=1_004_500).contains(&high_water),
+            "calibration drifted: high water {high_water}"
+        );
+        let output = emit_with_options(
+            &source,
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                use_define_for_class_fields: Some(true),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("function probe() { return 1; }"),
+            "authored single-line body lost preservation"
+        );
+        assert!(
+            code.contains("enumerable: true"),
+            "descriptor lowering missing"
+        );
     }
 
     #[test]
