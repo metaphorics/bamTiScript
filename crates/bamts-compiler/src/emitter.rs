@@ -624,6 +624,7 @@ pub(crate) fn print_with_jsx_plan(
             .filter(|token| token.kind() == TokenKind::LineComment)
             .map(|token| token.range())
             .collect(),
+        tokens: file.tokens(),
         source: file.source_text(),
         source_name: mapped_source_name,
         source_id: file.source_id(),
@@ -803,6 +804,9 @@ struct Emitter<'a> {
     /// stream carries them with original coordinates, which stay valid in
     /// the rewritten text because synthesis appends past authored content.
     line_comments: Vec<TextRange>,
+    /// The full authored token stream, sorted by start. Backs authored-form
+    /// lookups (arrow parameter parens) that the AST does not retain.
+    tokens: &'a [Token],
     source_id: SourceId,
     model: &'a SemanticModel,
     enum_facts: &'a EnumFacts,
@@ -897,6 +901,37 @@ impl Emitter<'_> {
                 self.newline();
             }
         }
+    }
+}
+
+impl Emitter<'_> {
+    /// Whether an arrow's single plain identifier parameter was authored
+    /// without parentheses (`props =>`). The AST drops the distinction, so
+    /// the token stream answers: a bare parameter has no `(` ending exactly
+    /// where the binding starts.
+    fn arrow_params_authored_bare(&self, arrow: &ArrowFunction) -> bool {
+        if arrow.parameters.len() != 1 {
+            return false;
+        }
+        let parameter = arrow.parameters[0].data();
+        if parameter.initializer.is_some()
+            || parameter.type_annotation.is_some()
+            || parameter.optional
+            || !parameter.decorators.is_empty()
+        {
+            return false;
+        }
+        if !matches!(parameter.binding.data(), BindingPattern::Identifier(_)) {
+            return false;
+        }
+        let start = parameter.binding.range().start();
+        let index = self
+            .tokens
+            .partition_point(|token| token.range().start() < start);
+        let Some(before) = index.checked_sub(1).and_then(|i| self.tokens.get(i)) else {
+            return true;
+        };
+        !(before.kind() == TokenKind::LParen && before.range().end() == start)
     }
 }
 
@@ -2176,7 +2211,16 @@ impl<'a> Emitter<'a> {
         if arrow.is_async {
             self.raw_mapped_char("async ", range, 'a', 5);
         }
-        self.emit_params_js(&arrow.parameters, range);
+        if self.arrow_params_authored_bare(arrow) {
+            // tsc preserves the authored bare form for a single plain
+            // identifier parameter (`props => {`); parenthesized forms keep
+            // their parens (arrowFunctionContexts).
+            if let Some(parameter) = arrow.parameters.first() {
+                self.emit_pattern(&parameter.data().binding);
+            }
+        } else {
+            self.emit_params_js(&arrow.parameters, range);
+        }
         let arrow_pos = self
             .source_pos_of(
                 TextRange::new(self.params_source_end(&arrow.parameters), range.end())
@@ -6121,6 +6165,28 @@ export default answer;
         let code = &javascript(&output).code;
         assert!(code.contains("var x = 1; // first\n"), "{code}");
         assert!(code.contains("var y; // Expect no error here\n"), "{code}");
+    }
+
+    #[test]
+    fn arrow_single_param_parens_follow_the_authored_form() {
+        // Authority: complicatedIndexesOfIntersectionsAreInferencable keeps
+        // `props => {`; arrowFunctionContexts keeps `(props) =>` and `() =>`.
+        // The AST drops the distinction, so the token stream answers.
+        let input = "var a = props => { return props; };
+var b = (props) => { return props; };
+var c = () => 1;
+";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        let code = &javascript(&output).code;
+        assert!(code.contains("var a = props => {"), "{code}");
+        assert!(code.contains("var b = (props) => {"), "{code}");
+        assert!(code.contains("var c = () =>"), "{code}");
     }
 
     #[test]
