@@ -847,18 +847,23 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
-    /// The authored single-line comment trailing `pos` on its source line,
-    /// if one exists (tsc preserves these with `removeComments` off).
-    fn trailing_line_comment(&self, pos: Utf16Pos) -> Option<TextRange> {
-        let line = self.source.line_column(pos).ok()?.0;
-        self.line_comments
+    /// The authored single-line comment between `after` and `limit` on
+    /// `after`'s source line, if one exists (tsc preserves these with
+    /// `removeComments` off, attached to the last statement on the line).
+    /// The bound stops a comment from duplicating onto every statement that
+    /// shares its line; `partition_point` keeps the scan logarithmic.
+    fn trailing_line_comment(&self, after: Utf16Pos, limit: Utf16Pos) -> Option<TextRange> {
+        let line = self.source.line_column(after).ok()?.0;
+        let start = self
+            .line_comments
+            .partition_point(|range| range.start() < after);
+        self.line_comments[start..]
             .iter()
+            .take_while(|range| range.start() < limit)
             .find(|range| {
-                range.start() >= pos
-                    && self
-                        .source
-                        .line_column(range.start())
-                        .is_ok_and(|(other, _)| other == line)
+                self.source
+                    .line_column(range.start())
+                    .is_ok_and(|(other, _)| other == line)
             })
             .copied()
     }
@@ -877,9 +882,12 @@ impl Emitter<'_> {
     /// tsc expands a body whose statement carries a trailing comment, a
     /// rule queued separately.
     fn emit_statement_list(&mut self, statements: &[Stmt]) {
-        for statement in statements {
+        for (index, statement) in statements.iter().enumerate() {
             if self.emit_statement(statement) {
-                if let Some(comment) = self.trailing_line_comment(statement.range().end()) {
+                let limit = statements
+                    .get(index + 1)
+                    .map_or_else(|| Utf16Pos::new(usize::MAX), |next| next.range().start());
+                if let Some(comment) = self.trailing_line_comment(statement.range().end(), limit) {
                     self.raw(" ");
                     if let Some(text) = self.source_slice(comment) {
                         let text = text.to_owned();
@@ -6130,6 +6138,24 @@ export default answer;
         let code = &javascript(&output).code;
         assert!(code.contains("var x = 1; // first\n"), "{code}");
         assert!(code.contains("var y; // Expect no error here\n"), "{code}");
+    }
+
+    #[test]
+    fn trailing_comment_attaches_to_the_last_statement_on_its_line() {
+        // tsc attaches a trailing comment to the last statement on the
+        // source line only: `var a = 1; var b = 2; // note` prints the
+        // comment after `b`, never duplicated after `a`.
+        let input = "var a = 1; var b = 2; // note\nvar c = 3;\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        let code = &javascript(&output).code;
+        assert!(code.contains("var a = 1;\n"), "{code}");
+        assert!(code.contains("var b = 2; // note\n"), "{code}");
     }
 
     #[test]
