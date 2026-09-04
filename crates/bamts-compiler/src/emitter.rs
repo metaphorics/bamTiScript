@@ -6526,7 +6526,9 @@ export default answer;
             "{code}"
         );
         assert!(
-            code.contains("case 3:\n                    z;\n                    return [3 /*break*/, 1];"),
+            code.contains(
+                "case 3:\n                    z;\n                    return [3 /*break*/, 1];"
+            ),
             "{code}"
         );
     }
