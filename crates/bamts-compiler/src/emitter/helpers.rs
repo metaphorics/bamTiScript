@@ -51,9 +51,11 @@ pub struct HelperOptions {
     /// When true, bind helpers from [`HelperOptions::module_specifier`] instead
     /// of inlining their bodies.
     pub import_helpers: bool,
-    /// Assume helpers exist globally; emit no prelude (`noEmitHelpers`).
+    /// Assume helpers exist globally; emit no prelude (`noEmitHelpers`). Takes
+    /// precedence over `import_helpers` when both are set: the more specific
+    /// "assume global" instruction wins, and the combination is contradictory
+    /// configuration no baseline exercises.
     pub no_emit_helpers: bool,
-    /// How imported helpers are bound. Ignored when `import_helpers` is false.
     pub style: HelperStyle,
     /// The module specifier used for imported helpers. Defaults to `tslib`.
     pub module_specifier: String,
