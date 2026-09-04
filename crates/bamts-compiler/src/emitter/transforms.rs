@@ -4011,11 +4011,11 @@ impl<'a> Rewriter<'a> {
         let Some(FunctionBody::Block(block)) = function.body.as_ref() else {
             return function.clone();
         };
-        let Some((hoisted, machine)) = self.generator_machine(block) else {
+        let Some((hoisted, state_name, temps, machine)) = self.generator_machine(block) else {
             return function.clone();
         };
         let range = block.range();
-        let state = self.ident("_a");
+        let state = self.ident(&state_name);
         let binding = self.node(state.range(), BindingPattern::Identifier(state));
         let parameter = self.node(
             binding.range(),
@@ -4073,8 +4073,10 @@ impl<'a> Rewriter<'a> {
                 argument: Some(Box::new(call)),
             }),
         );
+        let mut declarations = hoisted;
+        declarations.extend(temps.iter().cloned());
         let mut statements = Vec::new();
-        if let Some(declaration) = self.temp_declaration(hoisted, range) {
+        if let Some(declaration) = self.temp_declaration(declarations, range) {
             statements.push(declaration);
         }
         statements.push(return_stmt);
@@ -4087,100 +4089,37 @@ impl<'a> Rewriter<'a> {
         }
     }
 
-    /// Builds the `__generator` machine body: a flat statement list when the
-    /// body has no yields, otherwise a `switch (_a.label)` with one case per
-    /// yield segment. `var` declarations are hoisted into assignment form;
-    /// each statement-level yield splits a segment and the resumed value is
-    /// consumed through `_a.sent()`. Returns None when the body is richer
-    /// than this slice.
-    fn generator_machine(&mut self, block: &BlockNode) -> Option<(Vec<IdentifierNode>, Vec<Stmt>)> {
+    /// each yield splits a labeled segment and the resumed value flows back
+    /// through `<state>.sent()`. Expression-level yields reassemble per tsc
+    /// form: binary/template/sequence operands materialize into temps,
+    /// suspending call arguments rebuild through `.apply(void 0, [..])`,
+    /// array literals through prefix temps and `.concat`, object literals
+    /// through property-assignment sequences. Short-circuit shapes (logical
+    /// right operands, conditional branches, suspending `new` arguments)
+    /// and statement-level control flow keep the native generator and its
+    /// diagnostic rather than miscompiling.
+    fn generator_machine(&mut self, block: &BlockNode) -> Option<MachineParts> {
+        // Names follow tsc's allocation: temps `_a`.. first, then the state
+        // parameter after them. A probe pass with a throwaway state name
+        // discovers the temp count; a second pass builds the real tree.
+        let mut probe = MachineCtx::new("_m0s");
+        self.machine_statements(block, &mut probe)?;
+        let temp_count = probe.temps.len();
+        let state = machine_state_name(temp_count);
+        let mut ctx = MachineCtx::new(&state);
+        self.machine_statements(block, &mut ctx)?;
+        debug_assert_eq!(ctx.temps.len(), temp_count);
         let range = block.range();
-        let mut hoisted: Vec<IdentifierNode> = Vec::new();
-        let mut segments: Vec<Vec<Stmt>> = vec![Vec::new()];
-        let mut terminated = false;
-        for statement in &block.data().statements {
-            if terminated {
-                return None;
-            }
-            match statement.data() {
-                Statement::Variable(declaration) if declaration.kind == VariableKind::Var => {
-                    for declarator in &declaration.declarations {
-                        let BindingPattern::Identifier(name) = declarator.data().binding.data()
-                        else {
-                            return None;
-                        };
-                        let name = name.clone();
-                        hoisted.push(name.clone());
-                        if let Some(initializer) = &declarator.data().initializer {
-                            if contains_yield(initializer) {
-                                return None;
-                            }
-                            segments.last_mut()?.push(self.assign_statement(
-                                &name,
-                                initializer.as_ref().clone(),
-                                range,
-                            ));
-                        }
-                    }
-                }
-                Statement::Expression(expression) => {
-                    if let Expression::Yield(yielded) = expression.expression.data() {
-                        if yielded.delegate || yielded.argument.is_none() {
-                            return None;
-                        }
-                        let argument = yielded.argument.clone()?;
-                        let sentinel = self.number_expr("4 /*yield*/");
-                        let array = self.array_literal(vec![sentinel, *argument], range);
-                        segments.last_mut()?.push(self.machine_return(array, range));
-                        // The resumed value is consumed and discarded exactly
-                        // the way tsc's machine does: `_a.sent();`.
-                        let sent_call = self.state_sent_call(range);
-                        segments.push(vec![self.syn_node(
-                            range,
-                            Statement::Expression(ExpressionStatement {
-                                expression: Box::new(sent_call),
-                            }),
-                        )]);
-                    } else {
-                        if contains_yield(&expression.expression) {
-                            return None;
-                        }
-                        segments.last_mut()?.push(statement.clone());
-                    }
-                }
-                Statement::Return(returned) => {
-                    let terminator = match &returned.argument {
-                        Some(value) if contains_yield(value) => return None,
-                        Some(value) => {
-                            let sentinel = self.number_expr("2 /*return*/");
-                            let array = self.array_literal(vec![sentinel, *value.clone()], range);
-                            self.machine_return(array, range)
-                        }
-                        None => {
-                            let sentinel = self.return_sentinel(range);
-                            self.machine_return(sentinel, range)
-                        }
-                    };
-                    segments.last_mut()?.push(terminator);
-                    terminated = true;
-                }
-                _ => return None,
-            }
+        let hoisted = ctx.hoisted.clone();
+        let temps = ctx.temps.clone();
+        if ctx.segments.len() == 1 {
+            return Some((hoisted, state, temps, ctx.segments.pop()?));
         }
-        if !terminated {
-            let sentinel = self.return_sentinel(range);
-            segments
-                .last_mut()?
-                .push(self.machine_return(sentinel, range));
-        }
-        if segments.len() == 1 {
-            return Some((hoisted, segments.pop()?));
-        }
-        let state_expr = self.ident_expr("_a");
+        let state_expr = self.ident_expr(&state);
         let label_name = self.ident("label");
         let label = self.member_expr(&state_expr, MemberProperty::Named(label_name), range);
         let mut cases = Vec::new();
-        for (index, segment) in segments.into_iter().enumerate() {
+        for (index, segment) in ctx.segments.into_iter().enumerate() {
             let test = self.number_expr(&index.to_string());
             cases.push(self.node(
                 range,
@@ -4197,7 +4136,636 @@ impl<'a> Rewriter<'a> {
                 cases,
             }),
         );
-        Some((hoisted, vec![switch]))
+        Some((hoisted, state, temps, vec![switch]))
+    }
+
+    /// Rewrites the block's statements into machine segments. Evaluation
+    /// order is preserved by materializing already-computed sibling values
+    /// into temps before a suspending sibling splits the segment.
+    fn machine_statements(&mut self, block: &BlockNode, ctx: &mut MachineCtx) -> Option<()> {
+        let range = block.range();
+        for statement in &block.data().statements {
+            if ctx.terminated {
+                return None;
+            }
+            match statement.data() {
+                Statement::Variable(declaration) if declaration.kind == VariableKind::Var => {
+                    for declarator in &declaration.declarations {
+                        let BindingPattern::Identifier(name) = declarator.data().binding.data()
+                        else {
+                            return None;
+                        };
+                        let name = name.clone();
+                        ctx.hoisted.push(name.clone());
+                        if let Some(initializer) = &declarator.data().initializer {
+                            let value = if contains_yield(initializer) {
+                                self.eval(initializer, ctx)?
+                            } else {
+                                initializer.as_ref().clone()
+                            };
+                            let assign = self.assign_statement(&name, value, range);
+                            ctx.push(assign);
+                        }
+                    }
+                }
+                Statement::Expression(expression) => {
+                    // A comma sequence in statement position flattens: each
+                    // element discards its value, so they become standalone
+                    // statements in order.
+                    if let Expression::Sequence(sequence) = expression.expression.data() {
+                        for element in &sequence.expressions {
+                            self.machine_emit_expression(element, ctx)?;
+                        }
+                    } else {
+                        self.machine_emit_expression(&expression.expression, ctx)?;
+                    }
+                }
+                Statement::Return(returned) => {
+                    let terminator = match &returned.argument {
+                        Some(value) if contains_yield(value) => {
+                            let evaluated = self.eval(value, ctx)?;
+                            let sentinel = self.number_expr("2 /*return*/");
+                            let array = self.array_literal(vec![sentinel, evaluated], range);
+                            self.machine_return(array, range)
+                        }
+                        Some(value) => {
+                            let sentinel = self.number_expr("2 /*return*/");
+                            let array =
+                                self.array_literal(vec![sentinel, value.as_ref().clone()], range);
+                            self.machine_return(array, range)
+                        }
+                        None => {
+                            let sentinel = self.return_sentinel(range);
+                            self.machine_return(sentinel, range)
+                        }
+                    };
+                    ctx.push(terminator);
+                    ctx.terminated = true;
+                }
+                _ => return None,
+            }
+        }
+        if !ctx.terminated {
+            let sentinel = self.return_sentinel(range);
+            let ret = self.machine_return(sentinel, range);
+            ctx.push(ret);
+        }
+        Some(())
+    }
+
+    /// Emits one expression as a statement, splitting any suspension.
+    fn machine_emit_expression(&mut self, expression: &Expr, ctx: &mut MachineCtx) -> Option<()> {
+        let range = expression.range();
+        if !contains_yield(expression) {
+            ctx.push(self.node(
+                range,
+                Statement::Expression(ExpressionStatement {
+                    expression: Box::new(expression.clone()),
+                }),
+            ));
+            return Some(());
+        }
+        let value = self.eval(expression, ctx)?;
+        ctx.push(self.syn_node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(value),
+            }),
+        ));
+        Some(())
+    }
+
+    /// Evaluates an expression for the machine: subexpressions evaluated
+    /// before a suspension keep their values in temps, and the resume side
+    /// reassembles the form with `<state>.sent()` at the suspension point.
+    fn eval(&mut self, expr: &Expr, ctx: &mut MachineCtx) -> Option<Expr> {
+        if !contains_yield(expr) {
+            return Some(expr.clone());
+        }
+        let range = expr.range();
+        match expr.data() {
+            Expression::Yield(yielded) => {
+                if yielded.delegate {
+                    return None;
+                }
+                let argument = yielded.argument.as_ref()?;
+                let evaluated = self.eval(argument, ctx)?;
+                let sentinel = self.number_expr("4 /*yield*/");
+                let array = self.array_literal(vec![sentinel, evaluated], range);
+                let terminator = self.machine_return(array, range);
+                ctx.push(terminator);
+                ctx.segments.push(Vec::new());
+                Some(self.state_sent_call(&ctx.state, range))
+            }
+            Expression::Binary(binary) => {
+                let left = self.eval_sibling(&binary.left, contains_yield(&binary.right), ctx)?;
+                let left = self.paren_if_sent(left, range);
+                let right = self.eval(&binary.right, ctx)?;
+                let right = self.paren_if_sent(right, range);
+                Some(self.node(
+                    range,
+                    Expression::Binary(BinaryExpression {
+                        operator: binary.operator,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }),
+                ))
+            }
+            Expression::Logical(_) | Expression::Conditional(_) => None,
+            Expression::Assignment(assignment) => {
+                if let AssignmentTarget::Member(member) = assignment.left.data() {
+                    let base_suspends = contains_yield(&member.object)
+                        || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key));
+                    if base_suspends {
+                        return None;
+                    }
+                }
+                let right = self.eval(&assignment.right, ctx)?;
+                Some(self.node(
+                    range,
+                    Expression::Assignment(AssignmentExpression {
+                        operator: assignment.operator,
+                        left: assignment.left.clone(),
+                        right: Box::new(right),
+                    }),
+                ))
+            }
+            Expression::Unary(unary) => {
+                let argument = self.eval(&unary.argument, ctx)?;
+                Some(self.node(
+                    range,
+                    Expression::Unary(UnaryExpression {
+                        operator: unary.operator,
+                        argument: Box::new(argument),
+                    }),
+                ))
+            }
+            Expression::Parenthesized(inner) => {
+                let value = self.eval(inner, ctx)?;
+                Some(self.node(range, Expression::Parenthesized(Box::new(value))))
+            }
+            Expression::As(cast) => {
+                let value = self.eval(&cast.expression, ctx)?;
+                Some(self.node(
+                    range,
+                    Expression::As(AsExpression {
+                        expression: Box::new(value),
+                        type_node: cast.type_node.clone(),
+                    }),
+                ))
+            }
+            Expression::NonNull(non_null) => {
+                let value = self.eval(&non_null.expression, ctx)?;
+                Some(self.node(
+                    range,
+                    Expression::NonNull(NonNullExpression {
+                        expression: Box::new(value),
+                    }),
+                ))
+            }
+            Expression::Sequence(sequence) => {
+                let mut parts = Vec::new();
+                for (index, element) in sequence.expressions.iter().enumerate() {
+                    let later = sequence.expressions[index + 1..].iter().any(contains_yield);
+                    parts.push(self.eval_sibling(element, later, ctx)?);
+                }
+                self.sequence_expression(parts, range)
+            }
+            Expression::Template(template) => {
+                let mut expressions = Vec::new();
+                for (index, expression) in template.expressions.iter().enumerate() {
+                    let later = template.expressions[index + 1..].iter().any(contains_yield);
+                    expressions.push(self.eval_sibling(expression, later, ctx)?);
+                }
+                Some(self.node(
+                    range,
+                    Expression::Template(TemplateLiteral {
+                        elements: template.elements.clone(),
+                        expressions,
+                    }),
+                ))
+            }
+            Expression::Array(array) => self.eval_array(array, ctx, range),
+            Expression::Object(object) => self.eval_object(object, ctx, range),
+            Expression::Member(member) => {
+                let key_suspends = matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key));
+                let object_expr = if contains_yield(&member.object) {
+                    let value = self.eval(&member.object, ctx)?;
+                    self.paren_if_sent(value, range)
+                } else if key_suspends {
+                    let value = member.object.as_ref().clone();
+                    self.materialize(value, ctx, range)?
+                } else {
+                    member.object.as_ref().clone()
+                };
+                let property = match &member.property {
+                    MemberProperty::Computed(key) if contains_yield(key) => {
+                        MemberProperty::Computed(Box::new(self.eval(key, ctx)?))
+                    }
+                    other => other.clone(),
+                };
+                Some(self.node(
+                    range,
+                    Expression::Member(MemberExpression {
+                        object: Box::new(object_expr),
+                        property,
+                        optional: member.optional,
+                    }),
+                ))
+            }
+            Expression::Call(call) => {
+                let first_susp = call.arguments.iter().position(call_argument_suspends);
+                let has_spread = call
+                    .arguments
+                    .iter()
+                    .any(|argument| matches!(argument, CallArgument::Spread(_)));
+                let Some(first_susp) = first_susp else {
+                    // No suspending argument: a suspending callee reassembles
+                    // inline; arguments pass through unchanged.
+                    let callee = if contains_yield(&call.callee) {
+                        let value = self.eval(&call.callee, ctx)?;
+                        self.paren_if_sent(value, range)
+                    } else {
+                        call.callee.as_ref().clone()
+                    };
+                    let arguments = call.arguments.clone();
+                    return Some(self.node(
+                        range,
+                        Expression::Call(CallExpression {
+                            callee: Box::new(callee),
+                            optional: call.optional,
+                            type_arguments: call.type_arguments.clone(),
+                            arguments,
+                        }),
+                    ));
+                };
+                if has_spread || contains_yield(&call.callee) {
+                    return None;
+                }
+                // tsc's protocol for suspending arguments: the callee is
+                // held in a temp — for a member callee the object is held
+                // too, through a parenthesized temp assignment, and becomes
+                // the apply receiver. Arguments before the suspension are
+                // held in one temp array; resumption concats the rest.
+                let (apply_callee, receiver) = match call.callee.data() {
+                    Expression::Identifier(_) => {
+                        let temp = self.materialize(call.callee.as_ref().clone(), ctx, range)?;
+                        let void_zero = self.void_zero(range);
+                        (temp, void_zero)
+                    }
+                    Expression::Member(member)
+                        if !contains_yield(&member.object)
+                            && !matches!(&member.property, MemberProperty::Computed(_)) =>
+                    {
+                        let (ident, assign) =
+                            self.alloc_temp(member.object.as_ref().clone(), ctx, range)?;
+                        let parenthesized =
+                            self.node(range, Expression::Parenthesized(Box::new(assign)));
+                        let member_expr = self.node(
+                            range,
+                            Expression::Member(MemberExpression {
+                                object: Box::new(parenthesized),
+                                property: member.property.clone(),
+                                optional: member.optional,
+                            }),
+                        );
+                        let temp = self.materialize(member_expr, ctx, range)?;
+                        let reference = self.node(ident.range(), Expression::Identifier(ident));
+                        (temp, reference)
+                    }
+                    _ => return None,
+                };
+                let prior_form = if first_susp > 0 {
+                    let prior = call.arguments[..first_susp]
+                        .iter()
+                        .map(|argument| match argument {
+                            CallArgument::Expression(value) => Some(value.as_ref().clone()),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    let prior_array = self.array_literal(prior, range);
+                    Some(self.materialize(prior_array, ctx, range)?)
+                } else {
+                    None
+                };
+                let mut rest = Vec::new();
+                for (index, argument) in call.arguments.iter().skip(first_susp).enumerate() {
+                    let offset = first_susp + index;
+                    let later = call.arguments[offset + 1..]
+                        .iter()
+                        .any(call_argument_suspends);
+                    match argument {
+                        CallArgument::Expression(value) => {
+                            let evaluated = self.eval_sibling(value, later, ctx)?;
+                            rest.push(evaluated);
+                        }
+                        _ => return None,
+                    }
+                }
+                let args_form = if let Some(temp) = prior_form {
+                    let rest_array = self.array_literal(rest, range);
+                    let concat = self.member_access(temp, "concat", range);
+                    self.node(
+                        range,
+                        Expression::Call(CallExpression {
+                            callee: Box::new(concat),
+                            optional: false,
+                            type_arguments: None,
+                            arguments: vec![CallArgument::Expression(Box::new(rest_array))],
+                        }),
+                    )
+                } else {
+                    self.array_literal(rest, range)
+                };
+                let apply = self.member_access(apply_callee, "apply", range);
+                Some(self.node(
+                    range,
+                    Expression::Call(CallExpression {
+                        callee: Box::new(apply),
+                        optional: false,
+                        type_arguments: None,
+                        arguments: vec![
+                            CallArgument::Expression(Box::new(receiver)),
+                            CallArgument::Expression(Box::new(args_form)),
+                        ],
+                    }),
+                ))
+            }
+            Expression::New(new) => {
+                if new.arguments.iter().any(call_argument_suspends) {
+                    // The bind protocol for suspending `new` arguments is
+                    // beyond this slice.
+                    return None;
+                }
+                let callee = if contains_yield(&new.callee) {
+                    let value = self.eval(&new.callee, ctx)?;
+                    self.paren_if_sent(value, range)
+                } else {
+                    new.callee.as_ref().clone()
+                };
+                Some(self.node(
+                    range,
+                    Expression::New(NewExpression {
+                        callee: Box::new(callee),
+                        type_arguments: new.type_arguments.clone(),
+                        arguments: new.arguments.clone(),
+                    }),
+                ))
+            }
+            Expression::Import(import) => {
+                let source = self.eval(&import.source, ctx)?;
+                let options = match &import.options {
+                    Some(options) if contains_yield(options) => {
+                        Some(Box::new(self.eval(options, ctx)?))
+                    }
+                    other => other.clone(),
+                };
+                Some(self.node(
+                    range,
+                    Expression::Import(ImportExpression {
+                        source: Box::new(source),
+                        options,
+                    }),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Evaluates one sibling, materializing its value into a temp when a
+    /// later sibling suspends across it.
+    fn eval_sibling(
+        &mut self,
+        expr: &Expr,
+        later_suspends: bool,
+        ctx: &mut MachineCtx,
+    ) -> Option<Expr> {
+        let value = self.eval(expr, ctx)?;
+        if later_suspends {
+            self.materialize(value, ctx, expr.range())
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Array literals split at the first suspending element: suspension at
+    /// index 0 reassembles inline, a later suspension holds the evaluated
+    /// prefix in a temp and resumes through `.concat`.
+    fn eval_array(
+        &mut self,
+        array: &ArrayLiteral,
+        ctx: &mut MachineCtx,
+        range: TextRange,
+    ) -> Option<Expr> {
+        let first = array.elements.iter().position(
+            |element| matches!(element, ArrayElement::Expression(value) if contains_yield(value)),
+        );
+        let first = first?;
+        let mut elements = Vec::new();
+        for (index, element) in array.elements.iter().enumerate() {
+            match element {
+                ArrayElement::Expression(value) => {
+                    let later = array.elements[index + 1..]
+                        .iter()
+                        .any(|element| matches!(element, ArrayElement::Expression(value) if contains_yield(value)));
+                    let evaluated = self.eval_sibling(value, later, ctx)?;
+                    elements.push(ArrayElement::Expression(Box::new(evaluated)));
+                }
+                ArrayElement::Spread(_) if contains_yield_array(array) => return None,
+                other => elements.push(other.clone()),
+            }
+        }
+        if first == 0 {
+            return Some(self.node(range, Expression::Array(ArrayLiteral { elements })));
+        }
+        let prefix = array.elements[..first].to_vec();
+        let prefix_literal = self.node(range, Expression::Array(ArrayLiteral { elements: prefix }));
+        let temp = self.materialize(prefix_literal, ctx, range)?;
+        let rest = elements
+            .into_iter()
+            .skip(first)
+            .map(|element| match element {
+                ArrayElement::Expression(value) => Some(*value),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let rest_array = self.array_literal(rest, range);
+        let concat = self.member_access(temp, "concat", range);
+        Some(self.node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(concat),
+                optional: false,
+                type_arguments: None,
+                arguments: vec![CallArgument::Expression(Box::new(rest_array))],
+            }),
+        ))
+    }
+
+    /// Object literals hold the evaluated prefix in a temp and resume by
+    /// assigning properties in order, ending with the temp.
+    fn eval_object(
+        &mut self,
+        object: &ObjectLiteral,
+        ctx: &mut MachineCtx,
+        range: TextRange,
+    ) -> Option<Expr> {
+        if !object.members.iter().all(|member| {
+            matches!(member.data(), ObjectMember::Property(property) if !matches!(&property.name, PropertyName::Computed(_)))
+        }) {
+            return None;
+        }
+        let first = object
+            .members
+            .iter()
+            .position(|member| {
+                matches!(member.data(), ObjectMember::Property(property) if contains_yield(&property.value))
+            })?;
+        let prefix = object.members[..first].to_vec();
+        let prefix_literal =
+            self.node(range, Expression::Object(ObjectLiteral { members: prefix }));
+        let temp = self.materialize(prefix_literal, ctx, range)?;
+        let mut parts = Vec::new();
+        for member in &object.members[first..] {
+            let ObjectMember::Property(property) = member.data() else {
+                return None;
+            };
+            let value = &property.value;
+            let evaluated = self.eval(value, ctx)?;
+            parts.push(self.temp_property_assign(&temp, property, evaluated, range)?);
+        }
+        parts.push(temp);
+        self.sequence_expression(parts, range)
+    }
+
+    /// `<state>.sent()`
+    fn state_sent_call(&mut self, state: &str, range: TextRange) -> Expr {
+        let state_expr = self.ident_expr(state);
+        let sent_name = self.ident("sent");
+        let sent = self.member_expr(&state_expr, MemberProperty::Named(sent_name), range);
+        self.syn_node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(sent),
+                optional: false,
+                type_arguments: None,
+                arguments: Vec::new(),
+            }),
+        )
+    }
+
+    /// Wraps a `<state>.sent()` call in parentheses at the positions tsc
+    /// parenthesizes them: operands and member/new bases.
+    fn paren_if_sent(&mut self, expr: Expr, range: TextRange) -> Expr {
+        let sent_range = self.bank.intern("sent");
+        let is_sent = matches!(
+            expr.data(),
+            Expression::Call(call)
+                if matches!(
+                    call.callee.data(),
+                    Expression::Member(member)
+                        if matches!(&member.property, MemberProperty::Named(name)
+                            if name.data().token().range() == sent_range)
+                )
+        );
+        if is_sent {
+            self.node(range, Expression::Parenthesized(Box::new(expr)))
+        } else {
+            expr
+        }
+    }
+
+    fn member_access(&mut self, object: Expr, property: &str, range: TextRange) -> Expr {
+        let name = self.ident(property);
+        self.node(
+            range,
+            Expression::Member(MemberExpression {
+                object: Box::new(object),
+                property: MemberProperty::Named(name),
+                optional: false,
+            }),
+        )
+    }
+
+    fn sequence_expression(&mut self, parts: Vec<Expr>, range: TextRange) -> Option<Expr> {
+        if parts.len() < 2 {
+            return None;
+        }
+        Some(self.node(
+            range,
+            Expression::Sequence(SequenceExpression { expressions: parts }),
+        ))
+    }
+
+    /// `<temp>.<name> = <value>`
+    fn temp_property_assign(
+        &mut self,
+        temp: &Expr,
+        property: &ObjectProperty,
+        value: Expr,
+        range: TextRange,
+    ) -> Option<Expr> {
+        let name = match &property.name {
+            PropertyName::Identifier(name) => name.clone(),
+            PropertyName::String(_) => {
+                return None;
+            }
+            _ => return None,
+        };
+        let left = self.node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(temp.clone()),
+                property: MemberProperty::Named(name),
+            }),
+        );
+        Some(self.node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        ))
+    }
+
+    /// Holds an already-computed value in a fresh temp assignment so it
+    /// survives the suspension, and returns the temp reference.
+    fn materialize(&mut self, value: Expr, ctx: &mut MachineCtx, range: TextRange) -> Option<Expr> {
+        let (name, assign) = self.alloc_temp(value, ctx, range)?;
+        let statement = self.syn_node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(assign),
+            }),
+        );
+        ctx.push(statement);
+        Some(self.node(name.range(), Expression::Identifier(name)))
+    }
+
+    /// Allocates a temp and builds `<temp> = <value>` as an expression,
+    /// without emitting it: member-callee saving inlines the assignment in
+    /// parentheses instead of as a statement.
+    fn alloc_temp(
+        &mut self,
+        value: Expr,
+        ctx: &mut MachineCtx,
+        range: TextRange,
+    ) -> Option<(IdentifierNode, Expr)> {
+        let name_text = ctx.next_temp_name()?;
+        ctx.temp_names.push(name_text.clone());
+        let name = self.ident(&name_text);
+        ctx.temps.push(name.clone());
+        let left = self.node(name.range(), AssignmentTarget::Identifier(name.clone()));
+        let assign = self.node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        );
+        Some((name, assign))
     }
 
     /// `name = value;`
@@ -4241,22 +4809,6 @@ impl<'a> Rewriter<'a> {
             .map(|element| ArrayElement::Expression(Box::new(element)))
             .collect();
         self.node(range, Expression::Array(ArrayLiteral { elements }))
-    }
-
-    /// `_a.sent()`
-    fn state_sent_call(&mut self, range: TextRange) -> Expr {
-        let state = self.ident_expr("_a");
-        let sent_name = self.ident("sent");
-        let sent = self.member_expr(&state, MemberProperty::Named(sent_name), range);
-        self.syn_node(
-            range,
-            Expression::Call(CallExpression {
-                callee: Box::new(sent),
-                optional: false,
-                type_arguments: None,
-                arguments: Vec::new(),
-            }),
-        )
     }
 
     fn lower_class_expression(
@@ -5456,10 +6008,85 @@ fn raw_token_text(file: &SourceFile, token: &Token) -> String {
         .to_owned()
 }
 
+/// The machine built from one generator body: hoisted user names, the
+/// state parameter name, temp names, and the machine statements.
+type MachineParts = (Vec<IdentifierNode>, String, Vec<IdentifierNode>, Vec<Stmt>);
+
 /// The unescaped identifier spelling for a source identifier node.
-/// Whether an expression contains a yield of THIS function: nested
-/// function-like expressions own their own yields. Unrecognized variants
-/// report containment so the machine refuses to lower them.
+/// Builder state for one `__generator` machine pass.
+struct MachineCtx {
+    hoisted: Vec<IdentifierNode>,
+    temps: Vec<IdentifierNode>,
+    temp_names: Vec<String>,
+    segments: Vec<Vec<Stmt>>,
+    terminated: bool,
+    state: String,
+}
+
+impl MachineCtx {
+    fn new(state: &str) -> Self {
+        Self {
+            hoisted: Vec::new(),
+            temps: Vec::new(),
+            temp_names: Vec::new(),
+            segments: vec![Vec::new()],
+            terminated: false,
+            state: state.to_string(),
+        }
+    }
+
+    fn push(&mut self, statement: Stmt) {
+        self.segments
+            .last_mut()
+            .expect("open segment")
+            .push(statement);
+    }
+
+    /// The next free `_a`-style temp name, skipping the state parameter
+    /// and temps already allocated.
+    fn next_temp_name(&self) -> Option<String> {
+        let taken: std::collections::HashSet<String> = self
+            .temp_names
+            .iter()
+            .chain([&self.state])
+            .cloned()
+            .collect();
+        let mut index = 0u32;
+        loop {
+            let name = machine_name(index)?;
+            if !taken.contains(&name) {
+                return Some(name);
+            }
+            index += 1;
+        }
+    }
+}
+
+/// The `_a`, `_b`, … sequence used by the machine's temps and state.
+fn machine_name(index: u32) -> Option<String> {
+    let letters = b"abcdefghijklmnopqrstuvwxyz";
+    let index = index as usize;
+    if index >= letters.len() {
+        return None;
+    }
+    Some(format!("_{}", letters[index] as char))
+}
+
+fn machine_state_name(temp_count: usize) -> String {
+    machine_name(temp_count as u32).unwrap_or_else(|| "_state".to_string())
+}
+
+fn call_argument_suspends(argument: &CallArgument) -> bool {
+    matches!(argument, CallArgument::Expression(value) if contains_yield(value))
+}
+
+fn contains_yield_array(array: &ArrayLiteral) -> bool {
+    array
+        .elements
+        .iter()
+        .any(|element| matches!(element, ArrayElement::Expression(value) if contains_yield(value)))
+}
+
 fn contains_yield(expression: &Expr) -> bool {
     match expression.data() {
         Expression::Yield(_) => true,
