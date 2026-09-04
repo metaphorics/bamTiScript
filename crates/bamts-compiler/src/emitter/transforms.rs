@@ -3994,6 +3994,20 @@ impl<'a> Rewriter<'a> {
         let temp = self.temp_ident();
         let mut lowered =
             self.lower_class(&class_expression.class, expression.range(), Some(&temp));
+        // Nothing needed the temp — no field statements, computed keys,
+        // heritage temps, or static steps — so tsc keeps the class
+        // expression inline (classExpressionTest2 emits `var m = class C {`
+        // with type parameters stripped, never a temp IIFE).
+        if lowered.prelude.is_empty() && lowered.postlude.is_empty() {
+            let child_marked = self.any_marked(lowered.class.members.iter().map(|m| m.id()));
+            return self.wrap_marked(
+                expression.range(),
+                Expression::Class(ClassExpression {
+                    class: lowered.class,
+                }),
+                child_marked,
+            );
+        }
         let class = self.syn_node(
             expression.range(),
             Expression::Class(ClassExpression {
@@ -5937,6 +5951,20 @@ mod tests {
             "field initializer should move: {code}"
         );
     }
+    #[test]
+    fn class_expression_without_lowering_stays_inline() {
+        // Authority: classExpressionTest2 — a generic class expression with
+        // no lowered members emits inline with type parameters stripped
+        // (`var m = class C {`), never a temp-IIFE wrap.
+        let output = emit_at(
+            "function M() {\n    var m = class C<X> { f() { return 1; } };\n    return new m();\n}\n",
+            ScriptTarget::Es2015,
+        );
+        let code = javascript(&output);
+        assert!(code.contains("var m = class C {"), "{code}");
+        assert!(!code.contains("(() =>"), "{code}");
+    }
+
     #[test]
     fn derived_class_fields_follow_super_and_literal_names_are_preserved() {
         let output = emit_at(
