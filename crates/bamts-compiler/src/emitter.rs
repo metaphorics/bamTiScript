@@ -618,6 +618,12 @@ pub(crate) fn print_with_jsx_plan(
     let (map_source, _) = names.map_naming(surface);
     let mapped_source_name: &str = map_source.unwrap_or_else(|| names.source_name.as_ref());
     let mut emitter = Emitter {
+        line_comments: file
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::LineComment)
+            .map(|token| token.range())
+            .collect(),
         source: file.source_text(),
         source_name: mapped_source_name,
         source_id: file.source_id(),
@@ -792,6 +798,11 @@ const P_PRIMARY: u8 = 18;
 
 struct Emitter<'a> {
     source: &'a SourceText,
+    /// Authored single-line comment ranges, sorted by start. Backs trailing
+    /// comment preservation (`var y; // note`) in statement lists; the token
+    /// stream carries them with original coordinates, which stay valid in
+    /// the rewritten text because synthesis appends past authored content.
+    line_comments: Vec<TextRange>,
     source_id: SourceId,
     model: &'a SemanticModel,
     enum_facts: &'a EnumFacts,
@@ -833,6 +844,52 @@ struct Emitter<'a> {
     /// First rewriter-minted id for this file; ids below it are
     /// parser-assigned and must carry ranges within the authored text.
     synthesized_floor: u32,
+}
+
+impl Emitter<'_> {
+    /// The authored single-line comment trailing `pos` on its source line,
+    /// if one exists (tsc preserves these with `removeComments` off).
+    fn trailing_line_comment(&self, pos: Utf16Pos) -> Option<TextRange> {
+        let line = self.source.line_column(pos).ok()?.0;
+        self.line_comments
+            .iter()
+            .find(|range| {
+                range.start() >= pos
+                    && self
+                        .source
+                        .line_column(range.start())
+                        .is_ok_and(|(other, _)| other == line)
+            })
+            .copied()
+    }
+
+    /// The authored source text covered by `range`, when it lies wholly in
+    /// the source text.
+    fn source_slice(&self, range: TextRange) -> Option<&str> {
+        let start = self.source.utf16_to_byte(range.start()).ok()?;
+        let end = self.source.utf16_to_byte(range.end()).ok()?;
+        self.source.as_str().get(start..end)
+    }
+
+    /// Prints a statement list with tsc's default comment preservation: each
+    /// statement that emits is followed by its same-line trailing comment
+    /// before the newline. Single-line-preserved bodies do not route here —
+    /// tsc expands a body whose statement carries a trailing comment, a
+    /// rule queued separately.
+    fn emit_statement_list(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            if self.emit_statement(statement) {
+                if let Some(comment) = self.trailing_line_comment(statement.range().end()) {
+                    self.raw(" ");
+                    if let Some(text) = self.source_slice(comment) {
+                        let text = text.to_owned();
+                        self.raw(&text);
+                    }
+                }
+                self.newline();
+            }
+        }
+    }
 }
 
 impl<'a> Emitter<'a> {
@@ -1208,11 +1265,7 @@ impl<'a> Emitter<'a> {
     // ---- module drivers ---------------------------------------------------
 
     fn emit_module_js(&mut self, statements: &[Stmt]) {
-        for statement in statements {
-            if self.emit_statement(statement) {
-                self.newline();
-            }
-        }
+        self.emit_statement_list(statements);
     }
 
     fn emit_module_decl(&mut self, statements: &[Stmt]) {
@@ -1525,11 +1578,7 @@ impl<'a> Emitter<'a> {
         }
         self.newline();
         self.indent += 1;
-        for statement in &block.data().statements {
-            if self.emit_statement(statement) {
-                self.newline();
-            }
-        }
+        self.emit_statement_list(&block.data().statements);
         self.indent -= 1;
         self.raw_mapped_char_end("}", range, '}');
     }
@@ -1560,11 +1609,7 @@ impl<'a> Emitter<'a> {
             self.newline();
             if !case.consequent.is_empty() {
                 self.indent += 1;
-                for statement in &case.consequent {
-                    if self.emit_statement(statement) {
-                        self.newline();
-                    }
-                }
+                self.emit_statement_list(&case.consequent);
                 self.indent -= 1;
             }
         }
@@ -2462,11 +2507,7 @@ impl<'a> Emitter<'a> {
                 );
             }
         }
-        for statement in &body.statements {
-            if self.emit_statement(statement) {
-                self.newline();
-            }
-        }
+        self.emit_statement_list(&body.statements);
         self.indent -= 1;
         self.raw_mapped_char_end("}", range, '}');
     }
@@ -6072,6 +6113,23 @@ export default answer;
             declaration(&output).code,
             "export default interface Foo {\n}\n"
         );
+    }
+
+    #[test]
+    fn trailing_line_comment_follows_statement_in_javascript() {
+        // Authority: arrayAugment prints `var y; // Expect no error here`
+        // with removeComments off (the default).
+        let input = "var x = 1; // first\nvar y; // Expect no error here\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        let code = &javascript(&output).code;
+        assert!(code.contains("var x = 1; // first\n"), "{code}");
+        assert!(code.contains("var y; // Expect no error here\n"), "{code}");
     }
 
     #[test]
