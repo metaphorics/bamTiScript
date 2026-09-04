@@ -857,6 +857,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             "checkjs" => "checkJs",
             "resolvejsonmodule" => "resolveJsonModule",
             "moduleresolution" => "moduleResolution",
+            "noemithelpers" => "noEmitHelpers",
             "noemit" => "noEmit",
             "alwaysstrict" => "alwaysStrict",
             "usedefineforclassfields" => "useDefineForClassFields",

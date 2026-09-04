@@ -217,6 +217,7 @@ fn program_emit_options(program: &ResolvedProgram, mode: FrontendMode) -> Option
         module,
         program.use_define_for_class_fields(),
     );
+    options.no_emit_helpers = check.no_emit_helpers();
 
     // JSX routing is JavaScript-specific and already shared with the CLI path,
     // which applies the same overrides from `program.jsx()` after its base

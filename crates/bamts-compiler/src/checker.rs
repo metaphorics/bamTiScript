@@ -567,6 +567,9 @@ pub struct ProgramCheckOptions {
     /// Whether `alwaysStrict` is enabled: every source file is treated as if
     /// it begins with the "use strict" directive.
     always_strict: bool,
+    /// Whether `noEmitHelpers` is enabled: emit references downleveling
+    /// helpers without emitting their definitions.
+    no_emit_helpers: bool,
     /// ECMAScript target — drives lib derivation and downleveling decisions.
     target: crate::emitter::ScriptTarget,
     /// Active lib set — controls which intrinsic globals are installed.
@@ -585,6 +588,7 @@ impl ProgramCheckOptions {
             no_implicit_any: false,
             strict_property_initialization: false,
             always_strict: false,
+            no_emit_helpers: false,
             target: crate::emitter::ScriptTarget::EsNext,
             libs: LibSet::ALL,
             check_js: false,
@@ -599,6 +603,7 @@ impl ProgramCheckOptions {
             no_implicit_any: false,
             strict_property_initialization: false,
             always_strict: false,
+            no_emit_helpers: false,
             target: crate::emitter::ScriptTarget::EsNext,
             libs: LibSet::ALL,
             check_js: false,
@@ -639,6 +644,19 @@ impl ProgramCheckOptions {
     pub const fn with_always_strict(mut self, value: bool) -> Self {
         self.always_strict = value;
         self
+    }
+
+    /// Sets whether emit omits helper definitions (`noEmitHelpers`).
+    #[must_use]
+    pub const fn with_no_emit_helpers(mut self, value: bool) -> Self {
+        self.no_emit_helpers = value;
+        self
+    }
+
+    /// Whether emit omits helper definitions (`noEmitHelpers`).
+    #[must_use]
+    pub const fn no_emit_helpers(&self) -> bool {
+        self.no_emit_helpers
     }
 
     /// Sets the target from a string (e.g. `"es5"`, `"es2020"`) and derives

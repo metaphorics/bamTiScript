@@ -220,6 +220,7 @@ pub struct ResolvedProgram {
     strict_null_checks: bool,
     strict_property_initialization: bool,
     always_strict: bool,
+    no_emit_helpers: bool,
     use_define_for_class_fields: Option<bool>,
     target: crate::emitter::ScriptTarget,
     libs: crate::checker::intrinsic_environment::LibSet,
@@ -335,6 +336,7 @@ impl ResolvedProgram {
         .with_strict_null_checks(self.strict_null_checks)
         .with_strict_property_initialization(self.strict_property_initialization)
         .with_always_strict(self.always_strict)
+        .with_no_emit_helpers(self.no_emit_helpers)
         .with_script_target(self.target)
         .with_libs(self.libs)
         .with_check_js(self.check_js)
@@ -712,6 +714,7 @@ impl ProgramLoader {
             strict_null_checks: self.options.strict_null_checks(),
             strict_property_initialization: self.options.strict_property_initialization(),
             always_strict: self.options.always_strict(),
+            no_emit_helpers: self.options.no_emit_helpers(),
             use_define_for_class_fields: self.options.use_define_for_class_fields(),
             target,
             libs,
