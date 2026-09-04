@@ -6361,6 +6361,53 @@ export default answer;
     }
 
     #[test]
+    fn es5_async_arrow_becomes_function_expression() {
+        // Authority: asyncArrowFunction1_es5(target=es5) — ES5 has no
+        // arrows, so the lowered arrow is a function expression returning
+        // the awaiter with a `void 0` receiver (arrows never bind `this`).
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "var foo = async (): Promise<void> => {\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        let expected = "var foo = function () { return __awaiter(void 0, void 0, void 0, function () {\n    return __generator(this, function (_a) {\n        return [2 /*return*/];\n    });\n}); };";
+        assert!(code.contains(expected), "{code}");
+    }
+
+    #[test]
+    fn es5_async_arrow_with_this_keeps_the_arrow() {
+        // Bodies referencing `this` need the hoisted-capture machinery, so
+        // the conversion refuses and the arrow form stays.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x;\nvar foo = async () => {\n    await x;\n    this.y = 1;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("() => __awaiter(this"), "{code}");
+        assert!(
+            !code.contains("void 0, void 0, void 0, function () {\n    var"),
+            "{code}"
+        );
+    }
+
+    #[test]
     fn arrow_single_param_parens_follow_the_authored_form() {
         // Authority: complicatedIndexesOfIntersectionsAreInferencable keeps
         // `props => {`; arrowFunctionContexts keeps `(props) =>` and `() =>`.

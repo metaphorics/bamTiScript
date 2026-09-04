@@ -84,6 +84,7 @@ pub enum ScriptTarget {
 /// A language feature with a first-supporting [`ScriptTarget`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum LanguageFeature {
+    ArrowFunctions,
     Classes,
     Generators,
     Destructuring,
@@ -103,7 +104,9 @@ impl LanguageFeature {
     #[must_use]
     pub const fn since(self) -> ScriptTarget {
         match self {
-            Self::Classes | Self::Generators | Self::Destructuring => ScriptTarget::Es2015,
+            Self::ArrowFunctions | Self::Classes | Self::Generators | Self::Destructuring => {
+                ScriptTarget::Es2015
+            }
             Self::AsyncFunctions => ScriptTarget::Es2017,
             Self::Exponentiation => ScriptTarget::Es2016,
             Self::ObjectRestSpread | Self::AsyncIteration => ScriptTarget::Es2018,
@@ -5789,6 +5792,92 @@ impl<'a> Rewriter<'a> {
         let index = self.number_expr(index);
         self.member_expr(frame, MemberProperty::Computed(Box::new(index)), range)
     }
+    /// Whether an arrow body references `this` or `arguments`, whose
+    /// lexical capture needs hoisting when the arrow becomes a function
+    /// expression. Unrecognized shapes report capture so the conversion
+    /// refuses them.
+    fn arrow_body_captures(&self, body: &FunctionBody) -> bool {
+        match body {
+            FunctionBody::Expression(expr) => self.expr_captures(expr),
+            FunctionBody::Block(block) => block
+                .data()
+                .statements
+                .iter()
+                .any(|s| self.stmt_captures(s)),
+            FunctionBody::Missing(_) => true,
+        }
+    }
+
+    fn stmt_captures(&self, statement: &Stmt) -> bool {
+        match statement.data() {
+            Statement::Expression(statement) => self.expr_captures(&statement.expression),
+            Statement::Return(returned) => returned
+                .argument
+                .as_deref()
+                .is_some_and(|value| self.expr_captures(value)),
+            Statement::Variable(declaration) => declaration.declarations.iter().any(|declarator| {
+                declarator
+                    .data()
+                    .initializer
+                    .as_deref()
+                    .is_some_and(|value| self.expr_captures(value))
+            }),
+            Statement::Block(block) => block
+                .data()
+                .statements
+                .iter()
+                .any(|s| self.stmt_captures(s)),
+            Statement::If(if_statement) => {
+                self.expr_captures(&if_statement.test)
+                    || self.stmt_captures(&if_statement.consequent)
+                    || if_statement
+                        .alternate
+                        .as_deref()
+                        .is_some_and(|alternate| self.stmt_captures(alternate))
+            }
+            _ => true,
+        }
+    }
+
+    fn expr_captures(&self, expression: &Expr) -> bool {
+        match expression.data() {
+            Expression::This => true,
+            Expression::Identifier(identifier) => {
+                self.identifier_name(identifier).as_deref() == Some("arguments")
+            }
+            Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
+            Expression::Call(call) => {
+                self.expr_captures(&call.callee)
+                    || call.arguments.iter().any(|argument| match argument {
+                        CallArgument::Expression(value) => self.expr_captures(value),
+                        _ => false,
+                    })
+            }
+            Expression::Member(member) => {
+                self.expr_captures(&member.object)
+                    || matches!(&member.property, MemberProperty::Computed(key) if self.expr_captures(key))
+            }
+            Expression::Object(object) => object.members.iter().any(|member| match member.data() {
+                ObjectMember::Property(property) => {
+                    self.expr_captures(&property.value)
+                        || matches!(&property.name, PropertyName::Computed(key) if self.expr_captures(key))
+                }
+                _ => true,
+            }),
+            Expression::Array(array) => array.elements.iter().any(|element| match element {
+                ArrayElement::Expression(value) => self.expr_captures(value),
+                _ => true,
+            }),
+            Expression::Unary(unary) => self.expr_captures(&unary.argument),
+            Expression::Yield(yielded) => yielded
+                .argument
+                .as_deref()
+                .is_some_and(|value| self.expr_captures(value)),
+            Expression::Await(awaited) => self.expr_captures(&awaited.argument),
+            Expression::Assignment(assignment) => self.expr_captures(&assignment.right),
+            _ => true,
+        }
+    }
 
     fn rewrite_arrow(&mut self, expression: &Expr, arrow: &ArrowFunction) -> Expr {
         let parameters = self.rewrite_parameters(&arrow.parameters);
@@ -5835,8 +5924,26 @@ impl<'a> Rewriter<'a> {
                 expression.range(),
                 Expression::Function(FunctionExpression { function: inner }),
             );
+            // ES5 has no arrows: the lowered arrow becomes a function
+            // expression returning the awaiter, whose receiver is `void 0`
+            // because arrows never bind `this`. Bodies that capture
+            // `this`/`arguments` need the hoisted-capture machinery and
+            // keep the arrow instead.
+            let plain_parameters = arrow.parameters.iter().all(|parameter| {
+                matches!(
+                    parameter.data().binding.data(),
+                    BindingPattern::Identifier(_)
+                ) && parameter.data().initializer.is_none()
+            });
+            let lower_to_function = Self::needs(LanguageFeature::ArrowFunctions, self.options)
+                && plain_parameters
+                && !self.arrow_body_captures(&arrow.body);
+            let this_arg = if lower_to_function {
+                self.void_zero(expression.range())
+            } else {
+                self.syn_node(expression.range(), Expression::This)
+            };
             let awaiter = self.helper_ident(HelperKind::Awaiter);
-            let this_arg = self.syn_node(expression.range(), Expression::This);
             let void_zero = self.void_zero(expression.range());
             let call = self.syn_node(
                 expression.range(),
@@ -5852,6 +5959,24 @@ impl<'a> Rewriter<'a> {
                     ],
                 }),
             );
+            if lower_to_function {
+                // The expression body keeps tsc's converted-arrow layout:
+                // `function (params) { return awaiter; }` prints inline.
+                let function = FunctionLike {
+                    decorators: Vec::new(),
+                    name: None,
+                    is_async: false,
+                    is_generator: false,
+                    type_parameters: None,
+                    parameters,
+                    return_type: None,
+                    body: Some(FunctionBody::Expression(Box::new(call))),
+                };
+                return self.syn_node(
+                    expression.range(),
+                    Expression::Function(FunctionExpression { function }),
+                );
+            }
             return self.syn_node(
                 expression.range(),
                 Expression::Arrow(ArrowFunction {
@@ -5877,6 +6002,7 @@ impl<'a> Rewriter<'a> {
                                 argument: Some(Box::new(rewritten)),
                             }),
                         );
+
                         FunctionBody::Block(self.syn_node(
                             expression.range(),
                             Block {
