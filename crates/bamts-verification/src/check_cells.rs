@@ -5657,7 +5657,7 @@ export const t = 1;
             .filter(|(_, count)| **count < 0)
             .map(|(line, count)| (*count, line.clone()))
             .collect();
-        top_deficits.sort_by(|a, b| b.0.cmp(&a.0));
+        top_deficits.sort();
         // Indent-only mass: a trimmed-key map nets whitespace variants; a
         // trimmed form that nets zero while some untrimmed variant carries a
         // nonzero count is pure indentation drift.
