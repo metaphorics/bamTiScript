@@ -4197,6 +4197,10 @@ impl<'a> Rewriter<'a> {
                         self.machine_emit_expression(&expression.expression, ctx)?;
                     }
                 }
+                Statement::If(if_statement) => {
+                    self.machine_emit_if(statement, if_statement, ctx)?;
+                }
+
                 Statement::Return(returned) => {
                     let terminator = match &returned.argument {
                         Some(value) if contains_yield(value) => {
@@ -4250,6 +4254,159 @@ impl<'a> Rewriter<'a> {
             }),
         ));
         Some(())
+    }
+
+    /// Lowers an if-statement into the machine. A test-only suspension
+    /// reassembles inline with no labels; a suspending branch builds the
+    /// labeled shape: a negated-test break to the else label, the
+    /// consequent (splitting naturally), a break to the end label, the
+    /// alternate under the else label, an explicit end-label assignment
+    /// marking the join fallthrough, and the end label itself. Labels
+    /// number positionally: consequent resumes, else, alternate resumes,
+    /// end.
+    fn machine_emit_if(
+        &mut self,
+        statement: &Stmt,
+        if_statement: &IfStatement,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        let range = statement.range();
+        let cons_block = block_statements(&if_statement.consequent)?;
+        let alt_block = block_statements(if_statement.alternate.as_deref()?)?;
+        if !branch_is_simple(cons_block) || !branch_is_simple(alt_block) {
+            return None;
+        }
+        let cons_resumes = count_branch_yields(cons_block);
+        let alt_resumes = count_branch_yields(alt_block);
+
+        if cons_resumes == 0 && alt_resumes == 0 {
+            // Inline reassembly: only the test can suspend.
+            if !contains_yield(&if_statement.test) {
+                ctx.push(statement.clone());
+                return Some(());
+            }
+            let test = self.eval(&if_statement.test, ctx)?;
+            let rebuilt = self.node(
+                range,
+                Statement::If(IfStatement {
+                    test: Box::new(test),
+                    consequent: if_statement.consequent.clone(),
+                    alternate: if_statement.alternate.clone(),
+                }),
+            );
+            ctx.push(rebuilt);
+            return Some(());
+        }
+        if contains_yield(&if_statement.test) || ctx.terminated {
+            return None;
+        }
+
+        let base = ctx.segments.len() as u32;
+        let else_label = base + cons_resumes;
+        let end_label = else_label + 1 + alt_resumes;
+
+        // `if (!test) return [3 /*break*/, else];` — bare body.
+        let negated = self.node(
+            range,
+            Expression::Unary(UnaryExpression {
+                operator: UnaryOperator::Not,
+                argument: Box::new(if_statement.test.as_ref().clone()),
+            }),
+        );
+        let jump = self.break_to(else_label, range);
+        let guard = self.node(
+            range,
+            Statement::If(IfStatement {
+                test: Box::new(negated),
+                consequent: Box::new(jump),
+                alternate: None,
+            }),
+        );
+        ctx.push(guard);
+
+        self.machine_emit_branch(cons_block, ctx)?;
+        let cons_break = self.break_to(end_label, range);
+        ctx.push(cons_break);
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, else_label);
+        self.machine_emit_branch(alt_block, ctx)?;
+        let state = ctx.state.clone();
+        let mark = self.label_assignment(end_label, &state, range);
+        ctx.push(mark);
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, end_label);
+        Some(())
+    }
+
+    /// Emits a branch's simple statements into the current segment.
+    fn machine_emit_branch(&mut self, statements: &[Stmt], ctx: &mut MachineCtx) -> Option<()> {
+        for statement in statements {
+            match statement.data() {
+                Statement::Expression(expression) => {
+                    self.machine_emit_expression(&expression.expression, ctx)?;
+                }
+                Statement::Variable(declaration) if declaration.kind == VariableKind::Var => {
+                    for declarator in &declaration.declarations {
+                        let BindingPattern::Identifier(name) = declarator.data().binding.data()
+                        else {
+                            return None;
+                        };
+                        let name = name.clone();
+                        ctx.hoisted.push(name.clone());
+                        if let Some(initializer) = &declarator.data().initializer {
+                            let value = if contains_yield(initializer) {
+                                self.eval(initializer, ctx)?
+                            } else {
+                                initializer.as_ref().clone()
+                            };
+                            let assign = self.assign_statement(&name, value, statement.range());
+                            ctx.push(assign);
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    /// `return [3 /*break*/, label];`
+    fn break_to(&mut self, label: u32, range: TextRange) -> Stmt {
+        let sentinel = self.number_expr("3 /*break*/");
+        let target = self.number_expr(&label.to_string());
+        let array = self.array_literal(vec![sentinel, target], range);
+        self.machine_return(array, range)
+    }
+
+    /// `<state>.label = <label>;`
+    fn label_assignment(&mut self, label: u32, state: &str, range: TextRange) -> Stmt {
+        let state_ident = self.ident(state);
+        let label_name = self.ident("label");
+        let object = self.node(state_ident.range(), Expression::Identifier(state_ident));
+        let left = self.node(
+            range,
+            AssignmentTarget::Member(AssignmentMemberTarget {
+                object: Box::new(object),
+                property: MemberProperty::Named(label_name),
+            }),
+        );
+        let value = self.number_expr(&label.to_string());
+        let assign = self.node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        );
+        self.syn_node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(assign),
+            }),
+        )
     }
 
     /// Evaluates an expression for the machine: subexpressions evaluated
@@ -6052,11 +6209,115 @@ enum ChainSegment {
     },
 }
 
+/// The statements of a block branch, or None for non-block shapes this
+/// slice does not lower.
+fn block_statements(statement: &Stmt) -> Option<&[Stmt]> {
+    match statement.data() {
+        Statement::Block(block) => Some(&block.data().statements),
+        _ => None,
+    }
+}
+
+/// Whether every branch statement is a shape the labeled if slice emits.
+fn branch_is_simple(statements: &[Stmt]) -> bool {
+    statements.iter().all(|statement| {
+        matches!(
+            statement.data(),
+            Statement::Expression(_) | Statement::Variable(_)
+        )
+    })
+}
+
+/// The number of yield splits a branch's statements produce.
+fn count_branch_yields(statements: &[Stmt]) -> u32 {
+    statements
+        .iter()
+        .map(|statement| match statement.data() {
+            Statement::Expression(expression) => count_yields(&expression.expression),
+            Statement::Variable(declaration) => declaration
+                .declarations
+                .iter()
+                .map(|declarator| {
+                    declarator
+                        .data()
+                        .initializer
+                        .as_deref()
+                        .map_or(0, count_yields)
+                })
+                .sum(),
+            _ => 0,
+        })
+        .sum()
+}
+
 impl ChainSegment {
     const fn optional(&self) -> bool {
         match self {
             Self::Member { optional, .. } | Self::Call { optional, .. } => *optional,
         }
+    }
+}
+
+/// Counts the yield nodes of this function's body (nested function-likes
+/// own their own yields).
+fn count_yields(expression: &Expr) -> u32 {
+    match expression.data() {
+        Expression::Yield(_) => 1,
+        Expression::Identifier(_) | Expression::This | Expression::Super => 0,
+        Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => 0,
+        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => 0,
+        Expression::Template(template) => template.expressions.iter().map(count_yields).sum(),
+        Expression::Array(array) => array
+            .elements
+            .iter()
+            .map(|element| match element {
+                ArrayElement::Expression(value) => count_yields(value),
+                ArrayElement::Spread(spread) => count_yields(&spread.argument),
+                _ => 0,
+            })
+            .sum(),
+        Expression::Object(object) => object
+            .members
+            .iter()
+            .map(|member| match member.data() {
+                ObjectMember::Property(property) => count_yields(&property.value),
+                _ => 0,
+            })
+            .sum(),
+        Expression::Call(call) => {
+            count_yields(&call.callee)
+                + call
+                    .arguments
+                    .iter()
+                    .map(|argument| match argument {
+                        CallArgument::Expression(value) => count_yields(value),
+                        _ => 0,
+                    })
+                    .sum::<u32>()
+        }
+        Expression::Member(member) => {
+            count_yields(&member.object)
+                + match &member.property {
+                    MemberProperty::Computed(key) => count_yields(key),
+                    _ => 0,
+                }
+        }
+        Expression::New(new) => count_yields(&new.callee),
+        Expression::Await(awaited) => count_yields(&awaited.argument),
+        Expression::Unary(unary) => count_yields(&unary.argument),
+        Expression::Binary(binary) => count_yields(&binary.left) + count_yields(&binary.right),
+        Expression::Logical(logical) => count_yields(&logical.left) + count_yields(&logical.right),
+        Expression::Conditional(conditional) => {
+            count_yields(&conditional.test)
+                + count_yields(&conditional.consequent)
+                + count_yields(&conditional.alternate)
+        }
+        Expression::Assignment(assignment) => count_yields(&assignment.right),
+        Expression::Sequence(sequence) => sequence.expressions.iter().map(count_yields).sum(),
+        Expression::Parenthesized(inner) => count_yields(inner),
+        Expression::As(cast) => count_yields(&cast.expression),
+        Expression::NonNull(non_null) => count_yields(&non_null.expression),
+        _ => 0,
     }
 }
 

@@ -1537,9 +1537,22 @@ impl<'a> Emitter<'a> {
         self.emit_expression(&if_statement.test);
         self.raw_mapped_pos(")", if_statement.test.range().end());
         self.emit_control_body(&if_statement.consequent);
+        let machine_if = statement.id().get() >= self.synthesized_floor;
         if let Some(alternate) = &if_statement.alternate {
             let alt_range = alternate.range();
-            if matches!(alternate.data(), Statement::If(_)) {
+            if machine_if {
+                // tsc's machine output breaks before `else`.
+                self.newline();
+                if matches!(alternate.data(), Statement::If(_)) {
+                    let prev = self.anchor;
+                    self.anchor = alt_range;
+                    self.emit_if(alternate);
+                    self.anchor = prev;
+                } else {
+                    self.raw("else");
+                    self.emit_control_body(alternate);
+                }
+            } else if matches!(alternate.data(), Statement::If(_)) {
                 self.raw_mapped_pos(" else ", if_statement.consequent.range().end());
                 let prev = self.anchor;
                 self.anchor = alt_range;
@@ -1565,6 +1578,11 @@ impl<'a> Emitter<'a> {
                 if self.emit_statement(statement) {
                     self.newline();
                 }
+            }
+            _ if statement.id().get() >= self.synthesized_floor => {
+                // Machine control flow keeps the bare form tsc emits for
+                // synthesized bodies (`if (!x) return [3 /*break*/, 2];`).
+                self.emit_statement(statement);
             }
             _ => {
                 self.raw_mapped("{", self.anchor);
@@ -6381,6 +6399,34 @@ export default answer;
         let code = &javascript(&output).code;
         let expected = "var foo = function () { return __awaiter(void 0, void 0, void 0, function () {\n    return __generator(this, function (_a) {\n        return [2 /*return*/];\n    });\n}); };";
         assert!(code.contains(expected), "{code}");
+    }
+
+    #[test]
+    fn es5_async_if_branch_await_builds_labeled_machine() {
+        // Authority: es5-asyncFunctionIfStatements(target=es5)
+        // ifStatement2 — a suspending consequent builds the labeled shape:
+        // negated-test break to the else label, the consequent, a break to
+        // the end label, the alternate under the else label with an
+        // explicit end-label assignment, and the end label itself.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x, y, z;\nasync function ifStatement2() {\n    if (x) { await y; } else { z; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("if (!x) return [3 /*break*/, 2];"), "{code}");
+        assert!(
+            code.contains("case 2:\n                    z;\n                    _a.label = 3;\n                case 3: return [2 /*return*/];"),
+            "{code}"
+        );
     }
 
     #[test]
