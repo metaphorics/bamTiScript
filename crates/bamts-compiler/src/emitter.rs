@@ -1559,6 +1559,13 @@ impl<'a> Emitter<'a> {
                 self.emit_block_with_braces(block, self.anchor, BlockLayout::Statement)
             }
             Statement::Empty => self.raw("{}"),
+            _ if self.body_authored_same_line(statement) => {
+                // tsc keeps a brace-less control body authored on the
+                // head's line bare (`if (cond) return mod;`, APISample_*).
+                if self.emit_statement(statement) {
+                    self.newline();
+                }
+            }
             _ => {
                 self.raw_mapped("{", self.anchor);
                 self.newline();
@@ -1570,6 +1577,38 @@ impl<'a> Emitter<'a> {
                 self.raw_mapped_pos("}", self.anchor.end());
             }
         }
+    }
+
+    /// Whether a brace-less control body starts on the same source line as
+    /// the `)` that precedes it — the authored-bare shape tsc preserves.
+    fn body_authored_same_line(&self, statement: &Stmt) -> bool {
+        let start = statement.range().start();
+        let index = self
+            .tokens
+            .partition_point(|token| token.range().start() < start);
+        // Walk back past trivia (whitespace and comments are tokens); the
+        // first structural token decides.
+        let mut cursor = index;
+        let before = loop {
+            let Some(candidate) = cursor.checked_sub(1).and_then(|i| self.tokens.get(i)) else {
+                return false;
+            };
+            if !matches!(
+                candidate.kind(),
+                TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
+            ) {
+                break candidate;
+            }
+            cursor -= 1;
+        };
+        before.kind() == TokenKind::RParen
+            && matches!(
+                (
+                    self.source.line_column(before.range().end()),
+                    self.source.line_column(start)
+                ),
+                (Ok((line_a, _)), Ok((line_b, _))) if line_a == line_b
+            )
     }
 
     fn emit_block(&mut self, block: &BlockNode) {
@@ -6176,6 +6215,23 @@ export default answer;
         let code = &javascript(&output).code;
         assert!(code.contains("var x = 1; // first\n"), "{code}");
         assert!(code.contains("var y; // Expect no error here\n"), "{code}");
+    }
+
+    #[test]
+    fn bare_control_body_authored_same_line_stays_bare() {
+        // Authority: APISample_* — `if (cond) return mod;` keeps its
+        // brace-less authored form; a body authored on the next line
+        // still wraps.
+        let input = "function f(x) {\n    if (x) return 1;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        let code = &javascript(&output).code;
+        assert!(code.contains("if (x) return 1;"), "{code}");
     }
 
     #[test]
