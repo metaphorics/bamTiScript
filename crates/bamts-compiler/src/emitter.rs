@@ -6534,6 +6534,33 @@ export default answer;
     }
 
     #[test]
+    fn es5_labeled_while_with_labeled_continue_lowers() {
+        // Authority: es5-asyncFunctionWhileStatements(target=es5)
+        // whileStatement7 — a clean labeled loop with a labeled continue
+        // still lowers to the machine; the leaked-await walker once
+        // refused every labeled loop body, and no other pin covers it.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x;\nasync function f() {\n    A: while (x) { continue A; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(
+            code.contains("A: while (x) {\n                continue A;\n            }\n            return [2 /*return*/];"),
+            "{code}"
+        );
+        assert!(!code.contains("function*"), "{code}");
+    }
+
+    #[test]
     fn es5_async_switch_case_await_builds_dispatch_chain() {
         // Authority: es5-asyncFunctionSwitchStatements(target=es5)
         // switchStatement2 — a suspending case test yields, and its
