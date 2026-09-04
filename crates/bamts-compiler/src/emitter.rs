@@ -6769,4 +6769,286 @@ var c = () => 1;
             ["@accessorFirst", "@accessorSecond"]
         );
     }
+
+    #[test]
+    fn es5_async_for_update_increment_lowers() {
+        // Synthetic probe pinning the walker/machine contract: a for-update
+        // `i++` (Update over an Identifier) counts as zero resumes after the
+        // walker fix, so a suspending for-loop still lowers normally with
+        // the update emitted as plain machine code.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any, y: any, i: any;\nasync function f() {\n    for (; x; i++) { await y; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        let expected = "function f() {\n    return __awaiter(this, void 0, void 0, function () {\n        return __generator(this, function (_a) {\n            switch (_a.label) {\n                case 0: _a.label = 1;\n                case 1:\n                    if (!x) return [3 /*break*/, 4];\n                    return [4 /*yield*/, y];\n                case 2:\n                    _a.sent();\n                    _a.label = 3;\n                case 3:\n                    i++;\n                    return [3 /*break*/, 1];\n                case 4: return [2 /*return*/];\n            }\n        });\n    });\n}";
+        assert!(code.contains(expected), "{code}");
+        assert!(!code.contains("function*("), "{code}");
+    }
+
+    #[test]
+    fn es5_generator_update_computed_key_refuses() {
+        // Synthetic probe pinning the walker/machine contract: a while-test
+        // computed-key yield (`o[yield k]++` inside the test) counts as a
+        // resume, so the loop cannot stay inline; lowering routes to eval,
+        // which refuses with GENERATOR_REQUIRES_ES2015, and the native
+        // generator survives — never the inline machine clone.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input =
+            "declare var o: any, k: any;\nfunction* g() {\n    while (o[yield k]++ < 3) { }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(!code.contains("__generator(this,"), "{code}");
+        assert!(code.contains("function* g("), "{code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "{:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn es5_async_temp_collision_with_user_var() {
+        // Authority: awaitBinaryExpression5_es5 / asyncFunctionDeclaration9 —
+        // when a user variable collides with the machine's default temp name,
+        // the machine state parameter is renamed to _b and the user's _a stays
+        // the hoisted var.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input =
+            "async function f(x: any) {\n    var _a = 1;\n    await x;\n    return _a;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function (_b)"), "{code}");
+        assert!(code.contains("_b.label"), "{code}");
+        assert!(code.contains("_b.sent()"), "{code}");
+        assert!(code.contains("var _a;"), "{code}");
+        assert!(code.contains("_a = 1;"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_leaked_await_refuses() {
+        // Authority: es5-asyncFunction(target=es5) leaked await in left-hand
+        // of property access assignment cannot be lowered, so the native
+        // generator fallback is kept.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "async function f(a: any, b: any, c: any) {\n    (await a).b = c;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function* ()"), "{code}");
+        assert!(!code.contains("__generator(this,"), "{code}");
+        assert!(!code.contains(".sent()"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_binary_expression_await_materializes() {
+        // Authority: awaitBinaryExpression5_es5(target=es5) — the awaited
+        // operand is evaluated first, then combined with the saved left value
+        // through `.sent()`.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "async function f(a: any, b: any) {\n    return a + (await b);\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function (_b)"), "{code}");
+        assert!(code.contains("_b.label"), "{code}");
+        assert!(code.contains("_a + (_b.sent())"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_switch_discriminant_await_inline() {
+        // Authority: es5-asyncFunctionSwitchStatements(target=es5) — a
+        // discriminant that awaits is emitted as `switch (_a.sent())` inline
+        // in the resumed case.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "async function f(x: any) {\n    switch (await x) {\n        case 1: return 10;\n        default: return 20;\n    }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("switch (_a.sent()) {"), "{code}");
+        assert!(code.contains("case 0: return [4 /*yield*/, x];"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_labeled_loop_with_await_and_break_lowers() {
+        // Authority: es5-asyncFunctionWhileStatements(target=es5) — a labeled
+        // while body with an await and a labeled break lowers to the machine;
+        // the break becomes an explicit branch to the exit label.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any, y: any;\nasync function f() {\n    A: while (x) { await y; break A; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(!code.contains("function*("), "{code}");
+        assert!(
+            code.contains("__awaiter(this, void 0, void 0, function ("),
+            "{code}"
+        );
+        assert!(code.contains("if (!x) return [3 /*break*/, 2];"), "{code}");
+        assert!(code.contains("_a.sent();"), "{code}");
+        assert!(code.contains("return [3 /*break*/, 2];"), "{code}");
+    }
+
+    #[test]
+    fn es5_async_identifier_assignment_test_stays_inline() {
+        // Authority: es5-asyncFunctionWhileStatements(target=es5) — a while
+        // test that only assigns to an identifier carries no resume, so the
+        // whole test clones verbatim into the machine instead of routing the
+        // loop through eval.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any, y: any;\nasync function f() {\n    while (x = 1) { await y; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("if (!(x = 1))"), "{code}");
+        assert_eq!(
+            code.matches("return [4 /*yield*/, y];").count(),
+            1,
+            "{code}"
+        );
+        assert!(!code.contains("function*("), "{code}");
+    }
+    #[test]
+    fn es5_generator_object_spread_yield_refuses() {
+        // Contract pin, not a mutation claim: a while-test object spread
+        // carrying a yield (`{ ...(yield x) }`) is refused upstream by the
+        // machine's object-member wildcard, so the native generator survives
+        // whether or not count_yields tracks the spread — this pins the
+        // refusal shape: never the inline machine clone.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any;\nfunction* g() {\n    while ({ ...(yield x) }) { }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function* g("), "{code}");
+        assert!(!code.contains("__generator(this,"), "{code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "{:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn es5_generator_array_spread_yield_never_clones() {
+        // Mutation-provable: an array-literal spread carrying a yield
+        // (`[...(yield x)]` as a statement) must never lower to the inline
+        // machine — contains_yield_array reports the spread's yield, the
+        // lowering bails, and the native generator survives with
+        // GENERATOR_REQUIRES_ES2015. Reverting the Spread arm resurrects
+        // `__generator(this, ...)` wrapping a live yield.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x: any;\nfunction* g() {\n    [...(yield x)];\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(code.contains("function* g("), "{code}");
+        assert!(!code.contains("__generator(this,"), "{code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "{:?}",
+            output.diagnostics
+        );
+    }
 }
