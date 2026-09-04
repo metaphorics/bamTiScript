@@ -5499,11 +5499,24 @@ export const t = 1;
         }
         let groups = baseline_groups(&index);
         let mut case_paths = Vec::new();
-        for dir in ["compiler", "conformance"] {
-            let dir_path = cases_root.join(dir);
-            let entries = std::fs::read_dir(&dir_path).expect("case tree");
+        // Recursive walk: the conformance suite nests cases in
+        // subdirectories, and a flat read_dir samples only compiler's
+        // alphabetical head. Stride sampling then spreads the pick across
+        fn walk(
+            dir: &std::path::Path,
+            cases_root: &std::path::Path,
+            out: &mut Vec<(String, String)>,
+            baseline_names: &[String],
+        ) {
+            let Some(entries) = std::fs::read_dir(dir).ok() else {
+                return;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, cases_root, out, baseline_names);
+                    continue;
+                }
                 if path.extension().and_then(|ext| ext.to_str()) != Some("ts") {
                     continue;
                 }
@@ -5514,21 +5527,31 @@ export const t = 1;
                 }) {
                     continue;
                 }
-                let logical = format!("tests/cases/{dir}/{name}");
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(text) => text,
-                    Err(_) => continue,
+                let Ok(rel) = path.strip_prefix(cases_root) else {
+                    continue;
                 };
-                case_paths.push((logical, text));
+                let logical = format!("tests/cases/{}", rel.to_string_lossy().replace('\\', "/"));
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                out.push((logical, text));
             }
         }
+        walk(&cases_root, &cases_root, &mut case_paths, &baseline_names);
         case_paths.sort();
         case_paths.dedup();
-        let sample: Vec<_> = case_paths.into_iter().take(sample_cap).collect();
+        let stride = (case_paths.len() / sample_cap).max(1);
+        let sample: Vec<_> = case_paths
+            .iter()
+            .step_by(stride)
+            .take(sample_cap)
+            .cloned()
+            .collect();
 
         let mut regions: BTreeMap<&str, usize> = BTreeMap::new();
         let mut passes = 0usize;
         let mut skipped = 0usize;
+        let mut surplus: BTreeMap<String, isize> = BTreeMap::new();
         let mut examples: BTreeMap<&str, String> = BTreeMap::new();
         for (logical, text) in &sample {
             let units = split_case_units(logical, text);
@@ -5577,7 +5600,7 @@ export const t = 1;
                 .zip(act.iter())
                 .position(|(e, a)| e != a)
                 .unwrap_or_else(|| exp.len().min(act.len()));
-            let region = if exp
+            let region: &'static str = if exp
                 .get(first)
                 .is_some_and(|line| line.starts_with("//// ["))
             {
@@ -5591,10 +5614,21 @@ export const t = 1;
                     .and_then(|header| header.strip_prefix("//// ["))
                     .map(|rest| rest.trim_end_matches(']'))
                     .unwrap_or("header");
-                if section.ends_with(".d.ts") || section.ends_with(".ts") {
-                    "echo-or-dts"
+                if section.ends_with(".d.ts") {
+                    "dts-section"
+                } else if section.ends_with(".ts") {
+                    "source-echo"
                 } else if section.ends_with(".js") {
-                    "js-bytes"
+                    // Split by emitted shape: a shorter document is a
+                    // missing output (assembly or emit stop), a longer one
+                    // is extra content, otherwise bytes differ in place.
+                    if act.len() < exp.len() {
+                        "js-shorter"
+                    } else if act.len() > exp.len() {
+                        "js-longer"
+                    } else {
+                        "js-byte-differs"
+                    }
                 } else {
                     "other"
                 }
@@ -5607,50 +5641,16 @@ export const t = 1;
                     act.get(first).map(String::as_str).unwrap_or("<eof>"),
                 )
             });
-        }
-        // Alignment-free family mass: multiset surplus/deficit over every
-        // canonical line, so downstream deltas hidden behind an earlier
-        // first-delta still count. Indent-only pairs are same-trim lines on
-        // opposite sides; textual families are counted by substring.
-        let mut surplus: BTreeMap<String, isize> = BTreeMap::new();
-        for (logical, text) in &sample {
-            let units = split_case_units(logical, text);
-            let entry = entry_virtual_path(logical, &units);
-            let pragmas = parse_case_pragmas(text);
-            let compile_options = compile_option_pairs(&pragmas);
-            let Some(baseline_logical) =
-                resolve_stem_baseline(&groups, logical, "js", &compile_options)
-                    .ok()
-                    .flatten()
-            else {
-                continue;
-            };
-            let Ok(case) =
-                compile_case_frontend(&units, &entry, &pragmas, FrontendMode::JavaScript)
-            else {
-                continue;
-            };
-            let Ok(emitted) = emit_javascript_baseline(&case, logical) else {
-                continue;
-            };
-            let Ok(expected) = std::fs::read_to_string(authority.join(&baseline_logical)) else {
-                continue;
-            };
-            let canon = |text: &str| -> Vec<String> {
-                text.replace("\r\n", "\n")
-                    .replace('\r', "\n")
-                    .lines()
-                    .map(|line| line.trim_end().to_owned())
-                    .collect()
-            };
-            for line in canon(&expected) {
-                *surplus.entry(line).or_default() += 1;
+            // Fold the alignment-free surplus/deficit tally into this pass:
+            // compile failures and unresolvable baselines are already
+            // tallied above, and passing cases contribute net zero.
+            for line in &exp {
+                *surplus.entry(line.clone()).or_default() += 1;
             }
-            for line in canon(&emitted) {
-                *surplus.entry(line).or_default() -= 1;
+            for line in &act {
+                *surplus.entry(line.clone()).or_default() -= 1;
             }
         }
-        let mut indent_only = 0usize;
         let mut text_families: BTreeMap<&str, usize> = BTreeMap::new();
         let mut top_deficits: Vec<(isize, String)> = surplus
             .iter()
@@ -5658,11 +5658,20 @@ export const t = 1;
             .map(|(line, count)| (*count, line.clone()))
             .collect();
         top_deficits.sort_by(|a, b| b.0.cmp(&a.0));
+        // Indent-only mass: a trimmed-key map nets whitespace variants; a
+        // trimmed form that nets zero while some untrimmed variant carries a
+        // nonzero count is pure indentation drift.
+        let mut trimmed_net: BTreeMap<String, isize> = BTreeMap::new();
         for (line, count) in &surplus {
-            let Some(twin) = surplus.get(line.trim_start()) else {
+            *trimmed_net.entry(line.trim().to_owned()).or_default() += *count;
+        }
+        let mut indent_only = 0usize;
+        for (line, count) in &surplus {
+            if *count == 0 {
                 continue;
-            };
-            if *count < 0 && *twin > 0 {
+            }
+            let nets_zero = trimmed_net.get(line.trim()).is_some_and(|net| *net == 0);
+            if nets_zero {
                 indent_only += 1;
             }
         }
@@ -5681,12 +5690,14 @@ export const t = 1;
             };
             *text_families.entry(family).or_default() += count.unsigned_abs();
         }
+        let fails: usize = regions.values().sum();
         let mut report = format!(
-            "javascript_first_delta: sampled={} pass={} skipped={} indent_only_pairs={}\n",
+            "javascript_first_delta: sampled={} pass={} fail={} skipped={} indent_lines={}\n",
             sample.len(),
             passes,
+            fails,
             skipped,
-            indent_only / 2
+            indent_only
         );
         for (region, count) in &regions {
             report.push_str(&format!(
