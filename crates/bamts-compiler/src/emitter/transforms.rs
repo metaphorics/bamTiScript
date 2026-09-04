@@ -3845,13 +3845,6 @@ impl<'a> Rewriter<'a> {
     }
 
     fn rewrite_function_like(&mut self, function: &FunctionLike, range: TextRange) -> FunctionLike {
-        if function.is_generator && Self::needs(LanguageFeature::Generators, self.options) {
-            self.diag(
-                codes::GENERATOR_REQUIRES_ES2015,
-                range,
-                "generators require ScriptTarget::Es2015 or later",
-            );
-        }
         let parameters = self.rewrite_parameters(&function.parameters);
         if function.is_async && Self::needs(LanguageFeature::AsyncFunctions, self.options) {
             let mut rewritten = function.clone();
@@ -3859,11 +3852,24 @@ impl<'a> Rewriter<'a> {
             return self.lower_async_function(&rewritten, range);
         }
         let body = function.body.as_ref().map(|body| self.rewrite_body(body));
-        FunctionLike {
+        let mut rewritten = FunctionLike {
             parameters,
             body,
             ..function.clone()
+        };
+        if rewritten.is_generator && Self::needs(LanguageFeature::Generators, self.options) {
+            let lowered = self.lower_generator_function(&rewritten);
+            if lowered.is_generator {
+                self.diag(
+                    codes::GENERATOR_REQUIRES_ES2015,
+                    range,
+                    "generators require ScriptTarget::Es2015 or later",
+                );
+            } else {
+                rewritten = lowered;
+            }
         }
+        rewritten
     }
 
     fn rewrite_parameters(&mut self, parameters: &[ParameterNode]) -> Vec<ParameterNode> {
@@ -3940,6 +3946,11 @@ impl<'a> Rewriter<'a> {
             return_type: None,
             body: Some(inner_body),
         };
+        let inner = if Self::needs(LanguageFeature::Generators, self.options) {
+            self.lower_generator_function(&inner)
+        } else {
+            inner
+        };
         let inner_expr = self.syn_node(
             range,
             Expression::Function(FunctionExpression { function: inner }),
@@ -3987,6 +3998,263 @@ impl<'a> Rewriter<'a> {
             Expression::Unary(UnaryExpression {
                 operator: UnaryOperator::Void,
                 argument: Box::new(zero),
+            }),
+        )
+    }
+
+    /// Lowers a generator body to a `__generator(this, function (_a) {...})`
+    /// state machine for targets without native generators. Slice:
+    /// statement-list bodies whose yields sit at statement level, or bodies
+    /// with no yields at all; richer shapes keep the native generator (and
+    /// the user path keeps its requires-es2015 diagnostic).
+    fn lower_generator_function(&mut self, function: &FunctionLike) -> FunctionLike {
+        let Some(FunctionBody::Block(block)) = function.body.as_ref() else {
+            return function.clone();
+        };
+        let Some((hoisted, machine)) = self.generator_machine(block) else {
+            return function.clone();
+        };
+        let range = block.range();
+        let state = self.ident("_a");
+        let binding = self.node(state.range(), BindingPattern::Identifier(state));
+        let parameter = self.node(
+            binding.range(),
+            Parameter {
+                decorators: Vec::new(),
+                modifiers: ParameterModifiers {
+                    accessibility: None,
+                    is_readonly: false,
+                    is_override: false,
+                },
+                binding,
+                optional: false,
+                type_annotation: None,
+                initializer: None,
+            },
+        );
+        let machine_function = FunctionLike {
+            decorators: Vec::new(),
+            name: None,
+            is_async: false,
+            is_generator: false,
+            type_parameters: None,
+            parameters: vec![parameter],
+            return_type: None,
+            body: Some(FunctionBody::Block(self.syn_node(
+                range,
+                Block {
+                    statements: machine,
+                },
+            ))),
+        };
+        let machine_expr = self.syn_node(
+            range,
+            Expression::Function(FunctionExpression {
+                function: machine_function,
+            }),
+        );
+        let generator = self.helper_ident(HelperKind::Generator);
+        let this_arg = self.syn_node(range, Expression::This);
+        let call = self.syn_node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(generator),
+                optional: false,
+                type_arguments: None,
+                arguments: vec![
+                    CallArgument::Expression(Box::new(this_arg)),
+                    CallArgument::Expression(Box::new(machine_expr)),
+                ],
+            }),
+        );
+        let return_stmt = self.syn_node(
+            range,
+            Statement::Return(ReturnStatement {
+                argument: Some(Box::new(call)),
+            }),
+        );
+        let mut statements = Vec::new();
+        if let Some(declaration) = self.temp_declaration(hoisted, range) {
+            statements.push(declaration);
+        }
+        statements.push(return_stmt);
+        FunctionLike {
+            is_generator: false,
+            body: Some(FunctionBody::Block(
+                self.syn_node(range, Block { statements }),
+            )),
+            ..function.clone()
+        }
+    }
+
+    /// Builds the `__generator` machine body: a flat statement list when the
+    /// body has no yields, otherwise a `switch (_a.label)` with one case per
+    /// yield segment. `var` declarations are hoisted into assignment form;
+    /// each statement-level yield splits a segment and the resumed value is
+    /// consumed through `_a.sent()`. Returns None when the body is richer
+    /// than this slice.
+    fn generator_machine(&mut self, block: &BlockNode) -> Option<(Vec<IdentifierNode>, Vec<Stmt>)> {
+        let range = block.range();
+        let mut hoisted: Vec<IdentifierNode> = Vec::new();
+        let mut segments: Vec<Vec<Stmt>> = vec![Vec::new()];
+        let mut terminated = false;
+        for statement in &block.data().statements {
+            if terminated {
+                return None;
+            }
+            match statement.data() {
+                Statement::Variable(declaration) if declaration.kind == VariableKind::Var => {
+                    for declarator in &declaration.declarations {
+                        let BindingPattern::Identifier(name) = declarator.data().binding.data()
+                        else {
+                            return None;
+                        };
+                        let name = name.clone();
+                        hoisted.push(name.clone());
+                        if let Some(initializer) = &declarator.data().initializer {
+                            if contains_yield(initializer) {
+                                return None;
+                            }
+                            segments.last_mut()?.push(self.assign_statement(
+                                &name,
+                                initializer.as_ref().clone(),
+                                range,
+                            ));
+                        }
+                    }
+                }
+                Statement::Expression(expression) => {
+                    if let Expression::Yield(yielded) = expression.expression.data() {
+                        if yielded.delegate || yielded.argument.is_none() {
+                            return None;
+                        }
+                        let argument = yielded.argument.clone()?;
+                        let sentinel = self.number_expr("4 /*yield*/");
+                        let array = self.array_literal(vec![sentinel, *argument], range);
+                        segments.last_mut()?.push(self.machine_return(array, range));
+                        // The resumed value is consumed and discarded exactly
+                        // the way tsc's machine does: `_a.sent();`.
+                        let sent_call = self.state_sent_call(range);
+                        segments.push(vec![self.syn_node(
+                            range,
+                            Statement::Expression(ExpressionStatement {
+                                expression: Box::new(sent_call),
+                            }),
+                        )]);
+                    } else {
+                        if contains_yield(&expression.expression) {
+                            return None;
+                        }
+                        segments.last_mut()?.push(statement.clone());
+                    }
+                }
+                Statement::Return(returned) => {
+                    let terminator = match &returned.argument {
+                        Some(value) if contains_yield(value) => return None,
+                        Some(value) => {
+                            let sentinel = self.number_expr("2 /*return*/");
+                            let array = self.array_literal(vec![sentinel, *value.clone()], range);
+                            self.machine_return(array, range)
+                        }
+                        None => {
+                            let sentinel = self.return_sentinel(range);
+                            self.machine_return(sentinel, range)
+                        }
+                    };
+                    segments.last_mut()?.push(terminator);
+                    terminated = true;
+                }
+                _ => return None,
+            }
+        }
+        if !terminated {
+            let sentinel = self.return_sentinel(range);
+            segments
+                .last_mut()?
+                .push(self.machine_return(sentinel, range));
+        }
+        if segments.len() == 1 {
+            return Some((hoisted, segments.pop()?));
+        }
+        let state_expr = self.ident_expr("_a");
+        let label_name = self.ident("label");
+        let label = self.member_expr(&state_expr, MemberProperty::Named(label_name), range);
+        let mut cases = Vec::new();
+        for (index, segment) in segments.into_iter().enumerate() {
+            let test = self.number_expr(&index.to_string());
+            cases.push(self.node(
+                range,
+                SwitchCase {
+                    test: Some(Box::new(test)),
+                    consequent: segment,
+                },
+            ));
+        }
+        let switch = self.syn_node(
+            range,
+            Statement::Switch(SwitchStatement {
+                discriminant: Box::new(label),
+                cases,
+            }),
+        );
+        Some((hoisted, vec![switch]))
+    }
+
+    /// `name = value;`
+    fn assign_statement(&mut self, target: &IdentifierNode, value: Expr, range: TextRange) -> Stmt {
+        let left = self.node(target.range(), AssignmentTarget::Identifier(target.clone()));
+        let assignment = self.syn_node(
+            range,
+            Expression::Assignment(AssignmentExpression {
+                operator: AssignmentOperator::Assign,
+                left,
+                right: Box::new(value),
+            }),
+        );
+        self.syn_node(
+            range,
+            Statement::Expression(ExpressionStatement {
+                expression: Box::new(assignment),
+            }),
+        )
+    }
+
+    /// `return <argument>;`
+    fn machine_return(&mut self, argument: Expr, range: TextRange) -> Stmt {
+        self.syn_node(
+            range,
+            Statement::Return(ReturnStatement {
+                argument: Some(Box::new(argument)),
+            }),
+        )
+    }
+
+    /// `[2 /*return*/]`
+    fn return_sentinel(&mut self, range: TextRange) -> Expr {
+        let sentinel = self.number_expr("2 /*return*/");
+        self.array_literal(vec![sentinel], range)
+    }
+
+    fn array_literal(&mut self, elements: Vec<Expr>, range: TextRange) -> Expr {
+        let elements = elements
+            .into_iter()
+            .map(|element| ArrayElement::Expression(Box::new(element)))
+            .collect();
+        self.node(range, Expression::Array(ArrayLiteral { elements }))
+    }
+
+    /// `_a.sent()`
+    fn state_sent_call(&mut self, range: TextRange) -> Expr {
+        let state = self.ident_expr("_a");
+        let sent_name = self.ident("sent");
+        let sent = self.member_expr(&state, MemberProperty::Named(sent_name), range);
+        self.syn_node(
+            range,
+            Expression::Call(CallExpression {
+                callee: Box::new(sent),
+                optional: false,
+                type_arguments: None,
+                arguments: Vec::new(),
             }),
         )
     }
@@ -4992,6 +5260,11 @@ impl<'a> Rewriter<'a> {
                 return_type: None,
                 body: Some(body),
             };
+            let inner = if Self::needs(LanguageFeature::Generators, self.options) {
+                self.lower_generator_function(&inner)
+            } else {
+                inner
+            };
             let inner_expr = self.syn_node(
                 expression.range(),
                 Expression::Function(FunctionExpression { function: inner }),
@@ -5184,6 +5457,78 @@ fn raw_token_text(file: &SourceFile, token: &Token) -> String {
 }
 
 /// The unescaped identifier spelling for a source identifier node.
+/// Whether an expression contains a yield of THIS function: nested
+/// function-like expressions own their own yields. Unrecognized variants
+/// report containment so the machine refuses to lower them.
+fn contains_yield(expression: &Expr) -> bool {
+    match expression.data() {
+        Expression::Yield(_) => true,
+        Expression::Identifier(_) | Expression::This | Expression::Super => false,
+        Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => false,
+        // A yield inside a nested function belongs to that function.
+        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
+        Expression::Template(template) => template.expressions.iter().any(contains_yield),
+        Expression::TaggedTemplate(_) => true,
+        Expression::Array(array) => array.elements.iter().any(|element| match element {
+            ArrayElement::Expression(nested) => contains_yield(nested),
+            ArrayElement::Spread(spread) => contains_yield(&spread.argument),
+            _ => false,
+        }),
+        Expression::Object(object) => object.members.iter().any(|member| match member.data() {
+            ObjectMember::Property(property) => {
+                contains_yield(&property.value)
+                    || matches!(&property.name, PropertyName::Computed(key) if contains_yield(key))
+            }
+            _ => true,
+        }),
+        Expression::Call(call) => {
+            contains_yield(&call.callee)
+                || call.arguments.iter().any(|argument| match argument {
+                    CallArgument::Expression(nested) => contains_yield(nested),
+                    _ => false,
+                })
+        }
+        Expression::Member(member) => {
+            contains_yield(&member.object)
+                || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key))
+        }
+        Expression::New(new) => {
+            contains_yield(&new.callee)
+                || new.arguments.iter().any(|argument| match argument {
+                    CallArgument::Expression(nested) => contains_yield(nested),
+                    _ => false,
+                })
+        }
+        Expression::Await(awaited) => contains_yield(&awaited.argument),
+        Expression::Unary(unary) => contains_yield(&unary.argument),
+        Expression::Update(update) => match update.argument.data() {
+            AssignmentTarget::Member(member) => contains_yield(&member.object),
+            _ => false,
+        },
+        Expression::Binary(binary) => contains_yield(&binary.left) || contains_yield(&binary.right),
+        Expression::Logical(logical) => {
+            contains_yield(&logical.left) || contains_yield(&logical.right)
+        }
+        Expression::Conditional(conditional) => {
+            contains_yield(&conditional.test)
+                || contains_yield(&conditional.consequent)
+                || contains_yield(&conditional.alternate)
+        }
+        Expression::Assignment(assignment) => contains_yield(&assignment.right),
+        Expression::Sequence(sequence) => sequence.expressions.iter().any(contains_yield),
+        Expression::Parenthesized(nested) => contains_yield(nested),
+        Expression::As(cast) => contains_yield(&cast.expression),
+        Expression::Satisfies(_) | Expression::TypeAssertion(_) => true,
+        Expression::NonNull(non_null) => contains_yield(&non_null.expression),
+        Expression::Import(import) => {
+            contains_yield(&import.source) || import.options.as_deref().is_some_and(contains_yield)
+        }
+        Expression::JsxElement(_)
+        | Expression::JsxFragment(_)
+        | Expression::JsxSelfClosingElement(_) => true,
+    }
+}
+
 fn identifier_text(file: &SourceFile, ident: &IdentifierNode) -> String {
     raw_token_text(file, ident.data().token())
 }

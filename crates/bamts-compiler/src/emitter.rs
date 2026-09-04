@@ -1699,6 +1699,21 @@ impl<'a> Emitter<'a> {
                 }
                 None => self.raw_mapped("default:", case_range),
             }
+            // Synthesized machines (the __generator state machine) print a
+            // single-statement case inline the way tsc emits them. The
+            // discriminator is the case test: authored tests live inside the
+            // authored text, machine tests are interned past its end.
+            let inline = case.consequent.len() == 1
+                && case
+                    .test
+                    .as_ref()
+                    .is_some_and(|test| test.range().end() > self.authored_len);
+            if inline {
+                self.raw(" ");
+                self.emit_statement(&case.consequent[0]);
+                self.newline();
+                continue;
+            }
             self.newline();
             if !case.consequent.is_empty() {
                 self.indent += 1;
@@ -6258,6 +6273,91 @@ export default answer;
         );
         assert!(!code.contains("function __awaiter("), "{code}");
         assert!(!code.contains("function __generator("), "{code}");
+    }
+
+    #[test]
+    fn es5_async_empty_body_lowers_to_generator_machine() {
+        // Authority: es5-asyncFunction(target=es5) `empty` — a yield-free
+        // body becomes the linear machine with the bare return sentinel.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x;\nasync function empty() {\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        let expected = "function empty() {\n    return __awaiter(this, void 0, void 0, function () {\n        return __generator(this, function (_a) {\n            return [2 /*return*/];\n        });\n    });\n}";
+        assert!(code.contains(expected), "{code}");
+    }
+
+    #[test]
+    fn es5_async_await_lowers_to_switch_machine() {
+        // Authority: es5-asyncFunction(target=es5) `singleAwait` — each
+        // statement-level await splits a labeled case and the resumed value
+        // is consumed through _a.sent().
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x;\nasync function singleAwait() {\n    await x;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        let expected = "function singleAwait() {\n    return __awaiter(this, void 0, void 0, function () {\n        return __generator(this, function (_a) {\n            switch (_a.label) {\n                case 0: return [4 /*yield*/, x];\n                case 1:\n                    _a.sent();\n                    return [2 /*return*/];\n            }\n        });\n    });\n}";
+        assert!(code.contains(expected), "{code}");
+    }
+
+    #[test]
+    fn es5_async_statements_hoist_vars_into_machine() {
+        // Authority: awaitCallExpression5_es5(target=es5) `func` — var
+        // declarations hoist outside __generator and rebind as assignments.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var a: boolean;\ndeclare var o: { fn(arg0: boolean, arg1: boolean, arg2: boolean): void; };\ndeclare function before(): void;\ndeclare function after(): void;\nasync function func(): Promise<void> {\n    before();\n    var b = o.fn(a, a, a);\n    after();\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        let expected = "function func() {\n    return __awaiter(this, void 0, void 0, function () {\n        var b;\n        return __generator(this, function (_a) {\n            before();\n            b = o.fn(a, a, a);\n            after();\n            return [2 /*return*/];\n        });\n    });\n}";
+        assert!(code.contains(expected), "{code}");
+    }
+
+    #[test]
+    fn authored_switch_cases_never_inline() {
+        // Authority: sourceMapValidationSwitch — authored single-statement
+        // cases print one statement per line; only synthesized machine
+        // cases print inline.
+        let input = "var x = 10;\nswitch (x) {\ncase 5: x = 0;\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        let code = &javascript(&output).code;
+        assert!(code.contains("case 5:\n        x = 0;"), "{code}");
+        assert!(!code.contains("case 5: x = 0;"), "{code}");
     }
 
     #[test]
