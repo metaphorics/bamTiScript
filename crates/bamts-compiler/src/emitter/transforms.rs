@@ -189,6 +189,10 @@ pub fn analyze(file: &SourceFile, options: &TransformOptions) -> TransformPlan {
     let mut helpers = BTreeSet::new();
     if required.contains(&LanguageFeature::AsyncFunctions) {
         helpers.insert(HelperKind::Awaiter);
+    }
+    // __generator only when the target lacks native generators: at es2015+
+    // the awaiter body is a native function* and tsc emits no __generator.
+    if required.contains(&LanguageFeature::Generators) {
         helpers.insert(HelperKind::Generator);
     }
     if required.contains(&LanguageFeature::ObjectRestSpread)
@@ -6204,8 +6208,11 @@ mod tests {
         assert!(code.contains("function*"), "{code}");
         assert!(code.contains("yield"), "{code}");
         assert!(!code.contains("async "), "{code}");
-        assert!(code.contains("function __awaiter"), "{code}");
-        assert!(code.contains("function __generator"), "{code}");
+        assert!(
+            code.contains("var __awaiter = (this && this.__awaiter) || function"),
+            "{code}"
+        );
+        assert!(!code.contains("__generator"), "{code}");
     }
 
     #[test]
@@ -6223,10 +6230,13 @@ mod tests {
 
         let output = emit_transformed(&file, checked.product(), &transform_options, &names());
         let code = javascript(&output);
-        assert!(code.contains("function __awaiter"), "{code}");
         assert!(
-            code.contains("function __generator"),
-            "helper dependencies must close through the catalog: {code}"
+            code.contains("var __awaiter = (this && this.__awaiter) || function"),
+            "{code}"
+        );
+        assert!(
+            !code.contains("__generator"),
+            "native-generator targets emit no __generator: {code}"
         );
     }
 
