@@ -827,6 +827,7 @@ fn build_tsconfig(pragmas: &CasePragmas) -> String {
             | "checkjs"
             | "resolvejsonmodule"
             | "noemit"
+            | "noemithelpers"
             | "declaration"
             | "alwaysstrict"
             | "exactoptionalpropertytypes"

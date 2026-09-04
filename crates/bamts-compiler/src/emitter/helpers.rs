@@ -307,21 +307,11 @@ pub fn emit_helpers(
     options: &HelperOptions,
     file: Option<&SourceFile>,
 ) -> HelperEmit {
-    let helpers = close_helpers(requested);
-    if options.no_emit_helpers {
-        // `noEmitHelpers`: callers provide the helpers; the closed set is
-        // still recorded but no definition text is emitted.
-        return HelperEmit {
-            prelude: String::new(),
-            helpers,
-            diagnostics: Vec::new(),
-        };
-    }
-    emit_closed(helpers, options, file, Vec::new())
+    emit_closed(close_helpers(requested), options, file, Vec::new())
 }
 
 /// Resolves helper identifiers, recording [`codes::UNKNOWN_HELPER`] for names
-/// that are not in the catalog, then emits a prelude.
+/// that are not in the tslib catalog, then emits a prelude.
 #[must_use]
 pub fn emit_helpers_named(
     names: &[&str],
@@ -343,8 +333,7 @@ pub fn emit_helpers_named(
             )),
         }
     }
-    let helpers = close_helpers(&requested);
-    emit_closed(helpers, options, file, diagnostics)
+    emit_closed(close_helpers(&requested), options, file, diagnostics)
 }
 
 fn close_helpers(requested: &[HelperKind]) -> Vec<HelperKind> {
@@ -365,6 +354,17 @@ fn emit_closed(
     mut diagnostics: Vec<Diagnostic>,
 ) -> HelperEmit {
     if helpers.is_empty() {
+        diagnostics.sort();
+        return HelperEmit {
+            prelude: String::new(),
+            helpers,
+            diagnostics,
+        };
+    }
+    if options.no_emit_helpers {
+        // `noEmitHelpers`: callers provide the helpers; the closed set is
+        // still recorded (and name-resolution diagnostics kept) but no
+        // definition text is emitted. One gate serves both entry points.
         diagnostics.sort();
         return HelperEmit {
             prelude: String::new(),
