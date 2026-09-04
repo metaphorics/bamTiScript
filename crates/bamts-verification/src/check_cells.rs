@@ -2290,6 +2290,7 @@ pub fn emit_source_map_baseline(
             prog.is_commonjs().then_some(ModuleKind::CommonJs),
             prog.use_define_for_class_fields(),
         );
+        options.no_emit_helpers = check.no_emit_helpers();
         match prog.jsx_routing_decision(ProgramOutputKind::JavaScript) {
             JsxRoutingDecision::Emit | JsxRoutingDecision::TransformAndEmit => {
                 options.jsx = prog.jsx();
