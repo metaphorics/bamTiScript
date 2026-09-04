@@ -5424,7 +5424,15 @@ impl<'a> Rewriter<'a> {
                 ))
             }
             Expression::Import(import) => {
-                let source = self.eval(&import.source, ctx)?;
+                // Source operands run before the options suspend; a clean
+                // source with side effects must materialize into a temp
+                // ahead of the split, or its effects slip into the resume
+                // segment and run after the suspension.
+                let options_suspends = import.options.as_deref().is_some_and(contains_yield);
+                let source = match self.eval(&import.source, ctx)? {
+                    value if options_suspends => self.materialize(value, ctx, range)?,
+                    value => value,
+                };
                 let options = match &import.options {
                     Some(options) if contains_yield(options) => {
                         Some(Box::new(self.eval(options, ctx)?))
@@ -7068,10 +7076,12 @@ fn branch_statements(statement: &Stmt) -> &[Stmt] {
 /// The statements of a loop body: non-block bodies are shapes this slice
 /// refuses anyway; None renders as empty for counting purposes.
 fn loop_body_statements(body: &Stmt) -> &[Stmt] {
-    static NONE: &[Stmt] = &[];
+    // Non-block bodies are single-statement branches: counters and the
+    // return guard must see through them, or a nested `while (x) return z;`
+    // hides its return and the clone gate drops the value.
     match body.data() {
         Statement::Block(block) => &block.data().statements,
-        _ => NONE,
+        _ => std::slice::from_ref(body),
     }
 }
 
@@ -7143,6 +7153,12 @@ fn count_yields(expression: &Expr) -> u32 {
                 // suspensions, just like nested function-likes, so the
                 // wildcard below is safe for them.
                 ObjectMember::Spread(spread) => count_yields(&spread.argument),
+                // A method's computed name executes in the enclosing
+                // function; its body owns its own suspensions.
+                ObjectMember::Method(method) => match &method.name {
+                    PropertyName::Computed(key) => count_yields(key),
+                    _ => 0,
+                },
                 _ => 0,
             })
             .sum(),
@@ -7153,6 +7169,7 @@ fn count_yields(expression: &Expr) -> u32 {
                     .iter()
                     .map(|argument| match argument {
                         CallArgument::Expression(value) => count_yields(value),
+                        CallArgument::Spread(spread) => count_yields(&spread.argument),
                         _ => 0,
                     })
                     .sum::<u32>()
@@ -7171,6 +7188,7 @@ fn count_yields(expression: &Expr) -> u32 {
                     .iter()
                     .map(|argument| match argument {
                         CallArgument::Expression(value) => count_yields(value),
+                        CallArgument::Spread(spread) => count_yields(&spread.argument),
                         _ => 0,
                     })
                     .sum::<u32>()
@@ -7399,7 +7417,11 @@ fn machine_state_name(skip: &std::collections::HashSet<String>, temps: &[String]
 }
 
 fn call_argument_suspends(argument: &CallArgument) -> bool {
-    matches!(argument, CallArgument::Expression(value) if contains_yield(value))
+    match argument {
+        CallArgument::Expression(value) => contains_yield(value),
+        CallArgument::Spread(spread) => contains_yield(&spread.argument),
+        _ => false,
+    }
 }
 
 /// Whether an assignment target subtree still holds an await, so the
@@ -7433,14 +7455,18 @@ fn contains_await(expression: &Expr) -> bool {
                     || matches!(&property.name, PropertyName::Computed(key) if contains_await(key))
             }
             ObjectMember::Spread(spread) => contains_await(&spread.argument),
-            // Method-like members own their suspensions; cloning them is
-            // correct, not a leak.
+            // A method's computed name executes in the enclosing function;
+            // its body owns its own suspensions.
+            ObjectMember::Method(method) => {
+                matches!(&method.name, PropertyName::Computed(key) if contains_await(key))
+            }
             _ => false,
         }),
         Expression::Call(call) => {
             contains_await(&call.callee)
                 || call.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(value) => contains_await(value),
+                    CallArgument::Spread(spread) => contains_await(&spread.argument),
                     _ => false,
                 })
         }
@@ -7449,10 +7475,14 @@ fn contains_await(expression: &Expr) -> bool {
             contains_await(&new.callee)
                 || new.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(value) => contains_await(value),
+                    CallArgument::Spread(spread) => contains_await(&spread.argument),
                     _ => false,
                 })
         }
         Expression::Unary(unary) => contains_await(&unary.argument),
+        Expression::Import(import) => {
+            contains_await(&import.source) || import.options.as_deref().is_some_and(contains_await)
+        }
         Expression::Update(update) => match update.argument.data() {
             AssignmentTarget::Member(member) => {
                 target_contains_await(&member.object, &member.property)
@@ -7577,14 +7607,18 @@ fn contains_yield(expression: &Expr) -> bool {
                     || matches!(&property.name, PropertyName::Computed(key) if contains_yield(key))
             }
             ObjectMember::Spread(spread) => contains_yield(&spread.argument),
-            // Method-like members own their suspensions, like nested
-            // function-likes; cloning them is correct, not a leak.
+            // A method's computed name executes in the enclosing function;
+            // its body owns its own suspensions.
+            ObjectMember::Method(method) => {
+                matches!(&method.name, PropertyName::Computed(key) if contains_yield(key))
+            }
             _ => false,
         }),
         Expression::Call(call) => {
             contains_yield(&call.callee)
                 || call.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(nested) => contains_yield(nested),
+                    CallArgument::Spread(spread) => contains_yield(&spread.argument),
                     _ => false,
                 })
         }
@@ -7596,6 +7630,7 @@ fn contains_yield(expression: &Expr) -> bool {
             contains_yield(&new.callee)
                 || new.arguments.iter().any(|argument| match argument {
                     CallArgument::Expression(nested) => contains_yield(nested),
+                    CallArgument::Spread(spread) => contains_yield(&spread.argument),
                     _ => false,
                 })
         }

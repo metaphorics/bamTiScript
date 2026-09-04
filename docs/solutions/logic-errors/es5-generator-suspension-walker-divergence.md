@@ -136,4 +136,8 @@ actually mints.
 - The corpus-level regression gate is the suite pair
   (`cargo test -p bamts-compiler` + `cargo test -p bamts-verification` with
   `BAMTS_ALLOW_NODE_COMPAT=1`), never the bare CLI `-p` path (it never
-  lowers the machine — refusal form only).
+  lowers the machine — refusal form only). That pair is the leaf evidence;
+  the completion claim itself binds to the receipt-backed G3 compiler root
+  gate in `.outline/GATES.md` — a green suite pair is necessary, not
+  sufficient, and closure language must cite the G3 receipts, not the leaf
+  suites alone.
