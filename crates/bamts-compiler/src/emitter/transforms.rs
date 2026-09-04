@@ -608,7 +608,9 @@ struct CjsImportRef {
     property: Option<String>,
 }
 
-/// Allocates `_module_N` require locals that avoid source identifiers.
+/// Allocates tsc-shaped require locals (`<slug>_N`, sanitized with a leading
+/// underscore only when the slug cannot start an identifier) that avoid
+/// source identifiers.
 struct RequireNames {
     occupied: BTreeSet<String>,
     counters: BTreeMap<String, u32>,
@@ -625,9 +627,20 @@ impl RequireNames {
     fn allocate(&mut self, module: &str) -> String {
         let base = module.rsplit('/').next().unwrap_or(module);
         let counter = self.counters.entry(base.to_owned()).or_insert(0);
+        // tsc binds require locals as `<slug>_<n>` when the path's last
+        // segment can start an identifier (`enum_1`) and sanitizes with a
+        // leading underscore only when it cannot (`_10_lib_1`).
+        let starts_identifier = base
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$');
         loop {
             *counter += 1;
-            let candidate = format!("_{base}_{}", *counter);
+            let candidate = if starts_identifier {
+                format!("{base}_{}", *counter)
+            } else {
+                format!("_{base}_{}", *counter)
+            };
             if self.occupied.insert(candidate.clone()) {
                 return candidate;
             }
@@ -5951,6 +5964,16 @@ mod tests {
             "field initializer should move: {code}"
         );
     }
+    #[test]
+    fn require_locals_follow_the_tsc_slug_shape() {
+        // tsc binds `enum_1` for an identifier-starting slug and
+        // `_10_lib_1` when a leading digit forces sanitization.
+        let mut names = super::RequireNames::new(std::collections::BTreeSet::new());
+        assert_eq!(names.allocate("./enum"), "enum_1");
+        assert_eq!(names.allocate("./10_lib"), "_10_lib_1");
+        assert_eq!(names.allocate("./enum"), "enum_2");
+    }
+
     #[test]
     fn class_expression_without_lowering_stays_inline() {
         // Authority: classExpressionTest2 — a generic class expression with
