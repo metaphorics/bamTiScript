@@ -3019,6 +3019,10 @@ impl<'a> Rewriter<'a> {
         }
     }
 
+    /// Builds a wholly synthesized object literal. Every mint records in the
+    /// taint set: the printer's single-line object gate keys on it, and an
+    /// untainted descriptor collapsed `Object.defineProperty(this, "foo",
+    /// { ... })` onto one line where tsc expands (override18 regression).
     fn object_literal(&mut self, entries: Vec<(&str, Expr)>, range: TextRange) -> Expr {
         let mut members = Vec::new();
         for (name, value) in entries {
@@ -3028,9 +3032,9 @@ impl<'a> Rewriter<'a> {
                 modifier: PropertyModifier::None,
                 shorthand: false,
             };
-            members.push(self.node(range, ObjectMember::Property(property)));
+            members.push(self.syn_node(range, ObjectMember::Property(property)));
         }
-        self.node(range, Expression::Object(ObjectLiteral { members }))
+        self.syn_node(range, Expression::Object(ObjectLiteral { members }))
     }
 
     fn substitute_static_block(
@@ -6211,6 +6215,28 @@ mod tests {
             enumerable < configurable && configurable < writable && writable < value,
             "{code}"
         );
+    }
+
+    #[test]
+    fn synthesized_descriptor_object_expands_in_javascript() {
+        // Authority: override18(target=es2015).js — the defineProperty
+        // descriptor is wholly synthesized and prints multi-line even when
+        // the authored source is compact. An untainted mint collapsed it
+        // onto one line (sweep-2d76b09 regression).
+        let output = emit_with_options(
+            "class A { foo?: string; }\n",
+            EmitOptions {
+                target: ScriptTarget::Es2015,
+                use_define_for_class_fields: Some(true),
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&output);
+        assert!(
+            code.contains("Object.defineProperty(this, \"foo\", {\n            enumerable: true,"),
+            "{code}"
+        );
+        assert!(!code.contains("{ enumerable: true, configurable"), "{code}");
     }
 
     #[test]
