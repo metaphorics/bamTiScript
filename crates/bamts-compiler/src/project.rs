@@ -103,6 +103,33 @@ impl ProjectRoot {
         self.confine(joined)
     }
 
+    /// Resolves an output-target path relative to a confined directory.
+    ///
+    /// Output targets (`tsBuildInfoFile`, `outFile`) may point anywhere —
+    /// tsc accepts absolute and `..`-escaping values for them
+    /// (incrementalTsBuildInfoFile runs clean with `/a.tsbuildinfo`;
+    /// references tests use `../cache/info.json`), unlike source paths,
+    /// which `resolve_from` confines.
+    #[must_use]
+    pub fn resolve_output_from(
+        &self,
+        directory: impl AsRef<Path>,
+        path: impl AsRef<Path>,
+    ) -> PathBuf {
+        let directory = directory.as_ref();
+        let path = path.as_ref();
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            directory.join(path)
+        };
+        if joined.is_absolute() {
+            normalize_absolute(&joined)
+        } else {
+            normalize_absolute(&self.path.join(joined))
+        }
+    }
+
     /// Normalizes an absolute path and verifies that it belongs to this project.
     pub fn confine(&self, path: impl AsRef<Path>) -> Result<PathBuf, PathError> {
         let original = path.as_ref();
@@ -1205,6 +1232,7 @@ impl ProjectConfig {
             jsx_factory: optional_nested_string(compiler, "jsxFactory")?,
             jsx_fragment_factory: optional_nested_string(compiler, "jsxFragmentFactory")?,
             jsx_import_source: optional_nested_string(compiler, "jsxImportSource")?,
+            ts_build_info_file: optional_output_path(root, directory, compiler, "tsBuildInfoFile")?,
             strict,
             no_implicit_any: optional_bool(compiler, "noImplicitAny")?.unwrap_or(strict),
             strict_null_checks: optional_bool(compiler, "strictNullChecks")?.unwrap_or(strict),
@@ -1231,7 +1259,6 @@ impl ProjectConfig {
             emit_declaration_only: optional_bool(compiler, "emitDeclarationOnly")?.unwrap_or(false),
             incremental: optional_bool(compiler, "incremental")?.unwrap_or(false),
             composite: optional_bool(compiler, "composite")?.unwrap_or(false),
-            ts_build_info_file: optional_path(root, directory, compiler, "tsBuildInfoFile")?,
             new_line: optional_nested_string(compiler, "newLine")?,
             out_file: optional_path(root, directory, compiler, "outFile")?,
             base_url,
@@ -1361,6 +1388,7 @@ fn optional_bool(
         .and_then(|object| object.get(key))
         .map(|value| match value {
             JsonValue::Bool(b) => Ok(*b),
+
             JsonValue::String(s) => match s.trim().to_ascii_lowercase().as_str() {
                 "true" => Ok(true),
                 "false" => Ok(false),
@@ -1406,6 +1434,25 @@ fn string_list(object: &JsonObject, key: &'static str) -> Result<Arc<[Arc<str>]>
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Arc::from)
+}
+
+/// Reads an output-target path option, accepting absolute and
+/// root-escaping values (see [`ProjectRoot::resolve_output_from`]).
+fn optional_output_path(
+    root: &ProjectRoot,
+    directory: &Path,
+    object: Option<&JsonObject>,
+    key: &'static str,
+) -> Result<Option<PathBuf>, ConfigError> {
+    object
+        .and_then(|object| object.get(key))
+        .map(|value| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| invalid_field(key, "a path string"))?;
+            Ok(root.resolve_output_from(directory, value))
+        })
+        .transpose()
 }
 
 fn path_list(
