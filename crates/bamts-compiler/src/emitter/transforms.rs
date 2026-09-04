@@ -7040,6 +7040,11 @@ fn count_yields(expression: &Expr) -> u32 {
                             _ => 0,
                         }
                 }
+                // A spread element carries an expression; method-like
+                // members (methods/getters/setters) own their own
+                // suspensions, just like nested function-likes, so the
+                // wildcard below is safe for them.
+                ObjectMember::Spread(spread) => count_yields(&spread.argument),
                 _ => 0,
             })
             .sum(),
@@ -7074,6 +7079,20 @@ fn count_yields(expression: &Expr) -> u32 {
         }
         Expression::Await(awaited) => count_yields(&awaited.argument),
         Expression::Unary(unary) => count_yields(&unary.argument),
+        Expression::Update(update) => match update.argument.data() {
+            AssignmentTarget::Member(member) => {
+                count_yields(&member.object)
+                    + match &member.property {
+                        MemberProperty::Computed(key) => count_yields(key),
+                        _ => 0,
+                    }
+            }
+            // Pattern and invalid targets can carry yields in computed
+            // keys and defaults; a sentinel count routes them to eval,
+            // which refuses, rather than the inline verbatim clone.
+            AssignmentTarget::Identifier(_) => 0,
+            _ => 1,
+        },
         Expression::Binary(binary) => count_yields(&binary.left) + count_yields(&binary.right),
         Expression::Logical(logical) => count_yields(&logical.left) + count_yields(&logical.right),
         Expression::Conditional(conditional) => {
@@ -7091,14 +7110,24 @@ fn count_yields(expression: &Expr) -> u32 {
                                 _ => 0,
                             }
                     }
-                    _ => 0,
+                    // Pattern and invalid targets can carry yields; a
+                    // sentinel count routes them to eval, which refuses,
+                    // rather than the inline verbatim clone.
+                    AssignmentTarget::Identifier(_) => 0,
+                    _ => 1,
                 }
         }
         Expression::Sequence(sequence) => sequence.expressions.iter().map(count_yields).sum(),
         Expression::Parenthesized(inner) => count_yields(inner),
         Expression::As(cast) => count_yields(&cast.expression),
         Expression::NonNull(non_null) => count_yields(&non_null.expression),
-        _ => 0,
+        Expression::Import(import) => {
+            count_yields(&import.source) + import.options.as_deref().map_or(0, count_yields)
+        }
+        // Unknown shapes report non-zero: zero means provably clean and
+        // gates the inline verbatim clone; unknown routes to eval, whose
+        // refusal keeps the native form.
+        _ => 1,
     }
 }
 
@@ -7314,10 +7343,7 @@ fn contains_await(expression: &Expr) -> bool {
                     _ => false,
                 })
         }
-        Expression::Member(member) => {
-            contains_await(&member.object)
-                || matches!(&member.property, MemberProperty::Computed(key) if contains_await(key))
-        }
+        Expression::Member(member) => target_contains_await(&member.object, &member.property),
         Expression::New(new) => {
             contains_await(&new.callee)
                 || new.arguments.iter().any(|argument| match argument {
@@ -7326,6 +7352,16 @@ fn contains_await(expression: &Expr) -> bool {
                 })
         }
         Expression::Unary(unary) => contains_await(&unary.argument),
+        Expression::Update(update) => match update.argument.data() {
+            AssignmentTarget::Member(member) => {
+                target_contains_await(&member.object, &member.property)
+            }
+            // Pattern and invalid targets can carry expressions in
+            // computed keys and defaults; report containment so the
+            // machine refuses rather than clones.
+            AssignmentTarget::Identifier(_) => false,
+            _ => true,
+        },
         Expression::Binary(binary) => contains_await(&binary.left) || contains_await(&binary.right),
         Expression::Logical(logical) => {
             contains_await(&logical.left) || contains_await(&logical.right)
@@ -7337,8 +7373,16 @@ fn contains_await(expression: &Expr) -> bool {
         }
         Expression::Assignment(assignment) => {
             contains_await(&assignment.right)
-                || matches!(assignment.left.data(), AssignmentTarget::Member(member)
-                    if contains_await(&member.object))
+                || match assignment.left.data() {
+                    AssignmentTarget::Member(member) => {
+                        target_contains_await(&member.object, &member.property)
+                    }
+                    // Pattern and invalid targets can carry expressions in
+                    // computed keys and defaults; report containment so the
+                    // machine refuses rather than clones.
+                    AssignmentTarget::Identifier(_) => false,
+                    _ => true,
+                }
         }
         Expression::Sequence(sequence) => sequence.expressions.iter().any(contains_await),
         Expression::Parenthesized(inner) => contains_await(inner),
@@ -7409,10 +7453,11 @@ fn branch_awaits(statement: &Stmt) -> bool {
 }
 
 fn contains_yield_array(array: &ArrayLiteral) -> bool {
-    array
-        .elements
-        .iter()
-        .any(|element| matches!(element, ArrayElement::Expression(value) if contains_yield(value)))
+    array.elements.iter().any(|element| match element {
+        ArrayElement::Expression(value) => contains_yield(value),
+        ArrayElement::Spread(spread) => contains_yield(&spread.argument),
+        _ => false,
+    })
 }
 
 fn contains_yield(expression: &Expr) -> bool {
@@ -7424,11 +7469,7 @@ fn contains_yield(expression: &Expr) -> bool {
         Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
         Expression::Template(template) => template.expressions.iter().any(contains_yield),
         Expression::TaggedTemplate(_) => true,
-        Expression::Array(array) => array.elements.iter().any(|element| match element {
-            ArrayElement::Expression(nested) => contains_yield(nested),
-            ArrayElement::Spread(spread) => contains_yield(&spread.argument),
-            _ => false,
-        }),
+        Expression::Array(array) => contains_yield_array(array),
         Expression::Object(object) => object.members.iter().any(|member| match member.data() {
             ObjectMember::Property(property) => {
                 contains_yield(&property.value)
@@ -7457,8 +7498,15 @@ fn contains_yield(expression: &Expr) -> bool {
         Expression::Await(awaited) => contains_yield(&awaited.argument),
         Expression::Unary(unary) => contains_yield(&unary.argument),
         Expression::Update(update) => match update.argument.data() {
-            AssignmentTarget::Member(member) => contains_yield(&member.object),
-            _ => false,
+            AssignmentTarget::Member(member) => {
+                contains_yield(&member.object)
+                    || matches!(&member.property, MemberProperty::Computed(key) if contains_yield(key))
+            }
+            // Pattern and invalid targets can carry expressions in
+            // computed keys and defaults; report containment so the
+            // machine refuses rather than clones.
+            AssignmentTarget::Identifier(_) => false,
+            _ => true,
         },
         Expression::Binary(binary) => contains_yield(&binary.left) || contains_yield(&binary.right),
         Expression::Logical(logical) => {
