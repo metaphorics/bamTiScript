@@ -2467,33 +2467,16 @@ impl<'a> Emitter<'a> {
             .filter(|parameter| is_parameter_property(parameter.data()))
             .collect();
         let body = constructor.body.data();
-        if injections.is_empty() && body.statements.is_empty() {
-            // Same authority as any other empty block: same-line-authored
-            // prints `{ }` (243 spaced vs zero true-tight), while a body
-            // authored across lines keeps its newline (ParameterList6:
-            // `constructor(C) {\n}`). Open brace unmapped; the synthesized
-            // space stays unmapped; the close maps to its source token.
-            self.raw("{");
-            if self.node_spans_authored_lines(&constructor.body)
-                && self.source.spans_multiple_lines(constructor.body.range())
-            {
-                self.newline();
-            } else {
-                self.raw(" ");
-            }
-            self.raw_mapped_char_end("}", range, '}');
-            return;
-        }
-        // Preservation: a non-empty injection-free body authored on one line
-        // stays on one line. Parameter-property injections are synthesized
-        // at print time, so any injection forces the expanded path.
-        if injections.is_empty() && self.node_preserves_single_line(&constructor.body) {
-            self.raw("{ ");
-            for statement in &body.statements {
-                let _ = self.emit_statement(statement);
-                self.raw(" ");
-            }
-            self.raw_mapped_char_end("}", range, '}');
+        // An injection-free constructor body is an ordinary function-family
+        // body: empty, preserved-single-line, and expanded layouts all come
+        // from the one shared block rule (the next census correction lands
+        // there alone). Injections keep the expanded path below.
+        if injections.is_empty() {
+            self.emit_block_with_braces(
+                &constructor.body,
+                constructor.body.range(),
+                BlockLayout::FunctionBody,
+            );
             return;
         }
         self.raw("{");
