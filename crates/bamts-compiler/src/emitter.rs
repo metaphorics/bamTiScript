@@ -940,6 +940,16 @@ impl<'a> Emitter<'a> {
         !self.source.spans_multiple_lines(range)
     }
 
+    /// Whether a node is authored (not synthesized, range within the
+    /// authored text). The empty-body layout gate keys on this before
+    /// consulting authored line structure.
+    fn node_spans_authored_lines<T>(&self, node: &Node<T>) -> bool {
+        if self.is_synthesized(node.id()) {
+            return false;
+        }
+        node.range().end() <= self.authored_len
+    }
+
     /// Thin wrapper: checks a single AST node by its id and range.
     fn node_preserves_single_line<T>(&self, node: &Node<T>) -> bool {
         self.preserves_single_line(node.id(), node.range())
@@ -1469,11 +1479,21 @@ impl<'a> Emitter<'a> {
             } else {
                 self.raw("{");
             }
-            // Authority: tsc prints an empty block as `{ }` (strict census
-            // over 4501 single-unit `.ts` baselines: 2011 spaced paren-blocks
-            // plus arrows/try/static, zero true-tight outputs). The space is
-            // synthesized, so it stays unmapped like any other separator.
-            self.raw(" ");
+            // Authority, re-derived per context (2026-09-04 census: 285
+            // newline-authored to two-line, 1200 same-line to `{ }`, no
+            // try-family two-line evidence): same-line-authored empty
+            // bodies print `{ }` — the space is synthesized and unmapped —
+            // while a function-family body authored across lines keeps its
+            // newline (ParameterList6: `constructor(C) {\n}`). Synthesized
+            // or out-of-text ranges keep `{ }`.
+            if may_preserve
+                && self.node_spans_authored_lines(block)
+                && self.source.spans_multiple_lines(range)
+            {
+                self.newline();
+            } else {
+                self.raw(" ");
+            }
             self.raw_mapped_char_end("}", range, '}');
             return;
         }
@@ -2395,11 +2415,19 @@ impl<'a> Emitter<'a> {
             .collect();
         let body = constructor.body.data();
         if injections.is_empty() && body.statements.is_empty() {
-            // Same authority as any other empty block (`constructor() { }`:
-            // 243 spaced vs zero true-tight outputs). Open brace unmapped
-            // here as before; only the synthesized space and mapped close
-            // change.
-            self.raw("{ ");
+            // Same authority as any other empty block: same-line-authored
+            // prints `{ }` (243 spaced vs zero true-tight), while a body
+            // authored across lines keeps its newline (ParameterList6:
+            // `constructor(C) {\n}`). Open brace unmapped; the synthesized
+            // space stays unmapped; the close maps to its source token.
+            self.raw("{");
+            if self.node_spans_authored_lines(&constructor.body)
+                && self.source.spans_multiple_lines(constructor.body.range())
+            {
+                self.newline();
+            } else {
+                self.raw(" ");
+            }
             self.raw_mapped_char_end("}", range, '}');
             return;
         }
@@ -5957,6 +5985,38 @@ export default answer;
         assert!(code.contains("function (v)"), "{code}");
         assert!(code.contains("function* (w)"), "{code}");
         assert!(code.contains("function named(x)"), "{code}");
+    }
+
+    #[test]
+    fn empty_function_body_authored_across_lines_keeps_two_lines() {
+        // Authority: 285-baseline census — a newline-authored empty body
+        // prints `{\n}` (ParameterList6 ctor shape); same-line keeps `{ }`.
+        let input = "function f() {\n}\nclass C {\n  constructor() {\n  }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        let code = &javascript(&output).code;
+        assert!(code.contains("function f() {\n}\n"), "{code}");
+        assert!(code.contains("constructor() {\n    }"), "{code}");
+    }
+
+    #[test]
+    fn same_line_empty_bodies_keep_the_spaced_form() {
+        let input = "function g() {}\nclass D { constructor() {} }\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        let code = &javascript(&output).code;
+        assert!(code.contains("function g() { }"), "{code}");
+        assert!(code.contains("constructor() { }"), "{code}");
     }
 
     #[test]
