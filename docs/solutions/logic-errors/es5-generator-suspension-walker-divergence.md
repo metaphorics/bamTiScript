@@ -136,4 +136,6 @@ actually mints.
 - The corpus-level regression gate is the suite pair
   (`cargo test -p bamts-compiler` + `cargo test -p bamts-verification` with
   `BAMTS_ALLOW_NODE_COMPAT=1`), never the bare CLI `-p` path (it never
-  lowers the machine — refusal form only).
+  lowers the machine — refusal form only). These results are regression
+  evidence, not closure by themselves: completion requires their
+  receipt-backed G3 compiler root-gate linkage.
