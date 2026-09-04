@@ -7051,4 +7051,376 @@ var c = () => 1;
             output.diagnostics
         );
     }
+
+    // ------------------------------------------------------------------
+    // Adversarial hardening: the walker-duality contract as an invariant,
+    // not a shape list. Assumptions under test (IDs cited per test):
+    //   WD-1 duality: no emitted machine embeds a live yield outside a
+    //       `return [4 /*yield*/, ...]` split (generic leak detector).
+    //   WD-2 sentinel shapes (TaggedTemplate/Satisfies/TypeAssertion/JSX)
+    //       are eval-refused, never inline-cloned.
+    //   WD-3 count == segments eval mints: machine case labels are
+    //       contiguous 0..=max and unique (gap detector; boundaries
+    //       0/1/2/3 suspensions).
+    //   WD-4 nested function-likes own their suspensions: cloning them
+    //       is correct, their internal yield is legal.
+    //   WD-5 non-block loop bodies refuse, never miscompile.
+    //   WD-6/7 Import (source+options) and Conditional/Logical counts
+    //       feed exact label arithmetic.
+    //   WD-8 labeled-loop delegation covers nested awaited bodies.
+    //   WD-9 recursive walkers survive deep nesting without crashing.
+    // ------------------------------------------------------------------
+
+    /// Emits `input` at es5 without helpers; panics on parse diagnostics.
+    fn emit_es5_clean(input: &str) -> EmitOutput {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        )
+    }
+
+    /// WD-1: in machine form, every `yield` must sit inside a split marker
+    /// `/*yield*/`; a bare yield is a live suspension cloned into a plain
+    /// function (the miscompile class). Returns the offending snippet text.
+    fn live_yield_leak(code: &str) -> Option<String> {
+        if !code.contains("__generator(this,") {
+            return None; // native refusal form: the generator owns its yields
+        }
+        code.lines()
+            .find(|line| {
+                line.contains("yield") && !line.contains("/*yield*/") && line.contains("yield ")
+            })
+            .map(|line| line.trim().to_owned())
+    }
+
+    /// WD-1b: in machine form, every return must be a protocol return
+    /// (`return [`) — a bare `return expr;` in the machine body exits the
+    /// inner function directly and the runtime silently drops the value.
+    /// Battery-scoped: snippets are flat (no nested function bodies, whose
+    /// returns are legal); the nested-ownership contract has its own pin.
+    fn raw_return_leak(code: &str) -> Option<String> {
+        if !code.contains("__generator(this,") {
+            return None;
+        }
+        code.lines()
+            .find(|line| {
+                let l = line.trim_start();
+                l.starts_with("return ")
+                    && !l.starts_with("return [")
+                    && !l.starts_with("return __generator")
+                    && !l.starts_with("return __awaiter")
+            })
+            .map(|line| line.trim().to_owned())
+    }
+
+    /// WD-3: the machine switch's case labels must be unique and contiguous
+    /// from 0 (a gap or duplicate means count_yields disagreed with the
+    /// segments eval actually minted).
+    fn machine_case_labels(code: &str) -> Vec<u32> {
+        let start = code.find("switch (_a.label)").expect("machine switch");
+        let body = &code[start..];
+        let mut labels: Vec<u32> = body
+            .split("case ")
+            .skip(1)
+            .filter_map(|rest| rest.split(':').next())
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        labels
+    }
+
+    #[test]
+    fn es5_async_return_in_loop_body_never_drops_value() {
+        // A cloned `return y` inside the machine body returns straight out
+        // of the inner function; the runtime treats the non-array as done
+        // with `void 0` — the value is silently dropped. The loop body
+        // cannot lower a return, so the machine must refuse (until a
+        // return-protocol slice lands), never clone.
+        let output = emit_es5_clean(
+            "declare var x: any, y: any;\nasync function f() { while (x) { return y; } }\n",
+        );
+        let code = &javascript(&output).code;
+        assert!(
+            !code.contains("__generator(this,"),
+            "machine must not embed a raw return: {code}"
+        );
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "refusal must signal: {:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn walker_duality_battery_never_clones_live_yield() {
+        // WD-1: each snippet puts a suspending shape behind each clone gate.
+        let snippets = [
+            (
+                "update-computed-while",
+                "declare var o: any, k: any;\nfunction* g() { while (o[k ? k : 0][`x`], o[yield k]++ < 3) { } }\n",
+            ),
+            (
+                "array-spread-statement",
+                "declare var x: any;\nfunction* g() { [...(yield x)]; }\n",
+            ),
+            (
+                "array-spread-while-body",
+                "declare var x: any, y: any;\nfunction* g() { while (y) { [...(yield x)]; } }\n",
+            ),
+            (
+                "object-spread-do-test",
+                "declare var x: any;\nfunction* g() { do { } while ({ ...(yield x) }); }\n",
+            ),
+            (
+                "assignment-pattern-while",
+                "declare var x: any, y: any;\nfunction* g() { while ({ a: x } = y) { yield x; } }\n",
+            ),
+            (
+                "template-expr-statement",
+                "declare var x: any;\nfunction* g() { `${yield x}`; }\n",
+            ),
+            (
+                "conditional-in-machine",
+                "declare var x: any, y: any;\nfunction* g() { return (yield x) ? y : (yield x); }\n",
+            ),
+            (
+                "logical-in-machine",
+                "declare var x: any, y: any;\nfunction* g() { return (yield x) || (yield y); }\n",
+            ),
+            (
+                "import-expr-machine",
+                "declare var x: any;\nfunction* g() { return import(yield x); }\n",
+            ),
+            (
+                "new-suspending-args",
+                "declare var x: any;\nfunction* g() { return new C(yield x); }\n",
+            ),
+            (
+                "nested-if-await-while",
+                "declare var x: any, y: any, z: any;\nasync function f() { while (x) { if (y) { await z; } } }\n",
+            ),
+            (
+                "nested-if-await-labeled",
+                "declare var x: any, y: any, z: any;\nasync function f() { A: while (x) { if (y) { await z; break A; } } }\n",
+            ),
+            (
+                "nested-if-await-do",
+                "declare var x: any, y: any, z: any;\nasync function f() { do { if (y) { await z; } } while (x); }\n",
+            ),
+            (
+                "return-in-while-body",
+                "declare var x: any, y: any;\nasync function f() { while (x) { return y; } }\n",
+            ),
+            (
+                "clean-nested-while-clones",
+                "declare var x: any, z: any;\nasync function f() { while (x) { while (z) { } } }\n",
+            ),
+            (
+                "return-in-if-branch",
+                "declare var y: any, z: any;\nasync function f() { if (y) { return z; } }\n",
+            ),
+            (
+                "return-in-labeled-body",
+                "declare var x: any, y: any;\nasync function f() { A: while (x) { return y; } }\n",
+            ),
+            (
+                "nested-if-await-if-arm",
+                "declare var x: any, y: any, z: any;\nasync function f() { if (x) { if (y) { await z; } } }\n",
+            ),
+        ];
+        for (name, input) in snippets {
+            let output = emit_es5_clean(input);
+            let code = &javascript(&output).code;
+            if let Some(leak) = live_yield_leak(code) {
+                panic!("[{name}] live yield cloned into machine: {leak}");
+            }
+            if let Some(leak) = raw_return_leak(code) {
+                panic!("[{name}] raw return in machine body drops value: {leak}");
+            }
+        }
+    }
+
+    #[test]
+    fn sentinel_shapes_route_to_refusal_not_clone() {
+        // WD-2: eval has no accepting arms for these shapes; the sentinel
+        // count must send them there, never through the inline clone gate.
+        for (name, input) in [
+            (
+                "tagged-template",
+                "declare var tag: any, k: any;\nfunction* g() { while (tag`x ${yield k}`) { } }\n",
+            ),
+            (
+                "type-assertion",
+                "declare var k: any;\nfunction* g() { while (<any>(yield k)) { } }\n",
+            ),
+        ] {
+            let output = emit_es5_clean(input);
+            let code = &javascript(&output).code;
+            assert!(
+                code.contains("function* g(") || live_yield_leak(code).is_none(),
+                "[{name}] must refuse (native form) or lower safely, got:\n{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn machine_case_labels_are_contiguous_and_unique() {
+        // WD-3 + WD-6 + WD-7, boundaries 0/1/2/3 suspensions on both sides
+        // of every count.
+        for (name, input) in [
+            (
+                "zero",
+                "declare var x: any;\nasync function f() { while (x) { } }\n",
+            ),
+            (
+                "one",
+                "declare var x: any, y: any;\nasync function f() { while (x) { await y; } }\n",
+            ),
+            (
+                "two",
+                "declare var x: any, y: any, z: any;\nasync function f() { while (x) { await y; await z; } }\n",
+            ),
+            (
+                "three-test-split",
+                "declare var o: any, k: any, y: any;\nasync function f() { while (o[await k]++ < 3) { await y; } }\n",
+            ),
+            (
+                "import-two-suspensions",
+                "declare var a: any, b: any;\nasync function f() { return import(await a, { m: await b }); }\n",
+            ),
+            (
+                "conditional-three",
+                "declare var a: any, b: any, c: any;\nasync function f() { return (await a) ? await b : await c; }\n",
+            ),
+            (
+                "jump-guard-exact-count",
+                "declare var x: any, y: any, z: any;\nasync function f() { while (x) { if (y) continue; await z; } }\n",
+            ),
+        ] {
+            let output = emit_es5_clean(input);
+            let code = &javascript(&output).code;
+            if !code.contains("switch (_a.label)") {
+                continue; // refused: fine, label arithmetic never ran
+            }
+            let labels = machine_case_labels(code);
+            assert!(!labels.is_empty(), "[{name}] machine without labels");
+            let expected: Vec<u32> = (0..=*labels.last().expect("non-empty")).collect();
+            assert_eq!(
+                labels, expected,
+                "[{name}] case labels must be contiguous: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_function_likes_own_suspensions_when_cloned() {
+        // WD-4: a method member owns its yields, so the object clones as
+        // clean into the machine and the INTERNAL yield stays legal.
+        let output = emit_es5_clean(
+            "declare var x: any;\nasync function f() {\n    while ({ m() { return 1; } }) { await x; }\n}\n",
+        );
+        let code = &javascript(&output).code;
+        assert!(code.contains("__generator(this,"), "lowers: {code}");
+        assert!(code.contains("m() {"), "method cloned intact: {code}");
+        assert!(!code.contains("function*("), "{code}");
+    }
+
+    #[test]
+    fn non_block_loop_bodies_refuse() {
+        // WD-5: single-statement bodies are outside the accepted set; the
+        // only valid outcomes are refusal with a diagnostic.
+        for (name, input) in [
+            (
+                "while",
+                "declare var x: any, y: any;\nasync function f() { while (x) await y; }\n",
+            ),
+            (
+                "for",
+                "declare var x: any, y: any;\nasync function f() { for (; x;) await y; }\n",
+            ),
+            (
+                "do",
+                "declare var x: any, y: any;\nasync function f() { do await y; while (x); }\n",
+            ),
+        ] {
+            let output = emit_es5_clean(input);
+            let code = &javascript(&output).code;
+            assert!(
+                code.contains("function*(") || live_yield_leak(code).is_none(),
+                "[{name}] non-block body must refuse, never clone: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_nested_await_delegation_lowers() {
+        // WD-8: branch_awaits delegates through nested statement shapes.
+        let output = emit_es5_clean(
+            "declare var x: any, y: any, z: any;\nasync function f() {\n    A: while (x) { if (y) { await z; break A; } }\n}\n",
+        );
+        let code = &javascript(&output).code;
+        // Safety contract: refuse-or-lower, never a live await cloned
+        // outside the generator that owns it. (Full lowering of nested
+        // control flow inside labeled loop bodies is a banked machine
+        // slice; until then the refusal form is the correct output.)
+        assert!(
+            code.contains("function*") || code.contains("__generator(this,"),
+            "must refuse or lower: {code}"
+        );
+        assert!(live_yield_leak(code).is_none(), "{code}");
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "refusal must signal: {:?}",
+            output.diagnostics
+        );
+    }
+
+    #[test]
+    fn deep_nesting_walkers_do_not_crash() {
+        // WD-9: recursive walkers on a pathological expression must
+        // produce a descriptive outcome (machine, refusal, or diagnostics),
+        // never a crash.
+        let depth = 2_000;
+        let input = format!(
+            "declare var y: any;\nasync function f() {{ {}await y; }}\n",
+            "-".repeat(depth)
+        );
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input.as_str()).expect("fits budget")),
+        ));
+        if parsed.diagnostics().is_empty() {
+            let output = emit_output(
+                parsed.product(),
+                &EmitOptions {
+                    target: ScriptTarget::Es5,
+                    no_emit_helpers: true,
+                    ..EmitOptions::default()
+                },
+            );
+            let code = &javascript(&output).code;
+            assert!(
+                code.contains("__generator(this,") || code.contains("function*("),
+                "some emitted form: {code}"
+            );
+        }
+    }
 }

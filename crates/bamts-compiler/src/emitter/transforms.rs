@@ -3960,7 +3960,18 @@ impl<'a> Rewriter<'a> {
             body: Some(inner_body),
         };
         let inner = if Self::needs(LanguageFeature::Generators, self.options) {
-            self.lower_generator_function(&inner)
+            let lowered = self.lower_generator_function(&inner);
+            if lowered.is_generator {
+                // The machine declined; the inner stays a native generator
+                // inside __awaiter, which the target cannot run. Signal it
+                // instead of emitting ES2015+ syntax silently.
+                self.diag(
+                    codes::GENERATOR_REQUIRES_ES2015,
+                    range,
+                    "generators require ScriptTarget::Es2015 or later",
+                );
+            }
+            lowered
         } else {
             inner
         };
@@ -4304,7 +4315,11 @@ impl<'a> Rewriter<'a> {
         let cons_resumes = count_branch_yields(cons_block);
         let alt_resumes = count_branch_yields(alt_block);
 
-        if cons_resumes == 0 && alt_resumes == 0 {
+        if cons_resumes == 0
+            && alt_resumes == 0
+            && !statements_contain_return(cons_block)
+            && !statements_contain_return(alt_block)
+        {
             // Inline reassembly: only the test can suspend.
             if !contains_yield(&if_statement.test) {
                 ctx.push(statement.clone());
@@ -4370,7 +4385,9 @@ impl<'a> Rewriter<'a> {
         match body.data() {
             Statement::While(while_statement) => {
                 let body_block = block_statements(&while_statement.body)?;
-                if count_yields(&while_statement.test) == 0 && count_branch_yields(body_block) == 0
+                if count_yields(&while_statement.test) == 0
+                    && count_branch_yields(body_block) == 0
+                    && !statements_contain_return(body_block)
                 {
                     // Clean loops stay inline, label attached.
                     ctx.push(statement.clone());
@@ -4380,7 +4397,10 @@ impl<'a> Rewriter<'a> {
             }
             Statement::DoWhile(do_statement) => {
                 let body_block = block_statements(&do_statement.body)?;
-                if count_yields(&do_statement.test) == 0 && count_branch_yields(body_block) == 0 {
+                if count_yields(&do_statement.test) == 0
+                    && count_branch_yields(body_block) == 0
+                    && !statements_contain_return(body_block)
+                {
                     ctx.push(statement.clone());
                     return Some(());
                 }
@@ -4388,7 +4408,10 @@ impl<'a> Rewriter<'a> {
             }
             Statement::For(for_statement) => {
                 let body_block = block_statements(&for_statement.body)?;
-                if for_clauses_are_clean(for_statement) && count_branch_yields(body_block) == 0 {
+                if for_clauses_are_clean(for_statement)
+                    && count_branch_yields(body_block) == 0
+                    && !statements_contain_return(body_block)
+                {
                     let rebuilt =
                         self.inline_for_with_hoist(statement.range(), for_statement, ctx)?;
                     let label = match statement.data() {
@@ -4434,7 +4457,7 @@ impl<'a> Rewriter<'a> {
         let body_block = block_statements(&while_statement.body)?;
         let test_resumes = count_yields(&while_statement.test);
         let body_resumes = count_branch_yields(body_block);
-        if test_resumes == 0 && body_resumes == 0 {
+        if test_resumes == 0 && body_resumes == 0 && !statements_contain_return(body_block) {
             ctx.push(statement.clone());
             return Some(());
         }
@@ -4495,7 +4518,7 @@ impl<'a> Rewriter<'a> {
         let body_block = block_statements(&do_statement.body)?;
         let test_resumes = count_yields(&do_statement.test);
         let body_resumes = count_branch_yields(body_block);
-        if test_resumes == 0 && body_resumes == 0 {
+        if test_resumes == 0 && body_resumes == 0 && !statements_contain_return(body_block) {
             ctx.push(statement.clone());
             return Some(());
         }
@@ -4607,7 +4630,10 @@ impl<'a> Rewriter<'a> {
     ) -> Option<()> {
         let range = statement.range();
         let body_block = block_statements(&for_statement.body)?;
-        if for_clauses_are_clean(for_statement) && count_branch_yields(body_block) == 0 {
+        if for_clauses_are_clean(for_statement)
+            && count_branch_yields(body_block) == 0
+            && !statements_contain_return(body_block)
+        {
             let rebuilt = self.inline_for_with_hoist(range, for_statement, ctx)?;
             ctx.push(rebuilt);
             return Some(());
@@ -6981,7 +7007,10 @@ fn branch_is_simple(statements: &[Stmt]) -> bool {
     })
 }
 
-/// The number of yield splits a branch's statements produce.
+/// The number of yield splits a branch's statements produce. Zero gates
+/// the inline verbatim clone, so a statement shape the loop-body emitter
+/// cannot lower must report non-zero (it refuses, keeping the native
+/// form) — never zero.
 fn count_branch_yields(statements: &[Stmt]) -> u32 {
     statements
         .iter()
@@ -6998,9 +7027,78 @@ fn count_branch_yields(statements: &[Stmt]) -> u32 {
                         .map_or(0, count_yields)
                 })
                 .sum(),
-            _ => 0,
+            Statement::Continue(_) | Statement::Break(_) | Statement::Empty => 0,
+            Statement::Return(ret) => ret.argument.as_deref().map_or(0, count_yields),
+            Statement::Throw(throw) => count_yields(&throw.argument),
+            Statement::Block(block) => count_branch_yields(&block.data().statements),
+            // Clean nested control flow clones correctly inside a machine
+            // body, so it counts precisely; suspending nested shapes route
+            // to the body emitter, which refuses what it cannot lower.
+            Statement::If(if_statement) => {
+                count_yields(&if_statement.test)
+                    + count_branch_yields(branch_statements(&if_statement.consequent))
+                    + if_statement
+                        .alternate
+                        .as_ref()
+                        .map_or(0, |alt| count_branch_yields(branch_statements(alt)))
+            }
+            Statement::While(while_statement) => {
+                count_yields(&while_statement.test)
+                    + count_branch_yields(loop_body_statements(&while_statement.body))
+            }
+            Statement::DoWhile(do_statement) => {
+                count_yields(&do_statement.test)
+                    + count_branch_yields(loop_body_statements(&do_statement.body))
+            }
+            Statement::Labeled(labeled) => count_branch_yields(branch_statements(&labeled.body)),
+            _ => 1,
         })
         .sum()
+}
+
+/// The statements of an if/else branch: a block flattens, any other
+/// statement is a single-statement branch.
+fn branch_statements(statement: &Stmt) -> &[Stmt] {
+    match statement.data() {
+        Statement::Block(block) => &block.data().statements,
+        _ => std::slice::from_ref(statement),
+    }
+}
+
+/// The statements of a loop body: non-block bodies are shapes this slice
+/// refuses anyway; None renders as empty for counting purposes.
+fn loop_body_statements(body: &Stmt) -> &[Stmt] {
+    static NONE: &[Stmt] = &[];
+    match body.data() {
+        Statement::Block(block) => &block.data().statements,
+        _ => NONE,
+    }
+}
+
+/// Whether any statement in this region returns — at any nesting depth,
+/// but never inside a nested function-like (those own their returns).
+/// A cloned raw return exits the machine's inner function directly and
+/// the runtime silently drops the value, so clone gates must refuse.
+fn statements_contain_return(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match statement.data() {
+        Statement::Return(_) => true,
+        Statement::Block(block) => statements_contain_return(&block.data().statements),
+        Statement::If(if_statement) => {
+            statements_contain_return(branch_statements(&if_statement.consequent))
+                || if_statement
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alt| statements_contain_return(branch_statements(alt)))
+        }
+        Statement::While(while_statement) => {
+            statements_contain_return(loop_body_statements(&while_statement.body))
+        }
+        Statement::DoWhile(do_statement) => {
+            statements_contain_return(loop_body_statements(&do_statement.body))
+        }
+        Statement::Labeled(labeled) => statements_contain_return(branch_statements(&labeled.body)),
+        _ => false,
+    })
 }
 
 impl ChainSegment {
@@ -7334,7 +7432,10 @@ fn contains_await(expression: &Expr) -> bool {
                 contains_await(&property.value)
                     || matches!(&property.name, PropertyName::Computed(key) if contains_await(key))
             }
-            _ => true,
+            ObjectMember::Spread(spread) => contains_await(&spread.argument),
+            // Method-like members own their suspensions; cloning them is
+            // correct, not a leak.
+            _ => false,
         }),
         Expression::Call(call) => {
             contains_await(&call.callee)
@@ -7475,7 +7576,10 @@ fn contains_yield(expression: &Expr) -> bool {
                 contains_yield(&property.value)
                     || matches!(&property.name, PropertyName::Computed(key) if contains_yield(key))
             }
-            _ => true,
+            ObjectMember::Spread(spread) => contains_yield(&spread.argument),
+            // Method-like members own their suspensions, like nested
+            // function-likes; cloning them is correct, not a leak.
+            _ => false,
         }),
         Expression::Call(call) => {
             contains_yield(&call.callee)
