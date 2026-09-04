@@ -4206,6 +4206,9 @@ impl<'a> Rewriter<'a> {
                 Statement::DoWhile(do_statement) => {
                     self.machine_emit_do(statement, do_statement, ctx)?;
                 }
+                Statement::For(for_statement) => {
+                    self.machine_emit_for(statement, for_statement, ctx)?;
+                }
                 Statement::Labeled(labeled) => {
                     let name = self.identifier_name(&labeled.label)?;
                     ctx.loop_labels.push(name);
@@ -4374,6 +4377,27 @@ impl<'a> Rewriter<'a> {
                 }
                 self.machine_emit_do(body, do_statement, ctx)
             }
+            Statement::For(for_statement) => {
+                let body_block = block_statements(&for_statement.body)?;
+                if for_clauses_are_clean(for_statement) && count_branch_yields(body_block) == 0 {
+                    let rebuilt =
+                        self.inline_for_with_hoist(statement.range(), for_statement, ctx)?;
+                    let label = match statement.data() {
+                        Statement::Labeled(labeled) => labeled.label.clone(),
+                        _ => return None,
+                    };
+                    let labeled = self.node(
+                        statement.range(),
+                        Statement::Labeled(LabeledStatement {
+                            label,
+                            body: Box::new(rebuilt),
+                        }),
+                    );
+                    ctx.push(labeled);
+                    return Some(());
+                }
+                self.machine_emit_for(body, for_statement, ctx)
+            }
             Statement::Labeled(labeled) => {
                 let name = self.identifier_name(&labeled.label)?;
                 ctx.loop_labels.push(name);
@@ -4505,6 +4529,163 @@ impl<'a> Rewriter<'a> {
         let state = ctx.state.clone();
         let mark = self.label_assignment(exit_label, &state, range);
         ctx.push(mark);
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, exit_label);
+        Some(())
+    }
+
+    /// A clean for-loop whose head declares `var`s keeps tsc's shape: the
+    /// declarations hoist to the machine's var section and the head keeps
+    /// only an assignment initializer (`for (c = x; ...)`), or nothing.
+    fn inline_for_with_hoist(
+        &mut self,
+        range: TextRange,
+        for_statement: &ForStatement,
+        ctx: &mut MachineCtx,
+    ) -> Option<Stmt> {
+        let initializer = match &for_statement.initializer {
+            Some(ForInitializer::Variable(declaration)) => {
+                if declaration.declarations.len() != 1 {
+                    return None;
+                }
+                let declarator = &declaration.declarations[0];
+                let BindingPattern::Identifier(name) = declarator.data().binding.data() else {
+                    return None;
+                };
+                let name = name.clone();
+                ctx.hoisted.push(name.clone());
+                match &declarator.data().initializer {
+                    Some(initializer) => {
+                        let assign = self.assign_statement(
+                            &name,
+                            initializer.as_ref().clone(),
+                            initializer.range(),
+                        );
+                        let expression = match assign.data() {
+                            Statement::Expression(expression) => expression.expression.clone(),
+                            _ => return None,
+                        };
+                        Some(ForInitializer::Expression(expression))
+                    }
+                    None => None,
+                }
+            }
+            other => other.clone(),
+        };
+        Some(self.node(
+            range,
+            Statement::For(ForStatement {
+                initializer,
+                test: for_statement.test.clone(),
+                update: for_statement.update.clone(),
+                body: for_statement.body.clone(),
+            }),
+        ))
+    }
+
+    /// Lowers a for-loop into the machine. The initializer runs at the
+    /// head, the test label follows it (a suspending test resumes into the
+    /// guard), the negated guard exits to the exit label, the body runs
+    /// with continue targeting the update label (JS for semantics), the
+    /// update label holds the increment and loops back to the test label,
+    /// and the exit label continues the machine. Clean loops stay inline.
+    fn machine_emit_for(
+        &mut self,
+        statement: &Stmt,
+        for_statement: &ForStatement,
+        ctx: &mut MachineCtx,
+    ) -> Option<()> {
+        let range = statement.range();
+        let body_block = block_statements(&for_statement.body)?;
+        if for_clauses_are_clean(for_statement) && count_branch_yields(body_block) == 0 {
+            let rebuilt = self.inline_for_with_hoist(range, for_statement, ctx)?;
+            ctx.push(rebuilt);
+            return Some(());
+        }
+        let Some(test) = for_statement.test.as_deref() else {
+            // No test clause: the machine shape is not specced here.
+            return None;
+        };
+        if ctx.terminated {
+            return None;
+        }
+        let init_resumes = match &for_statement.initializer {
+            Some(ForInitializer::Expression(expression)) => count_yields(expression),
+            Some(ForInitializer::Variable(_)) | None => 0,
+        };
+        let test_resumes = count_yields(test);
+        let update_resumes = for_statement.update.as_deref().map_or(0, count_yields);
+        let body_resumes = count_branch_yields(body_block);
+        let head = ctx.segments.len() as u32 - 1;
+        let test_label = head + init_resumes + 1;
+        let guard_label = test_label + test_resumes;
+        let update_label = guard_label + body_resumes + 1;
+        let exit_label = update_label + update_resumes + 1;
+
+        match &for_statement.initializer {
+            Some(ForInitializer::Variable(declaration)) => {
+                // The declaration is plain data here; re-wrap it in a
+                // statement for the shared branch emitter.
+                let wrapper = self.node(
+                    range,
+                    Statement::Variable(VariableDeclaration {
+                        range: declaration.range,
+                        kind: declaration.kind,
+                        declarations: declaration.declarations.clone(),
+                    }),
+                );
+                self.machine_emit_branch(std::slice::from_ref(&wrapper), ctx)?;
+            }
+            Some(ForInitializer::Expression(expression)) => {
+                self.machine_emit_expression(expression, ctx)?;
+            }
+            None => {}
+        }
+        let state = ctx.state.clone();
+        let mark = self.label_assignment(test_label, &state, range);
+        ctx.push(mark);
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, test_label);
+        let evaluated = self.eval(test, ctx)?;
+        let negated = self.node(
+            test.range(),
+            Expression::Unary(UnaryExpression {
+                operator: UnaryOperator::Not,
+                argument: Box::new(evaluated),
+            }),
+        );
+        let jump = self.break_to(exit_label, range);
+        let guard = self.node(
+            range,
+            Statement::If(IfStatement {
+                test: Box::new(negated),
+                consequent: Box::new(jump),
+                alternate: None,
+            }),
+        );
+        ctx.push(guard);
+
+        self.machine_emit_loop_body(body_block, update_label, exit_label, ctx)?;
+        let body_terminated = ctx
+            .segments
+            .last()
+            .and_then(|segment| segment.last())
+            .is_some_and(|statement| matches!(statement.data(), Statement::Return(_)));
+        if !body_terminated {
+            let state = ctx.state.clone();
+            let mark = self.label_assignment(update_label, &state, range);
+            ctx.push(mark);
+        }
+
+        ctx.segments.push(Vec::new());
+        debug_assert_eq!(ctx.segments.len() as u32 - 1, update_label);
+        if let Some(update) = for_statement.update.as_deref() {
+            self.machine_emit_expression(update, ctx)?;
+        }
+        let back = self.break_to(test_label, range);
+        ctx.push(back);
 
         ctx.segments.push(Vec::new());
         debug_assert_eq!(ctx.segments.len() as u32 - 1, exit_label);
@@ -6485,6 +6666,23 @@ fn block_statements(statement: &Stmt) -> Option<&[Stmt]> {
         Statement::Block(block) => Some(&block.data().statements),
         _ => None,
     }
+}
+
+/// Whether a for-loop's clauses carry no suspensions (the body may).
+fn for_clauses_are_clean(for_statement: &ForStatement) -> bool {
+    let init_clean = match &for_statement.initializer {
+        Some(ForInitializer::Expression(expression)) => !contains_yield(expression),
+        _ => true,
+    };
+    let test_clean = for_statement
+        .test
+        .as_deref()
+        .is_none_or(|test| !contains_yield(test));
+    let update_clean = for_statement
+        .update
+        .as_deref()
+        .is_none_or(|update| !contains_yield(update));
+    init_clean && test_clean && update_clean
 }
 
 /// Whether every branch statement is a shape the labeled if slice emits.

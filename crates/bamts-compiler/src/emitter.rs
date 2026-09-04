@@ -6502,6 +6502,36 @@ export default answer;
     }
 
     #[test]
+    fn es5_async_for_clause_await_builds_phase_labels() {
+        // Authority: es5-asyncFunctionForStatements(target=es5)
+        // forStatement2 — the test clause suspends: init marks the test
+        // label, the guard resumes from the yield, the update loops back
+        // to the test label, and continue targets the update label.
+        let options = EmitOptions {
+            target: ScriptTarget::Es5,
+            no_emit_helpers: true,
+            ..EmitOptions::default()
+        };
+        let input = "declare var x, y, z, a;\nasync function forStatement2() {\n    for (x; await y; z) { a; }\n}\n";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &options);
+        let code = &javascript(&output).code;
+        assert!(
+            code.contains("case 0:\n                    x;\n                    _a.label = 1;\n                case 1: return [4 /*yield*/, y];"),
+            "{code}"
+        );
+        assert!(
+            code.contains("case 3:\n                    z;\n                    return [3 /*break*/, 1];"),
+            "{code}"
+        );
+    }
+
+    #[test]
     fn es5_async_arrow_with_this_keeps_the_arrow() {
         // Bodies referencing `this` need the hoisted-capture machinery, so
         // the conversion refuses and the arrow form stays.
