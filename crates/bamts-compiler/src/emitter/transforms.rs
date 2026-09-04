@@ -574,6 +574,7 @@ struct Rewriter<'a> {
     options: &'a TransformOptions,
     model: Option<&'a SemanticModel>,
     source_id: SourceId,
+    source: SourceText,
     source_text: String,
     bank: NameBank,
     ids: &'a mut NodeIdSource,
@@ -669,6 +670,7 @@ impl<'a> Rewriter<'a> {
             options,
             model,
             source_id: file.source_id(),
+            source: file.source_text().clone(),
             source_text: file.source_text().as_str().to_owned(),
             bank: NameBank::new(file.source_text()),
             ids,
@@ -1177,6 +1179,14 @@ impl<'a> Rewriter<'a> {
     fn helper_ident(&mut self, kind: HelperKind) -> Expr {
         self.used_helpers.insert(kind);
         self.ident_expr(kind.ident())
+    }
+
+    /// The authored spelling of an identifier, from the original text.
+    fn identifier_name(&self, ident: &IdentifierNode) -> Option<String> {
+        let token = ident.data().token();
+        let start = self.source.utf16_to_byte(token.range().start()).ok()?;
+        let end = self.source.utf16_to_byte(token.range().end()).ok()?;
+        self.source.as_str().get(start..end).map(str::to_owned)
     }
 
     fn number_expr(&mut self, lexeme: &str) -> Expr {
@@ -4089,26 +4099,30 @@ impl<'a> Rewriter<'a> {
         }
     }
 
-    /// each yield splits a labeled segment and the resumed value flows back
-    /// through `<state>.sent()`. Expression-level yields reassemble per tsc
-    /// form: binary/template/sequence operands materialize into temps,
-    /// suspending call arguments rebuild through `.apply(void 0, [..])`,
-    /// array literals through prefix temps and `.concat`, object literals
-    /// through property-assignment sequences. Short-circuit shapes (logical
-    /// right operands, conditional branches, suspending `new` arguments)
-    /// and statement-level control flow keep the native generator and its
-    /// diagnostic rather than miscompiling.
     fn generator_machine(&mut self, block: &BlockNode) -> Option<MachineParts> {
-        // Names follow tsc's allocation: temps `_a`.. first, then the state
-        // parameter after them. A probe pass with a throwaway state name
-        // discovers the temp count; a second pass builds the real tree.
-        let mut probe = MachineCtx::new("_m0s");
+        // User var names join the skip set so machine temps and the state
+        // parameter never collide with them. A probe pass with a throwaway
+        // state name discovers the temp count; a second pass builds the
+        // real tree with tsc's allocation: temps `_a`.. first, then the
+        // state parameter after them.
+        let mut skip = std::collections::HashSet::new();
+        for statement in &block.data().statements {
+            if let Statement::Variable(declaration) = statement.data() {
+                for declarator in &declaration.declarations {
+                    if let BindingPattern::Identifier(name) = declarator.data().binding.data()
+                        && let Some(text) = self.identifier_name(name)
+                    {
+                        skip.insert(text);
+                    }
+                }
+            }
+        }
+        let mut probe = MachineCtx::new("_m0s", skip.clone());
         self.machine_statements(block, &mut probe)?;
-        let temp_count = probe.temps.len();
-        let state = machine_state_name(temp_count);
-        let mut ctx = MachineCtx::new(&state);
+        let state = machine_state_name(&skip, &probe.temp_names);
+        let mut ctx = MachineCtx::new(&state, skip);
         self.machine_statements(block, &mut ctx)?;
-        debug_assert_eq!(ctx.temps.len(), temp_count);
+        debug_assert_eq!(ctx.temp_names.len(), probe.temp_names.len());
         let range = block.range();
         let hoisted = ctx.hoisted.clone();
         let temps = ctx.temps.clone();
@@ -6012,7 +6026,6 @@ fn raw_token_text(file: &SourceFile, token: &Token) -> String {
 /// state parameter name, temp names, and the machine statements.
 type MachineParts = (Vec<IdentifierNode>, String, Vec<IdentifierNode>, Vec<Stmt>);
 
-/// The unescaped identifier spelling for a source identifier node.
 /// Builder state for one `__generator` machine pass.
 struct MachineCtx {
     hoisted: Vec<IdentifierNode>,
@@ -6021,10 +6034,11 @@ struct MachineCtx {
     segments: Vec<Vec<Stmt>>,
     terminated: bool,
     state: String,
+    skip: std::collections::HashSet<String>,
 }
 
 impl MachineCtx {
-    fn new(state: &str) -> Self {
+    fn new(state: &str, skip: std::collections::HashSet<String>) -> Self {
         Self {
             hoisted: Vec::new(),
             temps: Vec::new(),
@@ -6032,6 +6046,7 @@ impl MachineCtx {
             segments: vec![Vec::new()],
             terminated: false,
             state: state.to_string(),
+            skip,
         }
     }
 
@@ -6042,12 +6057,13 @@ impl MachineCtx {
             .push(statement);
     }
 
-    /// The next free `_a`-style temp name, skipping the state parameter
-    /// and temps already allocated.
+    /// The next free `_a`-style temp name, skipping user var names, the
+    /// state parameter, and temps already allocated.
     fn next_temp_name(&self) -> Option<String> {
         let taken: std::collections::HashSet<String> = self
-            .temp_names
+            .skip
             .iter()
+            .chain(self.temp_names.iter())
             .chain([&self.state])
             .cloned()
             .collect();
@@ -6072,8 +6088,17 @@ fn machine_name(index: u32) -> Option<String> {
     Some(format!("_{}", letters[index] as char))
 }
 
-fn machine_state_name(temp_count: usize) -> String {
-    machine_name(temp_count as u32).unwrap_or_else(|| "_state".to_string())
+/// The state parameter takes the first free name after the temps.
+fn machine_state_name(skip: &std::collections::HashSet<String>, temps: &[String]) -> String {
+    let taken: std::collections::HashSet<&String> = skip.iter().chain(temps.iter()).collect();
+    let mut index = 0u32;
+    loop {
+        let name = machine_name(index).unwrap_or_else(|| "_state".to_string());
+        if !taken.contains(&name) {
+            return name;
+        }
+        index += 1;
+    }
 }
 
 fn call_argument_suspends(argument: &CallArgument) -> bool {
