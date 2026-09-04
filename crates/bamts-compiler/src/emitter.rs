@@ -1454,10 +1454,15 @@ impl<'a> Emitter<'a> {
             self.raw_mapped_char_end("}", range, '}');
             return;
         }
-        // Preservation: a non-empty body authored on one line stays on one
-        // line (`{ stmt; stmt; }`). Synthesized, past-authored-text, or
-        // multi-line-authored bodies take the expanded path below.
-        if self.node_preserves_single_line(block) {
+        // Preservation: a non-empty FUNCTION-family body (function, arrow;
+        // ctor checks separately) authored on one line stays on one line
+        // (`{ stmt; stmt; }`). `map_open_brace` encodes the same tsc split
+        // the brace-mapping doc above names: statement-level and control
+        // blocks always expand (authority: parser768531 baseline expands an
+        // authored single-line `{ a: 3; }`), so only unmapped bodies may
+        // preserve. Synthesized, past-authored-text, or multi-line-authored
+        // bodies take the expanded path below.
+        if !map_open_brace && self.node_preserves_single_line(block) {
             if map_open_brace {
                 self.raw_mapped_char("{", range, '{', 1);
             } else {
@@ -5904,6 +5909,21 @@ export default answer;
         assert!(parsed.diagnostics().is_empty());
         let output = emit_output(parsed.product(), &EmitOptions::default());
         assert_eq!(javascript(&output).code, "({\n    a: 1\n});\n");
+    }
+
+    #[test]
+    fn statement_block_expands_even_when_authored_single_line() {
+        // Authority: parser768531 baseline expands an authored single-line
+        // standalone block; preservation belongs to function-family bodies.
+        let input = "{ a: 3; } /x/;";
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
+        ));
+        assert!(parsed.diagnostics().is_empty());
+        let output = emit_output(parsed.product(), &EmitOptions::default());
+        assert_eq!(javascript(&output).code, "{\n    a: 3;\n}\n/x/;\n");
     }
 
     #[test]
