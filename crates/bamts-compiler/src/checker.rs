@@ -140,6 +140,7 @@ pub const PROPERTY_NOT_INITIALIZED: DiagnosticCode = DiagnosticCode::new("BAMTS-
 /// Diagnostic emitted when an assignment target resolves to a function.
 pub const SUPER_BEFORE_THIS: DiagnosticCode = DiagnosticCode::new("BAMTS-C090");
 pub const SUPER_BEFORE_SUPER_PROPERTY: DiagnosticCode = DiagnosticCode::new("BAMTS-C091");
+pub const SUPER_FIELD_VIA_SUPER: DiagnosticCode = DiagnosticCode::new("BAMTS-C092");
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
 /// Diagnostic emitted when an assignment target resolves to a namespace.
 pub const ASSIGNMENT_TO_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C030");
@@ -2171,7 +2172,7 @@ mod tests {
         PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
         PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
         ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS,
-        SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER,
         SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
         TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
         VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
@@ -5958,6 +5959,86 @@ function check(options: Options = {}) {
     /// accesses before a guaranteed `super()` call, with the oracle's
     /// flow shapes: arrows are exempt (deferred `this`), a conditional
     /// super() covers only its branch, and loops/try never guarantee.
+    /// The authority baseline checkSuperCallBeforeThisAccess.errors.txt
+    /// carries exactly five TS2855 rows (lines 9, 12, 17, 22, 45 of the
+    /// directive-stripped source); the count is the pinned oracle.
+    #[test]
+    fn super_field_via_super_matches_baseline_count() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = std::fs::read_to_string(root.join(concat!(
+            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+            "checkSuperCallBeforeThisAccess.ts"
+        )))
+        .unwrap();
+        let count = checker_codes(&check_text(&source))
+            .into_iter()
+            .filter(|code| *code == SUPER_FIELD_VIA_SUPER.as_str())
+            .count();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn super_field_via_super_matrix() {
+        fn field_codes(text: &str) -> Vec<&'static str> {
+            let result = check_text(text);
+            checker_codes(&result)
+                .into_iter()
+                .filter(|code| *code == SUPER_FIELD_VIA_SUPER.as_str())
+                .collect()
+        }
+        // A base field read through super fires even after super() ran.
+        assert_eq!(
+            field_codes(
+                "class A { field = 1; }
+                 class C extends A {
+                     constructor() { super(); super.field; }
+                 }"
+            ),
+            vec![SUPER_FIELD_VIA_SUPER.as_str()]
+        );
+        // Base methods and accessor pairs live on the prototype: no fire.
+        assert_eq!(
+            field_codes(
+                "class A { method() {} get pair() { return 1; } set pair(v) {} }
+                 class C extends A {
+                     constructor() { super(); super.method(); super.pair; }
+                 }"
+            ),
+            Vec::<&str>::new()
+        );
+        // A getter-only accessor is reachable too.
+        assert_eq!(
+            field_codes(
+                "class A { get only() { return 1; } }
+                 class C extends A { constructor() { super(); super.only; } }"
+            ),
+            Vec::<&str>::new()
+        );
+        // The inherited grandparent field still fires, and a name the base
+        // chain does not declare stays silent.
+        assert_eq!(
+            field_codes(
+                "class A { shared = 1; }
+                 class B extends A {}
+                 class C extends B { constructor() { super(); super.shared; super.absent; } }"
+            ),
+            vec![SUPER_FIELD_VIA_SUPER.as_str()]
+        );
+        // No base class, no super property check applies.
+        assert_eq!(
+            field_codes("class C { constructor() { super(); } }"),
+            Vec::<&str>::new()
+        );
+        // A field read before super() reports both TS17011 and TS2855.
+        let result = check_text(
+            "class A { field = 1; }
+             class C extends A { constructor() { super.field; super(); } }",
+        );
+        let codes = checker_codes(&result);
+        assert!(codes.contains(&SUPER_BEFORE_SUPER_PROPERTY.as_str()));
+        assert!(codes.contains(&SUPER_FIELD_VIA_SUPER.as_str()));
+    }
+
     #[test]
     fn super_before_this_flow_matrix() {
         fn codes(text: &str) -> Vec<&'static str> {

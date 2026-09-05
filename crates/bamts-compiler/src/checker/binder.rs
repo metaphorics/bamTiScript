@@ -42,11 +42,11 @@ use super::{
     PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
     SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR,
-    TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT,
-    UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED, USING_DECLARATION_BINDING_PATTERN,
-    USING_DECLARATION_IN_FOR_IN, USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE,
-    WITH_STATEMENT_NOT_ALLOWED,
+    SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED,
+    TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
+    TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
+    USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
+    USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
     ABSTRACT_CONSTRUCTOR_MESSAGE, ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
@@ -371,6 +371,12 @@ pub struct PropertyType {
     /// members default to `false`; properties that legitimately propagate
     /// through spread keep the flag explicitly.
     spreadable: bool,
+    /// Whether this property is backed by a get/set accessor pair. A
+    /// getter+setter pair reports `is_method == false` and
+    /// `getter_only == false`, the same shape as a field; this marker is
+    /// what tells them apart (`super.x` reaches accessors on the
+    /// prototype but never a field).
+    accessor: bool,
 }
 
 impl PropertyType {
@@ -387,6 +393,7 @@ impl PropertyType {
             declaring_types: Vec::new(),
             is_method: false,
             spreadable: false,
+            accessor: false,
         }
     }
 
@@ -440,6 +447,13 @@ impl PropertyType {
         self
     }
 
+    /// Marks this property as accessor-backed (a get or get/set pair).
+    #[must_use]
+    pub fn with_accessor(mut self, accessor: bool) -> Self {
+        self.accessor = accessor;
+        self
+    }
+
     #[must_use]
     pub fn with_spreadable(mut self, spreadable: bool) -> Self {
         self.spreadable = spreadable;
@@ -476,6 +490,13 @@ impl PropertyType {
         self.getter_only
     }
 
+    /// Whether a get/set accessor (not a field or method) backs this
+    /// property.
+    #[must_use]
+    pub const fn accessor(&self) -> bool {
+        self.accessor
+    }
+
     #[must_use]
     pub const fn type_id(&self) -> TypeId {
         self.type_id
@@ -509,6 +530,7 @@ impl PartialEq for PropertyType {
             && self.declaring_types == other.declaring_types
             && self.is_method == other.is_method
             && self.spreadable == other.spreadable
+            && self.accessor == other.accessor
     }
 }
 
@@ -526,6 +548,7 @@ impl std::hash::Hash for PropertyType {
         self.declaring_types.hash(state);
         self.is_method.hash(state);
         self.spreadable.hash(state);
+        self.accessor.hash(state);
     }
 }
 
@@ -2263,6 +2286,25 @@ impl TypeTable {
     }
 
     /// Ensures and returns the finite shallow view for one applied root.
+    /// Instance members of a class symbol's current template, without
+    /// instantiation. Membership kind (field, method, accessor) never
+    /// depends on type arguments, so callers that only ask kind
+    /// questions can skip the applied-view machinery.
+    #[must_use]
+    pub fn class_template_properties(&self, symbol: SymbolId) -> &[PropertyType] {
+        let Some(raw) = self
+            .classes
+            .get(&symbol)
+            .and_then(|metadata| metadata.template.as_ref().map(|template| template.raw))
+        else {
+            return &[];
+        };
+        match self.get(raw) {
+            Type::ObjectType(object) => object.properties(),
+            _ => &[],
+        }
+    }
+
     pub fn prepare_applied_class_view(&mut self, type_id: TypeId) -> Option<TypeId> {
         self.materialize_applied_class_view(type_id);
         self.applied_class_view(type_id)
@@ -3879,7 +3921,7 @@ impl TypeTable {
                     target.intersection_ordered(members)
                 }
                 Type::ObjectType(object) => {
-                    let properties = object
+                    let properties: Vec<PropertyType> = object
                         .properties
                         .into_iter()
                         .map(|property| {
@@ -3903,6 +3945,7 @@ impl TypeTable {
                             .with_accessibility(property.access(), declaring_class)
                             .with_declaring_types(declaring_types)
                             .with_method(property.is_method)
+                            .with_accessor(property.accessor)
                             .with_spreadable(property.spreadable)
                         })
                         .collect();
@@ -10621,140 +10664,148 @@ impl<'src> Binder<'src> {
                 });
                 continue;
             }
-            let (name, type_id, optional, readonly, getter_only, access, is_method) = match member
-                .data()
-            {
-                ClassMember::Property(property) if side.includes(property.modifiers.is_static) => {
-                    let Some(name) = self.property_key(&property.name) else {
-                        continue;
-                    };
-                    let type_id = self.class_property_type(
-                        property.type_annotation.as_ref(),
-                        property.initializer.as_deref(),
-                        &property.modifiers,
-                        scope,
-                        false,
-                    );
-                    (
-                        name,
-                        type_id,
-                        property.optional,
-                        property.modifiers.is_readonly,
-                        false,
-                        property
-                            .modifiers
-                            .accessibility
-                            .unwrap_or(Accessibility::Public),
-                        false,
-                    )
-                }
-                ClassMember::AutoAccessor(accessor)
-                    if side.includes(accessor.modifiers.is_static) =>
-                {
-                    let Some(name) = self.property_key(&accessor.name) else {
-                        continue;
-                    };
-                    let type_id = self.class_property_type(
-                        accessor.type_annotation.as_ref(),
-                        accessor.initializer.as_deref(),
-                        &accessor.modifiers,
-                        scope,
-                        false,
-                    );
-                    (
-                        name,
-                        type_id,
-                        false,
-                        accessor.modifiers.is_readonly,
-                        false,
-                        accessor
-                            .modifiers
-                            .accessibility
-                            .unwrap_or(Accessibility::Public),
-                        false,
-                    )
-                }
-                ClassMember::Method(method) if side.includes(method.modifiers.is_static) => {
-                    match method.modifier {
-                        PropertyModifier::None => {
-                            let Some(name) = self.property_key(&method.name) else {
-                                continue;
-                            };
-                            if name == "constructor" {
-                                continue;
-                            }
-                            let is_overload_signature =
-                                method.function.body.is_none() && !method.modifiers.is_abstract;
-                            if is_overload_signature {
-                                overload_state.insert(name.clone(), true);
-                            } else if overload_state.get(&name).copied().unwrap_or(false) {
-                                overload_state.insert(name.clone(), false);
-                                continue;
-                            }
-                            let signature_scope = self.class_method_signature_scope(
-                                member.id(),
-                                &method.function,
-                                scope,
-                            );
-                            let type_id = self
-                                .type_of_function_like_in_scope(&method.function, signature_scope);
-                            (
-                                name,
-                                type_id,
-                                method.optional,
-                                false,
-                                false,
-                                method
-                                    .modifiers
-                                    .accessibility
-                                    .unwrap_or(Accessibility::Public),
-                                true,
-                            )
-                        }
-                        PropertyModifier::Get => {
-                            let Some(name) = self.property_key(&method.name) else {
-                                continue;
-                            };
-                            let type_id = match &method.function.return_type {
-                                Some(annotation) => {
-                                    self.resolve_type(&annotation.data().type_node, scope)
-                                }
-                                None => self.types.any(),
-                            };
-                            let has_setter = class.members.iter().any(|candidate| {
-                                let ClassMember::Method(candidate) = candidate.data() else {
-                                    return false;
-                                };
-                                candidate.modifier == PropertyModifier::Set
-                                    && side.includes(candidate.modifiers.is_static)
-                                    && self.property_key(&candidate.name).as_deref()
-                                        == Some(name.as_str())
-                            });
-                            (
-                                name,
-                                type_id,
-                                method.optional,
-                                !has_setter,
-                                !has_setter,
-                                method
-                                    .modifiers
-                                    .accessibility
-                                    .unwrap_or(Accessibility::Public),
-                                false,
-                            )
-                        }
-                        PropertyModifier::Set => continue,
+            let (name, type_id, optional, readonly, getter_only, access, is_method, accessor) =
+                match member.data() {
+                    ClassMember::Property(property)
+                        if side.includes(property.modifiers.is_static) =>
+                    {
+                        let Some(name) = self.property_key(&property.name) else {
+                            continue;
+                        };
+                        let type_id = self.class_property_type(
+                            property.type_annotation.as_ref(),
+                            property.initializer.as_deref(),
+                            &property.modifiers,
+                            scope,
+                            false,
+                        );
+                        (
+                            name,
+                            type_id,
+                            property.optional,
+                            property.modifiers.is_readonly,
+                            false,
+                            property
+                                .modifiers
+                                .accessibility
+                                .unwrap_or(Accessibility::Public),
+                            false,
+                            false,
+                        )
                     }
-                }
-                _ => continue,
-            };
+                    ClassMember::AutoAccessor(accessor)
+                        if side.includes(accessor.modifiers.is_static) =>
+                    {
+                        let Some(name) = self.property_key(&accessor.name) else {
+                            continue;
+                        };
+                        let type_id = self.class_property_type(
+                            accessor.type_annotation.as_ref(),
+                            accessor.initializer.as_deref(),
+                            &accessor.modifiers,
+                            scope,
+                            false,
+                        );
+                        (
+                            name,
+                            type_id,
+                            false,
+                            accessor.modifiers.is_readonly,
+                            false,
+                            accessor
+                                .modifiers
+                                .accessibility
+                                .unwrap_or(Accessibility::Public),
+                            false,
+                            true,
+                        )
+                    }
+                    ClassMember::Method(method) if side.includes(method.modifiers.is_static) => {
+                        match method.modifier {
+                            PropertyModifier::None => {
+                                let Some(name) = self.property_key(&method.name) else {
+                                    continue;
+                                };
+                                if name == "constructor" {
+                                    continue;
+                                }
+                                let is_overload_signature =
+                                    method.function.body.is_none() && !method.modifiers.is_abstract;
+                                if is_overload_signature {
+                                    overload_state.insert(name.clone(), true);
+                                } else if overload_state.get(&name).copied().unwrap_or(false) {
+                                    overload_state.insert(name.clone(), false);
+                                    continue;
+                                }
+                                let signature_scope = self.class_method_signature_scope(
+                                    member.id(),
+                                    &method.function,
+                                    scope,
+                                );
+                                let type_id = self.type_of_function_like_in_scope(
+                                    &method.function,
+                                    signature_scope,
+                                );
+                                (
+                                    name,
+                                    type_id,
+                                    method.optional,
+                                    false,
+                                    false,
+                                    method
+                                        .modifiers
+                                        .accessibility
+                                        .unwrap_or(Accessibility::Public),
+                                    true,
+                                    false,
+                                )
+                            }
+                            PropertyModifier::Get => {
+                                let Some(name) = self.property_key(&method.name) else {
+                                    continue;
+                                };
+                                let type_id = match &method.function.return_type {
+                                    Some(annotation) => {
+                                        self.resolve_type(&annotation.data().type_node, scope)
+                                    }
+                                    None => self.types.any(),
+                                };
+                                let has_setter = class.members.iter().any(|candidate| {
+                                    let ClassMember::Method(candidate) = candidate.data() else {
+                                        return false;
+                                    };
+                                    candidate.modifier == PropertyModifier::Set
+                                        && side.includes(candidate.modifiers.is_static)
+                                        && self.property_key(&candidate.name).as_deref()
+                                            == Some(name.as_str())
+                                });
+                                (
+                                    name,
+                                    type_id,
+                                    method.optional,
+                                    !has_setter,
+                                    !has_setter,
+                                    method
+                                        .modifiers
+                                        .accessibility
+                                        .unwrap_or(Accessibility::Public),
+                                    false,
+                                    true,
+                                )
+                            }
+                            PropertyModifier::Set => continue,
+                        }
+                    }
+                    _ => continue,
+                };
             let _ = seen.insert(name.clone());
             properties.push(
                 PropertyType::new(name, optional, type_id)
                     .with_readonly(readonly)
                     .with_getter_only(getter_only)
                     .with_accessibility(access, declaring_class)
-                    .with_method(is_method),
+                    .with_method(is_method)
+                    .with_accessor(accessor),
             );
         }
         (properties, seen, iterator_property, async_iterator_property)
@@ -12018,7 +12069,11 @@ impl<'src> Binder<'src> {
             }
             Expression::Member(member) => {
                 if matches!(member.object.data(), Expression::Super) {
-                    self.check_super_member_access(member.object.range(), member.optional);
+                    self.check_super_member_access(
+                        member.object.range(),
+                        member.optional,
+                        &member.property,
+                    );
                 } else {
                     self.resolve_expr(&member.object, scope);
                     // A property read dereferences its object, so a nullable
@@ -12356,7 +12411,12 @@ impl<'src> Binder<'src> {
     /// classes and object literals are legal. Plain functions and the top
     /// level stay silent: no existing C-band code carries that diagnostic, and
     /// minting one is out of scope.
-    fn check_super_member_access(&mut self, range: TextRange, optional: bool) {
+    fn check_super_member_access(
+        &mut self,
+        range: TextRange,
+        optional: bool,
+        property: &MemberProperty,
+    ) {
         if optional {
             self.emit(BARE_SUPER_EXPRESSION, range, BARE_SUPER_EXPRESSION_MESSAGE);
             return;
@@ -12375,6 +12435,42 @@ impl<'src> Binder<'src> {
                 SUPER_BEFORE_SUPER_PROPERTY,
                 range,
                 SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
+            );
+        }
+        self.check_super_property_is_field(property);
+    }
+
+    /// TS2855: `super.x` reads the prototype chain, but a class field is an
+    /// own instance property, so the field is never visible through `super`
+    /// even after `super()` has run. Methods and accessors live on the
+    /// prototype and stay reachable.
+    fn check_super_property_is_field(&mut self, property: &MemberProperty) {
+        let MemberProperty::Named(identifier) = property else {
+            return;
+        };
+        if self.super_member_homes.last() != Some(&SuperMemberHome::ClassMember { derived: true }) {
+            return;
+        }
+        let Some(&owner) = self.class_owner_stack.last() else {
+            return;
+        };
+        let Some(&base) = self.class_base_symbols.get(&owner) else {
+            return;
+        };
+        let name = self.identifier_text(identifier);
+        let is_field = self
+            .types
+            .class_template_properties(base)
+            .iter()
+            .find(|member| member.name() == name.as_ref())
+            .is_some_and(|member| !member.is_method() && !member.accessor());
+        if is_field {
+            self.emit_with_message(
+                SUPER_FIELD_VIA_SUPER,
+                identifier.range(),
+                format!(
+                    "Class field '{name}' defined by the parent class is not accessible in the child class via super."
+                ),
             );
         }
     }
@@ -14131,7 +14227,7 @@ impl<'src> Binder<'src> {
             }
             AssignmentTarget::Member(member) => {
                 if matches!(member.object.data(), Expression::Super) {
-                    self.check_super_member_access(member.object.range(), false);
+                    self.check_super_member_access(member.object.range(), false, &member.property);
                 } else {
                     self.resolve_expr(&member.object, scope);
                 }
