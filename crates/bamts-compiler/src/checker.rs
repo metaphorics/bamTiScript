@@ -5975,6 +5975,27 @@ function check(options: Options = {}) {
             .filter(|code| *code == SUPER_FIELD_VIA_SUPER.as_str())
             .count();
         assert_eq!(count, 5);
+        // The Accessing variants each carry a single TS17009 row; variant 5
+        // reaches `this` inside the super() arguments, which evaluate before
+        // the call completes.
+        for variant in ["2", "5", "8"] {
+            let variant_source = std::fs::read_to_string(
+                root.join(format!(
+                    "target/authority/typescript-7.0.2-tests/tests/cases/compiler/checkSuperCallBeforeThisAccessing{variant}.ts"
+                )),
+            )
+            .unwrap();
+            let codes = checker_codes(&check_text(&variant_source));
+            assert_eq!(
+                codes
+                    .iter()
+                    .filter(|code| **code == SUPER_BEFORE_THIS.as_str())
+                    .count(),
+                1,
+                "variant {}",
+                variant
+            );
+        }
     }
 
     #[test]

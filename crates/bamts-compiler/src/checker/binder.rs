@@ -12052,13 +12052,21 @@ impl<'src> Binder<'src> {
                 }
             }
             Expression::Call(call) => {
-                if matches!(call.callee.data(), Expression::Super) {
-                    self.check_super_call(call.callee.range());
+                let is_super_call = matches!(call.callee.data(), Expression::Super);
+                if is_super_call {
+                    self.check_super_call_legality(call.callee.range());
                 } else {
                     self.resolve_expr(&call.callee, scope);
                 }
                 self.resolve_type_arguments(call.type_arguments.as_ref(), scope);
                 self.resolve_arguments(&call.arguments, scope);
+                // A call's arguments evaluate before the call completes, so
+                // `this` inside `super(this.x)` is still before `super()`;
+                // the flow may only be marked guaranteed once every
+                // argument has resolved.
+                if is_super_call {
+                    self.mark_super_call_completed(call.callee.range());
+                }
                 self.check_call(call, scope, expression.range());
             }
             Expression::New(new) => {
@@ -12475,24 +12483,14 @@ impl<'src> Binder<'src> {
         }
     }
 
-    fn check_super_call(&mut self, range: TextRange) {
+    fn check_super_call_legality(&mut self, range: TextRange) {
         let context = self
             .super_call_contexts
             .last()
             .copied()
             .unwrap_or(SuperCallContext::NonConstructor);
         let (code, message) = match context {
-            SuperCallContext::DerivedConstructor => {
-                if let Some(called) = self.derived_constructor_super_presence.last_mut() {
-                    *called = true;
-                }
-                if self.super_call_guarantees
-                    && let SuperFlow::Tracking { called } = &mut self.super_flow
-                {
-                    *called = true;
-                }
-                return;
-            }
+            SuperCallContext::DerivedConstructor => return,
             SuperCallContext::BaseConstructor
             | SuperCallContext::ConstructorParameters { derived: false } => (
                 SUPER_REFERENCE_NON_DERIVED,
@@ -12508,6 +12506,23 @@ impl<'src> Binder<'src> {
             ),
         };
         self.emit(code, range, message);
+    }
+
+    /// Records a resolved `super()` call: the constructor's missing-super
+    /// presence is satisfied, and in statement position the flow becomes
+    /// guaranteed. Runs after the call's arguments have resolved.
+    fn mark_super_call_completed(&mut self, _range: TextRange) {
+        if self.super_call_contexts.last().copied() != Some(SuperCallContext::DerivedConstructor) {
+            return;
+        }
+        if let Some(called) = self.derived_constructor_super_presence.last_mut() {
+            *called = true;
+        }
+        if self.super_call_guarantees
+            && let SuperFlow::Tracking { called } = &mut self.super_flow
+        {
+            *called = true;
+        }
     }
 
     fn resolve_object_member(&mut self, member: &'src ObjectMember, scope: ScopeId) {
