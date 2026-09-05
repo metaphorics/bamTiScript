@@ -43,7 +43,7 @@ use super::{
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
     SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
     SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED,
-    TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
+    SUPER_STATIC_MEMBER_VIA_SUPER, TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
     TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
     USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
     USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED,
@@ -12446,6 +12446,7 @@ impl<'src> Binder<'src> {
             );
         }
         self.check_super_property_is_field(property);
+        self.check_super_property_is_static(property);
     }
 
     /// TS2855: `super.x` reads the prototype chain, but a class field is an
@@ -12481,6 +12482,50 @@ impl<'src> Binder<'src> {
                 ),
             );
         }
+    }
+
+    /// TS2576: `super` resolves instance members, so a base class static
+    /// reached through it is a misspelling of `Base.member`.
+    fn check_super_property_is_static(&mut self, property: &MemberProperty) {
+        let MemberProperty::Named(identifier) = property else {
+            return;
+        };
+        if self.super_member_homes.last() != Some(&SuperMemberHome::ClassMember { derived: true }) {
+            return;
+        }
+        let Some(&owner) = self.class_owner_stack.last() else {
+            return;
+        };
+        let Some(&base) = self.class_base_symbols.get(&owner) else {
+            return;
+        };
+        let Some(&static_type) = self.class_constructor_types.get(&base) else {
+            return;
+        };
+        let name = self.identifier_text(identifier);
+        // The static side is a constructor type wrapping the structural
+        // member table.
+        let Type::ConstructorType { structural, .. } = self.types.get(static_type).clone() else {
+            return;
+        };
+        let Type::ObjectType(object) = self.types.get(structural).clone() else {
+            return;
+        };
+        if !object
+            .properties
+            .iter()
+            .any(|member| member.name() == name.as_ref())
+        {
+            return;
+        }
+        let base_name = self.symbols[base.get() as usize].name().to_owned();
+        self.emit_with_message(
+            SUPER_STATIC_MEMBER_VIA_SUPER,
+            identifier.range(),
+            format!(
+                "Property '{name}' does not exist on type '{base_name}'. Did you mean to access the static member '{base_name}.{name}' instead?"
+            ),
+        );
     }
 
     fn check_super_call_legality(&mut self, range: TextRange) {

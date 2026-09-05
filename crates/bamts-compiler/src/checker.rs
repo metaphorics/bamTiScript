@@ -141,6 +141,7 @@ pub const PROPERTY_NOT_INITIALIZED: DiagnosticCode = DiagnosticCode::new("BAMTS-
 pub const SUPER_BEFORE_THIS: DiagnosticCode = DiagnosticCode::new("BAMTS-C090");
 pub const SUPER_BEFORE_SUPER_PROPERTY: DiagnosticCode = DiagnosticCode::new("BAMTS-C091");
 pub const SUPER_FIELD_VIA_SUPER: DiagnosticCode = DiagnosticCode::new("BAMTS-C092");
+pub const SUPER_STATIC_MEMBER_VIA_SUPER: DiagnosticCode = DiagnosticCode::new("BAMTS-C093");
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
 /// Diagnostic emitted when an assignment target resolves to a namespace.
 pub const ASSIGNMENT_TO_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C030");
@@ -2173,9 +2174,9 @@ mod tests {
         PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
         ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS,
         SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER,
-        SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
-        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
-        VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind,
+        TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
+        TypeTable, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
         check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
@@ -5959,6 +5960,79 @@ function check(options: Options = {}) {
     /// accesses before a guaranteed `super()` call, with the oracle's
     /// flow shapes: arrows are exempt (deferred `this`), a conditional
     /// super() covers only its branch, and loops/try never guarantee.
+    /// The superAccess es2015 baseline carries one TS2576 (static S1 via
+    /// super) and two TS2855 (fields S2 and f); the es5 variant's TS2340
+    /// flavor is a separate target-conditional slice.
+    #[test]
+    fn super_static_member_matches_superaccess_baseline() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source =
+            std::fs::read_to_string(root.join(
+                "target/authority/typescript-7.0.2-tests/tests/cases/compiler/superAccess.ts",
+            ))
+            .unwrap();
+        let codes = checker_codes(&check_text(&source));
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            1
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_FIELD_VIA_SUPER.as_str())
+                .count(),
+            2
+        );
+    }
+
+    /// TS2576: super.S1 where S1 is a base static member. Also pins the
+    /// superAccess oracle shape: static fires TS2576, instance fields fire
+    /// TS2855, and a base instance method stays silent.
+    #[test]
+    fn super_static_member_via_super_matrix() {
+        let result = check_text(
+            "class MyBase {
+                 static S1: number = 5;
+                 f = () => 5;
+             }
+             class MyDerived extends MyBase {
+                 foo() {
+                     var l1 = super.S1;
+                     var l3 = super.f;
+                     var l4 = super.toString;
+                 }
+             }",
+        );
+        let codes = checker_codes(&result);
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_STATIC_MEMBER_VIA_SUPER.as_str())
+                .count(),
+            1,
+            "{codes:?}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_FIELD_VIA_SUPER.as_str())
+                .count(),
+            1,
+            "{codes:?}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == SUPER_BEFORE_SUPER_PROPERTY.as_str())
+                .count(),
+            0,
+            "{codes:?}"
+        );
+    }
+
     /// The authority baseline checkSuperCallBeforeThisAccess.errors.txt
     /// carries exactly five TS2855 rows (lines 9, 12, 17, 22, 45 of the
     /// directive-stripped source); the count is the pinned oracle.
