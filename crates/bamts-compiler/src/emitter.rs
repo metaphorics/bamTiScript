@@ -7323,7 +7323,17 @@ var c = () => 1;
             // Strip the protocol marker spans first: a line can carry both a
             // legitimate `return [4 /*yield*/, x]` split and a cloned live
             // yield; the marker must not exempt the whole line.
-            .find(|line| line.replace("/*yield*/", "").contains("yield"))
+            .find(|line| {
+                let stripped = line.replace("/*yield*/", "");
+                // The match must end as a token: `yielding` is an
+                // identifier, not the keyword.
+                stripped.match_indices("yield").any(|(i, _)| {
+                    stripped[i + 5..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                })
+            })
             .map(|line| line.trim().to_owned())
     }
 
@@ -7339,7 +7349,15 @@ var c = () => 1;
         code.lines()
             .find(|line| {
                 let l = line.trim();
+                // `return` must end as a token: `returning = 1;` is a
+                // plain assignment, not a protocol-breaking return.
+                let boundary = !l.starts_with("return")
+                    || l[6..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c.is_whitespace() || c == ';' || c == '}' || c == '(');
                 l.starts_with("return")
+                    && boundary
                     && !l.starts_with("return [")
                     && !l.starts_with("return __generator")
                     && !l.starts_with("return __awaiter")
@@ -7928,7 +7946,7 @@ var c = () => 1;
             let _ = tx.send(javascript(&output).code.clone());
         });
         let code = rx
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(std::time::Duration::from_secs(10))
             .expect("allocator must terminate past the alphabet");
         assert!(code.contains("__generator(this,"), "{code}");
     }
