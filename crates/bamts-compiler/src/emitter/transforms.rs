@@ -6418,30 +6418,39 @@ impl<'a> Rewriter<'a> {
         // signal the requires-es2015 refusal instead of breaking
         // silently. Static-field postludes reference the constructed
         // temp and can never hoist; they refuse the same way.
-        let mut refused = false;
-        let (suspending, mut clean): (Vec<_>, Vec<_>) = lowered
-            .prelude
-            .drain(..)
-            .partition(|statement| count_branch_yields(std::slice::from_ref(statement)) > 0);
-        if !suspending.is_empty() {
-            if hoist_suspending {
-                self.key_prelude.extend(suspending);
-            } else {
-                clean.extend(suspending);
-                refused = true;
-            }
+        // Whole-prelude move only: partitioning the prelude would
+        // reorder mixed suspending and clean keys, and computed keys
+        // evaluate in member order. Entries never reference the class
+        // temp (its declaration is pushed below), so the move is
+        // order-safe. An await counts too: in expression position the
+        // rewrite pass leaves it raw, and the machine entry gate then
+        // refuses the whole generator loudly.
+        let suspends = |statement: &Stmt| {
+            count_branch_yields(std::slice::from_ref(statement)) > 0
+                || statements_contain_await(std::slice::from_ref(statement))
+        };
+        let refused = lowered.prelude.iter().any(&suspends) && !hoist_suspending;
+        if !refused && hoist_suspending && lowered.prelude.iter().any(&suspends) {
+            self.key_prelude
+                .extend(std::mem::take(&mut lowered.prelude));
         }
-        lowered.prelude = clean;
-        let postlude_refused = lowered
-            .postlude
-            .iter()
-            .any(|statement| count_branch_yields(std::slice::from_ref(statement)) > 0);
+        let postlude_refused = lowered.postlude.iter().any(suspends);
         if refused || postlude_refused {
             self.diag(
                 codes::GENERATOR_REQUIRES_ES2015,
                 expression.range(),
                 "generators require ScriptTarget::Es2015 or later",
             );
+            // Returning the unlowered class keeps the failure loud and
+            // honest: the machine's class walker (heritage, computed
+            // names, field initializers) sees the suspension, refuses
+            // the conversion, and the generator stays native under the
+            // diagnostic. Lowering anyway would bury a raw yield or
+            // await inside a synthesized plain arrow the machine
+            // cannot see through.
+            if refused {
+                return expression.clone();
+            }
         }
         let class = self.syn_node(
             expression.range(),
@@ -7923,6 +7932,88 @@ impl ChainSegment {
     }
 }
 
+/// The enclosing-context code of a class: the heritage expression,
+/// computed member names, and field initializers. Method, constructor,
+/// and static-block bodies are function boundaries and own their
+/// suspensions, so they stay opaque to the enclosing walkers.
+fn count_class_context_yields(class: &ClassDeclaration) -> u32 {
+    let heritage = class
+        .extends
+        .as_ref()
+        .map(|heritage| count_yields(&heritage.expression))
+        .unwrap_or(0);
+    let members: u32 = class
+        .members
+        .iter()
+        .map(|member| match member.data() {
+            ClassMember::Method(method) => match &method.name {
+                PropertyName::Computed(key) => count_yields(key),
+                _ => 0,
+            },
+            ClassMember::Property(property) => match &property.name {
+                PropertyName::Computed(key) => count_yields(key),
+                _ => property.initializer.as_deref().map_or(0, count_yields),
+            },
+            ClassMember::AutoAccessor(accessor) => match &accessor.name {
+                PropertyName::Computed(key) => count_yields(key),
+                _ => accessor.initializer.as_deref().map_or(0, count_yields),
+            },
+            _ => 0,
+        })
+        .sum();
+    heritage + members
+}
+
+/// The await view of the same class-context walk.
+fn class_context_contains_await(class: &ClassDeclaration) -> bool {
+    if class
+        .extends
+        .as_ref()
+        .is_some_and(|heritage| contains_await(&heritage.expression))
+    {
+        return true;
+    }
+    class.members.iter().any(|member| match member.data() {
+        ClassMember::Method(method) => {
+            matches!(&method.name, PropertyName::Computed(key) if contains_await(key))
+        }
+        ClassMember::Property(property) => {
+            matches!(&property.name, PropertyName::Computed(key) if contains_await(key))
+                || property.initializer.as_deref().is_some_and(contains_await)
+        }
+        ClassMember::AutoAccessor(accessor) => {
+            matches!(&accessor.name, PropertyName::Computed(key) if contains_await(key))
+                || accessor.initializer.as_deref().is_some_and(contains_await)
+        }
+        _ => false,
+    })
+}
+
+/// The yield view of the same class-context walk.
+fn class_context_contains_yield(class: &ClassDeclaration) -> bool {
+    if class
+        .extends
+        .as_ref()
+        .is_some_and(|heritage| contains_yield(&heritage.expression))
+    {
+        return true;
+    }
+    class.members.iter().any(|member| match member.data() {
+        ClassMember::Method(method) => {
+            matches!(&method.name, PropertyName::Computed(key) if contains_yield(key))
+        }
+        ClassMember::Property(property) => {
+            matches!(&property.name, PropertyName::Computed(key) if contains_yield(key))
+                || property.initializer.as_deref().is_some_and(contains_yield)
+        }
+        ClassMember::AutoAccessor(accessor) => {
+            matches!(&accessor.name, PropertyName::Computed(key) if contains_yield(key))
+                || accessor.initializer.as_deref().is_some_and(contains_yield)
+        }
+        _ => false,
+    })
+}
+
 /// Counts the yield nodes of this function's body (nested function-likes
 /// own their own yields).
 fn count_yields(expression: &Expr) -> u32 {
@@ -7930,7 +8021,10 @@ fn count_yields(expression: &Expr) -> u32 {
         Expression::Yield(yielded) => 1 + yielded.argument.as_deref().map_or(0, count_yields),
         Expression::Identifier(_) | Expression::This | Expression::Super => 0,
         Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => 0,
-        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => 0,
+        Expression::Function(_) | Expression::Arrow(_) => 0,
+        // Heritage, computed names, and field initializers run in the
+        // enclosing context; bodies stay owned.
+        Expression::Class(class) => count_class_context_yields(&class.class),
         Expression::Template(template) => template.expressions.iter().map(count_yields).sum(),
         Expression::Array(array) => array
             .elements
@@ -8250,7 +8344,10 @@ fn contains_await(expression: &Expr) -> bool {
         Expression::Await(_) => true,
         Expression::Identifier(_) | Expression::This | Expression::Super => false,
         Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => false,
-        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
+        Expression::Function(_) | Expression::Arrow(_) => false,
+        // Heritage, computed names, and field initializers run in the
+        // enclosing context; bodies stay owned.
+        Expression::Class(class) => class_context_contains_await(&class.class),
         Expression::Yield(yielded) => yielded.argument.as_deref().is_some_and(contains_await),
         Expression::Template(template) => template.expressions.iter().any(contains_await),
         Expression::Array(array) => array.elements.iter().any(|element| match element {
@@ -8420,7 +8517,10 @@ fn contains_yield(expression: &Expr) -> bool {
         Expression::Identifier(_) | Expression::This | Expression::Super => false,
         Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => false,
         // A yield inside a nested function belongs to that function.
-        Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => false,
+        Expression::Function(_) | Expression::Arrow(_) => false,
+        // Heritage, computed names, and field initializers run in the
+        // enclosing context; bodies stay owned.
+        Expression::Class(class) => class_context_contains_yield(&class.class),
         Expression::Template(template) => template.expressions.iter().any(contains_yield),
         Expression::TaggedTemplate(_) => true,
         Expression::Array(array) => contains_yield_array(array),

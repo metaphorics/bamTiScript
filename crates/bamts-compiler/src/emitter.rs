@@ -7294,6 +7294,72 @@ var c = () => 1;
         );
     }
 
+    /// B1 order: computed keys evaluate in member order, so hoisting
+    /// must move the whole prelude - partitioning suspending keys away
+    /// from clean ones reorders evaluation.
+    #[test]
+    fn class_computed_keys_evaluate_in_member_order() {
+        let out = emit_es5_clean(
+            "var k1:any, k2:any;\nfunction* g(){ var C = class { [k1()](){} [yield k2()](){} }; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        let clean_first = code.find("k1()").expect("clean key evaluated");
+        let suspending = code.find("k2()").expect("suspending key evaluated");
+        assert!(
+            clean_first < suspending,
+            "member order must survive hoisting:\n{code}"
+        );
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+        let out = emit_es5_clean(
+            "var k1:any, k2:any;\nfunction* g(){ var C = class { [yield k1()](){} [k2()](){} }; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        let suspending = code.find("k1()").expect("suspending key evaluated");
+        let clean_second = code.find("k2()").expect("clean key evaluated");
+        assert!(
+            suspending < clean_second,
+            "member order must survive hoisting (suspending first):\n{code}"
+        );
+    }
+
+    /// B1 visibility: an await inside a class computed key or heritage
+    /// clause in expression position cannot lower - there is no hoist
+    /// channel - and must refuse the generator natively under the
+    /// requires-es2015 diagnostic, never bury the raw await inside a
+    /// synthesized arrow the machine cannot see through.
+    #[test]
+    fn class_expression_awaits_refuse_natively() {
+        for src in [
+            "var k:any;\nasync function h(){ foo(class { [await k](){} }); }\n",
+            "var f:any;\nasync function h(){ return class extends (await f()) {}; }\n",
+        ] {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(src).expect("fits")),
+            ));
+            let out = emit_output(
+                parsed.product(),
+                &EmitOptions {
+                    target: ScriptTarget::Es5,
+                    no_emit_helpers: true,
+                    ..EmitOptions::default()
+                },
+            );
+            let code = javascript(&out).code.clone();
+            assert!(
+                !code.contains("__generator(this,"),
+                "machine must refuse: {src}\n{code}"
+            );
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.message().contains("generators require")),
+                "refusal must be signalled: {src}"
+            );
+        }
+    }
+
     /// Emits `input` at es5 without helpers; panics on parse diagnostics.
     fn emit_es5_clean(input: &str) -> EmitOutput {
         let parsed = crate::parser::parse(crate::scanner::scan(
