@@ -28,11 +28,12 @@ use super::{
     ABSTRACT_CONSTRUCTOR, ACCESSOR_THIS_PARAMETER, AMBIENT_IMPLEMENTATION, ARGUMENT_COUNT_MISMATCH,
     ARGUMENT_NOT_ASSIGNABLE, ASSIGNMENT_TO_CONST, ASSIGNMENT_TO_FUNCTION, ASSIGNMENT_TO_NAMESPACE,
     ASSIGNMENT_TO_READONLY, AWAIT_USING_DECLARATION_IN_FOR_IN, BARE_SUPER_EXPRESSION,
-    CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
+    BLOCK_SCOPED_USED_BEFORE_DECLARATION, CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED,
+    CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE, CLASS_USED_BEFORE_DECLARATION,
     CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, CONSTRUCTOR_TYPE_PARAMETERS,
     DECLARATION_CONFLICTS_WITH_BUILTIN_GLOBAL, DERIVED_CONSTRUCTOR_MISSING_SUPER,
-    DUPLICATE_DECLARATION, EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE, EXPRESSION_NOT_CONSTRUCTABLE,
-    FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
+    DUPLICATE_DECLARATION, ENUM_USED_BEFORE_DECLARATION, EXCESS_PROPERTY, EXPRESSION_NOT_CALLABLE,
+    EXPRESSION_NOT_CONSTRUCTABLE, FOR_IN_LEFT_HAND_SIDE_INVALID, FOR_OF_ITERABLE_REQUIRED,
     FUNCTION_DECLARATION_IN_BLOCK_ES5_STRICT, FUNCTION_IMPLEMENTATION_WRONG_NAME,
     FUNCTION_OVERLOAD_MISSING_IMPLEMENTATION, GET_ACCESSOR_NO_RETURN, GET_ACCESSOR_PARAMETERS,
     IMPORT_CONFLICTS_WITH_LOCAL, INVALID_ASSIGNMENT_TARGET, INVALID_INDEXED_ACCESS_KEY,
@@ -14485,6 +14486,7 @@ impl<'src> Binder<'src> {
                     USED_BEFORE_ASSIGNED_MESSAGE,
                 );
             }
+            self.check_used_before_declaration(identifier, symbol, scope);
         } else if !self.suppresses_unresolved_value(scope) {
             if self.intrinsics.is_lib_gated_value(&name) {
                 self.emit(
@@ -14521,6 +14523,75 @@ impl<'src> Binder<'src> {
         }
         false
     }
+    /// TS2448/TS2449/TS2450: a block-scoped binding referenced textually
+    /// before its declaration. A reference separated from the declaration by
+    /// a function-like boundary is deferred instead - the function runs
+    /// after the binding initializes - so only same-function (or same
+    /// module top-level) uses count.
+    fn check_used_before_declaration(
+        &mut self,
+        identifier: &IdentifierNode,
+        symbol: SymbolId,
+        scope: ScopeId,
+    ) {
+        let symbol_data = &self.symbols[symbol.get() as usize];
+        let code = match symbol_data.kind {
+            SymbolKind::Variable(VariableKind::Let | VariableKind::Const) => {
+                BLOCK_SCOPED_USED_BEFORE_DECLARATION
+            }
+            SymbolKind::Class => CLASS_USED_BEFORE_DECLARATION,
+            SymbolKind::Enum => {
+                // A const enum is inlined at its use sites, so an early
+                // reference reads the cooked value instead of the runtime
+                // binding; tsc leaves it clean.
+                let is_const = self
+                    .enum_declarations
+                    .iter()
+                    .any(|binding| binding.symbol == symbol && binding.declaration.is_const);
+                if is_const {
+                    return;
+                }
+                ENUM_USED_BEFORE_DECLARATION
+            }
+            _ => return,
+        };
+        let declaration_scope = symbol_data.scope();
+        if identifier.range().start() >= symbol_data.range().start()
+            || self.boundary_scope(scope) != self.boundary_scope(declaration_scope)
+            || self.crosses_function_boundary(scope, declaration_scope)
+        {
+            return;
+        }
+        let name = self.identifier_text(identifier);
+        let message = match symbol_data.kind {
+            SymbolKind::Variable(_) => {
+                format!("Block-scoped variable '{name}' used before its declaration.")
+            }
+            SymbolKind::Class => format!("Class '{name}' used before its declaration."),
+            _ => format!("Enum '{name}' used before its declaration."),
+        };
+        self.emit_with_message(code, identifier.range(), message);
+    }
+
+    /// Whether walking from `from` up to `to` crosses a function-like
+    /// boundary.
+    fn crosses_function_boundary(&self, from: ScopeId, to: ScopeId) -> bool {
+        let mut scope = from;
+        loop {
+            if scope == to {
+                return false;
+            }
+            match self.scopes[scope.0 as usize].kind {
+                ScopeKind::Function | ScopeKind::Global | ScopeKind::Module => return true,
+                _ => {}
+            }
+            let Some(parent) = self.scopes[scope.0 as usize].parent else {
+                return true;
+            };
+            scope = parent;
+        }
+    }
+
     fn enclosing_this_owner(&self, mut scope: ScopeId) -> Option<SymbolId> {
         loop {
             let lexical = &self.scopes[scope.0 as usize];

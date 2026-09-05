@@ -142,6 +142,9 @@ pub const SUPER_BEFORE_THIS: DiagnosticCode = DiagnosticCode::new("BAMTS-C090");
 pub const SUPER_BEFORE_SUPER_PROPERTY: DiagnosticCode = DiagnosticCode::new("BAMTS-C091");
 pub const SUPER_FIELD_VIA_SUPER: DiagnosticCode = DiagnosticCode::new("BAMTS-C092");
 pub const SUPER_STATIC_MEMBER_VIA_SUPER: DiagnosticCode = DiagnosticCode::new("BAMTS-C093");
+pub const BLOCK_SCOPED_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C094");
+pub const CLASS_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C095");
+pub const ENUM_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C096");
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
 /// Diagnostic emitted when an assignment target resolves to a namespace.
 pub const ASSIGNMENT_TO_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C030");
@@ -2164,20 +2167,20 @@ fn imported_enum_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, CANNOT_FIND_NAME,
-        CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
-        CONSTRUCTOR_DECORATOR_NOT_SUPPORTED, DERIVED_CONSTRUCTOR_MISSING_SUPER,
-        DUPLICATE_DECLARATION, EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS,
-        IMPORTED_CONST_ENUM_CYCLE, IMPORTED_CONST_ENUM_NONCONSTANT, INVALID_ASSIGNMENT_TARGET,
-        MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
-        PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
-        PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
-        ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS,
-        SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER,
-        SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind,
-        TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId,
-        TypeTable, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
-        check_program_with_options,
+        ARGUMENT_NOT_ASSIGNABLE, BARE_SUPER_EXPRESSION, BLOCK_SCOPED_USED_BEFORE_DECLARATION,
+        CANNOT_FIND_NAME, CANNOT_FIND_NAME_LIB_GATED, CANNOT_FIND_NAMESPACE, CANNOT_FIND_TYPE,
+        CLASS_USED_BEFORE_DECLARATION, CONSTRUCTOR_DECORATOR_NOT_SUPPORTED,
+        DERIVED_CONSTRUCTOR_MISSING_SUPER, DUPLICATE_DECLARATION, ENUM_USED_BEFORE_DECLARATION,
+        EXPRESSION_NOT_CALLABLE, IMPORTED_CONST_ENUM_AMBIGUOUS, IMPORTED_CONST_ENUM_CYCLE,
+        IMPORTED_CONST_ENUM_NONCONSTANT, INVALID_ASSIGNMENT_TARGET, MISSING_METHOD_RETURN_TYPE,
+        MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER, PARAMETER_DECORATOR_NOT_SUPPORTED,
+        PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
+        ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY,
+        SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER,
+        ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE,
+        TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable, VALUE_CANNOT_BE_USED_HERE,
+        WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -5986,6 +5989,83 @@ function check(options: Options = {}) {
                 .count(),
             2
         );
+    }
+
+    /// The blockScopedEnumVariablesUseBeforeDef baseline carries exactly
+    /// one TS2450: the regular enum in foo1. The const enums (foo2,
+    /// AfterObject) are inlined at use sites and stay clean.
+    #[test]
+    fn enum_used_before_declaration_matches_baseline() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = std::fs::read_to_string(root.join(concat!(
+            "target/authority/typescript-7.0.2-tests/tests/cases/compiler/",
+            "blockScopedEnumVariablesUseBeforeDef.ts"
+        )))
+        .unwrap();
+        let codes = checker_codes(&check_text(&source));
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == ENUM_USED_BEFORE_DECLARATION.as_str())
+                .count(),
+            1,
+            "{codes:?}"
+        );
+    }
+
+    #[test]
+    fn block_scoped_used_before_declaration_matrix() {
+        fn codes(text: &str) -> Vec<&'static str> {
+            checker_codes(&check_text(text))
+        }
+        // let/const/class/enum referenced textually before declaration.
+        let late_binding = codes(
+            "return_early();
+             function return_early() {
+                 const v = x;
+                 let x = 1;
+                 class C {}
+                 new D();
+                 class D {}
+                 E.A;
+                 enum E { A }
+                 return v;
+             }",
+        );
+        assert!(late_binding.contains(&BLOCK_SCOPED_USED_BEFORE_DECLARATION.as_str()));
+        assert!(late_binding.contains(&CLASS_USED_BEFORE_DECLARATION.as_str()));
+        assert!(
+            late_binding.contains(&ENUM_USED_BEFORE_DECLARATION.as_str()),
+            "{late_binding:?}"
+        );
+        // A reference deferred through a function-like boundary is legal:
+        // the function runs after the binding initializes, and its body
+        // resolves once the binding is already in scope.
+        let deferred = codes(
+            "function g() {
+                 inner();
+                 let y = 1;
+                 function inner() { return y; }
+                 const f = () => y;
+             }
+             g();",
+        );
+        assert!(
+            !deferred.contains(&BLOCK_SCOPED_USED_BEFORE_DECLARATION.as_str()),
+            "{deferred:?}"
+        );
+        // var and function declarations hoist: no error.
+        let hoisted = codes(
+            "h();
+             var shared = 1;
+             function h() { return shared; }",
+        );
+        assert!(
+            !hoisted.contains(&BLOCK_SCOPED_USED_BEFORE_DECLARATION.as_str()),
+            "{hoisted:?}"
+        );
+        // Use at or after the declaration stays silent.
+        assert_eq!(codes("let a = 1; a; const b = a; b;"), Vec::<&str>::new());
     }
 
     /// TS2576: super.S1 where S1 is a base static member. Also pins the
