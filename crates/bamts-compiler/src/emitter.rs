@@ -7079,6 +7079,103 @@ var c = () => 1;
     //   WD-9 recursive walkers survive deep nesting without crashing.
     // ------------------------------------------------------------------
 
+    /// B4: destructuring defaults lower to tsc's ES5 shape - a temp
+    /// read then a `=== void 0` ternary - never erasing the default.
+    #[test]
+    fn destructuring_defaults_lower_to_ternary_declarators() {
+        let cases = [
+            (
+                "var o:any;\nvar { a = 1 } = o;\n",
+                "var _t0 = o.a, a = _t0 === void 0 ? 1 : _t0;",
+            ),
+            (
+                "var o:any;\nvar { p: q = 2 } = o;\n",
+                "var _t0 = o.p, q = _t0 === void 0 ? 2 : _t0;",
+            ),
+            (
+                "var o:any;\nvar { x: { y } = {} } = o;\n",
+                "var _t0 = o.x, _t1 = _t0 === void 0 ? {} : _t0, y = _t1.y;",
+            ),
+            (
+                "var arr:any;\nvar [c = 3, , [d = 4] = []] = arr;\n",
+                "var _t0 = arr[0], c = _t0 === void 0 ? 3 : _t0, _t1 = arr[2], _t2 = _t1 === void 0 ? [] : _t1, _t3 = _t2[0], d = _t3 === void 0 ? 4 : _t3;",
+            ),
+        ];
+        for (src, expected) in cases {
+            let out = emit_es5_clean(src);
+            let code = javascript(&out).code.clone();
+            assert!(
+                code.contains(expected),
+                "missing tsc default shape `{expected}` in:\n{code}"
+            );
+        }
+    }
+
+    /// B4: a default's suspension survives lowering - the machine splits
+    /// the default selection and no live yield leaks.
+    #[test]
+    fn destructuring_default_suspension_splits_the_machine() {
+        let out =
+            emit_es5_clean("var o:any, k:any;\nfunction* g(){ var { m = (yield k) } = o; }\n");
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(
+            code.contains("=== void 0"),
+            "selection test missing:\n{code}"
+        );
+        assert!(
+            code.contains("[4 /*yield*/, k]"),
+            "suspension missing:\n{code}"
+        );
+        assert!(code.contains("m = _t"), "final bind missing:\n{code}");
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+    }
+
+    /// B4: an await default must not land in a ternary - eval refuses
+    /// Conditional, so the __awaiter inner generator would stay native
+    /// `function*` at ES5. The branch form keeps the inner machine.
+    #[test]
+    fn destructuring_default_await_keeps_the_inner_machine() {
+        let out = emit_es5_clean(
+            "var o:any, k:any;\nasync function h(){ var { n = await k } = o; return n; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("__awaiter("), "async wrapper: {code}");
+        assert!(
+            code.contains("__generator(this,"),
+            "inner machine lost - await landed in a ternary:\n{code}"
+        );
+        assert!(!code.contains("? yield"), "ternary yield:\n{code}");
+    }
+
+    /// B4 walker: a suspending for-init binding signals refusal with the
+    /// requires-es2015 diagnostic rather than cloning silently.
+    #[test]
+    fn for_init_suspending_binding_signals_refusal() {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(SourceText::new(
+                "var o:any, k:any;\nfunction* g(){ for (var { a = (yield k) } = o;;) { break; } }\n",
+            )
+            .expect("fits")),
+        ));
+        let out = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.message().contains("generators require")),
+            "refusal must be signalled"
+        );
+    }
+
     /// Emits `input` at es5 without helpers; panics on parse diagnostics.
     fn emit_es5_clean(input: &str) -> EmitOutput {
         let parsed = crate::parser::parse(crate::scanner::scan(
