@@ -7252,6 +7252,48 @@ var c = () => 1;
         assert!(code.contains("if (c)"), "clean if clones inline:\n{code}");
     }
 
+    /// Bot-round B4 gaps: the suspending-declaration path must keep
+    /// sibling identifier declarators, declare computed-key temps,
+    /// bind array rest, exclude computed keys from object rest with
+    /// tsc's runtime coercion, and rewrite awaited sources so the
+    /// __awaiter inner generator still machine-converts.
+    #[test]
+    fn suspending_declarations_keep_sibling_and_rest_semantics() {
+        let out = emit_es5_clean(
+            "var y:any, obj:any;\nfunction* g(){ var x = 5, { a = (yield y) } = obj; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("x = 5"),
+            "sibling declarator dropped:\n{code}"
+        );
+        let out = emit_es5_clean(
+            "var k:any, arr:any;\nfunction* g(){ var [a = (yield k), ...r] = arr; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("r = arr.slice(1)"),
+            "array rest discarded:\n{code}"
+        );
+        let out =
+            emit_es5_clean("var k:any, o:any;\nfunction* g(){ var { [k]: v, ...rest } = o; }\n");
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("typeof _t0 === \"symbol\" ? _t0 : _t0 + \"\""),
+            "computed key must be excluded at runtime (tsc shape):\n{code}"
+        );
+        let out = emit_es5_clean("var k:any, o:any;\nfunction* g(){ var { [yield k]: v } = o; }\n");
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("var v, _t0, _t1"), "temps declared:\n{code}");
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+        let out = emit_es5_clean("var k:any;\nasync function h(){ var { a } = await k; }\n");
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("__generator(this,"),
+            "awaited source must rewrite so the inner machine converts:\n{code}"
+        );
+    }
+
     /// Emits `input` at es5 without helpers; panics on parse diagnostics.
     fn emit_es5_clean(input: &str) -> EmitOutput {
         let parsed = crate::parser::parse(crate::scanner::scan(

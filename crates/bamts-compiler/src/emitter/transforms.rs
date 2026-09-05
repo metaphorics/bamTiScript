@@ -1846,13 +1846,21 @@ impl<'a> Rewriter<'a> {
             out.push(hoist);
         }
         for declarator in &declaration.declarations {
-            let (rhs, needs_temp) = self.rhs_ident(declarator.data().initializer.as_deref(), range);
+            let initializer = declarator.data().initializer.as_deref();
+            if let BindingPattern::Identifier(ident) = declarator.data().binding.data() {
+                // A plain identifier declarator alongside a suspending
+                // binding still needs its assignment; the rewrite pass
+                // owns the initializer's awaits.
+                if let Some(init) = initializer {
+                    let value = self.rewrite_expr(init);
+                    out.push(self.assign_statement(ident, value, range));
+                }
+                continue;
+            }
+            let (rhs, needs_temp) = self.rhs_ident(initializer, range);
             if needs_temp {
-                let init = declarator
-                    .data()
-                    .initializer
-                    .as_deref()
-                    .cloned()
+                let init = initializer
+                    .map(|value| self.rewrite_expr(value))
                     .unwrap_or_else(|| self.ident_expr("undefined"));
                 let declarations = vec![self.make_declarator(rhs.clone(), Some(init), range)];
                 let temp = self.node(
@@ -1885,12 +1893,24 @@ impl<'a> Rewriter<'a> {
             BindingPattern::Identifier(_) | BindingPattern::Missing(_) => {}
             BindingPattern::Rest(_) => {}
             BindingPattern::Object(object) => {
-                let mut rest_names = Vec::new();
+                let mut rest_keys: Vec<RestExcludeKey> = Vec::new();
                 for property in &object.properties {
                     // The member expression this property reads.
                     let member = match &property.name {
                         PropertyName::Computed(key) => {
                             let temp = self.temp_ident();
+                            // The key temp needs its `var` even when the
+                            // key suspends: the assignment form would
+                            // otherwise target an undeclared name.
+                            let temp_decl = vec![self.make_declarator(temp.clone(), None, range)];
+                            out.push(self.node(
+                                range,
+                                Statement::Variable(VariableDeclaration {
+                                    range,
+                                    kind: VariableKind::Var,
+                                    declarations: temp_decl,
+                                }),
+                            ));
                             if contains_yield(key) {
                                 let assign =
                                     self.assign_statement(&temp, key.as_ref().clone(), range);
@@ -1899,33 +1919,27 @@ impl<'a> Rewriter<'a> {
                                 let value = self.rewrite_expr(key);
                                 out.push(self.make_temp_declaration(temp.clone(), value, range));
                             }
+                            rest_keys.push(RestExcludeKey::Computed(temp.clone()));
                             let reference =
                                 self.node(temp.range(), Expression::Identifier(temp.clone()));
                             self.member_computed(rhs, &reference, range)
                         }
                         _ => match property_key_text(self, property) {
                             Some(key) => {
-                                rest_names.push(key.clone());
+                                rest_keys.push(RestExcludeKey::Static(key.clone()));
                                 self.member_ident(rhs, &key, range)
                             }
                             None => continue,
                         },
                     };
-                    self.emit_property_statements(
-                        property,
-                        member,
-                        range,
-                        &mut rest_names,
-                        rhs,
-                        out,
-                    );
+                    self.emit_property_statements(property, member, range, rhs, out);
                 }
                 // The rest property binds after the named reads.
                 for property in &object.properties {
                     if let BindingPattern::Rest(rest) = property.binding.data()
                         && let BindingPattern::Identifier(ident) = rest.argument.data()
                     {
-                        let excluded = self.rest_exclude_literal(&rest_names, range);
+                        let excluded = self.rest_exclude_array(&rest_keys, range);
                         let call = self.rest_call(rhs, excluded, range);
                         out.push(self.assign_statement(ident, call, range));
                     }
@@ -1939,6 +1953,15 @@ impl<'a> Rewriter<'a> {
                             index += 1;
                         }
                         ArrayBindingElement::Binding(binding) => {
+                            if let BindingPattern::Rest(rest) = binding.data()
+                                && let BindingPattern::Identifier(ident) = rest.argument.data()
+                            {
+                                // Rest consumes the remainder without
+                                // advancing the element index.
+                                let slice = self.slice_call(rhs, index, range);
+                                out.push(self.assign_statement(ident, slice, range));
+                                continue;
+                            }
                             self.emit_element_statements(rhs, binding, index, range, out);
                             index += 1;
                         }
@@ -1965,7 +1988,6 @@ impl<'a> Rewriter<'a> {
         property: &ObjectBindingProperty,
         member: Expr,
         range: TextRange,
-        _rest_names: &mut Vec<String>,
         _rhs: &IdentifierNode,
         out: &mut Vec<Stmt>,
     ) {
@@ -2195,7 +2217,7 @@ impl<'a> Rewriter<'a> {
         let mut out = Vec::new();
         if needs_temp {
             let init = initializer
-                .cloned()
+                .map(|value| self.rewrite_expr(value))
                 .unwrap_or_else(|| self.ident_expr("undefined"));
             out.push(self.make_declarator(rhs.clone(), Some(init), range));
         }
@@ -2214,8 +2236,8 @@ impl<'a> Rewriter<'a> {
         object: &ObjectBindingPattern,
         range: TextRange,
         out: &mut Vec<VariableDeclaratorNode>,
-    ) {
-        let mut rest_names = Vec::new();
+    ) -> Vec<RestExcludeKey> {
+        let mut rest_keys = Vec::new();
         for property in &object.properties {
             let PropertyName::Computed(key) = &property.name else {
                 continue;
@@ -2224,6 +2246,7 @@ impl<'a> Rewriter<'a> {
             let value = self.rewrite_expr(key);
             let declaration = self.make_temp_declaration(temp.clone(), value, range);
             self.key_prelude.push(declaration);
+            rest_keys.push(RestExcludeKey::Computed(temp.clone()));
             let reference = self.node(temp.range(), Expression::Identifier(temp.clone()));
             let member = self.member_computed(rhs, &reference, range);
             self.lower_property_binding(property, member, range, out);
@@ -2234,7 +2257,7 @@ impl<'a> Rewriter<'a> {
             }
             if let BindingPattern::Rest(rest) = property.binding.data() {
                 if let BindingPattern::Identifier(ident) = rest.argument.data() {
-                    let excluded = self.rest_exclude_literal(&rest_names, range);
+                    let excluded = self.rest_exclude_array(&rest_keys, range);
                     let call = self.rest_call(rhs, excluded, range);
                     out.push(self.make_declarator(ident.clone(), Some(call), range));
                 }
@@ -2243,10 +2266,11 @@ impl<'a> Rewriter<'a> {
             let Some(key) = property_key_text(self, property) else {
                 continue;
             };
-            rest_names.push(key.clone());
+            rest_keys.push(RestExcludeKey::Static(key.clone()));
             let member = self.member_ident(rhs, &key, range);
             self.lower_property_binding(property, member, range, out);
         }
+        rest_keys
     }
 
     /// Binds one property's value expression: an identifier target with a
@@ -2318,7 +2342,7 @@ impl<'a> Rewriter<'a> {
         let mut out = Vec::new();
         if needs_temp {
             let init = initializer
-                .cloned()
+                .map(|value| self.rewrite_expr(value))
                 .unwrap_or_else(|| self.ident_expr("undefined"));
             out.push(self.make_declarator(rhs.clone(), Some(init), range));
         }
@@ -2682,17 +2706,67 @@ impl<'a> Rewriter<'a> {
         )
     }
 
-    fn rest_exclude_literal(&mut self, names: &[String], range: TextRange) -> Expr {
+    /// The `__rest` exclusion array. Static keys contribute plain
+    /// strings; computed keys contribute tsc's runtime coercion
+    /// (`typeof t === "symbol" ? t : t + ""`), because the excluded
+    /// property name is only known at runtime.
+    fn rest_exclude_array(&mut self, keys: &[RestExcludeKey], range: TextRange) -> Expr {
         let mut elements = Vec::new();
-        for name in names {
-            let literal = self.string_literal(name);
-            let expr = self.node(
-                literal.range(),
-                Expression::Literal(Literal::String(literal)),
-            );
+        for key in keys {
+            let expr = match key {
+                RestExcludeKey::Static(name) => {
+                    let literal = self.string_literal(name);
+                    self.node(
+                        literal.range(),
+                        Expression::Literal(Literal::String(literal)),
+                    )
+                }
+                RestExcludeKey::Computed(temp) => {
+                    let temp_expr = self.node(temp.range(), Expression::Identifier(temp.clone()));
+                    let symbol = self.string_literal("symbol");
+                    let symbol_expr =
+                        self.node(symbol.range(), Expression::Literal(Literal::String(symbol)));
+                    let typeof_argument =
+                        self.node(temp.range(), Expression::Identifier(temp.clone()));
+                    let typeof_expr = self.node(
+                        temp.range(),
+                        Expression::Unary(UnaryExpression {
+                            operator: UnaryOperator::Typeof,
+                            argument: Box::new(typeof_argument),
+                        }),
+                    );
+                    let test = self.node(
+                        temp.range(),
+                        Expression::Binary(BinaryExpression {
+                            operator: BinaryOperator::StrictEqual,
+                            left: Box::new(typeof_expr),
+                            right: Box::new(symbol_expr),
+                        }),
+                    );
+                    let empty = self.string_literal("");
+                    let empty_expr =
+                        self.node(empty.range(), Expression::Literal(Literal::String(empty)));
+                    let concat_left = self.node(temp.range(), Expression::Identifier(temp.clone()));
+                    let concat = self.node(
+                        temp.range(),
+                        Expression::Binary(BinaryExpression {
+                            operator: BinaryOperator::Add,
+                            left: Box::new(concat_left),
+                            right: Box::new(empty_expr),
+                        }),
+                    );
+                    self.node(
+                        temp.range(),
+                        Expression::Conditional(ConditionalExpression {
+                            test: Box::new(test),
+                            consequent: Box::new(temp_expr),
+                            alternate: Box::new(concat),
+                        }),
+                    )
+                }
+            };
             elements.push(ArrayElement::Expression(Box::new(expr)));
         }
-        let _ = range;
         self.node(range, Expression::Array(ArrayLiteral { elements }))
     }
 
@@ -7652,6 +7726,14 @@ fn for_clauses_are_clean(for_statement: &ForStatement) -> bool {
         .as_deref()
         .is_none_or(|update| !contains_yield(update));
     init_clean && test_clean && update_clean
+}
+
+/// One `__rest` exclusion entry: a static property name or the temp
+/// holding an evaluated computed key (excluded at runtime via tsc's
+/// symbol-aware coercion).
+enum RestExcludeKey {
+    Static(String),
+    Computed(IdentifierNode),
 }
 
 /// Suspensions inside a binding pattern: default initializers and
