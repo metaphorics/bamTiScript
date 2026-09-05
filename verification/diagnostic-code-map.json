@@ -540,6 +540,18 @@
       "evidence": "Value or type reference resolves to a known lib-gated global not in the active lib set -> TS2583 in the TypeScript 7.0.2 authority baselines: bigintWithoutLib(target=es5) (line 4).",
       "status": "mapped",
       "tsCode": 2583
+    },
+    {
+      "bamtsCode": "BAMTS-C090",
+      "evidence": "Derived constructor reads `this` before a guaranteed super() call -> TS17009 in the TypeScript 7.0.2 authority baselines: checkSuperCallBeforeThisAccess (line 7), checkSuperCallBeforeThisAccessing2 (line 5).",
+      "status": "mapped",
+      "tsCode": 17009
+    },
+    {
+      "bamtsCode": "BAMTS-C091",
+      "evidence": "Derived constructor reads a `super` property before a guaranteed super() call -> TS17011 in the TypeScript 7.0.2 authority baselines: checkSuperCallBeforeThisAccess (line 9), checkSuperCallBeforeThisAccessing3 (line 5).",
+      "status": "mapped",
+      "tsCode": 17011
     }
   ]
 }
