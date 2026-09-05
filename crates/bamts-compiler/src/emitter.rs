@@ -7684,4 +7684,37 @@ var c = () => 1;
         assert!(code.contains("/*yield*/, k"), "protocol form: {code}");
         assert!(live_yield_leak(code).is_none(), "{code}");
     }
+
+    #[test]
+    fn machine_state_name_terminates_past_the_alphabet() {
+        // Declaring _a.._z plus _state exhausted the old allocator's fixed
+        // fallback and hung compilation forever. A regression must fail
+        // this test, not wedge the runner, so the emit runs on a thread
+        // with a hard timeout.
+        // The skip set is built from BODY statements, so the alphabet must
+        // be declared inside the generator, not as ambient `declare var`.
+        let input = "function* g() { var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _state; yield 1; }\n";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let parsed_input = input.to_owned();
+        std::thread::spawn(move || {
+            let parsed = crate::parser::parse(crate::scanner::scan(
+                SourceId::new(0),
+                ScriptKind::TypeScript,
+                Arc::new(SourceText::new(parsed_input.as_str()).expect("fits budget")),
+            ));
+            let output = emit_output(
+                parsed.product(),
+                &EmitOptions {
+                    target: ScriptTarget::Es5,
+                    no_emit_helpers: true,
+                    ..EmitOptions::default()
+                },
+            );
+            let _ = tx.send(javascript(&output).code.clone());
+        });
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("allocator must terminate past the alphabet");
+        assert!(code.contains("__generator(this,"), "{code}");
+    }
 }

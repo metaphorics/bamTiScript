@@ -5807,7 +5807,11 @@ impl<'a> Rewriter<'a> {
             expression.range(),
             Statement::Variable(VariableDeclaration {
                 range: expression.range(),
-                kind: VariableKind::Let,
+                kind: if self.options.target >= ScriptTarget::Es2015 {
+                    VariableKind::Let
+                } else {
+                    VariableKind::Var
+                },
                 declarations: vec![declaration],
             }),
         ));
