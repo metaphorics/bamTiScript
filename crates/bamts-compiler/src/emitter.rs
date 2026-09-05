@@ -7236,20 +7236,18 @@ var c = () => 1;
     /// inline clean clone and the suspending labeled shape must lower.
     #[test]
     fn if_without_else_lowers_in_the_machine() {
-        let suspending = emit_es5_clean(
-            "var c:any, x:any;\nfunction* g(){ if (c) { yield x; } yield 2; }\n",
-        );
-        let code = javascript(&suspending).code;
+        let suspending =
+            emit_es5_clean("var c:any, x:any;\nfunction* g(){ if (c) { yield x; } yield 2; }\n");
+        let code = javascript(&suspending).code.clone();
         assert!(code.contains("__generator(this,"), "machine form: {code}");
         assert!(
             code.contains("[4 /*yield*/, x]"),
             "the branch suspension must split:\n{code}"
         );
         assert!(live_yield_leak(&code).is_none(), "live yield leaked");
-        let clean = emit_es5_clean(
-            "var c:any, x:any;\nfunction* g(){ yield 1; if (c) { x = 1; } }\n",
-        );
-        let code = javascript(&clean).code;
+        let clean =
+            emit_es5_clean("var c:any, x:any;\nfunction* g(){ yield 1; if (c) { x = 1; } }\n");
+        let code = javascript(&clean).code.clone();
         assert!(code.contains("__generator(this,"), "machine form: {code}");
         assert!(code.contains("if (c)"), "clean if clones inline:\n{code}");
     }
