@@ -145,6 +145,9 @@ pub const SUPER_STATIC_MEMBER_VIA_SUPER: DiagnosticCode = DiagnosticCode::new("B
 pub const BLOCK_SCOPED_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C094");
 pub const CLASS_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C095");
 pub const ENUM_USED_BEFORE_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS-C096");
+pub const REST_PARAMETER_NOT_LAST: DiagnosticCode = DiagnosticCode::new("BAMTS-C097");
+pub(crate) const REST_PARAMETER_NOT_LAST_MESSAGE: &str =
+    "A rest parameter must be last in a parameter list.";
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
 /// Diagnostic emitted when an assignment target resolves to a namespace.
 pub const ASSIGNMENT_TO_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C030");
@@ -2175,12 +2178,13 @@ mod tests {
         IMPORTED_CONST_ENUM_NONCONSTANT, INVALID_ASSIGNMENT_TARGET, MISSING_METHOD_RETURN_TYPE,
         MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER, PARAMETER_DECORATOR_NOT_SUPPORTED,
         PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR, PROPERTY_DOES_NOT_EXIST, ProgramCheckInput,
-        ProgramCheckOptions, PropertyType, ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY,
-        SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-        SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER,
-        ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR, TYPE_NOT_ASSIGNABLE,
-        TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable, VALUE_CANNOT_BE_USED_HERE,
-        WITH_STATEMENT_NOT_ALLOWED, check, check_program, check_program_with_options,
+        ProgramCheckOptions, PropertyType, REST_PARAMETER_NOT_LAST, ResolvedModuleEdge,
+        SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
+        SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED,
+        SUPER_STATIC_MEMBER_VIA_SUPER, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
+        TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
+        VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
+        check_program_with_options,
     };
     use crate::diagnostic::{DiagnosticSeverity, Recovered};
     use crate::namespace_plan::{ContainerAcquisition, ExportStorage};
@@ -6010,6 +6014,25 @@ function check(options: Options = {}) {
                 .count(),
             1,
             "{codes:?}"
+        );
+    }
+
+    /// TS1014: a rest parameter followed by anything else. Arrows and
+    /// constructors carry their own binders, so each shape is pinned; a
+    /// trailing rest parameter stays silent.
+    #[test]
+    fn rest_parameter_not_last_matrix() {
+        let codes = checker_codes(&check_text("function f(...x, y) { }"));
+        assert_eq!(codes, vec![REST_PARAMETER_NOT_LAST.as_str()]);
+        let arrow = checker_codes(&check_text("const g = (...x, y) => x;"));
+        assert_eq!(arrow, vec![REST_PARAMETER_NOT_LAST.as_str()]);
+        let ctor = checker_codes(&check_text("class C { constructor(...x, y) {} }"));
+        assert_eq!(ctor, vec![REST_PARAMETER_NOT_LAST.as_str()]);
+        let method = checker_codes(&check_text("class C { m(...x, y) {} }"));
+        assert_eq!(method, vec![REST_PARAMETER_NOT_LAST.as_str()]);
+        assert_eq!(
+            checker_codes(&check_text("function h(x, ...rest) { }")),
+            Vec::<&str>::new()
         );
     }
 

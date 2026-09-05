@@ -40,14 +40,15 @@ use super::{
     MEMBER_NOT_ACCESSIBLE, MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT,
     NAMESPACE_NO_EXPORTED_MEMBER, NEW_TARGET_OUTSIDE_FUNCTION, NON_VOID_FUNCTION_MUST_RETURN,
     PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
-    PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
-    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
-    SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER, SUPER_REFERENCE_NON_DERIVED,
-    SUPER_STATIC_MEMBER_VIA_SUPER, TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
-    TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
-    USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
-    USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED,
+    PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, REST_PARAMETER_NOT_LAST,
+    SET_ACCESSOR_PARAMETER_INITIALIZER, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT,
+    STRICT_NULL_MEMBER_ACCESS, SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_FIELD_VIA_SUPER,
+    SUPER_REFERENCE_NON_DERIVED, SUPER_STATIC_MEMBER_VIA_SUPER, TYPE_ALIAS_CIRCULAR,
+    TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT,
+    UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED, USING_DECLARATION_BINDING_PATTERN,
+    USING_DECLARATION_IN_FOR_IN, USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE,
+    WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
     ABSTRACT_CONSTRUCTOR_MESSAGE, ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
@@ -69,15 +70,16 @@ use super::{
     NON_VOID_FUNCTION_MUST_RETURN_MESSAGE, NOT_ASSIGNABLE_MESSAGE,
     PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE,
     PROPERTY_DOES_NOT_EXIST_MESSAGE, PROPERTY_NOT_INITIALIZED_MESSAGE,
-    SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
-    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
-    SUPER_BEFORE_THIS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
-    SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_REFERENCE_NON_DERIVED_MESSAGE,
-    TYPE_ALIAS_CIRCULAR_MESSAGE, TYPE_NESTING_TOO_DEEP_MESSAGE,
-    TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
-    USED_BEFORE_ASSIGNED_MESSAGE, USING_DECLARATION_BINDING_PATTERN_MESSAGE,
-    USING_DECLARATION_IN_FOR_IN_MESSAGE, USING_DECLARATION_MISSING_INITIALIZER_MESSAGE,
-    VALUE_CANNOT_BE_USED_HERE_MESSAGE, WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
+    REST_PARAMETER_NOT_LAST_MESSAGE, SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE,
+    STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE, STRICT_NULL_MEMBER_ACCESS_MESSAGE,
+    SUPER_BEFORE_SUPER_PROPERTY_MESSAGE, SUPER_BEFORE_THIS_MESSAGE,
+    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE, SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE,
+    SUPER_REFERENCE_NON_DERIVED_MESSAGE, TYPE_ALIAS_CIRCULAR_MESSAGE,
+    TYPE_NESTING_TOO_DEEP_MESSAGE, TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE,
+    UNUSED_EXPECT_ERROR_MESSAGE, USED_BEFORE_ASSIGNED_MESSAGE,
+    USING_DECLARATION_BINDING_PATTERN_MESSAGE, USING_DECLARATION_IN_FOR_IN_MESSAGE,
+    USING_DECLARATION_MISSING_INITIALIZER_MESSAGE, VALUE_CANNOT_BE_USED_HERE_MESSAGE,
+    WITH_STATEMENT_NOT_ALLOWED_MESSAGE,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::enum_plan::{self, EnumDeclarationBinding, EnumFacts};
@@ -9668,6 +9670,7 @@ impl<'src> Binder<'src> {
         });
         self.bind_type_parameters(function.type_parameters.as_ref(), scope);
         let this_type = self.this_parameter_type(&function.parameters, scope, this_type);
+        self.check_rest_parameter_last(&function.parameters);
         for parameter in &function.parameters {
             if self.is_this_parameter(parameter) {
                 continue;
@@ -9987,6 +9990,25 @@ impl<'src> Binder<'src> {
                 .or_else(|| initializer_type.map(|ty| self.types.widen(ty, false)))
                 .unwrap_or_else(|| self.types.any());
             self.symbol_types[symbol.get() as usize] = type_id;
+        }
+    }
+
+    /// TS1014: a rest parameter must be the last parameter. Constructor
+    /// and arrow parameter lists route through their own binders, so each
+    /// calls this beside its loop.
+    fn check_rest_parameter_last(&mut self, parameters: &[crate::syntax::ParameterNode]) {
+        for (index, parameter) in parameters.iter().enumerate() {
+            if matches!(
+                parameter.data().binding.data(),
+                crate::syntax::BindingPattern::Rest(_)
+            ) && index + 1 < parameters.len()
+            {
+                self.emit(
+                    REST_PARAMETER_NOT_LAST,
+                    parameter.range(),
+                    REST_PARAMETER_NOT_LAST_MESSAGE,
+                );
+            }
         }
     }
 
@@ -11777,6 +11799,7 @@ impl<'src> Binder<'src> {
                 self.bind_implicit_function_values(&constructor.parameters, child);
                 self.super_call_contexts
                     .push(SuperCallContext::ConstructorParameters { derived });
+                self.check_rest_parameter_last(&constructor.parameters);
                 for parameter in &constructor.parameters {
                     if self.is_parameter_property(parameter) {
                         self.resolve_parameter_property(parameter, child, scope);
@@ -11962,6 +11985,7 @@ impl<'src> Binder<'src> {
                 self.super_call_contexts
                     .push(SuperCallContext::NonConstructor);
                 self.bind_type_parameters(arrow.type_parameters.as_ref(), child);
+                self.check_rest_parameter_last(&arrow.parameters);
                 for parameter in &arrow.parameters {
                     self.resolve_non_constructor_parameter(parameter, child);
                 }
