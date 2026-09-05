@@ -41,11 +41,12 @@ use super::{
     PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
     PROPERTY_DOES_NOT_EXIST, PROPERTY_NOT_INITIALIZED, SET_ACCESSOR_PARAMETER_INITIALIZER,
     STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT, STRICT_NULL_MEMBER_ACCESS,
-    SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
-    SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR, TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE,
-    TYPE_PARAMETER_CIRCULAR_DEFAULT, UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED,
-    USING_DECLARATION_BINDING_PATTERN, USING_DECLARATION_IN_FOR_IN,
-    USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED,
+    SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS,
+    SUPER_CALL_OUTSIDE_CONSTRUCTOR, SUPER_REFERENCE_NON_DERIVED, TYPE_ALIAS_CIRCULAR,
+    TYPE_NESTING_TOO_DEEP, TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT,
+    UNUSED_EXPECT_ERROR, USED_BEFORE_ASSIGNED, USING_DECLARATION_BINDING_PATTERN,
+    USING_DECLARATION_IN_FOR_IN, USING_DECLARATION_MISSING_INITIALIZER, VALUE_CANNOT_BE_USED_HERE,
+    WITH_STATEMENT_NOT_ALLOWED,
 };
 use super::{
     ABSTRACT_CONSTRUCTOR_MESSAGE, ACCESSOR_THIS_PARAMETER_MESSAGE, AMBIENT_IMPLEMENTATION_MESSAGE,
@@ -68,7 +69,8 @@ use super::{
     PARAMETER_DECORATOR_NOT_SUPPORTED_MESSAGE, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR_MESSAGE,
     PROPERTY_DOES_NOT_EXIST_MESSAGE, PROPERTY_NOT_INITIALIZED_MESSAGE,
     SET_ACCESSOR_PARAMETER_INITIALIZER_MESSAGE, STATEMENT_NOT_ALLOWED_IN_AMBIENT_CONTEXT_MESSAGE,
-    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
+    STRICT_NULL_MEMBER_ACCESS_MESSAGE, SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
+    SUPER_BEFORE_THIS_MESSAGE, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE,
     SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE, SUPER_REFERENCE_NON_DERIVED_MESSAGE,
     TYPE_ALIAS_CIRCULAR_MESSAGE, TYPE_NESTING_TOO_DEEP_MESSAGE,
     TYPE_PARAMETER_CIRCULAR_DEFAULT_MESSAGE, UNUSED_EXPECT_ERROR_MESSAGE,
@@ -4740,6 +4742,16 @@ impl SemanticModel {
 /// derived class constructor body. Every other position (a base-class
 /// constructor, constructor parameter initializers, or any non-constructor
 /// function) maps to a distinct TypeScript diagnostic.
+/// Whether the current position sits inside a derived constructor body
+/// whose `super()` call has been guaranteed on every path so far, or in
+/// a context (nested function-like, non-derived body) where the
+/// before-super rules do not apply.
+#[derive(Clone, Copy, PartialEq)]
+enum SuperFlow {
+    Tracking { called: bool },
+    Suspended,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SuperCallContext {
     DerivedConstructor,
@@ -4971,6 +4983,11 @@ pub(crate) struct Binder<'src> {
     super_call_contexts: Vec<SuperCallContext>,
     /// Legal `super()` presence for active derived constructor bodies.
     derived_constructor_super_presence: Vec<bool>,
+    super_flow: SuperFlow,
+    /// Whether a super() call currently being resolved sits in statement
+    /// position (guarantees the flow) or inside a larger expression (a
+    /// ternary arm, an object member - guarantees nothing).
+    super_call_guarantees: bool,
     /// Whether each lexically enclosing class has a base class, innermost last.
     class_derived_stack: Vec<bool>,
     /// Own readonly storage properties for each lexically enclosing class.
@@ -5130,6 +5147,8 @@ impl<'src> Binder<'src> {
             reassigned_flow_roots_stack: Vec::new(),
             super_call_contexts: Vec::new(),
             derived_constructor_super_presence: Vec::new(),
+            super_flow: SuperFlow::Suspended,
+            super_call_guarantees: true,
             class_derived_stack: Vec::new(),
             constructor_writable_readonly_properties: Vec::new(),
             readonly_assignment_targets: HashSet::new(),
@@ -8760,23 +8779,55 @@ impl<'src> Binder<'src> {
                 self.resolve_statements(&block.data().statements, child);
             }
             Statement::Expression(statement) => {
+                let positional = matches!(
+                    statement.expression.data(),
+                    Expression::Call(call) if matches!(call.callee.data(), Expression::Super)
+                );
+                let outer_guarantees = self.super_call_guarantees;
+                self.super_call_guarantees = positional;
                 self.resolve_expr(&statement.expression, scope);
+                self.super_call_guarantees = outer_guarantees;
                 self.type_of_expr(&statement.expression, scope);
             }
             Statement::If(statement) => {
                 self.resolve_expr(&statement.test, scope);
                 self.type_of_expr(&statement.test, scope);
                 let parent = self.flow;
+                let entry_super_flow = self.super_flow;
                 let truthy = self.guards_for(&statement.test, false);
                 let falsy = self.guards_for(&statement.test, true);
                 let then_end = self.in_branch(parent, &truthy, |binder| {
                     binder.resolve_statement(&statement.consequent, scope);
                 });
+                let then_super = self.super_flow;
+                self.super_flow = entry_super_flow;
                 let else_end = self.in_branch(parent, &falsy, |binder| {
                     if let Some(alternate) = &statement.alternate {
                         binder.resolve_statement(alternate, scope);
                     }
                 });
+                let else_super = self.super_flow;
+                // super() guarantees past the if only when every
+                // fall-through path has called it: an always-exiting
+                // branch imposes nothing, and a missing alternate keeps
+                // the entry state for its implicit fall-through.
+                let then_exits = Self::statement_always_exits(statement.consequent.data());
+                let else_exits = statement
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alt| Self::statement_always_exits(alt.data()));
+                self.super_flow = match (entry_super_flow, then_super, else_super) {
+                    (SuperFlow::Tracking { called: entry }, then_flow, else_flow) => {
+                        let then_ok =
+                            then_exits || matches!(then_flow, SuperFlow::Tracking { called: true });
+                        let else_ok =
+                            else_exits || matches!(else_flow, SuperFlow::Tracking { called: true });
+                        SuperFlow::Tracking {
+                            called: entry && then_ok && else_ok,
+                        }
+                    }
+                    (suspended, _, _) => suspended,
+                };
                 // Only branches control can fall out of reach the merge, so an
                 // `if (guard) { return; }` leaves the negated guard in force after it.
                 let mut live = Vec::with_capacity(2);
@@ -8806,12 +8857,15 @@ impl<'src> Binder<'src> {
                 for case in &statement.cases {
                     self.publish_statement_class_shapes(&case.data().consequent, child);
                 }
+                let entry_super_flow = self.super_flow;
                 for case in &statement.cases {
                     self.check_bound_statements(&case.data().consequent, child);
+                    self.super_flow = entry_super_flow;
                 }
             }
             Statement::For(for_statement) => {
                 let child = self.new_scope(ScopeKind::For, Some(scope));
+                let entry_super_flow = self.super_flow;
                 if let Some(initializer) = &for_statement.initializer {
                     self.resolve_for_initializer(initializer, child);
                 }
@@ -8838,6 +8892,9 @@ impl<'src> Binder<'src> {
                     self.join_flow(parent, &[skipped, body_exit]);
                 } else {
                     self.flow = body_end;
+                }
+                if let SuperFlow::Tracking { .. } = self.super_flow {
+                    self.super_flow = entry_super_flow;
                 }
             }
             Statement::ForIn(for_statement) => {
@@ -8907,6 +8964,7 @@ impl<'src> Binder<'src> {
                 self.resolve_expr(&statement.test, scope);
                 self.type_of_expr(&statement.test, scope);
                 let parent = self.flow;
+                let entry_super_flow = self.super_flow;
                 let truthy = self.guards_for(&statement.test, false);
                 let falsy = self.guards_for(&statement.test, true);
                 let body_end = self.in_branch(parent, &truthy, |binder| {
@@ -8915,13 +8973,21 @@ impl<'src> Binder<'src> {
                 let skipped = self.branch_guarded(parent, &falsy);
                 let body_exit = self.branch_guarded(body_end, &falsy);
                 self.join_flow(parent, &[skipped, body_exit]);
+                // A super() inside the loop body ran zero times on the
+                // skip path, so it guarantees nothing afterwards.
+                self.super_flow = entry_super_flow;
             }
             Statement::DoWhile(statement) => {
+                let entry_super_flow = self.super_flow;
                 self.resolve_statement(&statement.body, scope);
+                if let SuperFlow::Tracking { .. } = self.super_flow {
+                    self.super_flow = entry_super_flow;
+                }
                 self.resolve_expr(&statement.test, scope);
                 self.type_of_expr(&statement.test, scope);
             }
             Statement::Try(statement) => {
+                let entry_super_flow = self.super_flow;
                 let block = &statement.block;
                 let try_scope = self.new_scope(ScopeKind::Block, Some(scope));
                 self.bind_statements(&block.data().statements, try_scope);
@@ -8939,6 +9005,11 @@ impl<'src> Binder<'src> {
                     let finally_scope = self.new_scope(ScopeKind::Block, Some(scope));
                     self.bind_statements(&finalizer.data().statements, finally_scope);
                     self.resolve_statements(&finalizer.data().statements, finally_scope);
+                }
+                // A throw before the super() call reaches the handler,
+                // so calls inside the try block guarantee nothing after.
+                if let SuperFlow::Tracking { .. } = self.super_flow {
+                    self.super_flow = entry_super_flow;
                 }
             }
             Statement::With(with_statement) => {
@@ -9533,6 +9604,13 @@ impl<'src> Binder<'src> {
         self.super_call_contexts
             .push(SuperCallContext::NonConstructor);
         self.super_member_homes.push(member_home);
+        // A nested function-like's `this` is either captured-and-deferred
+        // (arrows) or its own (functions), so the before-super rules do
+        // not apply inside it.
+        let outer_super_flow = self.super_flow;
+        self.super_flow = SuperFlow::Suspended;
+        let outer_guarantees = self.super_call_guarantees;
+        self.super_call_guarantees = true;
         self.bind_implicit_function_values(&function.parameters, scope);
         let function_symbol = function.name.as_ref().map(|name| {
             let symbol_scope = if is_declaration { parent } else { scope };
@@ -9652,6 +9730,8 @@ impl<'src> Binder<'src> {
         let popped_context = self.super_call_contexts.pop();
         debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
         let popped_home = self.super_member_homes.pop();
+        self.super_flow = outer_super_flow;
+        self.super_call_guarantees = outer_guarantees;
         debug_assert_eq!(popped_home, Some(member_home));
     }
 
@@ -11671,10 +11751,17 @@ impl<'src> Binder<'src> {
                 let this_type = self.class_this_type(scope, false);
                 self.this_context.push(this_type);
                 self.push_reassigned_scope();
+                let outer_super_flow = self.super_flow;
+                self.super_flow = if derived {
+                    SuperFlow::Tracking { called: false }
+                } else {
+                    SuperFlow::Suspended
+                };
                 self.in_isolated_flow(FlowNodeId::ROOT, |binder| {
                     binder.bind_statements(&constructor.body.data().statements, child);
                     binder.resolve_statements(&constructor.body.data().statements, child);
                 });
+                self.super_flow = outer_super_flow;
                 if track_super {
                     let called = self
                         .derived_constructor_super_presence
@@ -11764,6 +11851,13 @@ impl<'src> Binder<'src> {
                 self.resolve_value(identifier, expression.id(), scope);
             }
             Expression::This => {
+                if let SuperFlow::Tracking { called: false } = self.super_flow {
+                    self.emit(
+                        SUPER_BEFORE_THIS,
+                        expression.range(),
+                        SUPER_BEFORE_THIS_MESSAGE,
+                    );
+                }
                 let owner =
                     self.this_context
                         .last()
@@ -11842,6 +11936,12 @@ impl<'src> Binder<'src> {
                     FunctionBody::Expression(_) | FunctionBody::Missing(_) => None,
                 };
                 let body_flow = self.captured_flow_seed();
+                // An arrow defers its captured `this`: before-super rules
+                // do not apply inside its body.
+                let outer_super_flow = self.super_flow;
+                self.super_flow = SuperFlow::Suspended;
+                let outer_guarantees = self.super_call_guarantees;
+                self.super_call_guarantees = true;
                 self.push_reassigned_scope();
                 self.in_isolated_flow(body_flow, |binder| match &arrow.body {
                     FunctionBody::Block(block) => {
@@ -11891,6 +11991,8 @@ impl<'src> Binder<'src> {
                     debug_assert_eq!(popped, Some(body_id));
                 }
                 self.return_contexts.pop();
+                self.super_flow = outer_super_flow;
+                self.super_call_guarantees = outer_guarantees;
                 let popped_context = self.super_call_contexts.pop();
                 debug_assert_eq!(popped_context, Some(SuperCallContext::NonConstructor));
                 let type_id = self.type_of_arrow(arrow, scope);
@@ -12266,6 +12368,14 @@ impl<'src> Binder<'src> {
                 range,
                 SUPER_REFERENCE_NON_DERIVED_MESSAGE,
             );
+            return;
+        }
+        if let SuperFlow::Tracking { called: false } = self.super_flow {
+            self.emit(
+                SUPER_BEFORE_SUPER_PROPERTY,
+                range,
+                SUPER_BEFORE_SUPER_PROPERTY_MESSAGE,
+            );
         }
     }
 
@@ -12278,6 +12388,11 @@ impl<'src> Binder<'src> {
         let (code, message) = match context {
             SuperCallContext::DerivedConstructor => {
                 if let Some(called) = self.derived_constructor_super_presence.last_mut() {
+                    *called = true;
+                }
+                if self.super_call_guarantees
+                    && let SuperFlow::Tracking { called } = &mut self.super_flow
+                {
                     *called = true;
                 }
                 return;

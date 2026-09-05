@@ -138,6 +138,8 @@ const NOT_ASSIGNABLE_MESSAGE: &str = "Initializer type is not assignable to the 
 /// definitely assigned in the constructor.
 pub const PROPERTY_NOT_INITIALIZED: DiagnosticCode = DiagnosticCode::new("BAMTS-C028");
 /// Diagnostic emitted when an assignment target resolves to a function.
+pub const SUPER_BEFORE_THIS: DiagnosticCode = DiagnosticCode::new("BAMTS-C090");
+pub const SUPER_BEFORE_SUPER_PROPERTY: DiagnosticCode = DiagnosticCode::new("BAMTS-C091");
 pub const ASSIGNMENT_TO_FUNCTION: DiagnosticCode = DiagnosticCode::new("BAMTS-C029");
 /// Diagnostic emitted when an assignment target resolves to a namespace.
 pub const ASSIGNMENT_TO_NAMESPACE: DiagnosticCode = DiagnosticCode::new("BAMTS-C030");
@@ -302,6 +304,9 @@ pub(crate) const BARE_SUPER_EXPRESSION_MESSAGE: &str =
 pub(crate) const SUPER_REFERENCE_NON_DERIVED_MESSAGE: &str =
     "'super' can only be referenced in a derived class.";
 pub(crate) const SUPER_CALL_OUTSIDE_CONSTRUCTOR_MESSAGE: &str = "Super calls are not permitted outside constructors or in nested functions inside constructors.";
+pub(crate) const SUPER_BEFORE_THIS_MESSAGE: &str =
+    "'super' must be called before accessing 'this' in the constructor of a derived class.";
+pub(crate) const SUPER_BEFORE_SUPER_PROPERTY_MESSAGE: &str = "'super' must be called before accessing a property of 'super' in the constructor of a derived class.";
 pub(crate) const SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS_MESSAGE: &str =
     "'super' cannot be referenced in constructor arguments.";
 const DERIVED_CONSTRUCTOR_MISSING_SUPER_MESSAGE: &str =
@@ -2165,7 +2170,8 @@ mod tests {
         MISSING_METHOD_RETURN_TYPE, MIXED_EXPORT_ASSIGNMENT, NAMESPACE_NO_EXPORTED_MEMBER,
         PARAMETER_DECORATOR_NOT_SUPPORTED, PARAMETER_PROPERTY_ONLY_IN_CONSTRUCTOR,
         PROPERTY_DOES_NOT_EXIST, ProgramCheckInput, ProgramCheckOptions, PropertyType,
-        ResolvedModuleEdge, SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
+        ResolvedModuleEdge, SUPER_BEFORE_SUPER_PROPERTY, SUPER_BEFORE_THIS,
+        SUPER_CALL_IN_CONSTRUCTOR_ARGUMENTS, SUPER_CALL_OUTSIDE_CONSTRUCTOR,
         SUPER_REFERENCE_NON_DERIVED, ScopeKind, SymbolKind, TYPE_ALIAS_CIRCULAR,
         TYPE_NOT_ASSIGNABLE, TYPE_PARAMETER_CIRCULAR_DEFAULT, Type, TypeId, TypeTable,
         VALUE_CANNOT_BE_USED_HERE, WITH_STATEMENT_NOT_ALLOWED, check, check_program,
@@ -5945,6 +5951,77 @@ function check(options: Options = {}) {
         assert!(
             !has_with(&check_js("function f() { with ({}) {} }")),
             "sloppy nested function accepts with"
+        );
+    }
+
+    /// TS17009/TS17011: a derived constructor's `this` and `super.x`
+    /// accesses before a guaranteed `super()` call, with the oracle's
+    /// flow shapes: arrows are exempt (deferred `this`), a conditional
+    /// super() covers only its branch, and loops/try never guarantee.
+    #[test]
+    fn super_before_this_flow_matrix() {
+        fn codes(text: &str) -> Vec<&'static str> {
+            let result = check_text(text);
+            let mut found = checker_codes(&result)
+                .into_iter()
+                .filter(|code| {
+                    *code == SUPER_BEFORE_THIS.as_str()
+                        || *code == SUPER_BEFORE_SUPER_PROPERTY.as_str()
+                })
+                .collect::<Vec<_>>();
+            found.sort();
+            found
+        }
+
+        // Straight-line before/after.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor() { let a = this; super(); let b = this; } }"
+            ),
+            vec![SUPER_BEFORE_THIS.as_str()]
+        );
+        // super.x before super reports the property form.
+        assert_eq!(
+            codes("class A extends Object { constructor() { let a = super.x; super(); } }"),
+            vec![SUPER_BEFORE_SUPER_PROPERTY.as_str()]
+        );
+        // Arrows defer their this: no report inside, and none after.
+        assert_eq!(
+            codes("class A extends Object { constructor() { let f = () => this; super(); f(); } }"),
+            Vec::<&str>::new()
+        );
+        // Plain nested functions own their own this.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor() { let f = function () { return this; }; super(); } }"
+            ),
+            Vec::<&str>::new()
+        );
+        // A conditional super() covers its branch only.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor(c) {\nif (c) { super(); let a = this; }\nelse { let a = this; }\nlet b = this; } }"
+            ),
+            vec![SUPER_BEFORE_THIS.as_str(), SUPER_BEFORE_THIS.as_str()]
+        );
+        // A super() inside a loop guarantees nothing after it.
+        assert_eq!(
+            codes(
+                "class A extends Object { constructor(c) { while (c) { super(); break; } let a = this; } }"
+            ),
+            vec![SUPER_BEFORE_THIS.as_str()]
+        );
+        // Base constructors never track.
+        assert_eq!(
+            codes("class A { constructor() { let a = this; } }"),
+            Vec::<&str>::new()
+        );
+        // Field initializer and method this are not constructor-flow.
+        assert_eq!(
+            codes(
+                "class A extends Object { x = this; m() { return this; } constructor() { super(); } }"
+            ),
+            Vec::<&str>::new()
         );
     }
 
