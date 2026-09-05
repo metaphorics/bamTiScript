@@ -117,6 +117,10 @@ pub const INVALID_USING_DECLARATION: DiagnosticCode = DiagnosticCode::new("BAMTS
 pub const USING_DECLARATION_REQUIRES_INITIALIZER: DiagnosticCode =
     DiagnosticCode::new("BAMTS-P012");
 const UNTERMINATED_REGEX: DiagnosticCode = DiagnosticCode::new("BAMTS-L004");
+/// An argument-bearing yield expression parsed outside any generator.
+const YIELD_OUTSIDE_GENERATOR: DiagnosticCode = DiagnosticCode::new("BAMTS-P017");
+/// An await expression parsed inside a non-async function-like.
+const AWAIT_OUTSIDE_ASYNC: DiagnosticCode = DiagnosticCode::new("BAMTS-P018");
 
 /// A parser operation was interrupted before completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,6 +284,10 @@ struct ParserCheckpoint {
 struct KeywordContext {
     await_reserved: bool,
     yield_reserved: bool,
+    /// Inside any function-like body or parameter list. Top-level await
+    /// is legal in modules, so TS1308 fires only when this is set;
+    /// yield expressions are illegal outside generators everywhere.
+    in_function: bool,
 }
 
 /// Whether `global` / string-named module forms are recognized as ambient at
@@ -2182,6 +2190,7 @@ impl Parser {
         // Method, getter, or setter.
         if self.at(TokenKind::LParen) || self.at_less_like() || is_generator {
             let keyword_context = KeywordContext {
+                in_function: true,
                 await_reserved: is_async,
                 yield_reserved: is_generator,
             };
@@ -3254,6 +3263,16 @@ impl Parser {
         } else {
             None
         };
+        // A yield expression is legal only inside a generator; the
+        // argument-bearing form is unambiguous, so it reports TS1163
+        // wherever it appears outside one. A bare `yield` stays quiet:
+        // in sloppy code it is a plain identifier reference.
+        if !self.keyword_context.yield_reserved && argument.is_some() {
+            self.error_here(
+                YIELD_OUTSIDE_GENERATOR,
+                "A 'yield' expression is only allowed in a generator body.",
+            );
+        }
         self.node(
             start,
             Expression::Yield(YieldExpression { delegate, argument }),
@@ -3461,6 +3480,15 @@ impl Parser {
         if self.at(TokenKind::KwAwait) && self.can_start_expression_after(1) {
             self.bump();
             let argument = self.parse_unary_expression();
+            // Await belongs to async functions (or module top level,
+            // which no function-like context covers); a plain nested
+            // function-like parsing one is TS1308.
+            if !self.keyword_context.await_reserved && self.keyword_context.in_function {
+                self.error_here(
+                    AWAIT_OUTSIDE_ASYNC,
+                    "'await' expressions are only allowed within async functions and at the top levels of modules.",
+                );
+            }
             return self.node(
                 start,
                 Expression::Await(AwaitExpression {
@@ -4475,6 +4503,7 @@ impl Parser {
         // Method.
         if self.at(TokenKind::LParen) || self.at_less_like() {
             let keyword_context = KeywordContext {
+                in_function: true,
                 await_reserved: is_async,
                 yield_reserved: is_generator,
             };
@@ -4889,6 +4918,7 @@ impl Parser {
             None
         };
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: is_generator,
         };
@@ -5118,6 +5148,7 @@ impl Parser {
 
     fn parse_simple_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: false,
         };
@@ -5152,6 +5183,7 @@ impl Parser {
 
     fn parse_paren_arrow(&mut self, start: Utf16Pos, is_async: bool, no_in: bool) -> Expr {
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: false,
         };
@@ -5190,6 +5222,7 @@ impl Parser {
     ) -> Option<Expr> {
         let checkpoint = self.checkpoint();
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: false,
         };
@@ -5218,6 +5251,7 @@ impl Parser {
         let checkpoint = self.checkpoint();
         self.bump(); // `async`
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: true,
             yield_reserved: false,
         };
@@ -5258,6 +5292,7 @@ impl Parser {
             return None;
         }
         let keyword_context = KeywordContext {
+            in_function: true,
             await_reserved: is_async,
             yield_reserved: false,
         };
@@ -6553,6 +6588,101 @@ mod tests {
             .iter()
             .filter(|d| d.severity() == DiagnosticSeverity::Error)
             .collect()
+    }
+
+    /// B3: an argument-bearing yield outside any generator reports the
+    /// native code that projects onto TS1163; a bare `yield` stays
+    /// quiet (sloppy identifier reference), and generators stay clean.
+    #[test]
+    fn reports_yield_expression_outside_generators() {
+        let bad = parse_text("function f() { yield 1; }", ScriptKind::TypeScript);
+        assert!(
+            errors(&bad)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P017"),
+            "yield in plain function must report"
+        );
+        let nested = parse_text(
+            "function* g() { function h() { yield 1; } yield 2; }",
+            ScriptKind::TypeScript,
+        );
+        assert!(
+            errors(&nested)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P017"),
+            "yield in nested plain function must report"
+        );
+        let bare = parse_text("function f() { var x = yield; }", ScriptKind::TypeScript);
+        assert!(
+            !errors(&bare)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P017"),
+            "bare yield is a sloppy identifier, not a report"
+        );
+        assert_clean("function* g() { yield 1; }");
+    }
+
+    /// B3: await inside a non-async function-like (nested function or
+    /// arrow) reports the native code that projects onto TS1308;
+    /// async bodies and module top level stay clean.
+    #[test]
+    fn reports_await_outside_async_function_likes() {
+        let nested = parse_text(
+            "async function f() { function g() { return await k; } }",
+            ScriptKind::TypeScript,
+        );
+        assert!(
+            errors(&nested)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P018"),
+            "await in nested plain function must report"
+        );
+        let arrow = parse_text(
+            "async function f() { var g = () => await k; }",
+            ScriptKind::TypeScript,
+        );
+        assert!(
+            errors(&arrow)
+                .iter()
+                .any(|d| d.code().as_str() == "BAMTS-P018"),
+            "await in non-async arrow must report"
+        );
+        assert_clean("async function f() { return await k; }");
+        assert_clean("await k;");
+    }
+
+    /// B3: the native codes project onto the TypeScript surface the
+    /// driver reports - TS1163 and TS1308 with tsc's exact messages.
+    #[test]
+    fn projects_context_codes_onto_the_typescript_surface() {
+        let bad = parse_text("function f() { yield 1; }", ScriptKind::TypeScript);
+        let projected = crate::diagnostics_parser::typescript_parse_code(
+            bad.diagnostics()[0].code(),
+            bad.diagnostics()[0].message(),
+        )
+        .expect("yield code projects");
+        assert_eq!(projected.as_str(), "TS1163");
+        let awaited = parse_text(
+            "async function f() { function g() { return await k; } }",
+            ScriptKind::TypeScript,
+        );
+        let await_code = errors(&awaited)
+            .iter()
+            .find(|d| d.code().as_str() == "BAMTS-P018")
+            .copied()
+            .expect("await error present");
+        let projected = crate::diagnostics_parser::typescript_parse_code(
+            await_code.code(),
+            await_code.message(),
+        )
+        .expect("await code projects");
+        assert_eq!(projected.as_str(), "TS1308");
+        assert_eq!(
+            crate::diagnostics_parser::typescript_parse_message(projected),
+            Some(
+                "'await' expressions are only allowed within async functions and at the top levels of modules."
+            )
+        );
     }
 
     fn assert_clean(text: &str) -> Recovered<SourceFile> {
