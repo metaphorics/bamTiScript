@@ -7354,10 +7354,47 @@ var c = () => 1;
             assert!(
                 out.diagnostics
                     .iter()
-                    .any(|d| d.message().contains("generators require")),
+                    .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
                 "refusal must be signalled: {src}"
             );
         }
+    }
+
+    /// A suspending static-field initializer (postlude) refuses the
+    /// same way a key prelude does: the unlowered class keeps the
+    /// suspension visible and the generator stays native under the
+    /// signal - never a live yield inside the synthesized arrow.
+    #[test]
+    fn class_static_field_suspension_refuses_natively() {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new(
+                    "var k:any;\nfunction* g(){ var C = class { static x = yield k; }; }\n",
+                )
+                .expect("fits"),
+            ),
+        ));
+        let out = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        let code = javascript(&out).code.clone();
+        assert!(
+            !code.contains("__generator(this,"),
+            "machine must refuse the static-field suspension:\n{code}"
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "refusal must be signalled"
+        );
     }
 
     /// Emits `input` at es5 without helpers; panics on parse diagnostics.

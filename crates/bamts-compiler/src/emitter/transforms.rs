@@ -6447,10 +6447,9 @@ impl<'a> Rewriter<'a> {
             // the conversion, and the generator stays native under the
             // diagnostic. Lowering anyway would bury a raw yield or
             // await inside a synthesized plain arrow the machine
-            // cannot see through.
-            if refused {
-                return expression.clone();
-            }
+            // cannot see through - the postlude (static-field
+            // initializers) included, not just the key prelude.
+            return expression.clone();
         }
         let class = self.syn_node(
             expression.range(),
@@ -7932,11 +7931,16 @@ impl ChainSegment {
     }
 }
 
-/// The enclosing-context code of a class: the heritage expression,
-/// computed member names, and field initializers. Method, constructor,
-/// and static-block bodies are function boundaries and own their
-/// suspensions, so they stay opaque to the enclosing walkers.
+/// The enclosing-context code of a class: decorators, the heritage
+/// expression, computed member names, and field initializers. Method,
+/// constructor, and static-block bodies are function boundaries and own
+/// their suspensions, so they stay opaque to the enclosing walkers.
 fn count_class_context_yields(class: &ClassDeclaration) -> u32 {
+    let decorators: u32 = class
+        .decorators
+        .iter()
+        .map(|decorator| count_yields(&decorator.data().expression))
+        .sum();
     let heritage = class
         .extends
         .as_ref()
@@ -7961,15 +7965,19 @@ fn count_class_context_yields(class: &ClassDeclaration) -> u32 {
             _ => 0,
         })
         .sum();
-    heritage + members
+    decorators + heritage + members
 }
 
 /// The await view of the same class-context walk.
 fn class_context_contains_await(class: &ClassDeclaration) -> bool {
     if class
-        .extends
-        .as_ref()
-        .is_some_and(|heritage| contains_await(&heritage.expression))
+        .decorators
+        .iter()
+        .any(|decorator| contains_await(&decorator.data().expression))
+        || class
+            .extends
+            .as_ref()
+            .is_some_and(|heritage| contains_await(&heritage.expression))
     {
         return true;
     }
@@ -7992,9 +8000,13 @@ fn class_context_contains_await(class: &ClassDeclaration) -> bool {
 /// The yield view of the same class-context walk.
 fn class_context_contains_yield(class: &ClassDeclaration) -> bool {
     if class
-        .extends
-        .as_ref()
-        .is_some_and(|heritage| contains_yield(&heritage.expression))
+        .decorators
+        .iter()
+        .any(|decorator| contains_yield(&decorator.data().expression))
+        || class
+            .extends
+            .as_ref()
+            .is_some_and(|heritage| contains_yield(&heritage.expression))
     {
         return true;
     }
