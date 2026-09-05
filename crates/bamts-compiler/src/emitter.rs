@@ -6907,25 +6907,33 @@ var c = () => 1;
 
     #[test]
     fn es5_async_switch_discriminant_await_inline() {
-        // Authority: es5-asyncFunctionSwitchStatements(target=es5) — a
-        // discriminant that awaits is emitted as `switch (_a.sent())` inline
-        // in the resumed case.
-        let options = EmitOptions {
-            target: ScriptTarget::Es5,
-            no_emit_helpers: true,
-            ..EmitOptions::default()
-        };
-        let input = "async function f(x: any) {\n    switch (await x) {\n        case 1: return 10;\n        default: return 20;\n    }\n}\n";
-        let parsed = crate::parser::parse(crate::scanner::scan(
-            SourceId::new(0),
-            ScriptKind::TypeScript,
-            Arc::new(SourceText::new(input).expect("test source fits the per-file budget")),
-        ));
-        assert!(parsed.diagnostics().is_empty());
-        let output = emit_output(parsed.product(), &options);
+        // Return-bearing cases must not ride the discriminant-inline path:
+        // cloning them verbatim embeds a raw `return 10` in the machine's
+        // inner function, which drops the value through the protocol. Until
+        // the rebuilt-cases path routes returns through machine_statements,
+        // this shape refuses with the diagnostic — never a silent clone.
+        let output = emit_es5_clean(
+            "declare var x: any;\nasync function f() { switch (await x) { case 1: return 10; default: return 20; } }\n",
+        );
         let code = &javascript(&output).code;
-        assert!(code.contains("switch (_a.sent()) {"), "{code}");
-        assert!(code.contains("case 0: return [4 /*yield*/, x];"), "{code}");
+        assert!(
+            !code.contains("__generator(this,"),
+            "raw returns must not clone into the machine: {code}"
+        );
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+            "refusal must signal: {:?}",
+            output.diagnostics
+        );
+        // A return-free discriminant case still lowers inline.
+        let lowered = emit_es5_clean(
+            "declare var x: any;\nasync function f() { switch (await x) { case 1: r = 10; } }\n",
+        );
+        let code = &javascript(&lowered).code;
+        assert!(code.contains("switch (_a.sent())"), "{code}");
     }
 
     #[test]
@@ -7163,6 +7171,7 @@ var c = () => 1;
             !code.contains("__generator(this,"),
             "machine must not embed a raw return: {code}"
         );
+        assert!(code.contains("return y;"), "value preserved: {code}");
         assert!(
             output
                 .diagnostics
@@ -7180,7 +7189,7 @@ var c = () => 1;
         // must not leak), `false` refuses (native form + the requires-es2015
         // diagnostic + no machine). Expectations were derived from emitted
         // output; all-refusing output fails every `true` row.
-        let snippets: [(&str, &str, bool); 25] = [
+        let snippets: [(&str, &str, bool); 31] = [
             (
                 "update-computed-while",
                 "declare var o: any, k: any;\nfunction* g() { while (o[k ? k : 0][`x`], o[yield k]++ < 3) { } }\n",
@@ -7302,6 +7311,32 @@ var c = () => 1;
                 false,
             ),
             (
+                "yield-nested-lowers-with-exact-labels",
+                "declare var a: any;\nfunction* g() { while (yield (yield a)) {} }\n",
+                true,
+            ),
+            (
+                "for-var-init-yield-splits",
+                "declare var x: any, c: any;\nfunction* g() { for (var x = yield 1; c;) {} }\n",
+                true,
+            ),
+            (
+                "switch-case-return-refuses",
+                "declare var x: any, y: any;\nfunction* g() { while (y) { switch (x) { case 1: return 42; } } }\n",
+                false,
+            ),
+            (
+                "switch-multi-yield-case-test",
+                "declare var d: any, a: any, b: any, x: any;\nfunction* g() { switch (d) { case (yield a) + (yield b): x = 1; break; default: x = 2; } }\n",
+                true,
+            ),
+            (
+                "computed-key-temps-are-var-at-es5",
+                "declare var x: any, k: any, o: any;\nfunction* g() { while (x) { var { [k]: v } = o; } }\n",
+                true,
+            ),
+            ("bare-yield-lowers", "function* g() { yield; }\n", true),
+            (
                 "async-arrow-refusal-signals",
                 "declare var x: any, y: any, z: any;\nvar f = async () => { while (x) { if (y) { await z; } } };\n",
                 false,
@@ -7350,8 +7385,12 @@ var c = () => 1;
             let output = emit_es5_clean(input);
             let code = &javascript(&output).code;
             assert!(
-                code.contains("function* g(") || live_yield_leak(code).is_none(),
-                "[{name}] must refuse (native form) or lower safely, got:\n{code}"
+                code.contains("function* g(")
+                    && output
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015),
+                "[{name}] sentinel shape must refuse with the native form + diagnostic:\n{code}"
             );
         }
         // JSX expressions need TypeScriptReact parsing; the same sentinel
@@ -7408,14 +7447,40 @@ var c = () => 1;
                 "declare var a: any, b: any, c: any;\nasync function f() { return (await a) ? await b : await c; }\n",
             ),
             (
+                "nested-yield-labels",
+                "declare var a: any;\nfunction* g() { while (yield (yield a)) {} }\n",
+            ),
+            (
+                "for-var-init-split-labels",
+                "declare var x: any, c: any;\nfunction* g() { for (var x = yield 1; yield c;) { yield x; } }\n",
+            ),
+            (
                 "jump-guard-exact-count",
                 "declare var x: any, y: any, z: any;\nasync function f() { while (x) { if (y) continue; await z; } }\n",
             ),
         ] {
             let output = emit_es5_clean(input);
             let code = &javascript(&output).code;
-            if !code.contains("switch (_a.label)") {
-                continue; // refused: fine, label arithmetic never ran
+            let machine_switch = code
+                .match_indices("switch (_")
+                .map(|(i, _)| i)
+                .find(|&i| code[i..].contains(".label)"));
+            if machine_switch.is_none() {
+                if !code.contains("__generator(this,") {
+                    // Not lowered at all: the only honest alternative is a
+                    // signalled refusal — a silent skip would hide a
+                    // lowering regression.
+                    assert!(
+                        code.contains("function*")
+                            && output.diagnostics.iter().any(|d| {
+                                d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015
+                            }),
+                        "[{name}] neither machine nor signalled refusal:\n{code}"
+                    );
+                }
+                // A degenerate zero-resume machine needs no dispatch
+                // switch; there are no labels to check.
+                continue;
             }
             let labels = machine_case_labels(code);
             assert!(!labels.is_empty(), "[{name}] machine without labels");
@@ -7478,14 +7543,19 @@ var c = () => 1;
             let output = emit_es5_clean(input);
             let code = &javascript(&output).code;
             assert!(
-                code.contains("function*(") || live_yield_leak(code).is_none(),
-                "[{name}] non-block body must refuse, never clone: {code}"
+                !code.contains("__generator(this,")
+                    && code.contains("function*")
+                    && output
+                        .diagnostics
+                        .iter()
+                        .any(|d| { d.code() == transforms::codes::GENERATOR_REQUIRES_ES2015 }),
+                "[{name}] non-block body must refuse with the diagnostic, never lower or clone: {code}"
             );
         }
     }
 
     #[test]
-    fn labeled_nested_await_delegation_lowers() {
+    fn labeled_nested_await_delegation_refuses_until_nested_if_slice() {
         // WD-8: branch_awaits delegates through nested statement shapes.
         let output = emit_es5_clean(
             "declare var x: any, y: any, z: any;\nasync function f() {\n    A: while (x) { if (y) { await z; break A; } }\n}\n",
@@ -7581,14 +7651,37 @@ var c = () => 1;
             .nth(1)
             .and_then(|rest| rest.split("case 1:").next())
             .expect("two segments");
+        let source_pos = case0.find("_a = f();").expect("source temp");
+        let yield_pos = case0.find("/*yield*/").expect("split marker");
         assert!(
-            case0.contains("_a = f();"),
-            "source materialized pre-yield: {code}"
+            source_pos < yield_pos,
+            "source materializes before the yield: {code}"
         );
-        assert!(case0.contains("yield"), "suspension in segment 0: {code}");
         assert!(
             code.contains("import(_a,"),
             "resume reassembles from the temp: {code}"
         );
+    }
+
+    #[test]
+    fn es5_async_nested_async_arrow_keeps_its_awaits() {
+        // A nested async arrow owns its awaits: the outer function's
+        // await-to-yield rewrite must stop at the nested body, and the
+        // nested arrow keeps its own `await` for its own lowering pass.
+        // (Await inside a NON-async function is invalid input the parser
+        // does not yet reject — banked as a checker slice.)
+        let output = emit_es5_clean(
+            "declare var k: any;\nasync function f() { var g = async () => { return await k; }; }\n",
+        );
+        let code = &javascript(&output).code;
+        // The nested arrow lowers itself: its own __awaiter machine with
+        // the await in protocol form ([4 /*yield*/, k]) — no live yield.
+        assert_eq!(
+            code.matches("__awaiter").count(),
+            2,
+            "both the outer function and the nested arrow lower: {code}"
+        );
+        assert!(code.contains("/*yield*/, k"), "protocol form: {code}");
+        assert!(live_yield_leak(code).is_none(), "{code}");
     }
 }

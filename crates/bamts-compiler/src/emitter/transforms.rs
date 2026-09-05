@@ -2473,7 +2473,14 @@ impl<'a> Rewriter<'a> {
             range,
             Statement::Variable(VariableDeclaration {
                 range,
-                kind: VariableKind::Let,
+                // Temps can land inside machine bodies that clone
+                // verbatim; `let` there is a SyntaxError at ES5, but
+                // ES2015+ targets keep the tighter binding.
+                kind: if self.options.target >= ScriptTarget::Es2015 {
+                    VariableKind::Let
+                } else {
+                    VariableKind::Var
+                },
                 declarations: vec![declaration],
             }),
         )
@@ -4647,7 +4654,18 @@ impl<'a> Rewriter<'a> {
         }
         let init_resumes = match &for_statement.initializer {
             Some(ForInitializer::Expression(expression)) => count_yields(expression),
-            Some(ForInitializer::Variable(_)) | None => 0,
+            Some(ForInitializer::Variable(declaration)) => declaration
+                .declarations
+                .iter()
+                .map(|declarator| {
+                    declarator
+                        .data()
+                        .initializer
+                        .as_deref()
+                        .map_or(0, count_yields)
+                })
+                .sum(),
+            None => 0,
         };
         let test_resumes = count_yields(test);
         let update_resumes = for_statement.update.as_deref().map_or(0, count_yields);
@@ -4754,11 +4772,15 @@ impl<'a> Rewriter<'a> {
             .cases
             .iter()
             .any(|case| case_body_resumes(case) > 0);
-        if !disc_suspends && !any_test && !any_body {
+        let any_return = switch_statement
+            .cases
+            .iter()
+            .any(|case| statements_contain_return(&case.data().consequent));
+        if !disc_suspends && !any_test && !any_body && !any_return {
             ctx.push(statement.clone());
             return Some(());
         }
-        if disc_suspends && !any_test && !any_body {
+        if disc_suspends && !any_test && !any_body && !any_return {
             // Only the discriminant suspends: reassemble inline around
             // the resumed value, cases cloned.
             let discriminant = self.eval(&switch_statement.discriminant, ctx)?;
@@ -4795,11 +4817,14 @@ impl<'a> Rewriter<'a> {
         }
 
         let head = ctx.segments.len() as u32 - 1;
+        // One resume segment per yield node, not per suspending case: a
+        // case test like `(yield a) + (yield b)` splits twice, and a
+        // case-count under-count skews every dispatch target past it.
         let suspending_tests = switch_statement
             .cases
             .iter()
-            .filter(|case| case_test_suspends(case))
-            .count() as u32;
+            .map(|case| case.data().test.as_deref().map_or(0, count_yields))
+            .sum::<u32>();
         // Each suspending test's yield lands in the current segment and
         // its resume opens one new segment, so the dispatch phases span
         // head..head+suspending_tests and bodies start after.
@@ -5151,8 +5176,15 @@ impl<'a> Rewriter<'a> {
                 if yielded.delegate {
                     return None;
                 }
-                let argument = yielded.argument.as_ref()?;
-                let evaluated = self.eval(argument, ctx)?;
+                // A bare `yield;` is the same protocol with void 0; refusing
+                // the whole generator over the missing argument drops a
+                // trivial, common shape.
+                let void_argument = self.void_zero(expr.range());
+                let argument = yielded
+                    .argument
+                    .as_ref()
+                    .map_or(void_argument, |argument| argument.as_ref().clone());
+                let evaluated = self.eval(&argument, ctx)?;
                 let sentinel = self.number_expr("4 /*yield*/");
                 let array = self.array_literal(vec![sentinel, evaluated], range);
                 let terminator = self.machine_return(array, range);
@@ -5849,15 +5881,34 @@ impl<'a> Rewriter<'a> {
             );
         }
         match expression.data() {
-            Expression::Class(class) => self.lower_class_expression(expression, class, None),
+            Expression::Class(class) => {
+                let previous = self.replace_await;
+                self.replace_await = false;
+                let lowered = self.lower_class_expression(expression, class, None);
+                self.replace_await = previous;
+                lowered
+            }
             Expression::Function(function) => {
+                // A nested function-like owns its awaits: rewriting them
+                // into yields here would emit `yield` inside a non-async
+                // function, so the flag clears for the nested body and
+                // restores after.
+                let previous = self.replace_await;
+                self.replace_await = false;
                 let function = self.rewrite_function_like(&function.function, expression.range());
+                self.replace_await = previous;
                 self.node(
                     expression.range(),
                     Expression::Function(FunctionExpression { function }),
                 )
             }
-            Expression::Arrow(arrow) => self.rewrite_arrow(expression, arrow),
+            Expression::Arrow(arrow) => {
+                let previous = self.replace_await;
+                self.replace_await = false;
+                let rewritten = self.rewrite_arrow(expression, arrow);
+                self.replace_await = previous;
+                rewritten
+            }
             Expression::Await(awaited) => {
                 let argument = self.rewrite_expr(&awaited.argument);
                 self.node(
@@ -7003,7 +7054,16 @@ fn block_statements(statement: &Stmt) -> Option<&[Stmt]> {
 fn for_clauses_are_clean(for_statement: &ForStatement) -> bool {
     let init_clean = match &for_statement.initializer {
         Some(ForInitializer::Expression(expression)) => !contains_yield(expression),
-        _ => true,
+        Some(ForInitializer::Variable(declaration)) => {
+            declaration.declarations.iter().all(|declarator| {
+                declarator
+                    .data()
+                    .initializer
+                    .as_deref()
+                    .is_none_or(|init| !contains_yield(init))
+            })
+        }
+        None => true,
     };
     let test_clean = for_statement
         .test
@@ -7108,6 +7168,10 @@ fn statements_contain_return(statements: &[Stmt]) -> bool {
             statements_contain_return(branch_statements(&do_statement.body))
         }
         Statement::Labeled(labeled) => statements_contain_return(branch_statements(&labeled.body)),
+        Statement::Switch(switch_statement) => switch_statement
+            .cases
+            .iter()
+            .any(|case| statements_contain_return(&case.data().consequent)),
         _ => false,
     })
 }
@@ -7124,7 +7188,7 @@ impl ChainSegment {
 /// own their own yields).
 fn count_yields(expression: &Expr) -> u32 {
     match expression.data() {
-        Expression::Yield(_) => 1,
+        Expression::Yield(yielded) => 1 + yielded.argument.as_deref().map_or(0, count_yields),
         Expression::Identifier(_) | Expression::This | Expression::Super => 0,
         Expression::Literal(_) | Expression::Meta(_) | Expression::Missing(_) => 0,
         Expression::Function(_) | Expression::Class(_) | Expression::Arrow(_) => 0,
@@ -7409,7 +7473,12 @@ fn machine_state_name(skip: &std::collections::HashSet<String>, temps: &[String]
     let taken: std::collections::HashSet<&String> = skip.iter().chain(temps.iter()).collect();
     let mut index = 0u32;
     loop {
-        let name = machine_name(index).unwrap_or_else(|| "_state".to_string());
+        // Past the alphabet machine_name returns None forever; a fixed
+        // "_state" fallback would then loop endlessly when _state is also
+        // taken, so the suffix keeps every candidate fresh and the loop
+        // terminates.
+        let name =
+            machine_name(index).unwrap_or_else(|| format!("_state{}", index.saturating_sub(26)));
         if !taken.contains(&name) {
             return name;
         }
@@ -7553,7 +7622,16 @@ fn statements_contain_await(statements: &[Stmt]) -> bool {
         Statement::For(for_statement) => {
             let init = match &for_statement.initializer {
                 Some(ForInitializer::Expression(expression)) => contains_await(expression),
-                _ => false,
+                Some(ForInitializer::Variable(declaration)) => {
+                    declaration.declarations.iter().any(|declarator| {
+                        declarator
+                            .data()
+                            .initializer
+                            .as_deref()
+                            .is_some_and(contains_await)
+                    })
+                }
+                None => false,
             };
             let test = for_statement.test.as_deref().is_some_and(contains_await);
             let update = for_statement.update.as_deref().is_some_and(contains_await);
@@ -7569,6 +7647,9 @@ fn statements_contain_await(statements: &[Stmt]) -> bool {
         Statement::Labeled(labeled) => branch_awaits(&labeled.body),
         // Jumps and empties hold no expressions.
         Statement::Break(_) | Statement::Continue(_) | Statement::Empty => false,
+        // The machine helper wraps the body in try/catch, so a cloned raw
+        // throw is protocol-safe; only its argument's awaits matter.
+        Statement::Throw(throw_statement) => contains_await(&throw_statement.argument),
         _ => true,
     })
 }
@@ -9334,13 +9415,20 @@ console.log(JSON.stringify([bar, bar4, log]));
             ScriptTarget::Es5,
         );
         let code = javascript(&output);
-        let key_temp_at = code.find("let _t").expect("key temp declared");
-        let digits: String = code[key_temp_at + "let _t".len()..]
+        // ES5 temps are `var` (a `let` inside cloned machine bodies is a
+        // SyntaxError at ES5); ES2015+ keeps the tighter `let` binding.
+        let (kind, key_temp_at) = code
+            .find("var _t")
+            .map(|at| ("var", at))
+            .or_else(|| code.find("let _t").map(|at| ("let", at)))
+            .expect("key temp declared");
+        assert_eq!(kind, "var", "ES5 temp kind: {code}");
+        let digits: String = code[key_temp_at + "var _t".len()..]
             .chars()
             .take_while(|character| character.is_ascii_digit())
             .collect();
         let temp_name = format!("_t{digits}");
-        let declaration_form = format!("let {temp_name} = key;");
+        let declaration_form = format!("var {temp_name} = key;");
         assert!(
             code.contains(&declaration_form),
             "key evaluates once into a temp ({declaration_form:?}): {code}"
