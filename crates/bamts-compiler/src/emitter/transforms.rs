@@ -1802,7 +1802,7 @@ impl<'a> Rewriter<'a> {
                 let start = source.utf16_to_byte(range.start()).expect("binding start");
                 let end = source.utf16_to_byte(range.end()).expect("binding end");
                 let name = source.as_str()[start..end].to_owned();
-                self.lower_class_expression(value, class, Some(&name))
+                self.lower_class_expression(value, class, Some(&name), true)
             } else {
                 self.rewrite_expr(value)
             };
@@ -4847,7 +4847,13 @@ impl<'a> Rewriter<'a> {
     ) -> Option<()> {
         let range = statement.range();
         let cons_block = block_statements(&if_statement.consequent)?;
-        let alt_block = block_statements(if_statement.alternate.as_deref()?)?;
+        // A missing alternate is the empty else: fallthrough. Refusing
+        // the whole generator over `if (c) { ... }` with no else clause
+        // rejects one of the most common statement shapes.
+        let alt_block: &[Stmt] = match if_statement.alternate.as_deref() {
+            Some(alternate) => block_statements(alternate)?,
+            None => &[],
+        };
         if !branch_is_simple(cons_block) || !branch_is_simple(alt_block) {
             return None;
         }
@@ -6299,6 +6305,7 @@ impl<'a> Rewriter<'a> {
         expression: &Expr,
         class_expression: &ClassExpression,
         inferred_name: Option<&str>,
+        hoist_suspending: bool,
     ) -> Expr {
         if matches!(FieldMode::for_options(self.options), FieldMode::Native) {
             let lowered = self.lower_class(&class_expression.class, expression.range(), None);
@@ -6326,6 +6333,40 @@ impl<'a> Rewriter<'a> {
                     class: lowered.class,
                 }),
                 child_marked,
+            );
+        }
+        // A suspending computed key cannot live inside the IIFE: the
+        // arrow is a plain function, so a yield there is a SyntaxError
+        // (tsc 6.0.2 emits exactly that broken shape). Where the caller
+        // drains key_prelude into an enclosing statement list, the
+        // suspending key temps hoist out and the machine splits them;
+        // expression contexts cannot hoist, so they keep the IIFE and
+        // signal the requires-es2015 refusal instead of breaking
+        // silently. Static-field postludes reference the constructed
+        // temp and can never hoist; they refuse the same way.
+        let mut refused = false;
+        let (suspending, mut clean): (Vec<_>, Vec<_>) = lowered
+            .prelude
+            .drain(..)
+            .partition(|statement| count_branch_yields(std::slice::from_ref(statement)) > 0);
+        if !suspending.is_empty() {
+            if hoist_suspending {
+                self.key_prelude.extend(suspending);
+            } else {
+                clean.extend(suspending);
+                refused = true;
+            }
+        }
+        lowered.prelude = clean;
+        let postlude_refused = lowered
+            .postlude
+            .iter()
+            .any(|statement| count_branch_yields(std::slice::from_ref(statement)) > 0);
+        if refused || postlude_refused {
+            self.diag(
+                codes::GENERATOR_REQUIRES_ES2015,
+                expression.range(),
+                "generators require ScriptTarget::Es2015 or later",
             );
         }
         let class = self.syn_node(
@@ -6420,7 +6461,7 @@ impl<'a> Rewriter<'a> {
             Expression::Class(class) => {
                 let previous = self.replace_await;
                 self.replace_await = false;
-                let lowered = self.lower_class_expression(expression, class, None);
+                let lowered = self.lower_class_expression(expression, class, None, false);
                 self.replace_await = previous;
                 lowered
             }

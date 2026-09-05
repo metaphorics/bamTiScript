@@ -7176,6 +7176,84 @@ var c = () => 1;
         );
     }
 
+    /// B1: a suspending computed class key hoists out of the class
+    /// IIFE in statement contexts - the arrow is a plain function and
+    /// tsc 6.0.2 itself emits a SyntaxError for the in-IIFE form. The
+    /// machine splits the hoisted key temp and the arrow stays clean.
+    #[test]
+    fn class_computed_key_suspension_hoists_out_of_the_iife() {
+        let out = emit_es5_clean(
+            "var k:any;\nfunction* g(){ var C = class { [yield k]() {} }; return C; }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(
+            code.contains("[4 /*yield*/, k]"),
+            "the key's suspension must split:\n{code}"
+        );
+        assert!(
+            code.contains("_t1 = _a.sent()"),
+            "the key temp binds from sent():\n{code}"
+        );
+        assert!(
+            code.contains("[_t1]()"),
+            "the member reads the hoisted temp:\n{code}"
+        );
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+    }
+
+    /// B1: expression-position class expressions cannot hoist (no
+    /// enclosing statement drains key_prelude), so they keep tsc's
+    /// in-IIFE shape but carry the requires-es2015 refusal instead of
+    /// breaking silently.
+    #[test]
+    fn class_computed_key_in_expression_position_signals_refusal() {
+        let parsed = crate::parser::parse(crate::scanner::scan(
+            SourceId::new(0),
+            ScriptKind::TypeScript,
+            Arc::new(
+                SourceText::new("var k:any;\nfunction* h(){ foo(class { [yield k]() {} }); }\n")
+                    .expect("fits"),
+            ),
+        ));
+        let out = emit_output(
+            parsed.product(),
+            &EmitOptions {
+                target: ScriptTarget::Es5,
+                no_emit_helpers: true,
+                ..EmitOptions::default()
+            },
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.message().contains("generators require")),
+            "expression-position suspension must refuse loudly"
+        );
+    }
+
+    /// B7: if-without-else is the empty else, not a refusal - both the
+    /// inline clean clone and the suspending labeled shape must lower.
+    #[test]
+    fn if_without_else_lowers_in_the_machine() {
+        let suspending = emit_es5_clean(
+            "var c:any, x:any;\nfunction* g(){ if (c) { yield x; } yield 2; }\n",
+        );
+        let code = javascript(&suspending).code;
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(
+            code.contains("[4 /*yield*/, x]"),
+            "the branch suspension must split:\n{code}"
+        );
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+        let clean = emit_es5_clean(
+            "var c:any, x:any;\nfunction* g(){ yield 1; if (c) { x = 1; } }\n",
+        );
+        let code = javascript(&clean).code;
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(code.contains("if (c)"), "clean if clones inline:\n{code}");
+    }
+
     /// Emits `input` at es5 without helpers; panics on parse diagnostics.
     fn emit_es5_clean(input: &str) -> EmitOutput {
         let parsed = crate::parser::parse(crate::scanner::scan(
