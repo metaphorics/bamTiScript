@@ -7397,6 +7397,39 @@ var c = () => 1;
         );
     }
 
+    /// A for-of body suspending in a generator machine-splits through
+    /// the lowered classic loop - the ladder's machine slice composing
+    /// with the plain lowering.
+    #[test]
+    fn for_of_suspension_machine_splits_through_the_lowered_loop() {
+        let out =
+            emit_es5_clean("var it:any;\nfunction* g(){ for (const k of it) { yield k; } }\n");
+        let code = javascript(&out).code.clone();
+        assert!(code.contains("__generator(this,"), "machine form: {code}");
+        assert!(
+            code.contains("[4 /*yield*/, k]"),
+            "the body's suspension must split:\n{code}"
+        );
+        assert!(
+            code.contains("_t1[_t0]"),
+            "the binding reads the indexed element:\n{code}"
+        );
+        assert!(live_yield_leak(&code).is_none(), "live yield leaked");
+    }
+
+    /// A braceless for-of body is one statement, not a missing one:
+    /// the emitted loop must still contain it.
+    #[test]
+    fn braceless_for_of_body_survives_lowering() {
+        let out =
+            emit_es5_clean("var arr:any;\nfunction f(){ for (const k of arr) console.log(k); }\n");
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("console.log(k)"),
+            "the braceless body statement must survive:\n{code}"
+        );
+    }
+
     /// Emits `input` at es5 without helpers; panics on parse diagnostics.
     fn emit_es5_clean(input: &str) -> EmitOutput {
         let parsed = crate::parser::parse(crate::scanner::scan(

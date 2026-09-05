@@ -97,6 +97,7 @@ pub enum LanguageFeature {
     LogicalAssignment,
     ClassFields,
     Using,
+    ForOf,
 }
 
 impl LanguageFeature {
@@ -114,6 +115,7 @@ impl LanguageFeature {
             Self::LogicalAssignment => ScriptTarget::Es2021,
             Self::ClassFields => ScriptTarget::Es2022,
             Self::Using => ScriptTarget::EsNext,
+            Self::ForOf => ScriptTarget::Es2015,
         }
     }
 }
@@ -1514,6 +1516,16 @@ impl<'a> Rewriter<'a> {
                         "for-await-of requires ScriptTarget::Es2018 or later",
                     );
                 }
+                // tsc's default ES5 for-of: index the iterable
+                // (`for (var _i = 0, src = it; _i < src.length; _i++)`).
+                // The binding moves into the body as a declaration, so
+                // destructuring bindings and defaults compose through
+                // the ordinary destructuring lowering.
+                if for_of.mode == ForOfMode::Sync
+                    && Self::needs(LanguageFeature::ForOf, self.options)
+                {
+                    return self.lower_sync_for_of(statement, for_of);
+                }
                 let iterable = self.rewrite_expr(&for_of.iterable);
                 let body = self.rewrite_single_statement(&for_of.body);
                 vec![self.node(
@@ -1527,12 +1539,24 @@ impl<'a> Rewriter<'a> {
                 )]
             }
             Statement::ForIn(for_in) => {
+                // The for-in construct is native ES5; only the head's
+                // const/let binding needs var conversion there.
+                let binding = match &for_in.binding {
+                    ForBinding::Variable(declaration) => {
+                        let mut declaration = declaration.clone();
+                        if self.options.target <= ScriptTarget::Es5 {
+                            declaration.kind = VariableKind::Var;
+                        }
+                        ForBinding::Variable(declaration)
+                    }
+                    target @ ForBinding::Target(_) => target.clone(),
+                };
                 let object = self.rewrite_expr(&for_in.object);
                 let body = self.rewrite_single_statement(&for_in.body);
                 vec![self.node(
                     statement.range(),
                     Statement::ForIn(ForInStatement {
-                        binding: for_in.binding.clone(),
+                        binding,
                         object: Box::new(object),
                         body: Box::new(body),
                     }),
@@ -1658,6 +1682,118 @@ impl<'a> Rewriter<'a> {
     fn rewrite_block(&mut self, block: &BlockNode) -> BlockNode {
         let statements = self.rewrite_statements(&block.data().statements);
         self.node(block.range(), Block { statements })
+    }
+
+    /// tsc's default ES5 for-of lowering: `for (var _i = 0, src = IT;
+    /// _i < src.length; _i++) { BINDING = src[_i]; BODY }`. The binding
+    /// statement enters the body as a rewritten declaration so pattern
+    /// bindings and defaults compose with the destructuring lowering.
+    fn lower_sync_for_of(&mut self, statement: &Stmt, for_of: &ForOfStatement) -> Vec<Stmt> {
+        let range = statement.range();
+        let counter = self.temp_ident();
+        let source = self.temp_ident();
+        let iterable = self.rewrite_expr(&for_of.iterable);
+        let zero = self.number_expr("0");
+        let counter_decl = self.make_declarator(counter.clone(), Some(zero), range);
+        let source_decl = self.make_declarator(source.clone(), Some(iterable), range);
+        let initializer = ForInitializer::Variable(VariableDeclaration {
+            range,
+            kind: VariableKind::Var,
+            declarations: vec![counter_decl, source_decl],
+        });
+        let counter_expr = self.node(counter.range(), Expression::Identifier(counter.clone()));
+        let length = self.member_ident(&source, "length", range);
+        let test = self.node(
+            range,
+            Expression::Binary(BinaryExpression {
+                operator: BinaryOperator::LessThan,
+                left: Box::new(counter_expr.clone()),
+                right: Box::new(length),
+            }),
+        );
+        let counter_target = Box::new(self.node(
+            counter.range(),
+            AssignmentTarget::Identifier(counter.clone()),
+        ));
+        let update = self.node(
+            counter.range(),
+            Expression::Update(UpdateExpression {
+                operator: UpdateOperator::Increment,
+                argument: counter_target,
+                prefix: false,
+            }),
+        );
+        // The body's binding declaration: source[counter].
+        let element = self.member_computed(&source, &counter_expr, range);
+        let binding_statement = match &for_of.binding {
+            ForBinding::Variable(declaration) => {
+                let mut declaration = declaration.clone();
+                declaration.kind = VariableKind::Var;
+                if declaration.declarations.len() == 1 {
+                    let declarator = &declaration.declarations[0];
+                    let lowered = self.node(
+                        declarator.range(),
+                        VariableDeclarator {
+                            initializer: Some(Box::new(element)),
+                            ..declarator.data().clone()
+                        },
+                    );
+                    declaration.declarations = vec![lowered];
+                    self.node(range, Statement::Variable(declaration))
+                } else {
+                    let iterable = for_of.iterable.as_ref().clone();
+                    let body = self.rewrite_single_statement(&for_of.body);
+                    return vec![self.node(
+                        range,
+                        Statement::ForOf(ForOfStatement {
+                            mode: for_of.mode,
+                            binding: ForBinding::Variable(declaration),
+                            iterable: Box::new(iterable),
+                            body: Box::new(body),
+                        }),
+                    )];
+                }
+            }
+            // Assignment-target bindings have no lowering here; the
+            // verbatim statement below keeps the shape (and any
+            // applicable diagnostic) instead of dropping it.
+            target @ ForBinding::Target(_) => {
+                let iterable = for_of.iterable.as_ref().clone();
+                let body = self.rewrite_single_statement(&for_of.body);
+                return vec![self.node(
+                    range,
+                    Statement::ForOf(ForOfStatement {
+                        mode: for_of.mode,
+                        binding: target.clone(),
+                        iterable: Box::new(iterable),
+                        body: Box::new(body),
+                    }),
+                )];
+            }
+        };
+        // The binding declaration must itself lower (pattern bindings,
+        // defaults) - route it through the statement rewriter.
+        let lowered_binding = self.rewrite_statements(&[binding_statement]);
+        // A non-block body is a single statement, not a missing one:
+        // block_statements returns None for it, so the match form must
+        // push it rather than drop it.
+        let inner = self.rewrite_single_statement(&for_of.body);
+        let mut statements = lowered_binding;
+        match inner.data() {
+            Statement::Block(block) => statements.extend(block.data().statements.iter().cloned()),
+            _ => statements.push(inner.clone()),
+        }
+        let body_node = self.node(range, Block { statements });
+        let body_stmt = self.node(range, Statement::Block(body_node));
+        vec![self.node(
+            range,
+            Statement::For(ForStatement {
+                initializer: Some(initializer),
+                test: Some(Box::new(test)),
+                update: Some(Box::new(update)),
+                body: Box::new(body_stmt),
+            }),
+        )]
     }
 
     fn rewrite_variable_statement(
@@ -10388,6 +10524,47 @@ console.log(JSON.stringify([bar, bar4, log]));
         assert!(
             code.contains("(_t0 = obj).v = Math.pow(_t0.v, 3)"),
             "{code}"
+        );
+    }
+
+    /// ES5 for-of lowers to the index form and still loops: the
+    /// binding lands inside the body, the index bound is the iterable
+    /// length, and one pass collects every element.
+    #[test]
+    fn node_executes_lowered_for_of_collects_every_element() {
+        let output = emit_at(
+            "var out = [];\nfor (const k of [1, 2, 3]) { out.push(k); }\nfor (const k in { a: 1 }) { out.push(k); }\nconsole.log(out.join(\",\"));\n",
+            ScriptTarget::Es5,
+        );
+        let code = javascript(&output);
+        assert!(!code.contains("of "), "for-of must lower at es5:\n{code}");
+        assert!(
+            code.contains("var k in"),
+            "for-in keeps native form:\n{code}"
+        );
+        assert!(
+            !code.contains("const k"),
+            "head bindings convert to var:\n{code}"
+        );
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bamts-forof-{nonce}.cjs"));
+        std::fs::write(&path, code).expect("write lowered JavaScript");
+        let result = std::process::Command::new("node")
+            .arg(&path)
+            .output()
+            .expect("execute Node");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.status.success(),
+            "{}\n{code}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("1,2,3,a"),
+            "the loop must collect every element and key:\n{code}"
         );
     }
 
