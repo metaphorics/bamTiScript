@@ -7430,6 +7430,25 @@ var c = () => 1;
         );
     }
 
+    /// A destructuring binding in a for-of head composes with the
+    /// destructuring lowering: the element read becomes the binding's
+    /// initializer inside the loop body.
+    #[test]
+    fn for_of_pattern_binding_composes_with_destructuring() {
+        let out = emit_es5_clean(
+            "var arr:any;\nfor (const { a, b = 2 } of arr) { console.log(a + b); }\n",
+        );
+        let code = javascript(&out).code.clone();
+        assert!(
+            code.contains("void 0 ? 2 :"),
+            "the binding default must lower inside the loop:\n{code}"
+        );
+        assert!(
+            code.contains(".a"),
+            "the member read must bind from the element:\n{code}"
+        );
+    }
+
     /// Emits `input` at es5 without helpers; panics on parse diagnostics.
     fn emit_es5_clean(input: &str) -> EmitOutput {
         let parsed = crate::parser::parse(crate::scanner::scan(
